@@ -50,6 +50,11 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.proposal import (
+    ImmediateProposalHandle,
+    ProposalHandle,
+    SpeculatorOutput,
+)
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -506,6 +511,21 @@ class SpecDecodeBaseProposer:
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
+
+    def dispatch_proposal(self, **propose_kwargs) -> ProposalHandle:
+        """Start one proposal round; redeem the handle with collect_proposal.
+
+        The default implementation runs `propose` synchronously, so local
+        speculators behave exactly as before. A remote speculator proxy
+        overrides this pair to overlap draft compute with target-side
+        bookkeeping between dispatch and collect.
+        """
+        draft_token_ids = self.propose(**propose_kwargs)
+        return ImmediateProposalHandle(SpeculatorOutput.from_dense(draft_token_ids))
+
+    def collect_proposal(self, handle: ProposalHandle) -> SpeculatorOutput:
+        assert isinstance(handle, ImmediateProposalHandle)
+        return handle.output
 
     def propose(
         self,
