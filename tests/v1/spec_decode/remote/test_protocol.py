@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Control-plane protocol: envelope versioning, codec roundtrips, and
+stale-response identity semantics."""
+
+import msgspec
+import pytest
+
+from vllm.v1.spec_decode.remote.capabilities import (
+    SpeculatorPlacementCapabilities,
+    TargetFeatureKind,
+)
+from vllm.v1.spec_decode.remote.protocol import (
+    PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
+    AdvanceAndPropose,
+    CancelBatch,
+    CloseSequence,
+    ErrorReply,
+    FeatureSlot,
+    Hello,
+    HelloAck,
+    MessageEnvelope,
+    OpenSequence,
+    Ping,
+    Pong,
+    PrefillChunk,
+    ProposalResponse,
+    ProtocolError,
+    ProtocolVersionError,
+    RemoteServerLimits,
+    SequenceAck,
+    SequenceKey,
+    SpeculatorStatusCode,
+    TargetFeatureSchema,
+    decode_envelope,
+    decode_payload,
+    encode_message,
+)
+
+KEY = SequenceKey(verifier_instance_id="v0", sequence_id=7, generation=2)
+
+CAPABILITIES = SpeculatorPlacementCapabilities(
+    state_dependency="own_kv",
+    required_features=(
+        TargetFeatureKind.TOKEN_IDS,
+        TargetFeatureKind.AUX_HIDDEN_STATES,
+    ),
+    supports_parallel_drafting=True,
+    standalone_weights="materializable",
+)
+
+SCHEMA = TargetFeatureSchema(
+    schema_id=1,
+    slots=(
+        FeatureSlot(kind=TargetFeatureKind.TOKEN_IDS, dtype="int32", trailing_shape=()),
+        FeatureSlot(
+            kind=TargetFeatureKind.AUX_HIDDEN_STATES,
+            dtype="bfloat16",
+            trailing_shape=(2880,),
+        ),
+    ),
+)
+
+ALL_MESSAGES = [
+    Hello(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=PROTOCOL_MINOR,
+        verifier_instance_id="v0",
+        target_fingerprint="tf",
+        tokenizer_fingerprint="kf",
+        method="eagle3",
+        num_speculative_tokens=5,
+        parallel_drafting=True,
+        supported_transports=("cuda_ipc", "pinned_host"),
+    ),
+    HelloAck(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=PROTOCOL_MINOR,
+        server_id="s0",
+        session_id="sess",
+        session_epoch=3,
+        selected_transport="cuda_ipc",
+        capabilities=CAPABILITIES,
+        feature_schema=SCHEMA,
+        limits=RemoteServerLimits(
+            max_batch_size=128,
+            max_feature_tokens=8192,
+            max_sequences=128,
+            max_model_len=32768,
+            ring_slots=8,
+        ),
+    ),
+    OpenSequence(key=KEY),
+    PrefillChunk(
+        key=KEY,
+        offset=0,
+        num_tokens=128,
+        is_final=False,
+        feature_slot=3,
+        checksum=0xABCDEF,
+    ),
+    AdvanceAndPropose(
+        batch_id=9,
+        keys=(KEY,),
+        round_ids_slot=0,
+        accepted_counts_slot=1,
+        recovery_tokens_slot=2,
+        feature_slot=3,
+    ),
+    ProposalResponse(batch_id=9, sequence_number=42, result_slot=5),
+    SequenceAck(
+        key=KEY,
+        status=SpeculatorStatusCode.SEQUENCE_DESYNC,
+        detail="offset gap",
+    ),
+    CloseSequence(keys=(KEY,)),
+    CancelBatch(batch_id=9),
+    Ping(nonce=1),
+    Pong(nonce=1, queue_depth=4, active_sequences=2),
+    ErrorReply(status=SpeculatorStatusCode.INTERNAL_ERROR, detail="boom"),
+]
+
+
+@pytest.mark.parametrize("message", ALL_MESSAGES, ids=lambda m: type(m).__name__)
+def test_roundtrip(message):
+    data = encode_message(message, session_id="sess", request_id=11)
+    envelope = decode_envelope(data)
+    assert envelope.session_id == "sess"
+    assert envelope.request_id == 11
+    assert decode_payload(envelope) == message
+
+
+def test_major_version_mismatch_rejected():
+    encoder = msgspec.msgpack.Encoder()
+    data = encoder.encode(
+        MessageEnvelope(
+            protocol_major=PROTOCOL_MAJOR + 1,
+            protocol_minor=0,
+            message_type="ping",
+            session_id="",
+            request_id=0,
+            payload=encoder.encode(Ping()),
+        )
+    )
+    with pytest.raises(ProtocolVersionError):
+        decode_envelope(data)
+
+
+def test_unknown_message_type_rejected():
+    envelope = MessageEnvelope(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=0,
+        message_type="warp_speed",
+        session_id="",
+        request_id=0,
+        payload=b"",
+    )
+    with pytest.raises(ProtocolError, match="unknown message type"):
+        decode_payload(envelope)
+
+
+def test_minor_version_adds_ignorable_fields():
+    # A newer peer may add optional payload fields; they must be ignored.
+    payload = msgspec.msgpack.Encoder().encode(
+        {"nonce": 5, "field_from_the_future": "later"}
+    )
+    envelope = MessageEnvelope(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=99,
+        message_type="ping",
+        session_id="",
+        request_id=0,
+        payload=payload,
+    )
+    assert decode_payload(envelope) == Ping(nonce=5)
+
+
+def test_malformed_payload_raises_protocol_error():
+    envelope = MessageEnvelope(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=0,
+        message_type="hello",
+        session_id="",
+        request_id=0,
+        payload=b"\xc1garbage",
+    )
+    with pytest.raises(ProtocolError):
+        decode_payload(envelope)
+
+
+def test_unregistered_message_type_cannot_encode():
+    class Rogue(msgspec.Struct):
+        x: int = 0
+
+    with pytest.raises(ProtocolError, match="unregistered"):
+        encode_message(Rogue())
+
+
+def test_sequence_key_generation_distinguishes_stale_state():
+    # Same request identity, new generation: distinct key, so responses
+    # carrying the old generation cannot match current state.
+    assert KEY != SequenceKey("v0", 7, 3)
+    assert len({KEY, SequenceKey("v0", 7, 2)}) == 1
