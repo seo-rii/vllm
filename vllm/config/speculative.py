@@ -79,6 +79,37 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+RemoteDraftTransport = Literal["auto", "cuda_ipc", "pinned_host", "zmq"]
+RemoteDraftFailurePolicy = Literal["error", "target_only"]
+
+
+@config
+class RemoteDraftConfig:
+    """Placement configuration for running a target-conditioned speculator
+    in a standalone process on a dedicated same-host GPU.
+
+    This is orthogonal to the speculative method: `method` selects the
+    algorithm and `remote_draft` selects where it runs. Exactly one endpoint
+    is supported; routing across multiple draft servers is out of scope.
+    """
+
+    endpoint: str
+    """Control-plane endpoint of the standalone speculator server, e.g.
+    "unix:///run/vllm/drafter.sock"."""
+    transport: RemoteDraftTransport = "auto"
+    """Data-plane transport for target features and draft results. "auto"
+    negotiates CUDA IPC when peer access is available and falls back to a
+    pinned-host ring otherwise. "zmq" is a debug transport."""
+    failure_policy: RemoteDraftFailurePolicy = "target_only"
+    """What to do when the remote speculator fails or times out.
+    "target_only" (production default) keeps decoding without speculation
+    for the affected requests; "error" surfaces the failure as an engine
+    error (development / CI)."""
+    request_timeout_ms: int = Field(default=100, gt=0)
+    """Deadline for collecting a proposal before the affected rows fall
+    back to target-only decoding with valid_length=0."""
+    startup_timeout_ms: int = Field(default=30_000, gt=0)
+    """Deadline for the initial connection and HELLO handshake."""
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
@@ -457,6 +488,14 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    # Placement
+    remote_draft: RemoteDraftConfig | None = None
+    """Run the speculator in a standalone process on a dedicated same-host
+    GPU instead of co-located with the target model. Only supported for
+    target-conditioned speculators that keep their own draft KV cache
+    (EAGLE/EAGLE3/P-EAGLE and standard native MTP). `None` keeps the
+    existing co-located behavior."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1456,7 +1495,27 @@ class SpeculativeConfig:
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")
 
+        if self.remote_draft is not None:
+            self._validate_remote_draft()
+
         return self
+
+    def _validate_remote_draft(self) -> None:
+        from vllm.v1.spec_decode.remote.capabilities import (
+            remote_draft_config_incompatibilities,
+        )
+
+        reasons = remote_draft_config_incompatibilities(
+            method=self.method,
+            draft_tensor_parallel_size=self.draft_tensor_parallel_size,
+            draft_sample_method=self.draft_sample_method,
+            uses_target_kv=self.use_gemma4_mtp(),
+        )
+        if reasons:
+            raise ValueError(
+                "speculative_config.remote_draft is not supported with this "
+                "configuration: " + "; ".join(reasons)
+            )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
@@ -1797,6 +1856,9 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_remote_draft(self) -> bool:
+        return self.remote_draft is not None
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
