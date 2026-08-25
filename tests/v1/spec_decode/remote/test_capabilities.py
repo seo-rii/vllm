@@ -81,6 +81,32 @@ def test_unprovidable_features_reported_by_name():
     assert "next_prefill_tokens" in reasons[0]
 
 
+def test_unknown_future_feature_kind_rejected_by_name():
+    # A newer-minor server may require a kind this build does not know;
+    # it must surface as an unprovidable feature, not a decode error.
+    reasons = placement_incompatibilities(
+        make_capabilities(
+            required_features=(TargetFeatureKind.TOKEN_IDS, "rope_scales")
+        ),
+        parallel_drafting=False,
+        draft_sample_method="greedy",
+        provided_features={TargetFeatureKind.TOKEN_IDS},
+    )
+    assert len(reasons) == 1
+    assert "rope_scales" in reasons[0]
+
+
+def test_multi_module_requires_checkpoint_support():
+    reasons = placement_incompatibilities(
+        make_capabilities(supports_multi_module=False),
+        parallel_drafting=False,
+        draft_sample_method="greedy",
+        provided_features=EAGLE3_FEATURES,
+        uses_multi_module=True,
+    )
+    assert any("multi-module" in r for r in reasons)
+
+
 def test_parallel_drafting_requires_checkpoint_support():
     reasons = placement_incompatibilities(
         make_capabilities(supports_parallel_drafting=False),
@@ -140,3 +166,16 @@ def test_config_time_unresolved_draft_tp_allowed():
         )
         == []
     )
+
+
+def test_config_time_unknown_kv_sharing_fails_closed():
+    # If the MTP variant cannot be determined, remote placement is refused
+    # rather than assuming the draft keeps its own KV.
+    reasons = remote_draft_config_incompatibilities(
+        method="mtp",
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        uses_target_kv=None,
+    )
+    assert len(reasons) == 1
+    assert "cannot determine" in reasons[0]

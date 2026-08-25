@@ -1505,11 +1505,17 @@ class SpeculativeConfig:
             remote_draft_config_incompatibilities,
         )
 
+        if self.method == "mtp" and self.draft_model_config is None:
+            # The MTP variant (and thus KV sharing) cannot be determined
+            # without the draft model config; fail closed.
+            uses_target_kv = None
+        else:
+            uses_target_kv = self.use_gemma4_mtp()
         reasons = remote_draft_config_incompatibilities(
             method=self.method,
             draft_tensor_parallel_size=self.draft_tensor_parallel_size,
             draft_sample_method=self.draft_sample_method,
-            uses_target_kv=self.use_gemma4_mtp(),
+            uses_target_kv=uses_target_kv,
         )
         if reasons:
             raise ValueError(

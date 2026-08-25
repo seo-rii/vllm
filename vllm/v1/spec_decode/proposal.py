@@ -28,14 +28,9 @@ class SpeculatorOutput:
     """[batch, num_speculative_tokens] proposed draft token IDs."""
     valid_lengths: torch.Tensor
     """[batch] number of usable draft tokens per request."""
-    draft_logits: torch.Tensor | None = None
-    """Optional full draft logits for probabilistic rejection sampling."""
 
     @staticmethod
-    def from_dense(
-        token_ids: torch.Tensor,
-        draft_logits: torch.Tensor | None = None,
-    ) -> "SpeculatorOutput":
+    def from_dense(token_ids: torch.Tensor) -> "SpeculatorOutput":
         """Wrap a fully-valid [batch, K] proposal tensor."""
         batch_size, num_tokens = token_ids.shape
         valid_lengths = torch.full(
@@ -44,7 +39,7 @@ class SpeculatorOutput:
             dtype=torch.int32,
             device=token_ids.device,
         )
-        return SpeculatorOutput(token_ids, valid_lengths, draft_logits)
+        return SpeculatorOutput(token_ids, valid_lengths)
 
     @staticmethod
     def target_only(

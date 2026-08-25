@@ -18,7 +18,6 @@ def test_from_dense_marks_all_rows_fully_valid():
     output = SpeculatorOutput.from_dense(token_ids)
     assert output.token_ids is token_ids
     assert output.valid_lengths.tolist() == [3, 3]
-    assert output.draft_logits is None
 
 
 def test_target_only_zeroes_valid_lengths_not_tokens_only():

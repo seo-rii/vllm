@@ -12,7 +12,6 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 from vllm.v1.spec_decode.remote.protocol import (
     PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
     AdvanceAndPropose,
     CancelBatch,
     CloseSequence,
@@ -64,8 +63,6 @@ SCHEMA = TargetFeatureSchema(
 
 ALL_MESSAGES = [
     Hello(
-        protocol_major=PROTOCOL_MAJOR,
-        protocol_minor=PROTOCOL_MINOR,
         verifier_instance_id="v0",
         target_fingerprint="tf",
         tokenizer_fingerprint="kf",
@@ -75,8 +72,6 @@ ALL_MESSAGES = [
         supported_transports=("cuda_ipc", "pinned_host"),
     ),
     HelloAck(
-        protocol_major=PROTOCOL_MAJOR,
-        protocol_minor=PROTOCOL_MINOR,
         server_id="s0",
         session_id="sess",
         session_epoch=3,
@@ -174,6 +169,35 @@ def test_minor_version_adds_ignorable_fields():
         payload=payload,
     )
     assert decode_payload(envelope) == Ping(nonce=5)
+
+
+def test_unknown_feature_kind_stays_decodable():
+    # A newer-minor peer may advertise feature kinds this build does not
+    # know; the handshake must decode so the capability check can reject
+    # them by name instead of dying with a codec error.
+    ack = ALL_MESSAGES[1]
+    future_capabilities = SpeculatorPlacementCapabilities(
+        state_dependency="own_kv",
+        required_features=(TargetFeatureKind.TOKEN_IDS, "rope_scales"),
+        standalone_weights="complete",
+    )
+    future_ack = HelloAck(
+        server_id=ack.server_id,
+        session_id=ack.session_id,
+        session_epoch=ack.session_epoch,
+        selected_transport=ack.selected_transport,
+        capabilities=future_capabilities,
+        feature_schema=TargetFeatureSchema(
+            schema_id=2,
+            slots=(
+                FeatureSlot(kind="rope_scales", dtype="float32", trailing_shape=()),
+            ),
+        ),
+        limits=ack.limits,
+    )
+    decoded = decode_payload(decode_envelope(encode_message(future_ack)))
+    assert "rope_scales" in decoded.capabilities.required_features
+    assert decoded.feature_schema.slots[0].kind == "rope_scales"
 
 
 def test_malformed_payload_raises_protocol_error():
