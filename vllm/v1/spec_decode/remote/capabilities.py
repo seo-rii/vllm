@@ -18,10 +18,10 @@ import msgspec
 StateDependency = Literal["own_kv", "target_kv", "target_owned_state"]
 StandaloneWeights = Literal["complete", "materializable", "missing"]
 
-# Speculative methods eligible for remote placement in the first PR:
-# target-conditioned speculators that keep their own draft KV. Methods that
-# read the target KV cache directly (e.g. Gemma4 MTP) or that have not been
-# validated on the standalone runtime are rejected at startup.
+# Method families eligible for remote placement. This is a coarse
+# config-time gate only: MTP variant names are normalized to "mtp" before
+# validation, so variant- and checkpoint-level compatibility is enforced by
+# the capability report in the HELLO handshake, not by this set.
 REMOTE_DRAFT_SUPPORTED_METHODS = frozenset({"eagle", "eagle3", "mtp"})
 
 
@@ -48,15 +48,26 @@ class SpeculatorPlacementCapabilities(msgspec.Struct, frozen=True):
     verifier compares this against its own configuration and the features it
     can provide, and rejects the connection with an explicit error instead
     of silently running an unsupported combination.
+
+    Feature kinds are carried as plain strings (TargetFeatureKind values) so
+    that a newer-minor peer advertising an unknown kind stays decodable and
+    is rejected through `placement_incompatibilities` rather than failing
+    with a codec error.
     """
 
     state_dependency: StateDependency
-    required_features: tuple[TargetFeatureKind, ...]
+    required_features: tuple[str, ...]
     num_prefill_lookahead: int = 0
+    """Lookahead tokens the adapter needs per prefill chunk; negotiation
+    input for the prefill-chunk contract, not a reject gate."""
     supports_parallel_drafting: bool = False
     supports_multi_module: bool = False
     standalone_weights: StandaloneWeights = "missing"
     supports_probabilistic_draft: bool = False
+
+
+def _feature_value(kind: str) -> str:
+    return kind.value if isinstance(kind, TargetFeatureKind) else kind
 
 
 def placement_incompatibilities(
@@ -64,12 +75,15 @@ def placement_incompatibilities(
     *,
     parallel_drafting: bool,
     draft_sample_method: str,
-    provided_features: Collection[TargetFeatureKind],
+    provided_features: Collection[str],
+    uses_multi_module: bool = False,
 ) -> list[str]:
     """Return reasons why a negotiated placement is unsupported.
 
     An empty list means the verifier may use the remote speculator. Each
     entry is a human-readable reason suitable for a startup error message.
+    ``provided_features`` accepts TargetFeatureKind members or their string
+    values.
     """
     reasons: list[str] = []
     if capabilities.state_dependency != "own_kv":
@@ -84,8 +98,12 @@ def placement_incompatibilities(
             "materialize the speculator in a standalone process (e.g. "
             "embedding or LM head shared with the target)"
         )
-    provided = frozenset(provided_features)
-    missing = [f.value for f in capabilities.required_features if f not in provided]
+    provided = {_feature_value(f) for f in provided_features}
+    missing = [
+        _feature_value(f)
+        for f in capabilities.required_features
+        if _feature_value(f) not in provided
+    ]
     if missing:
         reasons.append(
             "the verifier cannot provide required target features: "
@@ -95,6 +113,11 @@ def placement_incompatibilities(
         reasons.append(
             "parallel_drafting is enabled but the speculator checkpoint does "
             "not support parallel drafting"
+        )
+    if uses_multi_module and not capabilities.supports_multi_module:
+        reasons.append(
+            "the draft checkpoint uses multiple speculative modules but the "
+            "speculator does not support multi-module drafting"
         )
     if (
         draft_sample_method != "greedy"
@@ -113,7 +136,7 @@ def remote_draft_config_incompatibilities(
     method: str | None,
     draft_tensor_parallel_size: int | None,
     draft_sample_method: str,
-    uses_target_kv: bool,
+    uses_target_kv: bool | None,
 ) -> list[str]:
     """Return reasons why a SpeculativeConfig cannot use remote_draft.
 
@@ -121,6 +144,8 @@ def remote_draft_config_incompatibilities(
     that can be decided before connecting to the standalone server. The
     remaining checks (checkpoint capabilities, feature schema, fingerprints)
     happen during the HELLO handshake via `placement_incompatibilities`.
+    ``uses_target_kv=None`` means the property could not be determined and
+    is rejected fail-closed.
     """
     reasons: list[str] = []
     if method not in REMOTE_DRAFT_SUPPORTED_METHODS:
@@ -128,7 +153,12 @@ def remote_draft_config_incompatibilities(
             f"method {method!r} is not supported with remote_draft; "
             f"supported methods: {sorted(REMOTE_DRAFT_SUPPORTED_METHODS)}"
         )
-    if uses_target_kv:
+    if uses_target_kv is None:
+        reasons.append(
+            "cannot determine whether the draft model shares the target KV "
+            "cache (draft model config is not resolved)"
+        )
+    elif uses_target_kv:
         reasons.append(
             "the speculator shares the target KV cache directly and cannot "
             "run on a dedicated device"
@@ -138,6 +168,8 @@ def remote_draft_config_incompatibilities(
             "remote_draft requires draft_tensor_parallel_size=1; got "
             f"{draft_tensor_parallel_size}"
         )
+    # Blanket config-time restriction; relax together with the
+    # supports_probabilistic_draft gate in placement_incompatibilities.
     if draft_sample_method != "greedy":
         reasons.append(
             "remote_draft currently requires draft_sample_method='greedy'; "

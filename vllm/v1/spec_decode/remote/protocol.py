@@ -11,8 +11,8 @@ Versioning rules:
 - A different ``protocol_major`` rejects the connection.
 - ``protocol_minor`` bumps may only add optional fields; unknown fields are
   ignored on decode.
-- The data-plane buffer layout is versioned independently via
-  ``IPC_LAYOUT_VERSION``.
+- The envelope is the single authority for the protocol version; payloads
+  never carry their own copy.
 """
 
 import enum
@@ -21,12 +21,10 @@ import msgspec
 
 from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
-    TargetFeatureKind,
 )
 
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
-IPC_LAYOUT_VERSION = 1
 
 
 class ProtocolError(Exception):
@@ -70,9 +68,13 @@ class SequenceKey(msgspec.Struct, frozen=True):
 
 
 class FeatureSlot(msgspec.Struct, frozen=True):
-    """One tensor slot in the negotiated target-feature layout."""
+    """One tensor slot in the negotiated target-feature layout.
 
-    kind: TargetFeatureKind
+    ``kind`` is a TargetFeatureKind value carried as a plain string so that
+    unknown kinds from a newer-minor peer stay decodable.
+    """
+
+    kind: str
     dtype: str
     trailing_shape: tuple[int, ...]
     optional: bool = False
@@ -102,8 +104,6 @@ class RemoteServerLimits(msgspec.Struct, frozen=True):
 class Hello(msgspec.Struct):
     """Verifier -> server handshake request."""
 
-    protocol_major: int
-    protocol_minor: int
     verifier_instance_id: str
     target_fingerprint: str
     tokenizer_fingerprint: str
@@ -117,8 +117,6 @@ class Hello(msgspec.Struct):
 class HelloAck(msgspec.Struct):
     """Server -> verifier handshake response."""
 
-    protocol_major: int
-    protocol_minor: int
     server_id: str
     session_id: str
     session_epoch: int
@@ -248,6 +246,8 @@ _MESSAGE_TYPES: dict[str, type[msgspec.Struct]] = {
 }
 _TYPE_NAMES = {cls: name for name, cls in _MESSAGE_TYPES.items()}
 
+# Codec instances reuse internal buffers and are not thread-safe; use them
+# from a single thread per connection.
 _encoder = msgspec.msgpack.Encoder()
 _envelope_decoder = msgspec.msgpack.Decoder(MessageEnvelope)
 _payload_decoders = {
