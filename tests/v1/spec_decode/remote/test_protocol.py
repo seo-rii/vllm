@@ -171,6 +171,93 @@ def test_minor_version_adds_ignorable_fields():
     assert decode_payload(envelope) == Ping(nonce=5)
 
 
+@pytest.mark.parametrize(
+    ("message_type", "payload"),
+    [
+        (
+            "open_sequence",
+            {
+                "key": {
+                    "verifier_instance_id": "v0",
+                    "sequence_id": -1,
+                    "generation": 0,
+                }
+            },
+        ),
+        (
+            "prefill_chunk",
+            {
+                "key": {
+                    "verifier_instance_id": "v0",
+                    "sequence_id": 0,
+                    "generation": 0,
+                },
+                "offset": -4,
+                "num_tokens": 1,
+                "is_final": True,
+                "feature_slot": 0,
+                "checksum": 0,
+            },
+        ),
+        ("proposal_response", {"batch_id": 9, "sequence_number": -1}),
+        (
+            "advance_and_propose",
+            {
+                "batch_id": 9,
+                "keys": [],
+                "accepted_counts_slot": -2,
+                "recovery_tokens_slot": 0,
+                "feature_slot": 0,
+            },
+        ),
+    ],
+    ids=["negative-sequence", "negative-offset", "negative-seqno", "negative-slot"],
+)
+def test_semantic_range_violation_rejected(message_type, payload):
+    # Structural decode success is not enough: out-of-range identifiers
+    # must be rejected at the codec layer.
+    envelope = MessageEnvelope(
+        protocol_major=PROTOCOL_MAJOR,
+        protocol_minor=0,
+        message_type=message_type,
+        session_id="",
+        request_id=0,
+        payload=msgspec.msgpack.Encoder().encode(payload),
+    )
+    with pytest.raises(ProtocolError, match="malformed"):
+        decode_payload(envelope)
+
+
+def test_degenerate_feature_shape_rejected():
+    ack = ALL_MESSAGES[1]
+    bad_ack = HelloAck(
+        server_id=ack.server_id,
+        session_id=ack.session_id,
+        session_epoch=ack.session_epoch,
+        selected_transport=ack.selected_transport,
+        capabilities=ack.capabilities,
+        feature_schema=TargetFeatureSchema(
+            schema_id=1,
+            slots=(
+                FeatureSlot(kind="token_ids", dtype="int32", trailing_shape=(0,)),
+            ),
+        ),
+        limits=ack.limits,
+    )
+    with pytest.raises(ProtocolError, match="malformed"):
+        decode_payload(decode_envelope(encode_message(bad_ack)))
+
+
+def test_failed_response_carries_no_result_slot():
+    response = ProposalResponse(
+        batch_id=1,
+        sequence_number=2,
+        status=SpeculatorStatusCode.QUEUE_FULL,
+    )
+    decoded = decode_payload(decode_envelope(encode_message(response)))
+    assert decoded.result_slot is None
+
+
 def test_unknown_feature_kind_stays_decodable():
     # A newer-minor peer may advertise feature kinds this build does not
     # know; the handshake must decode so the capability check can reject

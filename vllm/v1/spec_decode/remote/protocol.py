@@ -16,6 +16,7 @@ Versioning rules:
 """
 
 import enum
+from typing import Annotated
 
 import msgspec
 
@@ -25,6 +26,13 @@ from vllm.v1.spec_decode.remote.capabilities import (
 
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
+
+# Field-level range constraints are enforced by msgspec on decode, so a
+# peer cannot deliver negative identifiers or degenerate shapes. Checks
+# that need negotiated session state (slot ranges, batch limits, schema
+# identity) belong to the session layer, not this module.
+NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
+PositiveInt = Annotated[int, msgspec.Meta(gt=0)]
 
 
 class ProtocolError(Exception):
@@ -63,8 +71,8 @@ class SequenceKey(msgspec.Struct, frozen=True):
     """
 
     verifier_instance_id: str
-    sequence_id: int
-    generation: int
+    sequence_id: NonNegativeInt
+    generation: NonNegativeInt
 
 
 class FeatureSlot(msgspec.Struct, frozen=True):
@@ -76,7 +84,7 @@ class FeatureSlot(msgspec.Struct, frozen=True):
 
     kind: str
     dtype: str
-    trailing_shape: tuple[int, ...]
+    trailing_shape: tuple[PositiveInt, ...]
     optional: bool = False
 
 
@@ -87,18 +95,18 @@ class TargetFeatureSchema(msgspec.Struct, frozen=True):
     ``schema_id``; per-round messages never carry string feature maps.
     """
 
-    schema_id: int
+    schema_id: NonNegativeInt
     slots: tuple[FeatureSlot, ...]
 
 
 class RemoteServerLimits(msgspec.Struct, frozen=True):
     """Hard limits negotiated down to the smaller common value."""
 
-    max_batch_size: int
-    max_feature_tokens: int
-    max_sequences: int
-    max_model_len: int
-    ring_slots: int = 0
+    max_batch_size: PositiveInt
+    max_feature_tokens: PositiveInt
+    max_sequences: PositiveInt
+    max_model_len: PositiveInt
+    ring_slots: NonNegativeInt = 0
 
 
 class Hello(msgspec.Struct):
@@ -108,7 +116,7 @@ class Hello(msgspec.Struct):
     target_fingerprint: str
     tokenizer_fingerprint: str
     method: str
-    num_speculative_tokens: int
+    num_speculative_tokens: PositiveInt
     parallel_drafting: bool
     supported_transports: tuple[str, ...]
     draft_checkpoint_fingerprint: str = ""
@@ -119,7 +127,7 @@ class HelloAck(msgspec.Struct):
 
     server_id: str
     session_id: str
-    session_epoch: int
+    session_epoch: NonNegativeInt
     selected_transport: str
     capabilities: SpeculatorPlacementCapabilities
     feature_schema: TargetFeatureSchema
@@ -142,34 +150,35 @@ class PrefillChunk(msgspec.Struct):
     """
 
     key: SequenceKey
-    offset: int
-    num_tokens: int
+    offset: NonNegativeInt
+    num_tokens: NonNegativeInt
     is_final: bool
-    feature_slot: int
-    checksum: int
+    feature_slot: NonNegativeInt
+    checksum: NonNegativeInt
 
 
 class AdvanceAndPropose(msgspec.Struct):
     """Apply the last verification outcome and propose the next K tokens."""
 
-    batch_id: int
+    batch_id: NonNegativeInt
     keys: tuple[SequenceKey, ...]
-    round_ids_slot: int
-    accepted_counts_slot: int
-    recovery_tokens_slot: int
-    feature_slot: int
+    accepted_counts_slot: NonNegativeInt
+    recovery_tokens_slot: NonNegativeInt
+    feature_slot: NonNegativeInt
+    round_ids_slot: NonNegativeInt | None = None
 
 
 class ProposalResponse(msgspec.Struct):
     """Server -> verifier completion notice for one proposal batch.
 
     Draft tokens, per-row valid lengths, and per-row status live in the
-    data-plane slot referenced by ``result_slot``.
+    data-plane slot referenced by ``result_slot``; a failed batch carries
+    no result slot.
     """
 
-    batch_id: int
-    sequence_number: int
-    result_slot: int
+    batch_id: NonNegativeInt
+    sequence_number: NonNegativeInt
+    result_slot: NonNegativeInt | None = None
     status: SpeculatorStatusCode = SpeculatorStatusCode.OK
 
 
@@ -190,7 +199,7 @@ class CloseSequence(msgspec.Struct):
 class CancelBatch(msgspec.Struct):
     """Cancel not-yet-started work after a timeout or request finish."""
 
-    batch_id: int
+    batch_id: NonNegativeInt
 
 
 class Ping(msgspec.Struct):
@@ -203,8 +212,8 @@ class Pong(msgspec.Struct):
     """Liveness / load report."""
 
     nonce: int = 0
-    queue_depth: int = 0
-    active_sequences: int = 0
+    queue_depth: NonNegativeInt = 0
+    active_sequences: NonNegativeInt = 0
     healthy: bool = True
 
 
@@ -222,11 +231,11 @@ class MessageEnvelope(msgspec.Struct):
     carried by SequenceKey inside the payload, never by request_id.
     """
 
-    protocol_major: int
-    protocol_minor: int
+    protocol_major: PositiveInt
+    protocol_minor: NonNegativeInt
     message_type: str
     session_id: str
-    request_id: int
+    request_id: NonNegativeInt
     payload: bytes
 
 

@@ -29,6 +29,35 @@ class SpeculatorOutput:
     valid_lengths: torch.Tensor
     """[batch] number of usable draft tokens per request."""
 
+    def __post_init__(self) -> None:
+        # Structural checks only; value-level checks would force a device
+        # sync on the hot path.
+        if self.token_ids.ndim != 2:
+            raise ValueError(
+                f"token_ids must be 2-D [batch, K], got {self.token_ids.ndim}-D"
+            )
+        if self.valid_lengths.ndim != 1:
+            raise ValueError(
+                f"valid_lengths must be 1-D [batch], got "
+                f"{self.valid_lengths.ndim}-D"
+            )
+        if self.token_ids.shape[0] != self.valid_lengths.shape[0]:
+            raise ValueError(
+                f"batch size mismatch: token_ids has {self.token_ids.shape[0]} "
+                f"rows, valid_lengths has {self.valid_lengths.shape[0]}"
+            )
+        for name, tensor in (
+            ("token_ids", self.token_ids),
+            ("valid_lengths", self.valid_lengths),
+        ):
+            if tensor.is_floating_point() or tensor.is_complex():
+                raise ValueError(f"{name} must have an integer dtype")
+        if self.token_ids.device != self.valid_lengths.device:
+            raise ValueError(
+                f"token_ids ({self.token_ids.device}) and valid_lengths "
+                f"({self.valid_lengths.device}) must be on the same device"
+            )
+
     @staticmethod
     def from_dense(token_ids: torch.Tensor) -> "SpeculatorOutput":
         """Wrap a fully-valid [batch, K] proposal tensor."""
