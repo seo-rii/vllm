@@ -1471,6 +1471,13 @@ class SpeculativeConfig:
                         self.num_speculative_tokens,
                     )
 
+                if (
+                    self.remote_draft is not None
+                    and self.draft_tensor_parallel_size is None
+                ):
+                    # A remote drafter runs in its own process; never
+                    # inherit the target TP size as the default.
+                    self.draft_tensor_parallel_size = 1
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
                         self.target_parallel_config,
