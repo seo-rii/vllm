@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-phase proposal API: valid_lengths semantics and the synchronous
-default dispatch/collect path."""
+"""Split-phase proposal API: valid_lengths semantics, output invariants,
+and the synchronous default dispatch/collect path."""
 
+import pytest
 import torch
 
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -24,6 +25,30 @@ def test_target_only_zeroes_valid_lengths_not_tokens_only():
     output = SpeculatorOutput.target_only(2, 3, torch.device("cpu"))
     assert output.token_ids.shape == (2, 3)
     assert output.valid_lengths.tolist() == [0, 0]
+
+
+def test_batch_size_mismatch_rejected():
+    with pytest.raises(ValueError, match="batch size mismatch"):
+        SpeculatorOutput(
+            token_ids=torch.zeros(2, 3, dtype=torch.long),
+            valid_lengths=torch.zeros(3, dtype=torch.int32),
+        )
+
+
+def test_wrong_rank_rejected():
+    with pytest.raises(ValueError, match="2-D"):
+        SpeculatorOutput(
+            token_ids=torch.zeros(6, dtype=torch.long),
+            valid_lengths=torch.zeros(6, dtype=torch.int32),
+        )
+
+
+def test_non_integer_dtype_rejected():
+    with pytest.raises(ValueError, match="integer dtype"):
+        SpeculatorOutput(
+            token_ids=torch.zeros(2, 3),
+            valid_lengths=torch.zeros(2, dtype=torch.int32),
+        )
 
 
 def test_default_dispatch_collect_is_synchronous_propose():
