@@ -10,8 +10,15 @@ dedicated same-host GPU outside the target tensor-parallel group:
   target features it needs every round.
 - protocol: control-plane message types exchanged between the verifier and
   the standalone speculator server.
+- state: client-side handle/sequence state machines and the
+  placement-neutral batch/result types the session exposes to the runner.
+- transport: the framed inline stream transport (debug data plane).
+- session: the verifier-side session (handshake, sequence lifecycle,
+  dispatch/collect, failure latching).
+- server: the standalone server loop, idempotent sequence registry, the
+  adapter contract, and a deterministic fake adapter for tests.
 
-Modules in this package must stay importable without CUDA and without the
-heavyweight parts of vLLM so that protocol and capability logic can be unit
-tested in isolation.
+Only ``session`` imports torch; everything else must stay importable
+without CUDA and without the heavyweight parts of vLLM so protocol,
+registry, and state logic can be unit tested in isolation.
 """
