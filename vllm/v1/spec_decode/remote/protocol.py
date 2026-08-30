@@ -60,6 +60,7 @@ class SpeculatorStatusCode(enum.IntEnum):
     UNSUPPORTED_FEATURE = 6
     OUT_OF_MEMORY = 7
     INTERNAL_ERROR = 8
+    PROTOCOL_ERROR = 9
 
 
 class SequenceKey(msgspec.Struct, frozen=True):
@@ -307,6 +308,4 @@ def decode_payload(envelope: MessageEnvelope) -> msgspec.Struct:
     try:
         return decoder.decode(envelope.payload)
     except msgspec.DecodeError as e:
-        raise ProtocolError(
-            f"malformed {envelope.message_type} payload: {e}"
-        ) from e
+        raise ProtocolError(f"malformed {envelope.message_type} payload: {e}") from e

@@ -106,8 +106,7 @@ def placement_incompatibilities(
     ]
     if missing:
         reasons.append(
-            "the verifier cannot provide required target features: "
-            f"{sorted(missing)}"
+            f"the verifier cannot provide required target features: {sorted(missing)}"
         )
     if parallel_drafting and not capabilities.supports_parallel_drafting:
         reasons.append(

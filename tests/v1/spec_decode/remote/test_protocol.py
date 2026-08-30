@@ -238,9 +238,7 @@ def test_degenerate_feature_shape_rejected():
         capabilities=ack.capabilities,
         feature_schema=TargetFeatureSchema(
             schema_id=1,
-            slots=(
-                FeatureSlot(kind="token_ids", dtype="int32", trailing_shape=(0,)),
-            ),
+            slots=(FeatureSlot(kind="token_ids", dtype="int32", trailing_shape=(0,)),),
         ),
         limits=ack.limits,
     )
@@ -311,5 +309,5 @@ def test_unregistered_message_type_cannot_encode():
 def test_sequence_key_generation_distinguishes_stale_state():
     # Same request identity, new generation: distinct key, so responses
     # carrying the old generation cannot match current state.
-    assert KEY != SequenceKey("v0", 7, 3)
+    assert SequenceKey("v0", 7, 3) != KEY
     assert len({KEY, SequenceKey("v0", 7, 2)}) == 1
