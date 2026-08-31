@@ -180,8 +180,10 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
         capabilities: SpeculatorPlacementCapabilities | None = None,
         methods: Collection[str] = REMOTE_DRAFT_SUPPORTED_METHODS,
         hold_timeout_s: float = 10.0,
+        draft_checkpoint_fingerprint: str = "",
     ) -> None:
         self._vocab_size = vocab_size
+        self._draft_checkpoint_fingerprint = draft_checkpoint_fingerprint
         self._capabilities = capabilities or SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=(TargetFeatureKind.TOKEN_IDS.value,),
@@ -213,6 +215,9 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
 
     def supported_methods(self) -> Collection[str]:
         return self._methods
+
+    def draft_checkpoint_fingerprint(self) -> str:
+        return self._draft_checkpoint_fingerprint
 
     def prefix(self, key: SequenceKey) -> list[int] | None:
         return self._prefixes.get(key)
@@ -266,6 +271,8 @@ class SequenceEntry:
     """Server-side bookkeeping for one (verifier, sequence, generation)."""
 
     key: SequenceKey
+    owner: str = ""
+    """session_id of the connection that opened this generation."""
     state: SequenceState = SequenceState.OPENING
     applied_offset: int = 0
     last_chunk: tuple[int, int, int] | None = None
@@ -288,7 +295,9 @@ class SequenceRegistry:
     A newer generation replaces the entry; commands carrying an older
     generation are rejected as STALE_GENERATION. Duplicate open, duplicate
     prefill chunk (same offset and checksum), and duplicate close are all
-    acknowledged without side effects.
+    acknowledged without side effects. Entries record the session that
+    opened them, so the delayed disconnect of a superseded connection can
+    only release its own leftovers, never a reconnected verifier's state.
     """
 
     def __init__(self, clock=time.monotonic) -> None:
@@ -305,7 +314,7 @@ class SequenceRegistry:
         entry = self._entries.get(_registry_key(key))
         return entry if entry is not None and entry.key == key else None
 
-    def open(self, key: SequenceKey) -> OpenOutcome:
+    def open(self, key: SequenceKey, owner: str = "") -> OpenOutcome:
         entry = self._entries.get(_registry_key(key))
         if entry is not None:
             if key.generation < entry.key.generation:
@@ -316,11 +325,12 @@ class SequenceRegistry:
                     None,
                 )
             if key.generation == entry.key.generation:
+                entry.owner = owner
                 entry.last_activity = self._clock()
                 return OpenOutcome(SpeculatorStatusCode.OK, "already open", False, None)
         replaced = entry.key if entry is not None else None
         self._entries[_registry_key(key)] = SequenceEntry(
-            key=key, last_activity=self._clock()
+            key=key, owner=owner, last_activity=self._clock()
         )
         return OpenOutcome(SpeculatorStatusCode.OK, "", True, replaced)
 
@@ -398,11 +408,10 @@ class SequenceRegistry:
         del self._entries[_registry_key(key)]
         return entry.key
 
-    def close_all(self, verifier_instance_id: str) -> tuple[SequenceKey, ...]:
+    def close_all(self, owner: str) -> tuple[SequenceKey, ...]:
+        """Remove every entry still owned by one connection's session."""
         removed = tuple(
-            entry.key
-            for (vid, _), entry in self._entries.items()
-            if vid == verifier_instance_id
+            entry.key for entry in self._entries.values() if entry.owner == owner
         )
         for key in removed:
             del self._entries[_registry_key(key)]
@@ -598,10 +607,10 @@ class _ServerSession:
             self.inbound[data.slot] = data
 
     def cleanup(self) -> None:
-        if not self.verifier_instance_id:
+        if not self.session_id:
             return
         with self.server.lock:
-            keys = self.server.registry.close_all(self.verifier_instance_id)
+            keys = self.server.registry.close_all(self.session_id)
             if keys:
                 self.server.adapter.close_sequences(keys)
 
@@ -695,11 +704,7 @@ class _ServerSession:
                 f"match the server's {server.tokenizer_fingerprint!r}"
             )
         expected_draft = server.adapter.draft_checkpoint_fingerprint()
-        if (
-            expected_draft
-            and hello.draft_checkpoint_fingerprint
-            and hello.draft_checkpoint_fingerprint != expected_draft
-        ):
+        if expected_draft and hello.draft_checkpoint_fingerprint != expected_draft:
             reasons.append(
                 f"draft checkpoint fingerprint "
                 f"{hello.draft_checkpoint_fingerprint!r} does not match the "
@@ -817,7 +822,7 @@ class _ServerSession:
                     f"max_sequences={server.limits.max_sequences} reached",
                 )
                 return
-            outcome = registry.open(key)
+            outcome = registry.open(key, owner=self.session_id)
             if outcome.created:
                 if outcome.replaced is not None:
                     server.adapter.close_sequences((outcome.replaced,))
@@ -834,6 +839,25 @@ class _ServerSession:
                 request_id,
                 SpeculatorStatusCode.PROTOCOL_ERROR,
                 "key belongs to another verifier",
+            )
+            return
+        limits = self.server.limits
+        if message.num_tokens > limits.max_feature_tokens:
+            self._ack(
+                key,
+                request_id,
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                f"chunk of {message.num_tokens} tokens exceeds "
+                f"max_feature_tokens={limits.max_feature_tokens}",
+            )
+            return
+        if message.offset + message.num_tokens > limits.max_model_len:
+            self._ack(
+                key,
+                request_id,
+                SpeculatorStatusCode.OUT_OF_MEMORY,
+                f"prefill to offset {message.offset + message.num_tokens} "
+                f"exceeds max_model_len={limits.max_model_len}",
             )
             return
         problem = _frame_problems(frames, schema, message.num_tokens)
@@ -923,17 +947,32 @@ class _ServerSession:
         if len(accepted_counts) != num_rows or recovery.shape[:1] != (num_rows,):
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, "input frames do not match rows")
             return
+        num_tokens = self.num_speculative_tokens
+        if any(not 0 <= count <= num_tokens for count in accepted_counts):
+            fail(
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                f"accepted counts must be within 0..{num_tokens}",
+            )
+            return
         problem = _frame_problems(frames, schema, num_rows)
         if problem is not None:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
 
-        num_tokens = self.num_speculative_tokens
         with self.server.lock:
             registry = self.server.registry
             row_statuses = [
                 registry.begin_round(key, message.batch_id)[0] for key in message.keys
             ]
+            max_model_len = self.server.limits.max_model_len
+            for i, seq_key in enumerate(message.keys):
+                if row_statuses[i] is not SpeculatorStatusCode.OK:
+                    continue
+                entry = registry.get(seq_key)
+                if entry is not None and (
+                    entry.prefix_length + accepted_counts[i] + 1 > max_model_len
+                ):
+                    row_statuses[i] = SpeculatorStatusCode.OUT_OF_MEMORY
             active = tuple(
                 i
                 for i, status in enumerate(row_statuses)

@@ -21,6 +21,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     Pong,
     PrefillChunk,
     ProposalResponse,
+    RemoteServerLimits,
     SequenceAck,
     SequenceKey,
     SpeculatorStatusCode,
@@ -267,6 +268,27 @@ def test_first_message_must_be_hello(client):
     assert "expected hello" in reply.detail
 
 
+def test_hello_rejects_missing_or_mismatched_draft_fingerprint():
+    # The check must be fail-closed: when the server declares a draft
+    # checkpoint fingerprint, an empty client value is a mismatch too.
+    adapter = FakeDraftAdapter(vocab_size=VOCAB, draft_checkpoint_fingerprint="d1")
+    server = RemoteDraftServer(adapter)
+    server.start("tcp://127.0.0.1:0")
+    try:
+        for offered in ("", "other"):
+            client = RawClient(server.endpoint)
+            reply = client.hello(draft_checkpoint_fingerprint=offered)
+            assert isinstance(reply, ErrorReply)
+            assert "draft checkpoint fingerprint" in reply.detail
+            client.close()
+        client = RawClient(server.endpoint)
+        assert isinstance(client.hello(draft_checkpoint_fingerprint="d1"), HelloAck)
+        client.close()
+    finally:
+        adapter.release()
+        server.stop()
+
+
 def test_each_session_gets_a_fresh_epoch(server):
     first = RawClient(server.endpoint)
     second = RawClient(server.endpoint)
@@ -468,6 +490,64 @@ def test_rejected_batch_frames_are_not_read_by_a_later_round(client):
     assert tokens == [expected_row(20)]
 
 
+def test_accepted_counts_out_of_range_rejected(client, adapter):
+    # Out-of-range accepted counts would corrupt prefix accounting via
+    # ``prefix_length += accepted + 1``; the server must not trust them.
+    client.hello()
+    client.ready(key(80))
+    negative = client.propose(0, [key(80)], recovery=[1], accepted=[-1])
+    too_many = client.propose(
+        1, [key(80)], recovery=[1], accepted=[NUM_SPEC_TOKENS + 1]
+    )
+    assert negative.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    assert too_many.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    good = client.propose(2, [key(80)], recovery=[5])
+    assert good.status is OK
+    assert adapter.proposed_batches == [2]
+    assert adapter.prefix(key(80)) == [1, 2, 3, 5]
+
+
+def test_prefill_and_rounds_respect_advertised_limits():
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            max_batch_size=4,
+            max_feature_tokens=4,
+            max_sequences=8,
+            max_model_len=6,
+        ),
+    )
+    server.start("tcp://127.0.0.1:0")
+    client = RawClient(server.endpoint)
+    try:
+        client.hello()
+        k = key(90)
+        assert client.open(k).status is OK
+        too_long = client.prefill(k, [1] * 5, offset=0, is_final=False)
+        assert too_long.status is SpeculatorStatusCode.PROTOCOL_ERROR
+        assert "max_feature_tokens" in too_long.detail
+        assert client.prefill(k, [1, 2, 3, 4], offset=0, is_final=False).status is OK
+        overflow = client.prefill(k, [5, 6, 7], offset=4, is_final=True)
+        assert overflow.status is SpeculatorStatusCode.OUT_OF_MEMORY
+        assert "max_model_len" in overflow.detail
+        assert client.prefill(k, [5, 6], offset=4, is_final=True).status is OK
+
+        # The prefix sits at max_model_len: even accepted=0 grows it by the
+        # bonus token, so the row must come back OUT_OF_MEMORY untouched.
+        response = client.propose(0, [k], recovery=[9])
+        assert response.status is OK
+        _, valid, statuses = client.result(response)
+        assert statuses == [SpeculatorStatusCode.OUT_OF_MEMORY]
+        assert valid == [0]
+        assert adapter.proposed_batches == []
+        assert adapter.prefix(k) == [1, 2, 3, 4, 5, 6]
+    finally:
+        client.close()
+        adapter.release()
+        server.stop()
+
+
 def test_cancel_is_accepted_without_reply(client):
     client.hello()
     client.send(CancelBatch(batch_id=123))
@@ -523,6 +603,33 @@ def test_disconnect_releases_sequences(server, adapter, client):
     assert adapter.prefix(key(60)) is None
 
 
+def test_late_disconnect_only_releases_entries_the_session_still_owns(server, adapter):
+    # A reconnected verifier re-opens its sequences under new generations;
+    # when the old connection finally goes away, its cleanup must not take
+    # the replacement entries with it.
+    first = RawClient(server.endpoint)
+    second = RawClient(server.endpoint)
+    try:
+        first.hello()
+        first.ready(key(70))
+        first.ready(key(71))
+        second.hello()
+        second.ready(key(70, generation=1), tokens=(7, 8))
+        assert len(server.registry) == 2
+
+        first.close()
+        assert wait_until(lambda: len(server.registry) == 1)
+        response = second.propose(0, [key(70, generation=1)], recovery=[9])
+        assert response.status is OK
+        _, _, statuses = second.result(response)
+        assert statuses == [OK]
+        assert adapter.prefix(key(70, generation=1)) == [7, 8, 9]
+        assert adapter.prefix(key(71)) is None
+    finally:
+        first.close()
+        second.close()
+
+
 def test_stop_disconnects_clients(server, client):
     client.hello()
     server.stop()
@@ -569,12 +676,23 @@ def test_registry_prefill_and_rounds():
     assert registry.get(key(1)).prefix_length == 4 + 3
 
 
-def test_registry_close_all_by_verifier():
+def test_registry_close_all_releases_only_owned_entries():
     registry = SequenceRegistry()
-    registry.open(key(1))
-    registry.open(key(2))
-    registry.open(key(3, verifier="other"))
-    assert set(registry.close_all(VERIFIER)) == {key(1), key(2)}
+    registry.open(key(1), owner="s1")
+    registry.open(key(2), owner="s1")
+    registry.open(key(3, verifier="other"), owner="s2")
+    assert set(registry.close_all("s1")) == {key(1), key(2)}
     assert len(registry) == 1
+    assert registry.close_all("s1") == ()
     assert registry.close(key(3, verifier="other")) == key(3, verifier="other")
     assert registry.close(key(3, verifier="other")) is None
+
+
+def test_registry_reopen_transfers_ownership():
+    registry = SequenceRegistry()
+    registry.open(key(1), owner="old")
+    assert registry.open(key(1, generation=1), owner="new").created
+    assert registry.close_all("old") == ()
+    registry.open(key(1, generation=1), owner="newer")
+    assert set(registry.close_all("newer")) == {key(1, generation=1)}
+    assert len(registry) == 0
