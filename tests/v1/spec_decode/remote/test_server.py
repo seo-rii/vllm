@@ -75,7 +75,7 @@ class RawClient:
         self.conn = connect(endpoint, timeout=5.0)
         self.session_id = ""
         self.request_id = 0
-        self.frames = {}
+        self.frames: dict[int, DataFrame] = {}
         self.next_slot = 100
 
     def send(self, message, *, frames=()):
