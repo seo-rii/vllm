@@ -337,9 +337,13 @@ def test_prefill_idempotency_rules(client, adapter):
     assert duplicate.status is OK
     assert adapter.prefix(k) == [1, 2, 3]
 
+    changed_finality = client.prefill(k, [1, 2, 3], offset=0, is_final=True)
+    assert changed_finality.status is SpeculatorStatusCode.SEQUENCE_DESYNC
+    assert "finality" in changed_finality.detail
+
     mismatch = client.prefill(k, [9, 9, 9], offset=0, is_final=False)
     assert mismatch.status is SpeculatorStatusCode.SEQUENCE_DESYNC
-    assert "different checksum" in mismatch.detail
+    assert "different content" in mismatch.detail
 
     gap = client.prefill(k, [4], offset=5, is_final=False)
     assert gap.status is SpeculatorStatusCode.SEQUENCE_DESYNC
@@ -404,6 +408,44 @@ def test_close_acks_every_key(client):
         assert isinstance(ack, SequenceAck) and ack.status is OK
         acked.add(ack.key)
     assert acked == {key(5), key(6), key(7)}
+
+
+def test_max_sequences_is_global_and_allows_identity_replacement():
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            max_batch_size=4,
+            max_feature_tokens=16,
+            max_sequences=1,
+            max_model_len=32,
+        ),
+    )
+    server.start("tcp://127.0.0.1:0")
+    first = RawClient(server.endpoint)
+    replacement = RawClient(server.endpoint)
+    other = RawClient(server.endpoint)
+    try:
+        first.hello()
+        assert first.open(key(8)).status is OK
+
+        replacement.hello()
+        assert replacement.open(key(8, generation=1)).status is OK
+        assert first.open(key(8)).status is SpeculatorStatusCode.STALE_GENERATION
+        assert first.open(key(9)).status is SpeculatorStatusCode.QUEUE_FULL
+
+        other.hello(verifier_instance_id="other")
+        assert (
+            other.open(key(8, verifier="other")).status
+            is SpeculatorStatusCode.QUEUE_FULL
+        )
+        assert len(server.registry) == 1
+    finally:
+        first.close()
+        replacement.close()
+        other.close()
+        adapter.release()
+        server.stop()
 
 
 # ----------------------------------------------------------------------
@@ -630,6 +672,35 @@ def test_late_disconnect_only_releases_entries_the_session_still_owns(server, ad
         second.close()
 
 
+def test_live_sessions_cannot_mutate_each_others_sequences(server, adapter):
+    first = RawClient(server.endpoint)
+    second = RawClient(server.endpoint)
+    k = key(72)
+    try:
+        first.hello()
+        first.ready(k)
+        second.hello()
+
+        assert second.open(k).status is SpeculatorStatusCode.SEQUENCE_DESYNC
+        assert (
+            second.prefill(k, [9], offset=3).status
+            is SpeculatorStatusCode.SEQUENCE_DESYNC
+        )
+        response = second.propose(0, [k], recovery=[9])
+        _, valid, statuses = second.result(response)
+        assert valid == [0]
+        assert statuses == [SpeculatorStatusCode.SEQUENCE_DESYNC]
+        assert second.call(CloseSequence(keys=(k,))).status is OK
+
+        response = first.propose(0, [k], recovery=[4])
+        _, _, statuses = first.result(response)
+        assert statuses == [OK]
+        assert adapter.prefix(k) == [1, 2, 3, 4]
+    finally:
+        first.close()
+        second.close()
+
+
 def test_stop_disconnects_clients(server, client):
     client.hello()
     server.stop()
@@ -644,11 +715,11 @@ def test_stop_disconnects_clients(server, client):
 
 def test_registry_open_generations():
     registry = SequenceRegistry()
-    assert registry.open(key(1)).created
-    assert not registry.open(key(1)).created
-    outcome = registry.open(key(1, generation=2))
+    assert registry.open(key(1), owner="s1").created
+    assert not registry.open(key(1), owner="s1").created
+    outcome = registry.open(key(1, generation=2), owner="s1")
     assert outcome.created and outcome.replaced == key(1)
-    assert registry.open(key(1, generation=1)).status is (
+    assert registry.open(key(1, generation=1), owner="s1").status is (
         SpeculatorStatusCode.STALE_GENERATION
     )
     assert registry.get(key(1)) is None
@@ -657,22 +728,47 @@ def test_registry_open_generations():
 
 def test_registry_prefill_and_rounds():
     registry = SequenceRegistry()
-    registry.open(key(1))
-    assert registry.begin_round(key(1), 0)[0] is SpeculatorStatusCode.SEQUENCE_DESYNC
+    registry.open(key(1), owner="s1")
+    assert (
+        registry.begin_round(key(1), 0, owner="s1")[0]
+        is SpeculatorStatusCode.SEQUENCE_DESYNC
+    )
     assert registry.prefill(
-        key(1), offset=0, num_tokens=3, checksum=9, is_final=False
+        key(1),
+        owner="s1",
+        offset=0,
+        num_tokens=3,
+        checksum=9,
+        is_final=False,
     ) == (OK, "", True)
     assert (
-        registry.prefill(key(1), offset=0, num_tokens=3, checksum=9, is_final=False)[2]
+        registry.prefill(
+            key(1),
+            owner="s1",
+            offset=0,
+            num_tokens=3,
+            checksum=9,
+            is_final=False,
+        )[2]
         is False
     )
     assert (
-        registry.prefill(key(1), offset=3, num_tokens=1, checksum=1, is_final=True)[0]
+        registry.prefill(
+            key(1),
+            owner="s1",
+            offset=3,
+            num_tokens=1,
+            checksum=1,
+            is_final=True,
+        )[0]
         is OK
     )
-    assert registry.begin_round(key(1), 0) == (OK, "")
-    assert registry.begin_round(key(1), 0)[0] is SpeculatorStatusCode.ROUND_MISMATCH
-    registry.advance(key(1), 2)
+    assert registry.begin_round(key(1), 0, owner="s1") == (OK, "")
+    assert (
+        registry.begin_round(key(1), 0, owner="s1")[0]
+        is SpeculatorStatusCode.ROUND_MISMATCH
+    )
+    registry.advance(key(1), 2, owner="s1")
     assert registry.get(key(1)).prefix_length == 4 + 3
 
 
@@ -684,18 +780,33 @@ def test_registry_close_all_releases_only_owned_entries():
     assert set(registry.close_all("s1")) == {key(1), key(2)}
     assert len(registry) == 1
     assert registry.close_all("s1") == ()
-    assert registry.close(key(3, verifier="other")) == key(3, verifier="other")
-    assert registry.close(key(3, verifier="other")) is None
+    assert registry.close(key(3, verifier="other"), owner="s2") == key(
+        3, verifier="other"
+    )
+    assert registry.close(key(3, verifier="other"), owner="s2") is None
 
 
-def test_registry_reopen_transfers_ownership():
+def test_registry_new_generation_transfers_ownership():
     registry = SequenceRegistry()
     registry.open(key(1), owner="old")
     assert registry.open(key(1, generation=1), owner="new").created
     assert registry.close_all("old") == ()
-    registry.open(key(1, generation=1), owner="newer")
-    assert set(registry.close_all("newer")) == {key(1, generation=1)}
+    same_generation = registry.open(key(1, generation=1), owner="newer")
+    assert same_generation.status is SpeculatorStatusCode.SEQUENCE_DESYNC
+    assert registry.close_all("newer") == ()
+    assert set(registry.close_all("new")) == {key(1, generation=1)}
     assert len(registry) == 0
+
+
+def test_registry_rejects_other_owner_and_future_close():
+    registry = SequenceRegistry()
+    current = key(1, generation=1)
+    registry.open(current, owner="s1")
+    outcome = registry.open(current, owner="s2")
+    assert outcome.status is SpeculatorStatusCode.SEQUENCE_DESYNC
+    assert registry.close(key(1, generation=2), owner="s1") is None
+    assert registry.close(current, owner="s2") is None
+    assert registry.get(current) is not None
 
 
 def test_entrypoints_alias_exposes_server_main():
