@@ -275,8 +275,8 @@ class SequenceEntry:
     """session_id of the connection that opened this generation."""
     state: SequenceState = SequenceState.OPENING
     applied_offset: int = 0
-    last_chunk: tuple[int, int, int] | None = None
-    """(offset, num_tokens, checksum) of the last applied prefill chunk."""
+    last_chunk: tuple[int, int, int, bool] | None = None
+    """(offset, num_tokens, checksum, is_final) of the last applied chunk."""
     prefix_length: int = 0
     last_batch_id: int = -1
     last_activity: float = 0.0
@@ -314,7 +314,11 @@ class SequenceRegistry:
         entry = self._entries.get(_registry_key(key))
         return entry if entry is not None and entry.key == key else None
 
-    def open(self, key: SequenceKey, owner: str = "") -> OpenOutcome:
+    def has_identity(self, key: SequenceKey) -> bool:
+        """Whether this verifier and sequence ID already consume one slot."""
+        return _registry_key(key) in self._entries
+
+    def open(self, key: SequenceKey, *, owner: str) -> OpenOutcome:
         entry = self._entries.get(_registry_key(key))
         if entry is not None:
             if key.generation < entry.key.generation:
@@ -325,7 +329,13 @@ class SequenceRegistry:
                     None,
                 )
             if key.generation == entry.key.generation:
-                entry.owner = owner
+                if entry.owner != owner:
+                    return OpenOutcome(
+                        SpeculatorStatusCode.SEQUENCE_DESYNC,
+                        "generation is owned by another session",
+                        False,
+                        None,
+                    )
                 entry.last_activity = self._clock()
                 return OpenOutcome(SpeculatorStatusCode.OK, "already open", False, None)
         replaced = entry.key if entry is not None else None
@@ -338,24 +348,25 @@ class SequenceRegistry:
         self,
         key: SequenceKey,
         *,
+        owner: str,
         offset: int,
         num_tokens: int,
         checksum: int,
         is_final: bool,
     ) -> tuple[SpeculatorStatusCode, str, bool]:
         """Returns (status, detail, apply): apply is False for duplicates."""
-        status, detail, entry = self._lookup(key)
+        status, detail, entry = self._lookup(key, owner)
         if entry is None:
             return status, detail, False
         entry.last_activity = self._clock()
         if entry.last_chunk is not None and offset == entry.last_chunk[0]:
-            if (num_tokens, checksum) == entry.last_chunk[1:]:
+            if (num_tokens, checksum, is_final) == entry.last_chunk[1:]:
                 return SpeculatorStatusCode.OK, "duplicate chunk", False
             return (
                 SpeculatorStatusCode.SEQUENCE_DESYNC,
                 (
-                    f"chunk at offset {offset} was already applied with a "
-                    "different checksum"
+                    f"chunk at offset {offset} was already applied with "
+                    "different content or finality"
                 ),
                 False,
             )
@@ -373,14 +384,14 @@ class SequenceRegistry:
             )
         entry.applied_offset += num_tokens
         entry.prefix_length = entry.applied_offset
-        entry.last_chunk = (offset, num_tokens, checksum)
+        entry.last_chunk = (offset, num_tokens, checksum, is_final)
         entry.state = SequenceState.READY if is_final else SequenceState.PREFILLING
         return SpeculatorStatusCode.OK, "", True
 
     def begin_round(
-        self, key: SequenceKey, batch_id: int
+        self, key: SequenceKey, batch_id: int, *, owner: str
     ) -> tuple[SpeculatorStatusCode, str]:
-        status, detail, entry = self._lookup(key)
+        status, detail, entry = self._lookup(key, owner)
         if entry is None:
             return status, detail
         if entry.state is not SequenceState.READY:
@@ -394,16 +405,16 @@ class SequenceRegistry:
         entry.last_activity = self._clock()
         return SpeculatorStatusCode.OK, ""
 
-    def advance(self, key: SequenceKey, accepted: int) -> None:
+    def advance(self, key: SequenceKey, accepted: int, *, owner: str) -> None:
         entry = self.get(key)
-        if entry is not None:
+        if entry is not None and entry.owner == owner:
             # accepted drafts plus the bonus/recovery token
             entry.prefix_length += accepted + 1
 
-    def close(self, key: SequenceKey) -> SequenceKey | None:
-        """Remove the entry unless a newer generation owns it."""
+    def close(self, key: SequenceKey, *, owner: str) -> SequenceKey | None:
+        """Remove an exact key only when this connection still owns it."""
         entry = self._entries.get(_registry_key(key))
-        if entry is None or key.generation < entry.key.generation:
+        if entry is None or entry.key != key or entry.owner != owner:
             return None
         del self._entries[_registry_key(key)]
         return entry.key
@@ -418,7 +429,7 @@ class SequenceRegistry:
         return removed
 
     def _lookup(
-        self, key: SequenceKey
+        self, key: SequenceKey, owner: str
     ) -> tuple[SpeculatorStatusCode, str, SequenceEntry | None]:
         entry = self._entries.get(_registry_key(key))
         if entry is None:
@@ -433,6 +444,12 @@ class SequenceRegistry:
             return (
                 SpeculatorStatusCode.SEQUENCE_DESYNC,
                 f"generation {key.generation} was never opened",
+                None,
+            )
+        if entry.owner != owner:
+            return (
+                SpeculatorStatusCode.SEQUENCE_DESYNC,
+                "generation is owned by another session",
                 None,
             )
         return SpeculatorStatusCode.OK, "", entry
@@ -812,9 +829,8 @@ class _ServerSession:
         with server.lock:
             registry = server.registry
             if (
-                registry.get(key) is None
-                and registry.count(self.verifier_instance_id)
-                >= server.limits.max_sequences
+                not registry.has_identity(key)
+                and len(registry) >= server.limits.max_sequences
             ):
                 self._ack(
                     key,
@@ -876,6 +892,7 @@ class _ServerSession:
         with self.server.lock:
             status, detail, apply = self.server.registry.prefill(
                 key,
+                owner=self.session_id,
                 offset=message.offset,
                 num_tokens=message.num_tokens,
                 checksum=message.checksum,
@@ -963,7 +980,10 @@ class _ServerSession:
         with self.server.lock:
             registry = self.server.registry
             row_statuses = [
-                registry.begin_round(key, message.batch_id)[0] for key in message.keys
+                registry.begin_round(
+                    key, message.batch_id, owner=self.session_id
+                )[0]
+                for key in message.keys
             ]
             max_model_len = self.server.limits.max_model_len
             for i, seq_key in enumerate(message.keys):
@@ -1009,7 +1029,11 @@ class _ServerSession:
                 for i in active:
                     row_statuses[i] = result.row_statuses[i]
                     if row_statuses[i] is SpeculatorStatusCode.OK:
-                        registry.advance(message.keys[i], accepted_counts[i])
+                        registry.advance(
+                            message.keys[i],
+                            accepted_counts[i],
+                            owner=self.session_id,
+                        )
                 tokens, valid = result.token_ids, result.valid_lengths
             else:
                 tokens = ints_to_frame(
@@ -1045,7 +1069,7 @@ class _ServerSession:
             for key in message.keys:
                 if not self._owns(key):
                     continue
-                closed = self.server.registry.close(key)
+                closed = self.server.registry.close(key, owner=self.session_id)
                 if closed is not None:
                     removed.append(closed)
             if removed:
