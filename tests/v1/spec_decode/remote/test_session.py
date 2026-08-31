@@ -295,6 +295,26 @@ def test_only_one_proposal_may_be_in_flight(session):
     assert result.row_statuses == (OK,)
 
 
+def test_other_rpcs_cannot_consume_an_inflight_proposal(session):
+    a = ready(session, 1)
+    b = session.open_sequence(2)
+    handle = session.dispatch(batch(0, [a], recovery=[1]))
+
+    with pytest.raises(RemoteDraftError, match="still in flight"):
+        session.ping()
+    with pytest.raises(RemoteDraftError, match="still in flight"):
+        session.open_sequence(3)
+    with pytest.raises(RemoteDraftError, match="still in flight"):
+        session.prefill(b, features([2]), is_final=True)
+    with pytest.raises(RemoteDraftError, match="still in flight"):
+        session.close_sequences((b,))
+
+    assert session.sequence_state(b) is SequenceState.PREFILLING
+    assert session.sequence_state(SequenceKey("verifier-a", 3, 0)) is None
+    assert session.collect(handle).row_statuses == (OK,)
+    assert session.pending_frames == 0
+
+
 def test_dispatch_validates_schema_and_shapes(session):
     a = ready(session, 1)
     wrong_schema = RemoteProposalBatch(
@@ -372,7 +392,7 @@ def test_stale_generation_desyncs_then_reopen_recovers(session, server, adapter)
     a = ready(session, 1)
     newer = SequenceKey(a.verifier_instance_id, a.sequence_id, a.generation + 1)
     with server.lock:
-        server.registry.open(newer)
+        server.registry.open(newer, owner=session.session_id)
         adapter.open_sequence(newer)
 
     result = round_trip(session, batch(0, [a], recovery=[1]))
@@ -486,8 +506,13 @@ def test_reconnect_completes_rounds_with_fresh_wire_state(session):
 def test_reconnect_fences_handles_from_the_old_connection(session):
     a = ready(session, 1)
     handle = session.dispatch(batch(0, [a], recovery=[1]))
+    old_session_id = handle.session_id
     session.close()
     session.connect()
+    assert session.session_id != old_session_id
+    # Simulate a server restart that reuses an epoch. The random session ID
+    # remains authoritative even when an integer epoch happens to collide.
+    handle.session_epoch = session.session_epoch
     with pytest.raises(RemoteDraftError, match="belongs to session"):
         session.collect(handle)
 

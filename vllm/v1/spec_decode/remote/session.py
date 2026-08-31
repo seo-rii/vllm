@@ -317,6 +317,7 @@ class RemoteDraftSession:
         """
         if self._conn is not None:
             raise RemoteDraftError("session is already connected")
+        self._reset_connection_state()
         deadline = self._clock() + self._startup_timeout_s
         try:
             self._conn = transport_connect(
@@ -326,7 +327,6 @@ class RemoteDraftSession:
             raise RemoteDraftError(
                 f"cannot connect to remote draft server at {self._endpoint}: {e}"
             ) from e
-        self._reset_connection_state()
         identity = self._identity
         hello = Hello(
             verifier_instance_id=identity.verifier_instance_id,
@@ -386,6 +386,13 @@ class RemoteDraftSession:
         connection; carrying the old counters across a reconnect would make
         every fresh response look stale and be discarded.
         """
+        self._alive = False
+        self._session_id = ""
+        self._session_epoch = -1
+        self._capabilities = None
+        self._feature_schema = None
+        self._limits = None
+        self._selected_transport = ""
         self._next_request_id = 1
         self._next_slot = 0
         self._last_batch_id = -1
@@ -430,6 +437,7 @@ class RemoteDraftSession:
         Re-opening a desynced or invalidated sequence bumps the generation
         so the server discards anything it still holds for the old one.
         """
+        self._require_no_inflight("open a sequence")
         record = self._records.get(sequence_id)
         if record is not None and record.state not in (
             SequenceState.DESYNCED,
@@ -482,6 +490,7 @@ class RemoteDraftSession:
         that is already latched target-only silently ignores prefill so the
         request keeps running without speculation.
         """
+        self._require_no_inflight("prefill a sequence")
         record = self._current_record(key)
         if record.state is not SequenceState.PREFILLING:
             if record.state in (
@@ -532,6 +541,7 @@ class RemoteDraftSession:
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
         """Release remote state; unknown, stale, and closed keys are no-ops."""
+        self._require_no_inflight("close sequences")
         pending: list[SequenceKey] = []
         for key in keys:
             record = self._records.get(key.sequence_id)
@@ -589,12 +599,7 @@ class RemoteDraftSession:
         At most one proposal may be in flight per session: collect the
         previous handle before dispatching the next round.
         """
-        if self._inflight_batch_id is not None:
-            raise RemoteDraftError(
-                f"batch {batch.batch_id} dispatched while batch "
-                f"{self._inflight_batch_id} is still in flight; collect it "
-                "first"
-            )
+        self._require_no_inflight(f"dispatch batch {batch.batch_id}")
         if batch.batch_id <= self._last_batch_id:
             raise ValueError(
                 f"batch_id {batch.batch_id} is not newer than "
@@ -873,6 +878,7 @@ class RemoteDraftSession:
 
     def ping(self) -> Pong:
         """Round-trip liveness probe."""
+        self._require_no_inflight("ping the server")
         nonce = self._next_request_id
         deadline = self._clock() + self._request_timeout_s
         try:
@@ -1092,6 +1098,13 @@ class RemoteDraftSession:
         if self._conn is None or self._conn.closed:
             raise ConnectionClosed("session is not connected")
         return self._conn
+
+    def _require_no_inflight(self, operation: str) -> None:
+        if self._inflight_batch_id is not None:
+            raise RemoteDraftError(
+                f"cannot {operation} while batch {self._inflight_batch_id} is "
+                "still in flight; collect it first"
+            )
 
     def _raise_if_strict(self, detail: str) -> None:
         if self._failure_policy == "error":
