@@ -93,7 +93,7 @@ class RemoteDraftConfig:
     is supported; routing across multiple draft servers is out of scope.
     """
 
-    endpoint: str
+    endpoint: str = ""
     """Control-plane endpoint of the standalone speculator server, e.g.
     "unix:///run/vllm/drafter.sock"."""
     transport: RemoteDraftTransport = "auto"
@@ -110,6 +110,12 @@ class RemoteDraftConfig:
     back to target-only decoding with valid_length=0."""
     startup_timeout_ms: int = Field(default=30_000, gt=0)
     """Deadline for the initial connection and HELLO handshake."""
+
+    @model_validator(mode="after")
+    def _validate_endpoint(self) -> Self:
+        if not self.endpoint.strip():
+            raise ValueError("remote_draft.endpoint must not be empty")
+        return self
 
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(

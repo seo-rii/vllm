@@ -765,7 +765,8 @@ class RemoteDraftSession:
                 None,
             )
         frames = self._take_frames(response.result_slot, RESULT_FRAMES)
-        if any(frame is None for frame in frames):
+        token_frame, valid_frame, status_frame = frames
+        if token_frame is None or valid_frame is None or status_frame is None:
             logger.warning(
                 "Batch %d response references missing result frames at slot %d",
                 handle.batch_id,
@@ -779,9 +780,9 @@ class RemoteDraftSession:
         num_active = len(handle.active_rows)
         expected = (num_active, handle.num_speculative_tokens)
         try:
-            tokens = frame_to_tensor(frames[0])
-            valid = frame_to_tensor(frames[1])
-            status_codes = frame_to_ints(frames[2])
+            tokens = frame_to_tensor(token_frame)
+            valid = frame_to_tensor(valid_frame)
+            status_codes = frame_to_ints(status_frame)
         except TransportError as e:
             logger.warning(
                 "Batch %d result frames are malformed: %s", handle.batch_id, e

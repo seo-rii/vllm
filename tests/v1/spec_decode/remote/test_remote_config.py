@@ -28,6 +28,12 @@ def test_endpoint_is_required():
         RemoteDraftConfig()
 
 
+@pytest.mark.parametrize("endpoint", ["", "   "])
+def test_empty_endpoint_rejected(endpoint):
+    with pytest.raises(ValidationError):
+        RemoteDraftConfig(endpoint=endpoint)
+
+
 @pytest.mark.parametrize(
     "transport", ["cuda_ipc", "pinned_host", "zmq", "carrier_pigeon"]
 )
