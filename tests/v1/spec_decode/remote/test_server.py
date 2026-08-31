@@ -34,10 +34,13 @@ from vllm.v1.spec_decode.remote.server import (
     FakeDraftAdapter,
     RemoteDraftServer,
     SequenceRegistry,
+    StandaloneProposalBatch,
+    StandaloneProposalResult,
 )
 from vllm.v1.spec_decode.remote.transport import (
     FRAME_DATA,
     ConnectionClosed,
+    DataFrame,
     connect,
     decode_data_frame,
     frame_to_ints,
@@ -165,6 +168,24 @@ class RawClient:
         )
         return self.call(message, frames=frames)
 
+    def propose_with_frames(self, batch_id, keys, accepted, recovery, feature):
+        base = self.reserve(3)
+        frames = [
+            DataFrame(base, accepted.dtype, accepted.shape, accepted.payload),
+            DataFrame(base + 1, recovery.dtype, recovery.shape, recovery.payload),
+            DataFrame(base + 2, feature.dtype, feature.shape, feature.payload),
+        ]
+        return self.call(
+            AdvanceAndPropose(
+                batch_id=batch_id,
+                keys=tuple(keys),
+                accepted_counts_slot=base,
+                recovery_tokens_slot=base + 1,
+                feature_slot=base + 2,
+            ),
+            frames=frames,
+        )
+
     def result(self, response: ProposalResponse):
         base = response.result_slot
         tokens = self.frames.pop(base)
@@ -192,6 +213,26 @@ class RawClient:
 
 def expected_row(last_token: int):
     return [(last_token + j + 1) % VOCAB for j in range(NUM_SPEC_TOKENS)]
+
+
+class MalformedResultAdapter(FakeDraftAdapter):
+    def __init__(self, mode: str):
+        super().__init__(vocab_size=VOCAB)
+        self.mode = mode
+
+    def advance_and_propose(
+        self, batch: StandaloneProposalBatch
+    ) -> StandaloneProposalResult:
+        result = super().advance_and_propose(batch)
+        if self.mode == "short_payload":
+            valid_lengths = DataFrame(0, "int32", (len(batch.keys),), b"")
+        else:
+            valid_lengths = ints_to_frame(
+                0, [batch.num_speculative_tokens + 1] * len(batch.keys)
+            )
+        return StandaloneProposalResult(
+            result.token_ids, valid_lengths, result.row_statuses
+        )
 
 
 @pytest.fixture
@@ -483,6 +524,7 @@ def test_proposal_marks_unready_and_stale_rows(client):
         SpeculatorStatusCode.SEQUENCE_DESYNC,
         SpeculatorStatusCode.STALE_GENERATION,
     ]
+    assert valid == [NUM_SPEC_TOKENS, 0, 0]
     assert tokens[0] == expected_row(7)
 
 
@@ -514,6 +556,60 @@ def test_proposal_without_input_frames_is_protocol_error(client):
         )
     )
     assert response.status is SpeculatorStatusCode.PROTOCOL_ERROR
+
+
+@pytest.mark.parametrize(
+    ("accepted", "recovery"),
+    [
+        (
+            ints_to_frame(0, [0], shape=(1, 1)),
+            ints_to_frame(0, [1]),
+        ),
+        (
+            ints_to_frame(0, [0]),
+            ints_to_frame(0, [1], shape=(1, 1)),
+        ),
+        (
+            ints_to_frame(0, [0]),
+            DataFrame(0, "float32", (1,), b"\x00" * 4),
+        ),
+        (
+            ints_to_frame(0, [0]),
+            DataFrame(0, "int64", (1,), b""),
+        ),
+    ],
+    ids=["accepted-shape", "recovery-shape", "recovery-dtype", "recovery-bytes"],
+)
+def test_proposal_rejects_malformed_integer_frames(client, adapter, accepted, recovery):
+    client.hello()
+    k = key(42)
+    client.ready(k)
+    response = client.propose_with_frames(
+        0, [k], accepted, recovery, ints_to_frame(0, [1])
+    )
+    assert response.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    assert adapter.proposed_batches == []
+
+
+@pytest.mark.parametrize("mode", ["short_payload", "out_of_range"])
+def test_malformed_adapter_result_discards_sequence_state(mode):
+    adapter = MalformedResultAdapter(mode)
+    server = RemoteDraftServer(adapter)
+    server.start("tcp://127.0.0.1:0")
+    client = RawClient(server.endpoint)
+    k = key(43)
+    try:
+        client.hello()
+        client.ready(k)
+        response = client.propose(0, [k], recovery=[2])
+        assert response.status is SpeculatorStatusCode.INTERNAL_ERROR
+        assert response.result_slot is None
+        assert server.registry.get(k) is None
+        assert adapter.prefix(k) is None
+    finally:
+        client.close()
+        adapter.release()
+        server.stop()
 
 
 def test_rejected_batch_frames_are_not_read_by_a_later_round(client):
