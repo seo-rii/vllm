@@ -12,7 +12,11 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
-from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
+from vllm.v1.spec_decode.remote.protocol import (
+    RemoteServerLimits,
+    SequenceKey,
+    SpeculatorStatusCode,
+)
 from vllm.v1.spec_decode.remote.server import FakeDraftAdapter, RemoteDraftServer
 from vllm.v1.spec_decode.remote.session import (
     RemoteDraftError,
@@ -229,6 +233,7 @@ def test_handle_records_dispatch_metadata(session):
     assert handle.state is HandleState.DISPATCHED
     assert handle.active_rows == (0,)
     assert handle.session_epoch == session.session_epoch
+    assert handle.session_id == session.session_id
     assert session.sequence_state(a) is SequenceState.IN_FLIGHT
     session.collect(handle)
     assert handle.state is HandleState.COLLECTED
@@ -277,6 +282,17 @@ def test_batch_ids_must_increase(session):
     session.collect(session.dispatch(batch(3, [a], recovery=[1])))
     with pytest.raises(ValueError, match="not newer"):
         session.dispatch(batch(3, [a], recovery=[1]))
+
+
+def test_only_one_proposal_may_be_in_flight(session):
+    a = ready(session, 1)
+    b = ready(session, 2)
+    handle = session.dispatch(batch(0, [a], recovery=[1]))
+    with pytest.raises(RemoteDraftError, match="in flight"):
+        session.dispatch(batch(1, [b], recovery=[2]))
+    session.collect(handle)
+    result = round_trip(session, batch(1, [b], recovery=[2]))
+    assert result.row_statuses == (OK,)
 
 
 def test_dispatch_validates_schema_and_shapes(session):
@@ -399,6 +415,80 @@ def test_server_shutdown_raises_under_error_policy(make_session, server, adapter
     server.stop()
     handle = session.dispatch(batch(0, [a], recovery=[1]))
     with pytest.raises(RemoteDraftError):
+        session.collect(handle)
+
+
+def test_open_queue_full_latches_target_only(clock):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            max_batch_size=8,
+            max_feature_tokens=64,
+            max_sequences=1,
+            max_model_len=64,
+        ),
+    )
+    server.start("tcp://127.0.0.1:0")
+    session = RemoteDraftSession(server.endpoint, IDENTITY, clock=clock)
+    strict = RemoteDraftSession(
+        server.endpoint, IDENTITY, failure_policy="error", clock=clock
+    )
+    try:
+        session.connect()
+        a = ready(session, 1)
+        full = session.open_sequence(2)
+        assert session.sequence_state(full) is SequenceState.TARGET_ONLY
+        # The rejected sequence must degrade quietly, not wedge in OPENING:
+        # prefill is a no-op and rounds skip the row with valid_length=0.
+        session.prefill(full, features([1]), is_final=True)
+        result = round_trip(session, batch(0, [a, full], recovery=[3, 4]))
+        assert result.row_statuses == (OK, SpeculatorStatusCode.QUEUE_FULL)
+        assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS, 0]
+
+        strict.connect()
+        with pytest.raises(RemoteDraftError, match="QUEUE_FULL"):
+            strict.open_sequence(9)
+    finally:
+        session.close()
+        strict.close()
+        adapter.release()
+        server.stop()
+
+
+# ----------------------------------------------------------------------
+# Reconnect
+# ----------------------------------------------------------------------
+
+
+def test_reconnect_completes_rounds_with_fresh_wire_state(session):
+    a = ready(session, 1)
+    assert round_trip(session, batch(0, [a], recovery=[5])).row_statuses == (OK,)
+    old_epoch = session.session_epoch
+    session.close()
+    assert not session.connected
+
+    session.connect()
+    assert session.connected
+    assert session.session_epoch != old_epoch
+    b = session.open_sequence(1)
+    assert b.generation == a.generation + 1
+    session.prefill(b, features([1, 2]), is_final=True)
+    # batch_id 0 repeats and the new server session numbers its responses
+    # from 0 again; both must be accepted because that state is scoped to
+    # the connection, or every post-reconnect round would look stale.
+    result = round_trip(session, batch(0, [b], recovery=[7]))
+    assert result.row_statuses == (OK,)
+    assert result.output.token_ids.tolist() == [expected_row(7)]
+    assert session.pending_frames == 0
+
+
+def test_reconnect_fences_handles_from_the_old_connection(session):
+    a = ready(session, 1)
+    handle = session.dispatch(batch(0, [a], recovery=[1]))
+    session.close()
+    session.connect()
+    with pytest.raises(RemoteDraftError, match="belongs to session"):
         session.collect(handle)
 
 

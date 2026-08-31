@@ -177,6 +177,7 @@ class RemoteProposalHandle(ProposalHandle):
     num_speculative_tokens: int
     device: torch.device
     deadline: float
+    session_id: str = ""
     request_id: int = -1
     input_slot: int = -1
     state: HandleState = HandleState.CREATED
@@ -229,6 +230,7 @@ class RemoteDraftSession:
         self._next_slot = 0
         self._last_batch_id = -1
         self._last_sequence_number = -1
+        self._inflight_batch_id: int | None = None
         self._inbound: dict[int, DataFrame] = {}
         self._records: dict[int, _SequenceRecord] = {}
         self._generations: dict[int, int] = {}
@@ -307,7 +309,12 @@ class RemoteDraftSession:
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Connect and run the HELLO handshake; raises on any rejection."""
+        """Connect and run the HELLO handshake; raises on any rejection.
+
+        May be called again after the connection is lost; sequence numbers,
+        slots, and batch ids restart with the new connection, and handles
+        dispatched on the old one are fenced off at collect time.
+        """
         if self._conn is not None:
             raise RemoteDraftError("session is already connected")
         deadline = self._clock() + self._startup_timeout_s
@@ -319,6 +326,7 @@ class RemoteDraftSession:
             raise RemoteDraftError(
                 f"cannot connect to remote draft server at {self._endpoint}: {e}"
             ) from e
+        self._reset_connection_state()
         identity = self._identity
         hello = Hello(
             verifier_instance_id=identity.verifier_instance_id,
@@ -370,6 +378,21 @@ class RemoteDraftSession:
             ack.feature_schema.schema_id,
             len(ack.feature_schema.slots),
         )
+
+    def _reset_connection_state(self) -> None:
+        """Drop bookkeeping scoped to the previous connection.
+
+        The server numbers proposal responses and reads data slots per
+        connection; carrying the old counters across a reconnect would make
+        every fresh response look stale and be discarded.
+        """
+        self._next_request_id = 1
+        self._next_slot = 0
+        self._last_batch_id = -1
+        self._last_sequence_number = -1
+        self._inflight_batch_id = None
+        self._inbound.clear()
+        self._abandoned_batches.clear()
 
     def _handshake_rejections(self, ack: HelloAck) -> list[str]:
         identity = self._identity
@@ -435,7 +458,16 @@ class RemoteDraftSession:
         if status is SpeculatorStatusCode.OK:
             record.state = transition_sequence(record.state, SequenceState.PREFILLING)
         else:
-            self._apply_status(record, status)
+            if status is SpeculatorStatusCode.QUEUE_FULL:
+                # A rejected open left no server state to retry against;
+                # latch target-only so prefill and dispatch stay quiet
+                # no-ops instead of wedging the sequence in OPENING.
+                record.last_status = status
+                record.state = transition_sequence(
+                    record.state, SequenceState.TARGET_ONLY
+                )
+            else:
+                self._apply_status(record, status)
             self._raise_if_strict(
                 f"open_sequence({sequence_id}) failed: {status.name} {detail}"
             )
@@ -553,7 +585,16 @@ class RemoteDraftSession:
         Rows whose sequence is not READY (latched target-only, desynced,
         stale key, unknown) are skipped locally and report
         ``valid_length=0`` at collect time; they generate no wire traffic.
+
+        At most one proposal may be in flight per session: collect the
+        previous handle before dispatching the next round.
         """
+        if self._inflight_batch_id is not None:
+            raise RemoteDraftError(
+                f"batch {batch.batch_id} dispatched while batch "
+                f"{self._inflight_batch_id} is still in flight; collect it "
+                "first"
+            )
         if batch.batch_id <= self._last_batch_id:
             raise ValueError(
                 f"batch_id {batch.batch_id} is not newer than "
@@ -573,6 +614,7 @@ class RemoteDraftSession:
             )
         handle = RemoteProposalHandle(
             session_epoch=self._session_epoch,
+            session_id=self._session_id,
             batch_id=batch.batch_id,
             keys=batch.keys,
             active_rows=tuple(
@@ -624,6 +666,7 @@ class RemoteDraftSession:
             record.state = transition_sequence(record.state, SequenceState.IN_FLIGHT)
         handle.input_slot = base
         handle.state = transition_handle(handle.state, HandleState.DISPATCHED)
+        self._inflight_batch_id = batch.batch_id
         return handle
 
     def collect(self, handle: RemoteProposalHandle) -> RemoteProposalResult:
@@ -634,10 +677,15 @@ class RemoteDraftSession:
         ``failure_policy="error"`` they raise instead (after the same state
         updates).
         """
-        if handle.session_epoch != self._session_epoch:
+        if (
+            handle.session_id != self._session_id
+            or handle.session_epoch != self._session_epoch
+        ):
             raise RemoteDraftError(
-                f"handle for batch {handle.batch_id} belongs to session epoch "
-                f"{handle.session_epoch}, current epoch is {self._session_epoch}"
+                f"handle for batch {handle.batch_id} belongs to session "
+                f"{handle.session_id!r} (epoch {handle.session_epoch}); the "
+                f"current session is {self._session_id!r} "
+                f"(epoch {self._session_epoch})"
             )
         if handle.state is HandleState.COMPLETED:
             # Nothing was dispatched: every row was skipped locally.
@@ -674,6 +722,8 @@ class RemoteDraftSession:
             statuses = self._fail_rows(handle, SpeculatorStatusCode.INTERNAL_ERROR)
         else:
             statuses, tokens, valid = self._apply_response(handle, response)
+        if self._inflight_batch_id == handle.batch_id:
+            self._inflight_batch_id = None
         handle.state = transition_handle(handle.state, outcome)
         handle.state = transition_handle(handle.state, HandleState.COLLECTED)
         return self._finalize(handle, statuses, tokens, valid)
@@ -1060,6 +1110,7 @@ class RemoteDraftSession:
             if can_transition_sequence(record.state, SequenceState.INVALID):
                 record.state = SequenceState.INVALID
                 record.last_status = SpeculatorStatusCode.INTERNAL_ERROR
+        self._inflight_batch_id = None
         self._inbound.clear()
         self._drop_connection()
 
