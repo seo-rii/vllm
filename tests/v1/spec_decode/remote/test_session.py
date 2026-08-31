@@ -197,7 +197,12 @@ def test_handshake_timeout_is_reported():
         listener.close()
 
 
-def test_explicit_transport_is_not_implemented_yet():
+def test_explicit_inline_transport_connects(make_session):
+    session = make_session(transport="inline")
+    assert session.selected_transport == "inline"
+
+
+def test_unimplemented_transport_is_rejected():
     with pytest.raises(NotImplementedError):
         RemoteDraftSession("tcp://127.0.0.1:1", IDENTITY, transport="zmq")
 
