@@ -202,10 +202,10 @@ class RemoteDraftSession:
         startup_timeout_ms: int = 30_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if transport != "auto":
+        if transport not in ("auto", INLINE_TRANSPORT):
             raise NotImplementedError(
                 f"remote_draft.transport={transport!r} has no data-plane "
-                "implementation yet; use 'auto'"
+                "implementation yet; use 'auto' or 'inline'"
             )
         if failure_policy not in ("error", "target_only"):
             raise ValueError(f"unknown failure_policy {failure_policy!r}")
