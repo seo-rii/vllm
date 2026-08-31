@@ -498,13 +498,14 @@ class RemoteDraftServer:
         capabilities = self.adapter.capabilities()
         logger.info(
             "Remote draft server %s ready at %s: protocol %d.%d, methods %s, "
-            "required features %s, transports %s, max_batch_size %d, "
-            "max_model_len %d",
+            "draft fingerprint %r, required features %s, transports %s, "
+            "max_batch_size %d, max_model_len %d",
             self.server_id,
             self._listener.endpoint,
             PROTOCOL_MAJOR,
             PROTOCOL_MINOR,
             sorted(self.adapter.supported_methods()),
+            self.adapter.draft_checkpoint_fingerprint(),
             list(capabilities.required_features),
             list(SUPPORTED_TRANSPORTS),
             self.limits.max_batch_size,
