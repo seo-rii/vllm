@@ -696,3 +696,11 @@ def test_registry_reopen_transfers_ownership():
     registry.open(key(1, generation=1), owner="newer")
     assert set(registry.close_all("newer")) == {key(1, generation=1)}
     assert len(registry) == 0
+
+
+def test_entrypoints_alias_exposes_server_main():
+    """`python -m vllm.entrypoints.remote_draft_server` is the documented CLI."""
+    from vllm.entrypoints.remote_draft_server import main as alias_main
+    from vllm.v1.spec_decode.remote.server import main as server_main
+
+    assert alias_main is server_main
