@@ -54,7 +54,7 @@ class ConnectionClosed(TransportError):
     """The peer closed the connection or the socket failed."""
 
 
-class DataFrame(msgspec.Struct, frozen=True):
+class DataFrame(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """One tensor on the data plane.
 
     ``dtype`` is the torch dtype name (``"int32"``, ``"bfloat16"``) and
@@ -286,8 +286,10 @@ def connect(endpoint: str, timeout: float | None = None) -> FramedConnection:
     family, address = parse_endpoint(endpoint)
     try:
         if family == socket.AF_INET:
+            assert isinstance(address, tuple)
             sock = socket.create_connection(address, timeout=timeout)
         else:
+            assert isinstance(address, str)
             sock = socket.socket(family, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             sock.connect(address)
