@@ -612,9 +612,9 @@ class RemoteDraftSession:
                 f"accepted_counts must be [{batch_size}], got "
                 f"{tuple(batch.accepted_counts.shape)}"
             )
-        if batch.recovery_tokens.shape[:1] != (batch_size,):
+        if batch.recovery_tokens.shape != (batch_size,):
             raise ValueError(
-                f"recovery_tokens must have {batch_size} rows, got "
+                f"recovery_tokens must be [{batch_size}], got "
                 f"{tuple(batch.recovery_tokens.shape)}"
             )
         handle = RemoteProposalHandle(

@@ -330,10 +330,20 @@ def test_dispatch_validates_schema_and_shapes(session):
         session.dispatch(
             RemoteProposalBatch(1, (a,), tokens([0, 0]), tokens([1]), features([1]))
         )
+    with pytest.raises(ValueError, match="recovery_tokens"):
+        session.dispatch(
+            RemoteProposalBatch(
+                2,
+                (a,),
+                tokens([0]),
+                tokens([[1]]),
+                features([1]),
+            )
+        )
     with pytest.raises(ValueError, match="required feature slot"):
         session.dispatch(
             RemoteProposalBatch(
-                2, (a,), tokens([0]), tokens([1]), FeatureBatch(1, (None,))
+                3, (a,), tokens([0]), tokens([1]), FeatureBatch(1, (None,))
             )
         )
 

@@ -108,16 +108,22 @@ def ints_to_frame(
 
 def frame_to_ints(frame: DataFrame) -> list[int]:
     """Read an integer DataFrame without torch (row-major, flattened)."""
-    typecode, itemsize = _int_typecode(frame.dtype)
+    typecode, _ = _int_typecode(frame.dtype)
+    validate_integer_frame(frame)
+    data = array.array(typecode)
+    data.frombytes(frame.payload)
+    return data.tolist()
+
+
+def validate_integer_frame(frame: DataFrame) -> None:
+    """Validate an integer frame's dtype and payload size without decoding it."""
+    _, itemsize = _int_typecode(frame.dtype)
     expected = math.prod(frame.shape) * itemsize
     if len(frame.payload) != expected:
         raise TransportError(
             f"data frame {frame.slot} has {len(frame.payload)} payload bytes, "
             f"expected {expected} for {frame.dtype} shape {frame.shape}"
         )
-    data = array.array(typecode)
-    data.frombytes(frame.payload)
-    return data.tolist()
 
 
 def _int_typecode(dtype: str) -> tuple[str, int]:

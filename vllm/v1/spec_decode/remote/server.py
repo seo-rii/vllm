@@ -69,6 +69,7 @@ from vllm.v1.spec_decode.remote.transport import (
     frame_to_ints,
     ints_to_frame,
     listen,
+    validate_integer_frame,
 )
 
 logger = init_logger(__name__)
@@ -957,13 +958,14 @@ class _ServerSession:
         if accepted is None or recovery is None:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, "missing input frames")
             return
+        if accepted.shape != (num_rows,) or recovery.shape != (num_rows,):
+            fail(SpeculatorStatusCode.PROTOCOL_ERROR, "input frames do not match rows")
+            return
         try:
             accepted_counts = frame_to_ints(accepted)
+            validate_integer_frame(recovery)
         except TransportError as e:
-            fail(SpeculatorStatusCode.PROTOCOL_ERROR, f"accepted_counts: {e}")
-            return
-        if len(accepted_counts) != num_rows or recovery.shape[:1] != (num_rows,):
-            fail(SpeculatorStatusCode.PROTOCOL_ERROR, "input frames do not match rows")
+            fail(SpeculatorStatusCode.PROTOCOL_ERROR, f"integer input frame: {e}")
             return
         num_tokens = self.num_speculative_tokens
         if any(not 0 <= count <= num_tokens for count in accepted_counts):
@@ -980,9 +982,7 @@ class _ServerSession:
         with self.server.lock:
             registry = self.server.registry
             row_statuses = [
-                registry.begin_round(
-                    key, message.batch_id, owner=self.session_id
-                )[0]
+                registry.begin_round(key, message.batch_id, owner=self.session_id)[0]
                 for key in message.keys
             ]
             max_model_len = self.server.limits.max_model_len
@@ -1000,6 +1000,7 @@ class _ServerSession:
                 if status is SpeculatorStatusCode.OK
             )
             if active:
+                active_keys = tuple(message.keys[i] for i in active)
                 try:
                     result = self.server.adapter.advance_and_propose(
                         StandaloneProposalBatch(
@@ -1018,9 +1019,11 @@ class _ServerSession:
                         self.session_id,
                         message.batch_id,
                     )
+                    self._discard_owned_sequences(active_keys)
                     fail(SpeculatorStatusCode.INTERNAL_ERROR, "adapter raised")
                     return
                 if not _result_well_formed(result, num_rows, num_tokens):
+                    self._discard_owned_sequences(active_keys)
                     fail(
                         SpeculatorStatusCode.INTERNAL_ERROR,
                         "adapter returned a malformed result",
@@ -1034,7 +1037,14 @@ class _ServerSession:
                             accepted_counts[i],
                             owner=self.session_id,
                         )
-                tokens, valid = result.token_ids, result.valid_lengths
+                valid_lengths = frame_to_ints(result.valid_lengths)
+                for i, status in enumerate(row_statuses):
+                    if status is not SpeculatorStatusCode.OK:
+                        valid_lengths[i] = 0
+                tokens = result.token_ids
+                valid = ints_to_frame(
+                    0, valid_lengths, dtype=result.valid_lengths.dtype
+                )
             else:
                 tokens = ints_to_frame(
                     0,
@@ -1085,6 +1095,16 @@ class _ServerSession:
                     "key belongs to another verifier",
                 )
 
+    def _discard_owned_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        """Drop adapter and registry state after an ambiguous adapter failure."""
+        removed: list[SequenceKey] = []
+        for key in keys:
+            closed = self.server.registry.close(key, owner=self.session_id)
+            if closed is not None:
+                removed.append(closed)
+        if removed:
+            self.server.adapter.close_sequences(tuple(removed))
+
     def _take_frames(self, base: int, count: int) -> list[DataFrame | None]:
         return [self.inbound.pop(base + i, None) for i in range(count)]
 
@@ -1118,13 +1138,24 @@ def _frame_problems(
 def _result_well_formed(
     result: StandaloneProposalResult, num_rows: int, num_tokens: int
 ) -> bool:
-    return (
-        tuple(result.token_ids.shape) == (num_rows, num_tokens)
-        and tuple(result.valid_lengths.shape) == (num_rows,)
-        and len(result.row_statuses) == num_rows
-        and result.token_ids.dtype in ("int32", "int64")
-        and result.valid_lengths.dtype in ("int32", "int64")
-    )
+    if (
+        result.token_ids.shape != (num_rows, num_tokens)
+        or result.valid_lengths.shape != (num_rows,)
+        or len(result.row_statuses) != num_rows
+        or result.token_ids.dtype not in ("int32", "int64")
+        or result.valid_lengths.dtype not in ("int32", "int64")
+        or any(
+            not isinstance(status, SpeculatorStatusCode)
+            for status in result.row_statuses
+        )
+    ):
+        return False
+    try:
+        validate_integer_frame(result.token_ids)
+        valid_lengths = frame_to_ints(result.valid_lengths)
+    except TransportError:
+        return False
+    return all(0 <= length <= num_tokens for length in valid_lengths)
 
 
 def _checksum(frames: list[DataFrame | None]) -> int:
