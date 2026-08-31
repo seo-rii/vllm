@@ -16,14 +16,24 @@ def test_defaults_are_production_safe():
     assert config.startup_timeout_ms > 0
 
 
+def test_inline_transport_is_explicitly_supported():
+    config = RemoteDraftConfig(
+        endpoint="unix:///run/vllm/drafter.sock", transport="inline"
+    )
+    assert config.transport == "inline"
+
+
 def test_endpoint_is_required():
     with pytest.raises(ValidationError):
         RemoteDraftConfig()
 
 
-def test_invalid_transport_rejected():
+@pytest.mark.parametrize(
+    "transport", ["cuda_ipc", "pinned_host", "zmq", "carrier_pigeon"]
+)
+def test_unimplemented_transport_rejected(transport):
     with pytest.raises(ValidationError):
-        RemoteDraftConfig(endpoint="unix:///x.sock", transport="carrier_pigeon")
+        RemoteDraftConfig(endpoint="unix:///x.sock", transport=transport)
 
 
 def test_nonpositive_timeout_rejected():

@@ -79,7 +79,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
-RemoteDraftTransport = Literal["auto", "cuda_ipc", "pinned_host", "zmq"]
+RemoteDraftTransport = Literal["auto", "inline"]
 RemoteDraftFailurePolicy = Literal["error", "target_only"]
 
 
@@ -97,9 +97,9 @@ class RemoteDraftConfig:
     """Control-plane endpoint of the standalone speculator server, e.g.
     "unix:///run/vllm/drafter.sock"."""
     transport: RemoteDraftTransport = "auto"
-    """Data-plane transport for target features and draft results. "auto"
-    negotiates CUDA IPC when peer access is available and falls back to a
-    pinned-host ring otherwise. "zmq" is a debug transport."""
+    """Data-plane transport for target features and draft results. The initial
+    runtime supports the copy-based "inline" transport; "auto" currently
+    selects it. Zero-copy transports will be exposed when implemented."""
     failure_policy: RemoteDraftFailurePolicy = "target_only"
     """What to do when the remote speculator fails or times out.
     "target_only" (production default) keeps decoding without speculation
@@ -110,6 +110,7 @@ class RemoteDraftConfig:
     back to target-only decoding with valid_length=0."""
     startup_timeout_ms: int = Field(default=30_000, gt=0)
     """Deadline for the initial connection and HELLO handshake."""
+
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
