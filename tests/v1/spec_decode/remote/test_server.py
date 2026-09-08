@@ -6,6 +6,7 @@ gating, idempotent sequence commands, batch ordering, and error replies."""
 import threading
 import time
 import zlib
+from unittest.mock import Mock
 
 import pytest
 
@@ -591,6 +592,46 @@ def test_proposal_rejects_malformed_integer_frames(client, adapter, accepted, re
     )
     assert response.status is SpeculatorStatusCode.PROTOCOL_ERROR
     assert adapter.proposed_batches == []
+
+
+@pytest.mark.parametrize("operation", ["prefill", "propose"])
+@pytest.mark.parametrize("payload", [b"", b"\x00" * 8], ids=["short", "long"])
+def test_feature_payload_rejected_before_adapter(
+    client, adapter, server, monkeypatch, operation, payload
+):
+    client.hello()
+    k = key(44)
+    if operation == "prefill":
+        assert client.open(k).status is OK
+        method = "prefill"
+        expected_prefix = []
+    else:
+        client.ready(k)
+        method = "advance_and_propose"
+        expected_prefix = [1, 2, 3]
+    adapter_call = Mock(wraps=getattr(adapter, method))
+    monkeypatch.setattr(adapter, method, adapter_call)
+    feature = DataFrame(client.reserve(1), "int32", (1,), payload)
+    if operation == "prefill":
+        response = client.call(
+            PrefillChunk(
+                key=k,
+                offset=0,
+                num_tokens=1,
+                is_final=True,
+                feature_slot=feature.slot,
+                checksum=checksum(feature),
+            ),
+            frames=[feature],
+        )
+    else:
+        response = client.propose_with_frames(
+            0, [k], ints_to_frame(0, [0]), ints_to_frame(0, [4]), feature
+        )
+    assert response.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    adapter_call.assert_not_called()
+    assert adapter.prefix(k) == expected_prefix
+    assert server.registry.get(k).prefix_length == len(expected_prefix)
 
 
 @pytest.mark.parametrize("mode", ["short_payload", "out_of_range"])

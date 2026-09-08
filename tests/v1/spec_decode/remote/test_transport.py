@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.remote.transport import (
     ints_to_frame,
     listen,
     parse_endpoint,
+    validate_frame,
 )
 
 
@@ -140,6 +141,37 @@ def test_int_frame_rejects_shape_and_dtype_mismatch():
     truncated = DataFrame(slot=0, dtype="int32", shape=(2,), payload=b"\x00" * 7)
     with pytest.raises(TransportError, match="payload bytes"):
         frame_to_ints(truncated)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "itemsize"),
+    [
+        ("int32", 4),
+        ("int64", 8),
+        ("float16", 2),
+        ("bfloat16", 2),
+        ("float32", 4),
+        ("float64", 8),
+    ],
+)
+def test_frame_validation_checks_payload_size(dtype, itemsize):
+    validate_frame(DataFrame(0, dtype, (2, 3), bytes(6 * itemsize)))
+    for length in (6 * itemsize - 1, 6 * itemsize + 1):
+        with pytest.raises(TransportError, match="payload bytes"):
+            validate_frame(DataFrame(0, dtype, (2, 3), bytes(length)))
+
+
+@pytest.mark.parametrize(
+    ("frame", "match"),
+    [
+        (DataFrame(0, "unknown", (1,), b"\x00"), "unknown dtype"),
+        (DataFrame(0, "int32", (-1, -1), bytes(4)), "negative shape"),
+        (DataFrame(0, "float32", (0, 3), bytes(4)), "payload bytes"),
+    ],
+)
+def test_frame_validation_rejects_invalid_metadata(frame, match):
+    with pytest.raises(TransportError, match=match):
+        validate_frame(frame)
 
 
 def test_control_and_data_frames_roundtrip(pair):
