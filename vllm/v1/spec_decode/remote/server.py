@@ -69,6 +69,7 @@ from vllm.v1.spec_decode.remote.transport import (
     frame_to_ints,
     ints_to_frame,
     listen,
+    validate_frame,
     validate_integer_frame,
 )
 
@@ -1132,6 +1133,10 @@ def _frame_problems(
                 f"feature slot {i} ({spec.kind}) has dtype {frame.dtype}, "
                 f"schema says {spec.dtype}"
             )
+        try:
+            validate_frame(frame)
+        except TransportError as e:
+            return f"feature slot {i} ({spec.kind}): {e}"
     return None
 
 

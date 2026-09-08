@@ -40,6 +40,14 @@ _RECV_MAX = 1 << 24
 # torch dtype name -> (array typecode, itemsize) for the torch-free integer
 # helpers used on the server side.
 _INT_TYPECODES = {"int32": ("i", 4), "int64": ("q", 8)}
+_DTYPE_ITEMSIZE = {
+    "int32": 4,
+    "int64": 8,
+    "float16": 2,
+    "bfloat16": 2,
+    "float32": 4,
+    "float64": 8,
+}
 
 
 class TransportError(Exception):
@@ -117,7 +125,20 @@ def frame_to_ints(frame: DataFrame) -> list[int]:
 
 def validate_integer_frame(frame: DataFrame) -> None:
     """Validate an integer frame's dtype and payload size without decoding it."""
-    _, itemsize = _int_typecode(frame.dtype)
+    _int_typecode(frame.dtype)
+    validate_frame(frame)
+
+
+def validate_frame(frame: DataFrame) -> None:
+    """Validate a frame's dtype, shape, and payload size without decoding it."""
+    try:
+        itemsize = _DTYPE_ITEMSIZE[frame.dtype]
+    except KeyError:
+        raise TransportError(f"unknown dtype {frame.dtype!r} in data frame") from None
+    if any(size < 0 for size in frame.shape):
+        raise TransportError(
+            f"data frame {frame.slot} has negative shape {frame.shape}"
+        )
     expected = math.prod(frame.shape) * itemsize
     if len(frame.payload) != expected:
         raise TransportError(
