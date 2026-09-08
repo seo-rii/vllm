@@ -245,10 +245,15 @@ class Listener:
     """Bound server socket handing out FramedConnections."""
 
     def __init__(
-        self, sock: socket.socket, endpoint: str, unix_path: str | None
+        self,
+        sock: socket.socket,
+        endpoint: str,
+        unix_path: str | None,
+        unix_identity: tuple[int, int] | None,
     ) -> None:
         self._sock = sock
         self._unix_path = unix_path
+        self._unix_identity = unix_identity
         self.endpoint = endpoint
         """Resolved endpoint, with the actual port for ``tcp://host:0``."""
 
@@ -264,11 +269,13 @@ class Listener:
         return FramedConnection(conn)
 
     def close(self) -> None:
+        unix_identity = self._unix_identity
+        self._unix_identity = None
         try:
             self._sock.close()
         finally:
-            if self._unix_path is not None:
-                _unlink_quietly(self._unix_path)
+            if self._unix_path is not None and unix_identity is not None:
+                _unlink_if_owned(self._unix_path, unix_identity)
 
 
 def _tune(sock: socket.socket) -> None:
@@ -276,9 +283,11 @@ def _tune(sock: socket.socket) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def _unlink_quietly(path: str) -> None:
+def _unlink_if_owned(path: str, identity: tuple[int, int]) -> None:
     with contextlib.suppress(OSError):
-        os.unlink(path)
+        info = os.stat(path, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) == identity:
+            os.unlink(path)
 
 
 def connect(endpoint: str, timeout: float | None = None) -> FramedConnection:
@@ -306,6 +315,7 @@ def listen(endpoint: str, backlog: int = 16) -> Listener:
     family, address = parse_endpoint(endpoint)
     sock = socket.socket(family, socket.SOCK_STREAM)
     unix_path: str | None = None
+    unix_identity: tuple[int, int] | None = None
     try:
         if family == socket.AF_INET:
             if sys.platform != "win32":
@@ -316,11 +326,14 @@ def listen(endpoint: str, backlog: int = 16) -> Listener:
         else:
             assert isinstance(address, str)
             unix_path = address
-            _unlink_quietly(unix_path)
             sock.bind(unix_path)
+            info = os.stat(unix_path, follow_symlinks=False)
+            unix_identity = (info.st_dev, info.st_ino)
             resolved = f"unix://{unix_path}"
         sock.listen(backlog)
     except OSError as e:
         sock.close()
+        if unix_path is not None and unix_identity is not None:
+            _unlink_if_owned(unix_path, unix_identity)
         raise TransportError(f"cannot listen on {endpoint}: {e}") from e
-    return Listener(sock, resolved, unix_path)
+    return Listener(sock, resolved, unix_path, unix_identity)
