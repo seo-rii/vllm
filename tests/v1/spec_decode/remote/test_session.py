@@ -358,6 +358,35 @@ def test_dispatch_validates_schema_and_shapes(session):
 # ----------------------------------------------------------------------
 
 
+def test_queue_full_latches_target_only_without_skipping_recovery(
+    session, adapter, monkeypatch
+):
+    a = ready(session, 1)
+    propose = adapter.advance_and_propose
+
+    def busy_once(batch_):
+        if batch_.batch_id == 0:
+            result = propose(dataclasses.replace(batch_, active_rows=()))
+            return dataclasses.replace(
+                result,
+                valid_lengths=tensor_to_frame(0, tokens([0])),
+                row_statuses=(SpeculatorStatusCode.QUEUE_FULL,),
+            )
+        return propose(batch_)
+
+    monkeypatch.setattr(adapter, "advance_and_propose", busy_once)
+    result = round_trip(session, batch(0, [a], recovery=[4]))
+    assert result.row_statuses == (SpeculatorStatusCode.QUEUE_FULL,)
+    assert result.output.valid_lengths.tolist() == [0]
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+
+    result = round_trip(session, batch(1, [a], recovery=[5]))
+    assert result.row_statuses == (SpeculatorStatusCode.QUEUE_FULL,)
+    assert result.output.valid_lengths.tolist() == [0]
+    assert adapter.proposed_batches == [0]
+    assert adapter.prefix(a) == [1, 2, 3]
+
+
 def test_timeout_latches_target_only_and_purges_stale_result(session, adapter, clock):
     a = ready(session, 1)
     b = ready(session, 2)

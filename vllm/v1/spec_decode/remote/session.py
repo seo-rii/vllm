@@ -94,9 +94,6 @@ _DESYNC_STATUSES = frozenset(
         SpeculatorStatusCode.ROUND_MISMATCH,
     }
 )
-_RETRYABLE_STATUSES = frozenset(
-    {SpeculatorStatusCode.OK, SpeculatorStatusCode.QUEUE_FULL}
-)
 
 
 class RemoteDraftError(Exception):
@@ -1009,9 +1006,7 @@ class RemoteDraftSession:
         self, record: _SequenceRecord, status: SpeculatorStatusCode
     ) -> None:
         record.last_status = status
-        if status in _RETRYABLE_STATUSES:
-            # Nothing on the server changed for a rejected-as-busy row, so
-            # it may be proposed again next round.
+        if status is SpeculatorStatusCode.OK:
             if record.state is SequenceState.IN_FLIGHT:
                 record.state = SequenceState.READY
             return
@@ -1020,6 +1015,8 @@ class RemoteDraftSession:
         ):
             record.state = SequenceState.DESYNCED
             return
+        # QUEUE_FULL also drops this round's advancement; a later recovery
+        # token cannot restore the skipped verifier context.
         if can_transition_sequence(record.state, SequenceState.TARGET_ONLY):
             record.state = SequenceState.TARGET_ONLY
 
