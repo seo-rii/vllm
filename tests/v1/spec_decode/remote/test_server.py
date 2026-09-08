@@ -3,6 +3,7 @@
 """Standalone draft server driven over the raw wire protocol: handshake
 gating, idempotent sequence commands, batch ordering, and error replies."""
 
+import socket
 import threading
 import time
 import zlib
@@ -838,6 +839,44 @@ def test_live_sessions_cannot_mutate_each_others_sequences(server, adapter):
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.timeout(10)
+def test_server_closes_connection_when_verifier_stops_reading(
+    server, client, monkeypatch
+):
+    client.hello(num_speculative_tokens=1 << 18)
+    k = key(1)
+    client.ready(k)
+    client.conn._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    conn = next(iter(server._connections))
+    conn._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    server.send_timeout_s = 0.05
+    closed = threading.Event()
+    original_close = conn.close
+
+    def close_and_notify():
+        original_close()
+        closed.set()
+
+    monkeypatch.setattr(conn, "close", close_and_notify)
+    base = client.reserve(3)
+    client.send(
+        AdvanceAndPropose(
+            batch_id=0,
+            keys=(k,),
+            accepted_counts_slot=base,
+            recovery_tokens_slot=base + 1,
+            feature_slot=base + 2,
+        ),
+        frames=[
+            ints_to_frame(base, [0]),
+            ints_to_frame(base + 1, [4]),
+            ints_to_frame(base + 2, [4]),
+        ],
+    )
+    assert closed.wait(5.0)
+    assert conn.closed
 
 
 def test_stop_disconnects_clients(server, client):

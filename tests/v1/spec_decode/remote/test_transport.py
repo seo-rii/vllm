@@ -6,15 +6,19 @@ integer frame helpers."""
 import socket
 import struct
 import threading
+import time
+from unittest.mock import Mock, call
 
 import pytest
 
+from vllm.v1.spec_decode.remote import transport
 from vllm.v1.spec_decode.remote.transport import (
     FRAME_CONTROL,
     FRAME_DATA,
     MAX_FRAME_BYTES,
     ConnectionClosed,
     DataFrame,
+    FramedConnection,
     TransportError,
     TransportTimeout,
     connect,
@@ -188,6 +192,71 @@ def test_control_and_data_frames_roundtrip(pair):
     assert (data.slot, frame_to_ints(data)) == (7, [5, 6])
     frame = server.recv(timeout=5.0)
     assert (frame.kind, frame.body) == (FRAME_CONTROL, b"")
+
+
+@pytest.mark.timeout(5)
+def test_send_deadline_closes_connection_when_peer_does_not_read():
+    sock, peer = socket.socketpair()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    connection = FramedConnection(sock)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TransportTimeout, match="sending a frame"):
+            connection.send_data(
+                DataFrame(0, "int32", (1 << 18,), bytes(1 << 20)),
+                deadline=started + 0.05,
+            )
+        assert time.monotonic() - started < 2.0
+        assert connection.closed
+        with pytest.raises(ConnectionClosed):
+            connection.send_control(b"cannot reuse partial write")
+    finally:
+        connection.close()
+        peer.close()
+
+
+def test_send_frames_share_absolute_deadline(monkeypatch):
+    now = [10.0]
+    clock = Mock()
+    clock.monotonic.side_effect = lambda: now[0]
+    monkeypatch.setattr(transport, "time", clock)
+    sock = Mock(spec=socket.socket)
+
+    def sendall(data):
+        now[0] += 2.0
+
+    sock.sendall.side_effect = sendall
+    connection = FramedConnection(sock)
+    connection.send_control(b"first", deadline=15.0)
+    with pytest.raises(TransportTimeout):
+        connection.send_data(ints_to_frame(0, [1]), deadline=15.0)
+    assert sock.settimeout.call_args_list == [
+        call(None),
+        call(5.0),
+        call(3.0),
+        call(1.0),
+    ]
+    assert sock.sendall.call_count == 3
+    assert connection.closed
+
+
+def test_send_without_deadline_resets_previous_receive_timeout(pair):
+    client, server = pair
+    with pytest.raises(TransportTimeout):
+        client.recv(timeout=0.01)
+    client.send_control(b"no send deadline")
+    assert client._sock.gettimeout() is None
+    assert server.recv(timeout=1.0).body == b"no send deadline"
+
+
+def test_send_failure_closes_connection():
+    sock = Mock(spec=socket.socket)
+    sock.sendall.side_effect = BrokenPipeError("peer disconnected")
+    connection = FramedConnection(sock)
+    with pytest.raises(ConnectionClosed, match="send failed"):
+        connection.send_control(b"cannot deliver")
+    assert connection.closed
+    sock.close.assert_called_once()
 
 
 def test_partial_frame_survives_timeout():

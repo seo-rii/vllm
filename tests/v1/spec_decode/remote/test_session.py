@@ -433,6 +433,44 @@ def test_timeout_latches_target_only_and_purges_stale_result(session, adapter, c
     assert session.sequence_state(a) is None
 
 
+def test_dispatch_expired_during_encoding_sends_no_proposal(
+    session, adapter, clock, monkeypatch
+):
+    a = ready(session, 1)
+
+    def slow_encode(slot, tensor):
+        frame = tensor_to_frame(slot, tensor)
+        clock.advance(1.0)
+        return frame
+
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.remote.session.tensor_to_frame", slow_encode
+    )
+    result = round_trip(session, batch(0, [a], recovery=[4]))
+    assert result.output.valid_lengths.tolist() == [0]
+    assert not session.connected
+    assert adapter.proposed_batches == []
+
+
+def test_collect_timeout_does_not_write_after_deadline(
+    session, adapter, clock, monkeypatch
+):
+    a = ready(session, 1)
+    adapter.hold_batches.add(0)
+    handle = session.dispatch(batch(0, [a], recovery=[4]))
+    clock.advance(1.0)
+
+    def reject_late_write(*args, **kwargs):
+        pytest.fail("fallback must not wait on a cancellation write")
+
+    monkeypatch.setattr(session._conn, "send_control", reject_late_write)
+    result = session.collect(handle)
+    assert result.row_statuses == (SpeculatorStatusCode.TIMEOUT,)
+    assert result.output.valid_lengths.tolist() == [0]
+    assert session.connected
+    adapter.release()
+
+
 def test_failure_policy_error_raises_after_latching(make_session, adapter, clock):
     session = make_session(failure_policy="error")
     a = ready(session, 1)
