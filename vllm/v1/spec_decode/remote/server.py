@@ -483,6 +483,7 @@ class RemoteDraftServer:
         target_fingerprint: str = "",
         tokenizer_fingerprint: str = "",
         handshake_timeout_s: float = 30.0,
+        send_timeout_s: float = 30.0,
         clock=time.monotonic,
     ) -> None:
         self.adapter = adapter
@@ -491,6 +492,7 @@ class RemoteDraftServer:
         self.target_fingerprint = target_fingerprint
         self.tokenizer_fingerprint = tokenizer_fingerprint
         self.handshake_timeout_s = handshake_timeout_s
+        self.send_timeout_s = send_timeout_s
         self.registry = SequenceRegistry(clock)
         self.lock = threading.Lock()
         self._epoch = 0
@@ -637,20 +639,27 @@ class _ServerSession:
     # -- handshake -------------------------------------------------------
 
     def _handshake(self) -> bool:
+        deadline = time.monotonic() + self.server.handshake_timeout_s
         try:
-            frame = self.conn.recv(timeout=self.server.handshake_timeout_s)
+            frame = self.conn.recv(timeout=max(0.0, deadline - time.monotonic()))
         except TransportError:
             return False
         if frame.kind != FRAME_CONTROL:
             self._send(
-                ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, "expected hello"), 0
+                ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, "expected hello"),
+                0,
+                deadline=deadline,
             )
             return False
         try:
             envelope = decode_envelope(frame.body)
             message = decode_payload(envelope)
         except ProtocolError as e:
-            self._send(ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, str(e)), 0)
+            self._send(
+                ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, str(e)),
+                0,
+                deadline=deadline,
+            )
             return False
         if not isinstance(message, Hello):
             self._send(
@@ -659,6 +668,7 @@ class _ServerSession:
                     f"expected hello, got {envelope.message_type}",
                 ),
                 envelope.request_id,
+                deadline=deadline,
             )
             return False
         reasons = self._hello_rejections(message)
@@ -668,6 +678,7 @@ class _ServerSession:
                     SpeculatorStatusCode.UNSUPPORTED_FEATURE, "; ".join(reasons)
                 ),
                 envelope.request_id,
+                deadline=deadline,
             )
             return False
         selected = next(
@@ -689,6 +700,7 @@ class _ServerSession:
                 limits=self.server.limits,
             ),
             envelope.request_id,
+            deadline=deadline,
         )
         logger.info(
             "Session %s (epoch %d) opened for verifier %s over %s",
@@ -740,18 +752,23 @@ class _ServerSession:
 
     # -- request loop ----------------------------------------------------
 
-    def _send(self, message: Any, request_id: int) -> None:
+    def _send(
+        self, message: Any, request_id: int, *, deadline: float | None = None
+    ) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + self.server.send_timeout_s
         with contextlib.suppress(TransportError):
             self.conn.send_control(
                 encode_message(
                     message, session_id=self.session_id, request_id=request_id
-                )
+                ),
+                deadline=deadline,
             )
 
-    def _send_frames(self, frames: list[DataFrame]) -> bool:
+    def _send_frames(self, frames: list[DataFrame], *, deadline: float) -> bool:
         try:
             for frame in frames:
-                self.conn.send_data(frame)
+                self.conn.send_data(frame, deadline=deadline)
         except TransportError:
             return False
         return True
@@ -814,8 +831,14 @@ class _ServerSession:
         request_id: int,
         status: SpeculatorStatusCode = SpeculatorStatusCode.OK,
         detail: str = "",
+        *,
+        deadline: float | None = None,
     ) -> None:
-        self._send(SequenceAck(key=key, status=status, detail=detail), request_id)
+        self._send(
+            SequenceAck(key=key, status=status, detail=detail),
+            request_id,
+            deadline=deadline,
+        )
 
     def _open(self, message: OpenSequence, request_id: int) -> None:
         key = message.key
@@ -1057,12 +1080,14 @@ class _ServerSession:
 
         base = self.next_result_slot
         self.next_result_slot += _RESULT_FRAMES
+        deadline = time.monotonic() + self.server.send_timeout_s
         sent = self._send_frames(
             [
                 msgspec.structs.replace(tokens, slot=base),
                 msgspec.structs.replace(valid, slot=base + 1),
                 ints_to_frame(base + 2, [int(s) for s in row_statuses]),
-            ]
+            ],
+            deadline=deadline,
         )
         if sent:
             self._send(
@@ -1072,6 +1097,7 @@ class _ServerSession:
                     result_slot=base,
                 ),
                 request_id,
+                deadline=deadline,
             )
 
     def _close(self, message: CloseSequence, request_id: int) -> None:
@@ -1085,15 +1111,17 @@ class _ServerSession:
                     removed.append(closed)
             if removed:
                 self.server.adapter.close_sequences(tuple(removed))
+        deadline = time.monotonic() + self.server.send_timeout_s
         for key in message.keys:
             if self._owns(key):
-                self._ack(key, request_id)
+                self._ack(key, request_id, deadline=deadline)
             else:
                 self._ack(
                     key,
                     request_id,
                     SpeculatorStatusCode.PROTOCOL_ERROR,
                     "key belongs to another verifier",
+                    deadline=deadline,
                 )
 
     def _discard_owned_sequences(self, keys: tuple[SequenceKey, ...]) -> None:

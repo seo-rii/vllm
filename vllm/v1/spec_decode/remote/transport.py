@@ -55,7 +55,7 @@ class TransportError(Exception):
 
 
 class TransportTimeout(TransportError):
-    """No complete frame arrived before the deadline."""
+    """A frame could not be sent or received before the deadline."""
 
 
 class ConnectionClosed(TransportError):
@@ -180,9 +180,9 @@ def parse_endpoint(endpoint: str) -> tuple[int, tuple[str, int] | str]:
 class FramedConnection:
     """Blocking, single-reader framed stream with per-call deadlines.
 
-    A timeout leaves any partially received frame buffered, so the stream
-    never desynchronizes across retries. ``close`` may be called from
-    another thread to unblock a pending ``recv``.
+    Receive timeouts leave partial frames buffered for retries. Send
+    failures close the stream because a partial write cannot be resumed.
+    ``close`` may be called from another thread to unblock pending I/O.
     """
 
     def __init__(self, sock: socket.socket) -> None:
@@ -195,13 +195,13 @@ class FramedConnection:
     def closed(self) -> bool:
         return self._closed
 
-    def send_control(self, data: bytes) -> None:
-        self._send(FRAME_CONTROL, data)
+    def send_control(self, data: bytes, *, deadline: float | None = None) -> None:
+        self._send(FRAME_CONTROL, data, deadline=deadline)
 
-    def send_data(self, frame: DataFrame) -> None:
-        self._send(FRAME_DATA, _frame_encoder.encode(frame))
+    def send_data(self, frame: DataFrame, *, deadline: float | None = None) -> None:
+        self._send(FRAME_DATA, _frame_encoder.encode(frame), deadline=deadline)
 
-    def _send(self, kind: int, body: bytes) -> None:
+    def _send(self, kind: int, body: bytes, *, deadline: float | None = None) -> None:
         if self._closed:
             raise ConnectionClosed("connection is closed")
         if len(body) > MAX_FRAME_BYTES:
@@ -209,10 +209,21 @@ class FramedConnection:
                 f"frame of {len(body)} bytes exceeds {MAX_FRAME_BYTES}"
             )
         try:
-            self._sock.sendall(_HEADER.pack(kind, len(body)))
-            if body:
-                self._sock.sendall(body)
+            for part in (_HEADER.pack(kind, len(body)), body):
+                if not part:
+                    continue
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                self._sock.settimeout(remaining)
+                self._sock.sendall(part)
+        except TimeoutError:
+            self.close()
+            raise TransportTimeout("timed out sending a frame") from None
         except OSError as e:
+            self.close()
             raise ConnectionClosed(f"send failed: {e}") from e
 
     def recv(self, timeout: float | None = None) -> Frame:

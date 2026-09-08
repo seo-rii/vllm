@@ -33,7 +33,6 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 from vllm.v1.spec_decode.remote.protocol import (
     AdvanceAndPropose,
-    CancelBatch,
     CloseSequence,
     ErrorReply,
     Hello,
@@ -336,7 +335,7 @@ class RemoteDraftSession:
             draft_checkpoint_fingerprint=identity.draft_checkpoint_fingerprint,
         )
         try:
-            request_id = self._send(hello)
+            request_id = self._send(hello, deadline=deadline)
             _, ack = self._await(
                 lambda env, msg: (
                     isinstance(msg, HelloAck) and env.request_id == request_id
@@ -562,7 +561,7 @@ class RemoteDraftSession:
         deadline = self._clock() + self._request_timeout_s
         remaining = set(keys)
         try:
-            request_id = self._send(CloseSequence(keys=keys))
+            request_id = self._send(CloseSequence(keys=keys), deadline=deadline)
             while remaining:
                 _, ack = self._await(
                     lambda env, msg: (
@@ -660,7 +659,9 @@ class RemoteDraftSession:
             feature_slot=base + 2,
         )
         try:
-            handle.request_id = self._send(message, frames=frames)
+            handle.request_id = self._send(
+                message, frames=frames, deadline=handle.deadline
+            )
         except TransportError as e:
             self._invalidate(f"connection lost while dispatching: {e}")
             handle.state = transition_handle(handle.state, HandleState.COMPLETED)
@@ -676,7 +677,7 @@ class RemoteDraftSession:
     def collect(self, handle: RemoteProposalHandle) -> RemoteProposalResult:
         """Wait for the round dispatched as ``handle``; one-shot.
 
-        Timeouts cancel the batch on the server, latch the affected
+        Timeouts abandon the batch, latch the affected
         sequences target-only, and return an all-zero output; under
         ``failure_policy="error"`` they raise instead (after the same state
         updates).
@@ -711,7 +712,9 @@ class RemoteDraftSession:
                 handle.deadline,
             )
         except TransportTimeout:
-            self._cancel(handle)
+            # The deadline is exhausted. Do not delay fallback with an
+            # advisory cancellation write; discard the late result instead.
+            self._abandoned_batches.add(handle.batch_id)
             outcome = HandleState.TIMED_OUT
             statuses = self._fail_rows(handle, SpeculatorStatusCode.TIMEOUT)
         except TransportError as e:
@@ -865,13 +868,6 @@ class RemoteDraftSession:
                 self._apply_status(record, status)
         return dict.fromkeys(handle.active_rows, status)
 
-    def _cancel(self, handle: RemoteProposalHandle) -> None:
-        self._abandoned_batches.add(handle.batch_id)
-        try:
-            self._send(CancelBatch(batch_id=handle.batch_id))
-        except TransportError as e:
-            self._invalidate(f"connection lost while cancelling: {e}")
-
     # ------------------------------------------------------------------
     # Health and teardown
     # ------------------------------------------------------------------
@@ -882,7 +878,7 @@ class RemoteDraftSession:
         nonce = self._next_request_id
         deadline = self._clock() + self._request_timeout_s
         try:
-            self._send(Ping(nonce=nonce))
+            self._send(Ping(nonce=nonce), deadline=deadline)
             _, pong = self._await(
                 lambda env, msg: isinstance(msg, Pong) and msg.nonce == nonce,
                 deadline,
@@ -902,15 +898,31 @@ class RemoteDraftSession:
     # Internals
     # ------------------------------------------------------------------
 
-    def _send(self, message: Any, *, frames: list[DataFrame] | None = None) -> int:
+    def _send(
+        self,
+        message: Any,
+        *,
+        deadline: float,
+        frames: list[DataFrame] | None = None,
+    ) -> int:
         conn = self._require_connection()
         request_id = self._next_request_id
         self._next_request_id += 1
-        for frame in frames or ():
-            conn.send_data(frame)
-        conn.send_control(
-            encode_message(message, session_id=self._session_id, request_id=request_id)
-        )
+        # Translate the injectable session clock to the transport's monotonic
+        # clock once, so every frame consumes the same remaining budget.
+        wire_deadline = time.monotonic() + (deadline - self._clock())
+        try:
+            for frame in frames or ():
+                conn.send_data(frame, deadline=wire_deadline)
+            conn.send_control(
+                encode_message(
+                    message, session_id=self._session_id, request_id=request_id
+                ),
+                deadline=wire_deadline,
+            )
+        except TransportTimeout:
+            self._invalidate("timed out while sending")
+            raise
         return request_id
 
     def _await(
@@ -986,7 +998,7 @@ class RemoteDraftSession:
     ) -> tuple[SpeculatorStatusCode, str]:
         deadline = self._clock() + self._request_timeout_s
         try:
-            request_id = self._send(message, frames=frames)
+            request_id = self._send(message, frames=frames, deadline=deadline)
             _, ack = self._await(
                 lambda env, msg: (
                     isinstance(msg, SequenceAck)
