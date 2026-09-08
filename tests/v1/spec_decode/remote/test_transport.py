@@ -70,6 +70,61 @@ def test_listen_resolves_ephemeral_port():
         listener.close()
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets unavailable")
+def test_unix_listener_refuses_live_socket(tmp_path):
+    path = tmp_path / "draft.sock"
+    listener = listen(f"unix://{path}")
+    try:
+        with pytest.raises(TransportError, match="cannot listen"):
+            listen(listener.endpoint)
+        client = connect(listener.endpoint, timeout=1.0)
+        server = listener.accept(timeout=1.0)
+        try:
+            client.send_control(b"still listening")
+            assert server.recv(timeout=1.0).body == b"still listening"
+        finally:
+            client.close()
+            server.close()
+    finally:
+        listener.close()
+    assert not path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets unavailable")
+def test_unix_listener_preserves_existing_file(tmp_path):
+    path = tmp_path / "draft.sock"
+    path.write_text("keep")
+    with pytest.raises(TransportError, match="cannot listen"):
+        listen(f"unix://{path}")
+    assert path.read_text() == "keep"
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets unavailable")
+@pytest.mark.parametrize(
+    "replace_live", [True, False], ids=["live-path", "closed-path"]
+)
+def test_unix_close_preserves_replacement_listener(tmp_path, replace_live):
+    path = tmp_path / "draft.sock"
+    listener = listen(f"unix://{path}")
+    try:
+        if replace_live:
+            path.unlink()
+        else:
+            listener.close()
+        replacement = listen(listener.endpoint)
+        try:
+            listener.close()
+            client = connect(replacement.endpoint, timeout=1.0)
+            server = replacement.accept(timeout=1.0)
+            client.close()
+            server.close()
+        finally:
+            replacement.close()
+    finally:
+        listener.close()
+    assert not path.exists()
+
+
 def test_int_frame_roundtrip():
     frame = ints_to_frame(3, [1, -2, 3, 4], dtype="int64", shape=(2, 2))
     assert frame.slot == 3
