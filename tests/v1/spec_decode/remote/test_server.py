@@ -3,6 +3,7 @@
 """Standalone draft server driven over the raw wire protocol: handshake
 gating, idempotent sequence commands, batch ordering, and error replies."""
 
+import threading
 import time
 import zlib
 
@@ -41,6 +42,7 @@ from vllm.v1.spec_decode.remote.transport import (
     FRAME_DATA,
     ConnectionClosed,
     DataFrame,
+    Listener,
     connect,
     decode_data_frame,
     frame_to_ints,
@@ -802,6 +804,52 @@ def test_stop_disconnects_clients(server, client):
     server.stop()
     with pytest.raises(ConnectionClosed):
         client.recv(timeout=5.0)
+
+
+def test_stop_closes_connection_accepted_before_registration(adapter, monkeypatch):
+    accepted = threading.Event()
+    register = threading.Event()
+    joining_acceptor = threading.Event()
+    original_accept = Listener.accept
+
+    def accept_then_pause(listener, timeout=None):
+        conn = original_accept(listener, timeout)
+        accepted.set()
+        assert register.wait(5.0)
+        return conn
+
+    monkeypatch.setattr(Listener, "accept", accept_then_pause)
+    server = RemoteDraftServer(adapter)
+    endpoint = server.start("tcp://127.0.0.1:0")
+    acceptor = server._acceptor
+    assert acceptor is not None
+    original_join = acceptor.join
+
+    def observe_acceptor_join():
+        joining_acceptor.set()
+        original_join()
+
+    monkeypatch.setattr(acceptor, "join", observe_acceptor_join)
+    conn = connect(endpoint, timeout=5.0)
+    stopper = threading.Thread(target=server.stop, daemon=True)
+    try:
+        assert accepted.wait(5.0)
+        stopper.start()
+        assert joining_acceptor.wait(5.0)
+        register.set()
+        stopper.join(timeout=5.0)
+        assert not stopper.is_alive()
+        assert not acceptor.is_alive()
+        assert not server._workers
+        assert not server._connections
+        with pytest.raises(ConnectionClosed):
+            conn.recv(timeout=5.0)
+    finally:
+        register.set()
+        conn.close()
+        if stopper.ident is not None:
+            stopper.join(timeout=5.0)
+        server.stop()
 
 
 # ----------------------------------------------------------------------
