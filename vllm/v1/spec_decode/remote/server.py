@@ -540,11 +540,11 @@ class RemoteDraftServer:
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.close()
-        for conn in list(self._connections):
-            conn.close()
         if self._acceptor is not None:
             self._acceptor.join()
             self._acceptor = None
+        for conn in list(self._connections):
+            conn.close()
         for worker in self._workers:
             worker.join()
         self._workers.clear()
