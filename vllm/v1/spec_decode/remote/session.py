@@ -602,6 +602,8 @@ class RemoteDraftSession:
                 f"batch_id {batch.batch_id} is not newer than "
                 f"{self._last_batch_id}; batch ids must increase per session"
             )
+        if len(set(batch.keys)) != len(batch.keys):
+            raise ValueError("batch contains duplicate sequence keys")
         self._last_batch_id = batch.batch_id
         batch_size = len(batch.keys)
         if batch.accepted_counts.shape != (batch_size,):
