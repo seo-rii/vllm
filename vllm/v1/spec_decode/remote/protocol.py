@@ -63,7 +63,7 @@ class SpeculatorStatusCode(enum.IntEnum):
     PROTOCOL_ERROR = 9
 
 
-class SequenceKey(msgspec.Struct, frozen=True):
+class SequenceKey(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """Identity of one draft sequence's state on the server.
 
     ``generation`` increments whenever the verifier re-creates state for the
@@ -76,7 +76,7 @@ class SequenceKey(msgspec.Struct, frozen=True):
     generation: NonNegativeInt
 
 
-class FeatureSlot(msgspec.Struct, frozen=True):
+class FeatureSlot(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """One tensor slot in the negotiated target-feature layout.
 
     ``kind`` is a TargetFeatureKind value carried as a plain string so that
@@ -89,7 +89,7 @@ class FeatureSlot(msgspec.Struct, frozen=True):
     optional: bool = False
 
 
-class TargetFeatureSchema(msgspec.Struct, frozen=True):
+class TargetFeatureSchema(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """Fixed slot ordering negotiated at handshake.
 
     After the handshake the data plane only ever refers to this layout by
@@ -100,7 +100,7 @@ class TargetFeatureSchema(msgspec.Struct, frozen=True):
     slots: tuple[FeatureSlot, ...]
 
 
-class RemoteServerLimits(msgspec.Struct, frozen=True):
+class RemoteServerLimits(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """Hard limits negotiated down to the smaller common value."""
 
     max_batch_size: PositiveInt

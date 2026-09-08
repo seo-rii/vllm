@@ -41,7 +41,7 @@ class TargetFeatureKind(str, enum.Enum):
     TARGET_TOPK_INDICES = "target_topk_indices"
 
 
-class SpeculatorPlacementCapabilities(msgspec.Struct, frozen=True):
+class SpeculatorPlacementCapabilities(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     """What a concrete speculator adapter and checkpoint support.
 
     Reported by the standalone server during the HELLO handshake. The

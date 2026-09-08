@@ -38,8 +38,7 @@ class SpeculatorOutput:
             )
         if self.valid_lengths.ndim != 1:
             raise ValueError(
-                f"valid_lengths must be 1-D [batch], got "
-                f"{self.valid_lengths.ndim}-D"
+                f"valid_lengths must be 1-D [batch], got {self.valid_lengths.ndim}-D"
             )
         if self.token_ids.shape[0] != self.valid_lengths.shape[0]:
             raise ValueError(
@@ -84,9 +83,7 @@ class SpeculatorOutput:
                 dtype=torch.int64,
                 device=device,
             ),
-            valid_lengths=torch.zeros(
-                batch_size, dtype=torch.int32, device=device
-            ),
+            valid_lengths=torch.zeros(batch_size, dtype=torch.int32, device=device),
         )
 
 
