@@ -289,6 +289,19 @@ def test_batch_ids_must_increase(session):
         session.dispatch(batch(3, [a], recovery=[1]))
 
 
+def test_duplicate_keys_are_rejected_without_consuming_the_batch(session, adapter):
+    a = ready(session, 1)
+    with pytest.raises(ValueError, match="duplicate sequence keys"):
+        session.dispatch(batch(0, [a, a], recovery=[4, 4]))
+
+    assert session.sequence_state(a) is SequenceState.READY
+    assert adapter.proposed_batches == []
+    assert adapter.prefix(a) == [1, 2, 3]
+    result = round_trip(session, batch(0, [a], recovery=[4]))
+    assert result.row_statuses == (OK,)
+    assert adapter.prefix(a) == [1, 2, 3, 4]
+
+
 def test_only_one_proposal_may_be_in_flight(session):
     a = ready(session, 1)
     b = ready(session, 2)
