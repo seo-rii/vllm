@@ -98,6 +98,19 @@ _MAX_INPUT_FRAMES = 4
 # ----------------------------------------------------------------------
 
 
+class AdapterError(Exception):
+    """A per-sequence failure an adapter reports instead of crashing.
+
+    The server acknowledges the command with ``status`` and drops the
+    sequence, so the verifier falls back to target-only for that request.
+    """
+
+    def __init__(self, status: SpeculatorStatusCode, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
 @dataclass(frozen=True)
 class PrefillInputs:
     """One verified prompt chunk in negotiated schema order.
@@ -980,11 +993,15 @@ class _ServerSession:
                 )
                 return
             outcome = registry.open(key, owner=self.session_id)
+            status, detail = outcome.status, outcome.detail
             if outcome.created:
                 if outcome.replaced is not None:
                     server.adapter.close_sequences((outcome.replaced,))
-                server.adapter.open_sequence(key)
-        self._ack(key, request_id, outcome.status, outcome.detail)
+                failure = self._call_adapter(server.adapter.open_sequence, key)
+                if failure is not None:
+                    registry.close(key, owner=self.session_id)
+                    status, detail = failure
+        self._ack(key, request_id, status, detail)
 
     def _prefill(self, message: PrefillChunk, request_id: int) -> None:
         key = message.key
@@ -1039,7 +1056,8 @@ class _ServerSession:
                 is_final=message.is_final,
             )
             if apply:
-                self.server.adapter.prefill(
+                failure = self._call_adapter(
+                    self.server.adapter.prefill,
                     key,
                     PrefillInputs(
                         offset=message.offset,
@@ -1048,7 +1066,27 @@ class _ServerSession:
                         features=tuple(frames),
                     ),
                 )
+                if failure is not None:
+                    self._discard_owned_sequences((key,))
+                    status, detail = failure
         self._ack(key, request_id, status, detail)
+
+    def _call_adapter(
+        self, method: Any, key: SequenceKey, *args: Any
+    ) -> tuple[SpeculatorStatusCode, str] | None:
+        """Run a per-sequence adapter command; returns the failure, if any."""
+        try:
+            method(key, *args)
+        except AdapterError as e:
+            return e.status, e.detail
+        except Exception:
+            logger.exception(
+                "Session %s: adapter failed on sequence %d",
+                self.session_id,
+                key.sequence_id,
+            )
+            return SpeculatorStatusCode.INTERNAL_ERROR, "adapter raised"
+        return None
 
     def _propose(self, message: AdvanceAndPropose, request_id: int) -> None:
         schema = self.server.adapter.feature_schema()
