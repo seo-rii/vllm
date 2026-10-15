@@ -18,7 +18,7 @@ dedicated same-host GPU outside the target tensor-parallel group:
 - server: the standalone server loop, idempotent sequence registry, the
   adapter contract, and a deterministic fake adapter for tests.
 
-Only ``session`` imports torch; everything else must stay importable
-without CUDA and without the heavyweight parts of vLLM so protocol,
-registry, and state logic can be unit tested in isolation.
+Only ``session`` operates on tensors. The server, protocol, registry, and
+state logic exchange raw data-plane frames, so they need no GPU and can be
+unit tested in isolation.
 """

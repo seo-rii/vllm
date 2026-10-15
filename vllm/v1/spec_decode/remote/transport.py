@@ -4,9 +4,10 @@
 
 This is the ``inline`` transport: control frames carry encoded
 MessageEnvelopes and data frames carry raw tensor bytes tagged with a slot
-index, multiplexed on one stream connection. It is dependency-free and
-correct rather than fast; zero-copy transports (CUDA IPC, pinned-host ring)
-replace only the data-plane half and keep the control plane as is.
+index, multiplexed on one stream connection. It needs only the standard
+library and msgspec, and is correct rather than fast; zero-copy transports
+(CUDA IPC, pinned-host ring) replace only the data-plane half and keep the
+control plane as is.
 
 Frame layout: ``kind:u8 | length:u32 big-endian | body``. Data-plane
 payloads are in native byte order, which is acceptable because remote

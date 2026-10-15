@@ -3,9 +3,9 @@
 """Standalone speculator server: sessions, sequence registry, and the
 adapter contract a concrete drafter implements.
 
-The server is torch-free so protocol and registry logic can be tested
-without a GPU; adapters receive and return data-plane frames and do their
-own device handling. Requests on one connection are processed serially,
+The server never operates on tensors, so protocol and registry logic can
+be tested without a GPU; adapters receive and return data-plane frames and
+do their own device handling. Requests on one connection are processed serially,
 which yields the initial invariants directly: no two proposals run on the
 same sequence at once, batch IDs increase monotonically per session, and
 a response is only sent after its result frames.
