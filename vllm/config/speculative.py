@@ -96,8 +96,9 @@ class RemoteDraftConfig:
     """
 
     endpoint: str = ""
-    """Control-plane endpoint of the standalone speculator server, e.g.
-    "unix:///run/vllm/drafter.sock"."""
+    """Control-plane endpoint of the standalone speculator server:
+    "unix:///path" or "tcp://host:port". The server is unauthenticated, so
+    prefer a UNIX socket or a loopback address."""
     transport: RemoteDraftTransport = "auto"
     """Data-plane transport for target features and draft results. The initial
     runtime supports the copy-based "inline" transport; "auto" currently
@@ -115,8 +116,11 @@ class RemoteDraftConfig:
 
     @model_validator(mode="after")
     def _validate_endpoint(self) -> Self:
+        from vllm.v1.spec_decode.remote.transport import parse_endpoint
+
         if not self.endpoint.strip():
             raise ValueError("remote_draft.endpoint must not be empty")
+        parse_endpoint(self.endpoint)
         return self
 
 

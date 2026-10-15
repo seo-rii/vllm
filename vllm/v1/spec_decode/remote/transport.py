@@ -15,6 +15,7 @@ placement is same-host only.
 
 import array
 import contextlib
+import ipaddress
 import math
 import os
 import socket
@@ -160,9 +161,15 @@ def parse_endpoint(endpoint: str) -> tuple[int, tuple[str, int] | str]:
     """Parse ``tcp://host:port`` or ``unix:///path`` into a socket address."""
     parts = urlsplit(endpoint)
     if parts.scheme == "tcp":
-        if parts.hostname is None or parts.port is None:
+        try:
+            port = parts.port
+        except ValueError as e:
+            raise ValueError(f"invalid tcp port in {endpoint!r}") from e
+        if not parts.hostname or port is None:
             raise ValueError(f"tcp endpoint needs host and port: {endpoint!r}")
-        return socket.AF_INET, (parts.hostname, parts.port)
+        if ":" in parts.hostname:
+            return socket.AF_INET6, (parts.hostname, port)
+        return socket.AF_INET, (parts.hostname, port)
     if parts.scheme == "unix":
         path = parts.path or parts.netloc
         if not path:
@@ -177,11 +184,27 @@ def parse_endpoint(endpoint: str) -> tuple[int, tuple[str, int] | str]:
     )
 
 
+def is_local_endpoint(endpoint: str) -> bool:
+    """Whether only processes on this host can reach ``endpoint``."""
+    family, address = parse_endpoint(endpoint)
+    if not isinstance(address, tuple):
+        return True
+    host = address[0]
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class FramedConnection:
     """Blocking, single-reader framed stream with per-call deadlines.
 
-    Receive timeouts leave partial frames buffered for retries. Send
-    failures close the stream because a partial write cannot be resumed.
+    Receive timeouts leave partial frames buffered for retries. A send
+    whose deadline passed before the frame started leaves the stream
+    intact; any other send failure closes it because a partial write cannot
+    be resumed.
     ``close`` may be called from another thread to unblock pending I/O.
     """
 
@@ -208,6 +231,8 @@ class FramedConnection:
             raise TransportError(
                 f"frame of {len(body)} bytes exceeds {MAX_FRAME_BYTES}"
             )
+        if deadline is not None and deadline <= time.monotonic():
+            raise TransportTimeout("deadline elapsed before sending a frame")
         try:
             for part in (_HEADER.pack(kind, len(body)), body):
                 if not part:
@@ -311,7 +336,7 @@ class Listener:
 
 
 def _tune(sock: socket.socket) -> None:
-    if sock.family == socket.AF_INET:
+    if sock.family in (socket.AF_INET, socket.AF_INET6):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
@@ -326,7 +351,7 @@ def connect(endpoint: str, timeout: float | None = None) -> FramedConnection:
     """Open a client connection to ``endpoint``."""
     family, address = parse_endpoint(endpoint)
     try:
-        if family == socket.AF_INET:
+        if family in (socket.AF_INET, socket.AF_INET6):
             assert isinstance(address, tuple)
             sock = socket.create_connection(address, timeout=timeout)
         else:
@@ -349,11 +374,13 @@ def listen(endpoint: str, backlog: int = 16) -> Listener:
     unix_path: str | None = None
     unix_identity: tuple[int, int] | None = None
     try:
-        if family == socket.AF_INET:
+        if family in (socket.AF_INET, socket.AF_INET6):
             if sys.platform != "win32":
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(address)
             host, port = sock.getsockname()[:2]
+            if family == socket.AF_INET6:
+                host = f"[{host}]"
             resolved = f"tcp://{host}:{port}"
         else:
             assert isinstance(address, str)
