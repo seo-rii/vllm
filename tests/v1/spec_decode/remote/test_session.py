@@ -13,10 +13,12 @@ from vllm.v1.spec_decode.remote.capabilities import (
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import (
+    FeatureSlot,
     HelloAck,
     RemoteServerLimits,
     SequenceKey,
     SpeculatorStatusCode,
+    TargetFeatureSchema,
 )
 from vllm.v1.spec_decode.remote.server import (
     DEFAULT_LIMITS,
@@ -372,6 +374,103 @@ def test_other_rpcs_cannot_consume_an_inflight_proposal(session):
     assert session.pending_frames == 0
 
 
+def ragged_batch(batch_id, keys, query_lens, token_ids, *extra_slots):
+    return RemoteProposalBatch(
+        batch_id=batch_id,
+        keys=tuple(keys),
+        accepted_counts=tokens([0] * len(keys)),
+        recovery_tokens=tokens(list(range(len(keys))), torch.int64),
+        features=FeatureBatch(1, (tokens(token_ids), *extra_slots)),
+        query_lens=tokens(query_lens),
+    )
+
+
+def test_ragged_token_features_follow_their_rows(session, adapter):
+    # Token-level features carry each row's target tokens back to back
+    # (MRV2's [num_tokens, ...] layout); skipping an unready row must drop
+    # exactly its segment.
+    a = ready(session, 1)
+    skipped = session.open_sequence(2)
+    b = ready(session, 3)
+    result = round_trip(
+        session,
+        ragged_batch(0, [a, skipped, b], [2, 3, 1], [10, 11, 20, 21, 22, 30]),
+    )
+    assert result.row_statuses[0] is OK
+    assert result.row_statuses[2] is OK
+    assert adapter.round_tokens == {a: [10, 11], b: [30]}
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "token_ids", "match"),
+    [
+        ([2], [1, 2], "query_lens must be"),
+        ([-1, 3], [1, 2], "non-negative"),
+        ([1, 1], [1, 2, 3], "expected 2 rows"),
+    ],
+)
+def test_query_lens_must_describe_token_features(
+    session, adapter, query_lens, token_ids, match
+):
+    a = ready(session, 1)
+    b = ready(session, 2)
+    with pytest.raises(ValueError, match=match):
+        session.dispatch(ragged_batch(0, [a, b], query_lens, token_ids))
+    assert adapter.proposed_batches == []
+    # A rejected batch does not consume its id.
+    assert round_trip(session, batch(0, [a], recovery=[1])).row_statuses == (OK,)
+
+
+def test_per_sequence_slots_hold_one_row_per_key(clock):
+    schema = TargetFeatureSchema(
+        schema_id=1,
+        slots=(
+            FeatureSlot(kind="token_ids", dtype="int32", trailing_shape=()),
+            FeatureSlot(
+                kind="temperature",
+                dtype="float32",
+                trailing_shape=(),
+                per_sequence=True,
+            ),
+        ),
+    )
+    adapter = FakeDraftAdapter(vocab_size=VOCAB, feature_schema=schema)
+    server = RemoteDraftServer(adapter)
+    server.start("tcp://127.0.0.1:0")
+    identity = dataclasses.replace(
+        IDENTITY, provided_features=("token_ids", "temperature")
+    )
+    session = RemoteDraftSession(server.endpoint, identity, clock=clock)
+    temps = torch.tensor([0.5, 0.0, 1.0])
+    try:
+        session.connect()
+        a = session.open_sequence(1)
+        with pytest.raises(ValueError, match="temperature"):
+            session.prefill(
+                a, FeatureBatch(1, (tokens([1, 2]), temps[:2])), is_final=True
+            )
+        session.prefill(a, FeatureBatch(1, (tokens([1, 2]), temps[:1])), is_final=True)
+        skipped = session.open_sequence(2)
+        b = session.open_sequence(3)
+        session.prefill(b, FeatureBatch(1, (tokens([4]), temps[:1])), is_final=True)
+
+        with pytest.raises(ValueError, match="temperature"):
+            session.dispatch(
+                ragged_batch(0, [a, skipped, b], [1, 1, 2], [7, 8, 9, 9], temps[:2])
+            )
+        result = round_trip(
+            session,
+            ragged_batch(0, [a, skipped, b], [1, 1, 2], [7, 8, 9, 9], temps),
+        )
+        assert result.row_statuses[0] is OK
+        assert result.row_statuses[2] is OK
+        assert adapter.round_tokens == {a: [7], b: [9, 9]}
+    finally:
+        session.close()
+        adapter.release()
+        server.stop()
+
+
 def test_dispatch_validates_schema_and_shapes(session):
     a = ready(session, 1)
     wrong_schema = RemoteProposalBatch(
@@ -546,6 +645,24 @@ def test_rows_beyond_max_batch_size_degrade_instead_of_raising(clock):
         assert result.row_statuses == (OK, OK, SpeculatorStatusCode.QUEUE_FULL)
         assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS] * 2 + [0]
         assert session.sequence_state(keys[2]) is SequenceState.TARGET_ONLY
+    finally:
+        session.close()
+        server.stop()
+
+
+def test_rows_beyond_max_feature_tokens_degrade_instead_of_raising(clock):
+    server, adapter = limited_server(max_feature_tokens=4)
+    identity = dataclasses.replace(IDENTITY, max_num_batched_tokens=4)
+    session = RemoteDraftSession(server.endpoint, identity, clock=clock)
+    try:
+        session.connect()
+        keys = [ready(session, i, prompt=(1,)) for i in range(3)]
+        result = round_trip(
+            session, ragged_batch(0, keys, [3, 2, 1], [1, 2, 3, 4, 5, 6])
+        )
+        assert result.row_statuses == (OK, SpeculatorStatusCode.QUEUE_FULL, OK)
+        assert adapter.round_tokens == {keys[0]: [1, 2, 3], keys[2]: [6]}
+        assert session.sequence_state(keys[1]) is SequenceState.TARGET_ONLY
     finally:
         session.close()
         server.stop()

@@ -16,6 +16,7 @@ desynced sequence already bumps the generation so that step can build on
 it.
 """
 
+import itertools
 import math
 import time
 import zlib
@@ -509,6 +510,7 @@ class RemoteDraftSession:
         schema = self.feature_schema
         limits = self.limits
         num_tokens = self._chunk_length(features)
+        self._check_features(features, num_tokens=num_tokens, num_sequences=1)
         overflow = None
         if num_tokens > limits.max_feature_tokens:
             overflow = (
@@ -529,7 +531,9 @@ class RemoteDraftSession:
             )
             return
         base = self._reserve_slots(len(schema.slots))
-        frames = self._feature_frames(base, features, num_tokens, rows=None)
+        frames = self._feature_frames(
+            base, features, token_rows=None, sequence_rows=None
+        )
         checksum = _checksum(frames)
         chunk = PrefillChunk(
             key=key,
@@ -619,7 +623,6 @@ class RemoteDraftSession:
             )
         if len(set(batch.keys)) != len(batch.keys):
             raise ValueError("batch contains duplicate sequence keys")
-        self._last_batch_id = batch.batch_id
         batch_size = len(batch.keys)
         if batch.accepted_counts.shape != (batch_size,):
             raise ValueError(
@@ -631,6 +634,12 @@ class RemoteDraftSession:
                 f"recovery_tokens must be [{batch_size}], got "
                 f"{tuple(batch.recovery_tokens.shape)}"
             )
+        query_lens = _query_lens(batch)
+        if self._feature_schema is not None:
+            self._check_features(
+                batch.features, num_tokens=sum(query_lens), num_sequences=batch_size
+            )
+        self._last_batch_id = batch.batch_id
         handle = RemoteProposalHandle(
             session_epoch=self._session_epoch,
             session_id=self._session_id,
@@ -639,6 +648,7 @@ class RemoteDraftSession:
             active_rows=self._admit(
                 batch.keys,
                 [i for i, key in enumerate(batch.keys) if self._is_ready(key)],
+                query_lens,
             ),
             num_speculative_tokens=self._identity.num_speculative_tokens,
             device=batch.recovery_tokens.device,
@@ -647,28 +657,36 @@ class RemoteDraftSession:
         if not handle.active_rows or not self._alive:
             handle.state = transition_handle(handle.state, HandleState.COMPLETED)
             return handle
-        schema = self.feature_schema
-        if batch.features.schema_id != schema.schema_id:
-            raise ValueError(
-                f"features carry schema {batch.features.schema_id}, session "
-                f"negotiated schema {schema.schema_id}"
-            )
-        num_active = len(handle.active_rows)
-        rows = None
-        if num_active != batch_size:
+        rows = token_rows = None
+        if len(handle.active_rows) != batch_size:
             rows = torch.tensor(handle.active_rows, dtype=torch.long)
-        base = self._reserve_slots(2 + len(schema.slots))
+            token_rows = _token_rows(query_lens, handle.active_rows)
+        num_inputs = 2 if batch.query_lens is None else 3
+        base = self._reserve_slots(num_inputs + len(self.feature_schema.slots))
         frames = [
             tensor_to_frame(base, _select_rows(batch.accepted_counts, rows)),
             tensor_to_frame(base + 1, _select_rows(batch.recovery_tokens, rows)),
         ]
-        frames.extend(self._feature_frames(base + 2, batch.features, batch_size, rows))
+        if batch.query_lens is not None:
+            active_lens = [query_lens[i] for i in handle.active_rows]
+            frames.append(
+                tensor_to_frame(base + 2, torch.tensor(active_lens, dtype=torch.int32))
+            )
+        frames.extend(
+            self._feature_frames(
+                base + num_inputs,
+                batch.features,
+                token_rows=token_rows,
+                sequence_rows=rows,
+            )
+        )
         message = AdvanceAndPropose(
             batch_id=batch.batch_id,
             keys=tuple(batch.keys[i] for i in handle.active_rows),
             accepted_counts_slot=base,
             recovery_tokens_slot=base + 1,
-            feature_slot=base + 2,
+            feature_slot=base + num_inputs,
+            query_lens_slot=None if batch.query_lens is None else base + 2,
         )
         try:
             handle.request_id = self._send(
@@ -1045,25 +1063,40 @@ class RemoteDraftSession:
         # token cannot restore the skipped verifier context.
         self._latch_target_only(record, status)
 
-    def _admit(self, keys: tuple[SequenceKey, ...], rows: list[int]) -> tuple[int, ...]:
+    def _admit(
+        self, keys: tuple[SequenceKey, ...], rows: list[int], query_lens: list[int]
+    ) -> tuple[int, ...]:
         """Keep the rows the server limits allow; latch the rest target-only.
 
         The handshake already checked the verifier's declared limits, so
         this only triggers when the runner exceeds what it declared.
         """
-        if self._limits is None or len(rows) <= self._limits.max_batch_size:
+        limits = self._limits
+        if limits is None:
             return tuple(rows)
-        admitted = rows[: self._limits.max_batch_size]
-        for i in rows[len(admitted) :]:
-            self._latch_target_only(
-                self._records[keys[i].sequence_id], SpeculatorStatusCode.QUEUE_FULL
+        admitted: list[int] = []
+        num_tokens = 0
+        for i in rows:
+            if (
+                len(admitted) < limits.max_batch_size
+                and num_tokens + query_lens[i] <= limits.max_feature_tokens
+            ):
+                admitted.append(i)
+                num_tokens += query_lens[i]
+            else:
+                self._latch_target_only(
+                    self._records[keys[i].sequence_id],
+                    SpeculatorStatusCode.QUEUE_FULL,
+                )
+        if len(admitted) != len(rows):
+            logger.warning(
+                "Remote draft batch exceeds the server max_batch_size=%d or "
+                "max_feature_tokens=%d; %d of %d ready rows decode target-only",
+                limits.max_batch_size,
+                limits.max_feature_tokens,
+                len(rows) - len(admitted),
+                len(rows),
             )
-        logger.warning(
-            "Remote draft batch of %d ready rows exceeds the server "
-            "max_batch_size=%d; the rest decode target-only",
-            len(rows),
-            self._limits.max_batch_size,
-        )
         return tuple(admitted)
 
     def _latch_target_only(
@@ -1102,20 +1135,20 @@ class RemoteDraftSession:
             )
         return record
 
-    def _feature_frames(
-        self,
-        base: int,
-        features: FeatureBatch,
-        expected_rows: int,
-        rows: torch.Tensor | None,
-    ) -> list[DataFrame]:
+    def _check_features(
+        self, features: FeatureBatch, *, num_tokens: int, num_sequences: int
+    ) -> None:
         schema = self.feature_schema
+        if features.schema_id != schema.schema_id:
+            raise ValueError(
+                f"features carry schema {features.schema_id}, session "
+                f"negotiated schema {schema.schema_id}"
+            )
         if len(features.slots) != len(schema.slots):
             raise ValueError(
                 f"features carry {len(features.slots)} slots, schema "
                 f"{schema.schema_id} has {len(schema.slots)}"
             )
-        frames: list[DataFrame] = []
         for i, (spec, tensor) in enumerate(zip(schema.slots, features.slots)):
             if tensor is None:
                 if not spec.optional:
@@ -1123,20 +1156,40 @@ class RemoteDraftSession:
                         f"required feature slot {i} ({spec.kind}) is missing"
                     )
                 continue
-            if tensor.shape[0] != expected_rows:
+            expected = num_sequences if spec.per_sequence else num_tokens
+            if tensor.ndim == 0 or tensor.shape[0] != expected:
                 raise ValueError(
-                    f"feature slot {i} ({spec.kind}) has {tensor.shape[0]} rows, "
-                    f"expected {expected_rows}"
+                    f"feature slot {i} ({spec.kind}) has shape "
+                    f"{tuple(tensor.shape)}, expected {expected} rows"
                 )
-            frames.append(tensor_to_frame(base + i, _select_rows(tensor, rows)))
+
+    def _feature_frames(
+        self,
+        base: int,
+        features: FeatureBatch,
+        *,
+        token_rows: torch.Tensor | None,
+        sequence_rows: torch.Tensor | None,
+    ) -> list[DataFrame]:
+        frames: list[DataFrame] = []
+        for i, (spec, tensor) in enumerate(
+            zip(self.feature_schema.slots, features.slots)
+        ):
+            if tensor is not None:
+                rows = sequence_rows if spec.per_sequence else token_rows
+                frames.append(tensor_to_frame(base + i, _select_rows(tensor, rows)))
         return frames
 
     def _chunk_length(self, features: FeatureBatch) -> int:
-        lengths = {t.shape[0] for t in features.slots if t is not None}
+        lengths = {
+            tensor.shape[0]
+            for spec, tensor in zip(self.feature_schema.slots, features.slots)
+            if tensor is not None and tensor.ndim and not spec.per_sequence
+        }
         if len(lengths) != 1:
             raise ValueError(
-                "prefill features must all share one token dimension, got "
-                f"{sorted(lengths)}"
+                "prefill token-level features must all share one token "
+                f"dimension, got {sorted(lengths)}"
             )
         return lengths.pop()
 
@@ -1182,6 +1235,27 @@ class RemoteDraftSession:
         conn, self._conn = self._conn, None
         if conn is not None:
             conn.close()
+
+
+def _query_lens(batch: RemoteProposalBatch) -> list[int]:
+    batch_size = len(batch.keys)
+    if batch.query_lens is None:
+        return [1] * batch_size
+    if batch.query_lens.shape != (batch_size,) or batch.query_lens.is_floating_point():
+        raise ValueError(
+            f"query_lens must be an integer [{batch_size}] tensor, got "
+            f"{batch.query_lens.dtype} {tuple(batch.query_lens.shape)}"
+        )
+    query_lens = batch.query_lens.tolist()
+    if any(length < 0 for length in query_lens):
+        raise ValueError(f"query_lens must be non-negative, got {query_lens}")
+    return query_lens
+
+
+def _token_rows(query_lens: list[int], rows: tuple[int, ...]) -> torch.Tensor:
+    """Indices of the token-level feature rows that belong to ``rows``."""
+    starts = list(itertools.accumulate(query_lens, initial=0))
+    return torch.cat([torch.arange(starts[i], starts[i] + query_lens[i]) for i in rows])
 
 
 def _select_rows(tensor: torch.Tensor, rows: torch.Tensor | None) -> torch.Tensor:

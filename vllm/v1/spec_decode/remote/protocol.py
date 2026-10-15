@@ -87,6 +87,9 @@ class FeatureSlot(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     dtype: str
     trailing_shape: tuple[PositiveInt, ...]
     optional: bool = False
+    per_sequence: bool = False
+    """One row per sequence (e.g. temperature) instead of one row per
+    target token (e.g. hidden states)."""
 
 
 class TargetFeatureSchema(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
@@ -155,6 +158,9 @@ class OpenSequence(msgspec.Struct):
 class PrefillChunk(msgspec.Struct):
     """Append one prompt chunk to a sequence's draft state.
 
+    Token-level feature slots hold ``num_tokens`` rows and per-sequence
+    slots hold one row.
+
     ``offset`` must equal the number of tokens the server has already
     applied; a gap or checksum mismatch yields SEQUENCE_DESYNC. Duplicate
     chunks with a matching checksum may be ACKed idempotently.
@@ -169,7 +175,12 @@ class PrefillChunk(msgspec.Struct):
 
 
 class AdvanceAndPropose(msgspec.Struct):
-    """Apply the last verification outcome and propose the next K tokens."""
+    """Apply the last verification outcome and propose the next K tokens.
+
+    Per-sequence feature slots hold one row per key. Token-level slots hold
+    ``sum(query_lens)`` rows, the target tokens of each key in key order;
+    without ``query_lens_slot`` every key contributes exactly one row.
+    """
 
     batch_id: NonNegativeInt
     keys: tuple[SequenceKey, ...]
@@ -177,6 +188,8 @@ class AdvanceAndPropose(msgspec.Struct):
     recovery_tokens_slot: NonNegativeInt
     feature_slot: NonNegativeInt
     round_ids_slot: NonNegativeInt | None = None
+    query_lens_slot: NonNegativeInt | None = None
+    """Integer frame [len(keys)] of token-level feature rows per key."""
 
 
 class ProposalResponse(msgspec.Struct):

@@ -130,6 +130,10 @@ class RemoteProposalBatch:
     accepted_counts: "torch.Tensor"
     recovery_tokens: "torch.Tensor"
     features: FeatureBatch
+    query_lens: "torch.Tensor | None" = None
+    """[batch] CPU tensor: rows each key owns in token-level feature slots,
+    which then hold ``sum(query_lens)`` rows in key order. None means one
+    row per key."""
 
 
 @dataclass

@@ -100,7 +100,11 @@ _MAX_INPUT_FRAMES = 4
 
 @dataclass(frozen=True)
 class PrefillInputs:
-    """One verified prompt chunk in negotiated schema order."""
+    """One verified prompt chunk in negotiated schema order.
+
+    Token-level feature frames hold ``num_tokens`` rows; per-sequence
+    frames hold one row.
+    """
 
     offset: int
     num_tokens: int
@@ -115,6 +119,11 @@ class StandaloneProposalBatch:
     Rows not in ``active_rows`` were rejected by the registry (stale,
     desynced, not prefilled); the adapter must still return a row for them
     but must not advance their state.
+
+    Per-sequence feature frames hold one row per key. Token-level feature
+    frames hold ``sum(query_lens)`` rows: key ``i`` owns the
+    ``query_lens[i]`` rows after those of keys ``0..i-1``, inactive keys
+    included.
     """
 
     batch_id: int
@@ -124,6 +133,7 @@ class StandaloneProposalBatch:
     accepted_counts: DataFrame
     recovery_tokens: DataFrame
     features: tuple[DataFrame | None, ...]
+    query_lens: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -181,8 +191,9 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
 
     ``proposal[i, j] = (recovery_token[i] + j + 1) % vocab_size``, so a
     verifier can check end to end that the right rows came back in the
-    right order. ``hold_batches`` makes a batch block until ``release`` is
-    called, which is how slow-server and timeout paths are exercised.
+    right order. Feature slot 0 must be token-level TOKEN_IDS.
+    ``hold_batches`` makes a batch block until ``release`` is called, which
+    is how slow-server and timeout paths are exercised.
     """
 
     def __init__(
@@ -193,6 +204,7 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
         methods: Collection[str] = REMOTE_DRAFT_SUPPORTED_METHODS,
         hold_timeout_s: float = 10.0,
         draft_checkpoint_fingerprint: str = "",
+        feature_schema: TargetFeatureSchema | None = None,
     ) -> None:
         self._vocab_size = vocab_size
         self._draft_checkpoint_fingerprint = draft_checkpoint_fingerprint
@@ -203,7 +215,7 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
             standalone_weights="complete",
         )
         self._methods = frozenset(methods)
-        self._schema = TargetFeatureSchema(
+        self._schema = feature_schema or TargetFeatureSchema(
             schema_id=1,
             slots=(
                 FeatureSlot(
@@ -214,6 +226,8 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
             ),
         )
         self._prefixes: dict[SequenceKey, list[int]] = {}
+        self.round_tokens: dict[SequenceKey, list[int]] = {}
+        """Token-level TOKEN_IDS rows each active key received last round."""
         self._hold_timeout_s = hold_timeout_s
         self._release = threading.Event()
         self.hold_batches: set[int] = set()
@@ -251,6 +265,14 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
         if batch.batch_id in self.hold_batches:
             self._release.wait(self._hold_timeout_s)
         self.proposed_batches.append(batch.batch_id)
+        token_ids = batch.features[0]
+        if token_ids is not None:
+            values = frame_to_ints(token_ids)
+            start = 0
+            for i, length in enumerate(batch.query_lens):
+                if i in batch.active_rows:
+                    self.round_tokens[batch.keys[i]] = values[start : start + length]
+                start += length
         recovery = frame_to_ints(batch.recovery_tokens)
         num_rows = len(batch.keys)
         num_tokens = batch.num_speculative_tokens
@@ -995,7 +1017,7 @@ class _ServerSession:
                 f"exceeds max_model_len={limits.max_model_len}",
             )
             return
-        problem = _frame_problems(frames, schema, message.num_tokens)
+        problem = _frame_problems(frames, schema, message.num_tokens, 1)
         if problem is not None:
             self._ack(key, request_id, SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
@@ -1033,8 +1055,9 @@ class _ServerSession:
         accepted = self.inbound.pop(message.accepted_counts_slot, None)
         recovery = self.inbound.pop(message.recovery_tokens_slot, None)
         frames = self._take_frames(message.feature_slot, len(schema.slots))
-        if message.round_ids_slot is not None:
-            self.inbound.pop(message.round_ids_slot, None)
+        lens_frame = None
+        if message.query_lens_slot is not None:
+            lens_frame = self.inbound.pop(message.query_lens_slot, None)
         sequence_number = self.sequence_number
         self.sequence_number += 1
 
@@ -1091,7 +1114,32 @@ class _ServerSession:
                 f"accepted counts must be within 0..{num_tokens}",
             )
             return
-        problem = _frame_problems(frames, schema, num_rows)
+        query_lens = [1] * num_rows
+        if message.query_lens_slot is not None:
+            if lens_frame is None or lens_frame.shape != (num_rows,):
+                fail(
+                    SpeculatorStatusCode.PROTOCOL_ERROR,
+                    "query_lens frame is missing or does not match rows",
+                )
+                return
+            try:
+                query_lens = frame_to_ints(lens_frame)
+            except TransportError as e:
+                fail(SpeculatorStatusCode.PROTOCOL_ERROR, f"query_lens frame: {e}")
+                return
+            if any(length < 0 for length in query_lens):
+                fail(SpeculatorStatusCode.PROTOCOL_ERROR, "negative query_lens")
+                return
+        num_feature_tokens = sum(query_lens)
+        max_feature_tokens = self.server.limits.max_feature_tokens
+        if num_feature_tokens > max_feature_tokens:
+            fail(
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                f"{num_feature_tokens} feature tokens exceed "
+                f"max_feature_tokens={max_feature_tokens}",
+            )
+            return
+        problem = _frame_problems(frames, schema, num_feature_tokens, num_rows)
         if problem is not None:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
@@ -1129,6 +1177,7 @@ class _ServerSession:
                             accepted_counts=accepted,
                             recovery_tokens=recovery,
                             features=tuple(frames),
+                            query_lens=tuple(query_lens),
                         )
                     )
                 except Exception:
@@ -1236,13 +1285,17 @@ class _ServerSession:
 
 
 def _frame_problems(
-    frames: list[DataFrame | None], schema: TargetFeatureSchema, num_rows: int
+    frames: list[DataFrame | None],
+    schema: TargetFeatureSchema,
+    num_tokens: int,
+    num_sequences: int,
 ) -> str | None:
     for i, (spec, frame) in enumerate(zip(schema.slots, frames)):
         if frame is None:
             if spec.optional:
                 continue
             return f"required feature slot {i} ({spec.kind}) is missing"
+        num_rows = num_sequences if spec.per_sequence else num_tokens
         if frame.shape[:1] != (num_rows,):
             return (
                 f"feature slot {i} ({spec.kind}) has shape {frame.shape}, "
