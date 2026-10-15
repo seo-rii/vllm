@@ -35,6 +35,14 @@ def test_empty_endpoint_rejected(endpoint):
 
 
 @pytest.mark.parametrize(
+    "endpoint", ["http://127.0.0.1:5555", "tcp://127.0.0.1", "drafter.sock"]
+)
+def test_malformed_endpoint_rejected(endpoint):
+    with pytest.raises(ValidationError, match="endpoint"):
+        RemoteDraftConfig(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
     "transport", ["cuda_ipc", "pinned_host", "zmq", "carrier_pigeon"]
 )
 def test_unimplemented_transport_rejected(transport):

@@ -25,6 +25,7 @@ from vllm.v1.spec_decode.remote.transport import (
     decode_data_frame,
     frame_to_ints,
     ints_to_frame,
+    is_local_endpoint,
     listen,
     parse_endpoint,
     validate_frame,
@@ -49,6 +50,45 @@ def test_parse_tcp_endpoint():
     )
 
 
+def test_parse_ipv6_tcp_endpoint():
+    assert parse_endpoint("tcp://[::1]:5555") == (socket.AF_INET6, ("::1", 5555))
+
+
+def test_ipv6_listener_round_trip():
+    try:
+        listener = listen("tcp://[::1]:0")
+    except TransportError:
+        pytest.skip("IPv6 loopback unavailable")
+    try:
+        assert listener.endpoint.startswith("tcp://[::1]:")
+        client = connect(listener.endpoint, timeout=5.0)
+        server = listener.accept(timeout=5.0)
+        client.send_control(b"v6")
+        assert server.recv(timeout=5.0).body == b"v6"
+        client.close()
+        server.close()
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "local"),
+    [
+        ("tcp://127.0.0.1:1", True),
+        ("tcp://[::1]:1", True),
+        ("tcp://localhost:1", True),
+        ("tcp://0.0.0.0:1", False),
+        ("tcp://10.0.0.5:1", False),
+        ("tcp://draft-host:1", False),
+        ("unix:///run/vllm/draft.sock", True),
+    ],
+)
+def test_is_local_endpoint(endpoint, local):
+    if endpoint.startswith("unix") and not hasattr(socket, "AF_UNIX"):
+        pytest.skip("unix sockets unavailable")
+    assert is_local_endpoint(endpoint) is local
+
+
 def test_parse_unix_endpoint():
     if not hasattr(socket, "AF_UNIX"):
         pytest.skip("unix sockets unavailable")
@@ -59,7 +99,15 @@ def test_parse_unix_endpoint():
 
 
 @pytest.mark.parametrize(
-    "endpoint", ["http://127.0.0.1:1", "tcp://127.0.0.1", "unix://", "draft"]
+    "endpoint",
+    [
+        "http://127.0.0.1:1",
+        "tcp://127.0.0.1",
+        "tcp://127.0.0.1:99999",
+        "tcp://:5555",
+        "unix://",
+        "draft",
+    ],
 )
 def test_parse_rejects_bad_endpoints(endpoint):
     with pytest.raises(ValueError):
@@ -238,6 +286,17 @@ def test_send_frames_share_absolute_deadline(monkeypatch):
     ]
     assert sock.sendall.call_count == 3
     assert connection.closed
+
+
+def test_expired_deadline_before_frame_keeps_stream_usable(pair):
+    # Nothing reached the wire, so frame boundaries are intact and the
+    # connection must not be torn down.
+    client, server = pair
+    with pytest.raises(TransportTimeout, match="before sending"):
+        client.send_control(b"too late", deadline=time.monotonic() - 1.0)
+    assert not client.closed
+    client.send_control(b"next")
+    assert server.recv(timeout=1.0).body == b"next"
 
 
 def test_send_without_deadline_resets_previous_receive_timeout(pair):
