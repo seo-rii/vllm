@@ -3,22 +3,32 @@
 """Verifier session against the fake draft server: negotiation, proposal
 rounds, failure latching, stale-response discard, and shutdown recovery."""
 
+import contextlib
 import dataclasses
+import threading
+import time
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from vllm.v1.spec_decode.remote import session as session_module
 from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import (
+    ErrorReply,
     FeatureSlot,
     HelloAck,
     RemoteServerLimits,
+    SequenceAck,
     SequenceKey,
     SpeculatorStatusCode,
     TargetFeatureSchema,
+    decode_envelope,
+    decode_payload,
+    encode_message,
 )
 from vllm.v1.spec_decode.remote.server import (
     DEFAULT_LIMITS,
@@ -40,6 +50,7 @@ from vllm.v1.spec_decode.remote.state import (
     RemoteProposalBatch,
     SequenceState,
 )
+from vllm.v1.spec_decode.remote.transport import TransportError, listen
 
 VOCAB = 50
 NUM_SPEC_TOKENS = 3
@@ -574,20 +585,43 @@ def test_timeout_latches_target_only_and_purges_stale_result(session, adapter, c
 def test_dispatch_expired_during_encoding_sends_no_proposal(
     session, adapter, clock, monkeypatch
 ):
+    # Nothing was written, so the round times out without tearing down the
+    # connection the other requests still use.
     a = ready(session, 1)
+    b = ready(session, 2)
 
     def slow_encode(slot, tensor):
         frame = tensor_to_frame(slot, tensor)
         clock.advance(1.0)
         return frame
 
-    monkeypatch.setattr(
-        "vllm.v1.spec_decode.remote.session.tensor_to_frame", slow_encode
-    )
+    monkeypatch.setattr(session_module, "tensor_to_frame", slow_encode)
     result = round_trip(session, batch(0, [a], recovery=[4]))
+    assert result.row_statuses == (SpeculatorStatusCode.TIMEOUT,)
     assert result.output.valid_lengths.tolist() == [0]
-    assert not session.connected
+    assert session.connected
     assert adapter.proposed_batches == []
+
+    monkeypatch.undo()
+    assert round_trip(session, batch(1, [b], recovery=[5])).row_statuses == (OK,)
+
+
+def test_large_writes_get_a_size_proportional_budget(session, monkeypatch):
+    a = session.open_sequence(1)
+    monkeypatch.setattr(session_module, "_MIN_WRITE_BYTES_PER_S", 1000)
+    budgets = []
+    send_data = session._conn.send_data
+
+    def record(frame, *, deadline=None):
+        budgets.append(deadline - time.monotonic())
+        send_data(frame, deadline=deadline)
+
+    monkeypatch.setattr(session._conn, "send_data", record)
+    # 1000 int32 tokens at 1000 B/s is a 4 s write budget, far beyond the
+    # 100 ms request timeout that would otherwise cut the copy short.
+    session.prefill(a, features(list(range(1000))), is_final=True)
+    assert budgets and budgets[0] > 3.0
+    assert session.sequence_state(a) is SequenceState.READY
 
 
 def test_collect_timeout_does_not_write_after_deadline(
@@ -607,6 +641,23 @@ def test_collect_timeout_does_not_write_after_deadline(
     assert result.output.valid_lengths.tolist() == [0]
     assert session.connected
     adapter.release()
+
+
+def test_latched_rows_report_their_failure_once(session, adapter, clock, monkeypatch):
+    a = ready(session, 1)
+    b = ready(session, 2)
+    adapter.hold_batches.add(0)
+    handle = session.dispatch(batch(0, [a], recovery=[1]))
+    clock.advance(10.0)
+    assert session.collect(handle).row_statuses == (SpeculatorStatusCode.TIMEOUT,)
+    adapter.release()
+
+    warning = Mock()
+    monkeypatch.setattr(session_module.logger, "warning", warning)
+    for batch_id in (1, 2, 3):
+        result = round_trip(session, batch(batch_id, [a, b], recovery=[1, 2]))
+        assert result.row_statuses == (SpeculatorStatusCode.TIMEOUT, OK)
+    warning.assert_not_called()
 
 
 def test_failure_policy_error_raises_after_latching(make_session, adapter, clock):
@@ -632,18 +683,27 @@ def limited_server(**limits):
     return server, adapter
 
 
-def test_rows_beyond_max_batch_size_degrade_instead_of_raising(clock):
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+def test_rows_beyond_max_batch_size_follow_failure_policy(clock, policy):
     # Reachable only when the runner sends more rows than it declared; the
-    # overflow must fall back to target-only rather than kill the engine.
+    # overflow must fall back to target-only rather than kill the engine,
+    # unless the error policy asks for failures to surface.
     server, adapter = limited_server(max_batch_size=2)
     identity = dataclasses.replace(IDENTITY, max_num_seqs=2)
-    session = RemoteDraftSession(server.endpoint, identity, clock=clock)
+    session = RemoteDraftSession(
+        server.endpoint, identity, failure_policy=policy, clock=clock
+    )
     try:
         session.connect()
         keys = [ready(session, i) for i in range(3)]
-        result = round_trip(session, batch(0, keys, recovery=[1, 2, 3]))
-        assert result.row_statuses == (OK, OK, SpeculatorStatusCode.QUEUE_FULL)
-        assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS] * 2 + [0]
+        handle = session.dispatch(batch(0, keys, recovery=[1, 2, 3]))
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="QUEUE_FULL"):
+                session.collect(handle)
+        else:
+            result = session.collect(handle)
+            assert result.row_statuses == (OK, OK, SpeculatorStatusCode.QUEUE_FULL)
+            assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS] * 2 + [0]
         assert session.sequence_state(keys[2]) is SequenceState.TARGET_ONLY
     finally:
         session.close()
@@ -811,6 +871,102 @@ def test_reconnect_completes_rounds_with_fresh_wire_state(session):
     assert session.pending_frames == 0
 
 
+def test_lost_connection_reconnects_with_backoff(make_session, server, clock):
+    session = make_session()
+    endpoint = server.endpoint
+    old = ready(session, 1)
+    server.stop()
+    round_trip(session, batch(0, [old], recovery=[1]))
+    assert not session.connected
+
+    # No server yet: one attempt, then quiet until the backoff elapses.
+    connects = Mock(wraps=session_module.transport_connect)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(session_module, "transport_connect", connects)
+        assert session.sequence_state(session.open_sequence(2)) is SequenceState.INVALID
+        assert session.sequence_state(session.open_sequence(3)) is SequenceState.INVALID
+        assert connects.call_count == 1
+
+        restarted = RemoteDraftServer(FakeDraftAdapter(vocab_size=VOCAB))
+        restarted.start(endpoint)
+        try:
+            clock.advance(1.0)
+            fresh = ready(session, 4)
+            assert connects.call_count == 2
+            assert session.connected
+            result = round_trip(session, batch(0, [old, fresh], recovery=[1, 5]))
+            assert result.row_statuses[1] is OK
+            assert result.output.token_ids[1].tolist() == expected_row(5)
+            assert session.sequence_state(old) is SequenceState.INVALID
+        finally:
+            session.close()
+            restarted.stop()
+
+
+def test_open_after_a_silent_restart_uses_the_new_server(make_session, server):
+    # The session only learns that the old connection is dead when the
+    # open fails on it; that request must still get the new connection.
+    session = make_session()
+    endpoint = server.endpoint
+    ready(session, 1)
+    server.stop()
+    restarted = RemoteDraftServer(FakeDraftAdapter(vocab_size=VOCAB))
+    restarted.start(endpoint)
+    try:
+        key = session.open_sequence(2)
+        assert session.connected
+        assert key.generation == 1
+        assert session.sequence_state(key) is SequenceState.PREFILLING
+    finally:
+        session.close()
+        restarted.stop()
+
+
+def test_error_reply_to_an_earlier_request_is_ignored(clock):
+    listener = listen("tcp://127.0.0.1:0")
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    ack = HelloAck(
+        server_id="scripted",
+        session_id="s",
+        session_epoch=1,
+        selected_transport="inline",
+        capabilities=adapter.capabilities(),
+        feature_schema=adapter.feature_schema(),
+        limits=DEFAULT_LIMITS,
+    )
+
+    def serve():
+        conn = listener.accept(timeout=5.0)
+        with contextlib.suppress(TransportError):
+            hello = decode_envelope(conn.recv(timeout=5.0).body)
+            conn.send_control(
+                encode_message(ack, session_id="s", request_id=hello.request_id)
+            )
+            envelope = decode_envelope(conn.recv(timeout=5.0).body)
+            stale = ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, "abandoned")
+            conn.send_control(
+                encode_message(stale, session_id="s", request_id=hello.request_id)
+            )
+            reply = SequenceAck(key=decode_payload(envelope).key)
+            conn.send_control(
+                encode_message(reply, session_id="s", request_id=envelope.request_id)
+            )
+            conn.recv(timeout=5.0)
+        conn.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    session = RemoteDraftSession(listener.endpoint, IDENTITY, clock=clock)
+    try:
+        session.connect()
+        key = session.open_sequence(1)
+        assert session.sequence_state(key) is SequenceState.PREFILLING
+    finally:
+        session.close()
+        thread.join()
+        listener.close()
+
+
 def test_reconnect_fences_handles_from_the_old_connection(session):
     a = ready(session, 1)
     handle = session.dispatch(batch(0, [a], recovery=[1]))
@@ -836,9 +992,24 @@ def test_open_twice_is_an_error(session):
         session.open_sequence(1)
 
 
-def test_reopened_sequence_id_gets_a_new_generation(session):
+def test_acknowledged_close_forgets_the_sequence(session, adapter):
+    # Generations exist to fence server state that may still be around; once
+    # the server acknowledged the close there is none, and remembering every
+    # sequence id ever opened would grow without bound.
+    for sequence_id in range(50):
+        session.close_sequences((ready(session, sequence_id),))
+    assert session._generations == {}
+    reopened = ready(session, 1)
+    assert reopened.generation == 0
+    result = round_trip(session, batch(0, [reopened], recovery=[4]))
+    assert result.row_statuses == (OK,)
+
+
+def test_unacknowledged_close_keeps_bumping_the_generation(session):
     first = ready(session, 1)
+    session.close()
     session.close_sequences((first,))
+    session.connect()
     second = session.open_sequence(1)
     assert second.generation == first.generation + 1
 
@@ -855,6 +1026,49 @@ def test_close_is_idempotent(session, server, adapter):
     assert session.sequence_state(b) is None
     assert len(server.registry) == 0
     assert adapter.prefix(a) is None
+
+
+def test_prefill_many_writes_every_chunk_before_waiting(
+    session, server, adapter, monkeypatch
+):
+    a = session.open_sequence(1)
+    b = session.open_sequence(2)
+    c = session.open_sequence(3)
+    # The server holds a newer generation of b, so only b's chunk fails.
+    newer = SequenceKey(b.verifier_instance_id, b.sequence_id, b.generation + 1)
+    with server.lock:
+        server.registry.open(newer, owner=session.session_id)
+        adapter.open_sequence(newer)
+
+    events: list[str] = []
+    send, wait = session._send, session._await
+
+    def record_send(*args, **kwargs):
+        events.append("send")
+        return send(*args, **kwargs)
+
+    def record_wait(*args, **kwargs):
+        events.append("wait")
+        return wait(*args, **kwargs)
+
+    monkeypatch.setattr(session, "_send", record_send)
+    monkeypatch.setattr(session, "_await", record_wait)
+    session.prefill_many(
+        [
+            (a, features([1, 2]), True),
+            (b, features([3]), True),
+            (c, features([4, 5]), False),
+        ]
+    )
+    assert events == ["send"] * 3 + ["wait"] * 3
+    assert session.sequence_state(a) is SequenceState.READY
+    assert session.sequence_state(b) is SequenceState.DESYNCED
+    assert session.sequence_state(c) is SequenceState.PREFILLING
+    assert adapter.prefix(a) == [1, 2]
+    assert adapter.prefix(c) == [4, 5]
+
+    with pytest.raises(ValueError, match="one prefill chunk per sequence"):
+        session.prefill_many([(c, features([6]), True), (c, features([7]), True)])
 
 
 def test_prefill_rejects_stale_key_and_ready_sequence(session):
