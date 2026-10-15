@@ -13,12 +13,13 @@ a response is only sent after its result frames.
 
 import argparse
 import contextlib
+import itertools
 import threading
 import time
 import uuid
 import zlib
 from abc import ABC, abstractmethod
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -68,6 +69,7 @@ from vllm.v1.spec_decode.remote.transport import (
     decode_data_frame,
     frame_to_ints,
     ints_to_frame,
+    is_local_endpoint,
     listen,
     validate_frame,
     validate_integer_frame,
@@ -85,6 +87,9 @@ SUPPORTED_TRANSPORTS = (INLINE_TRANSPORT,)
 
 _ACCEPT_POLL_S = 0.2
 _RESULT_FRAMES = 3
+# Input frames an AdvanceAndPropose may reference besides its feature
+# slots: accepted counts, recovery tokens, query lengths, round ids.
+_MAX_INPUT_FRAMES = 4
 
 
 # ----------------------------------------------------------------------
@@ -150,6 +155,10 @@ class StandaloneDraftAdapter(ABC):
 
     def draft_checkpoint_fingerprint(self) -> str:
         return ""
+
+    def warmup(self) -> None:  # noqa: B027
+        """Compile and capture before the server accepts connections, so the
+        first verifier rounds are not spent on one-time setup."""
 
     @abstractmethod
     def open_sequence(self, key: SequenceKey) -> None: ...
@@ -304,13 +313,15 @@ class SequenceRegistry:
 
     def __init__(self, clock=time.monotonic) -> None:
         self._entries: dict[tuple[str, int], SequenceEntry] = {}
+        self._counts: dict[str, int] = {}
         self._clock = clock
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def count(self, verifier_instance_id: str) -> int:
-        return sum(1 for vid, _ in self._entries if vid == verifier_instance_id)
+        """Open sequences of one verifier; safe to call without the lock."""
+        return self._counts.get(verifier_instance_id, 0)
 
     def get(self, key: SequenceKey) -> SequenceEntry | None:
         entry = self._entries.get(_registry_key(key))
@@ -341,6 +352,8 @@ class SequenceRegistry:
                 entry.last_activity = self._clock()
                 return OpenOutcome(SpeculatorStatusCode.OK, "already open", False, None)
         replaced = entry.key if entry is not None else None
+        if replaced is None:
+            self._add_count(key.verifier_instance_id, 1)
         self._entries[_registry_key(key)] = SequenceEntry(
             key=key, owner=owner, last_activity=self._clock()
         )
@@ -396,6 +409,11 @@ class SequenceRegistry:
         status, detail, entry = self._lookup(key, owner)
         if entry is None:
             return status, detail
+        if entry.state is SequenceState.DESYNCED:
+            return (
+                SpeculatorStatusCode.SEQUENCE_DESYNC,
+                "an earlier round failed for this sequence",
+            )
         if entry.state is not SequenceState.READY:
             return SpeculatorStatusCode.SEQUENCE_DESYNC, "sequence is not prefilled"
         if batch_id <= entry.last_batch_id:
@@ -413,12 +431,22 @@ class SequenceRegistry:
             # accepted drafts plus the bonus/recovery token
             entry.prefix_length += accepted + 1
 
+    def desync(self, key: SequenceKey, *, owner: str) -> None:
+        """Refuse further rounds after a failed one.
+
+        The adapter did not advance the row, so its draft state no longer
+        matches the verifier's; a later round must not silently extend it.
+        """
+        entry = self.get(key)
+        if entry is not None and entry.owner == owner:
+            entry.state = SequenceState.DESYNCED
+
     def close(self, key: SequenceKey, *, owner: str) -> SequenceKey | None:
         """Remove an exact key only when this connection still owns it."""
         entry = self._entries.get(_registry_key(key))
         if entry is None or entry.key != key or entry.owner != owner:
             return None
-        del self._entries[_registry_key(key)]
+        self._remove(key)
         return entry.key
 
     def close_all(self, owner: str) -> tuple[SequenceKey, ...]:
@@ -427,8 +455,19 @@ class SequenceRegistry:
             entry.key for entry in self._entries.values() if entry.owner == owner
         )
         for key in removed:
-            del self._entries[_registry_key(key)]
+            self._remove(key)
         return removed
+
+    def _remove(self, key: SequenceKey) -> None:
+        del self._entries[_registry_key(key)]
+        self._add_count(key.verifier_instance_id, -1)
+
+    def _add_count(self, verifier_instance_id: str, delta: int) -> None:
+        count = self._counts.get(verifier_instance_id, 0) + delta
+        if count:
+            self._counts[verifier_instance_id] = count
+        else:
+            self._counts.pop(verifier_instance_id, None)
 
     def _lookup(
         self, key: SequenceKey, owner: str
@@ -471,7 +510,8 @@ class RemoteDraftServer:
 
     ``start`` binds the endpoint and serves in background threads (one
     acceptor plus one per connection); ``stop`` tears everything down and
-    joins. Adapter and registry access is serialized by one lock.
+    joins. Adapter and registry access is serialized by one lock; liveness
+    probes never take it, so they answer while the adapter is busy.
     """
 
     def __init__(
@@ -495,7 +535,9 @@ class RemoteDraftServer:
         self.send_timeout_s = send_timeout_s
         self.registry = SequenceRegistry(clock)
         self.lock = threading.Lock()
-        self._epoch = 0
+        self._queue_lock = threading.Lock()
+        self._queue_depth = 0
+        self._epochs = itertools.count(1)
         self._listener: Listener | None = None
         self._acceptor: threading.Thread | None = None
         self._workers: list[threading.Thread] = []
@@ -506,11 +548,40 @@ class RemoteDraftServer:
     def endpoint(self) -> str | None:
         return self._listener.endpoint if self._listener is not None else None
 
+    @property
+    def queue_depth(self) -> int:
+        """Adapter calls running or waiting for their turn."""
+        return self._queue_depth
+
+    @contextlib.contextmanager
+    def adapter_turn(self) -> Iterator[None]:
+        """Hold the adapter and registry lock, counted in ``queue_depth``."""
+        with self._queue_lock:
+            self._queue_depth += 1
+        try:
+            with self.lock:
+                yield
+        finally:
+            with self._queue_lock:
+                self._queue_depth -= 1
+
     def start(self, endpoint: str) -> str:
-        """Bind and serve in the background; returns the resolved endpoint."""
+        """Warm up, bind, and serve in the background.
+
+        Returns the resolved endpoint. The endpoint does not accept
+        connections until the adapter has finished warming up.
+        """
         if self._listener is not None:
             raise RuntimeError("server is already running")
+        self.adapter.warmup()
         self._listener = listen(endpoint)
+        if not is_local_endpoint(self._listener.endpoint):
+            logger.warning(
+                "Remote draft server listens on %s, which is reachable from "
+                "other hosts; the protocol has no authentication, so bind to "
+                "a loopback address or a UNIX socket.",
+                self._listener.endpoint,
+            )
         self._stopping.clear()
         self._acceptor = threading.Thread(
             target=self._accept_loop, name="remote-draft-acceptor", daemon=True
@@ -553,9 +624,7 @@ class RemoteDraftServer:
         self._workers.clear()
 
     def next_epoch(self) -> int:
-        with self.lock:
-            self._epoch += 1
-            return self._epoch
+        return next(self._epochs)
 
     def _accept_loop(self) -> None:
         listener = self._listener
@@ -568,6 +637,7 @@ class RemoteDraftServer:
             except TransportError:
                 break
             self._connections.add(conn)
+            self._workers = [w for w in self._workers if w.is_alive()]
             worker = threading.Thread(
                 target=self._serve_connection,
                 args=(conn,),
@@ -604,6 +674,7 @@ class _ServerSession:
         self.sequence_number = 0
         self.next_result_slot = 0
         self.cancelled_batches = 0
+        self.max_pending_frames = 0
 
     def run(self) -> None:
         if not self._handshake():
@@ -620,6 +691,9 @@ class _ServerSession:
                 return
             if frame.kind == FRAME_CONTROL:
                 self._handle_control(frame.body)
+                # Frames precede the message that consumes them, so whatever
+                # it left behind can never be referenced again.
+                self.inbound.clear()
                 continue
             try:
                 data = decode_data_frame(frame.body)
@@ -627,11 +701,21 @@ class _ServerSession:
                 self._send(ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, str(e)), 0)
                 continue
             self.inbound[data.slot] = data
+            if len(self.inbound) > self.max_pending_frames:
+                self._send(
+                    ErrorReply(
+                        SpeculatorStatusCode.PROTOCOL_ERROR,
+                        f"more than {self.max_pending_frames} data frames "
+                        "without a control message",
+                    ),
+                    0,
+                )
+                return
 
     def cleanup(self) -> None:
         if not self.session_id:
             return
-        with self.server.lock:
+        with self.server.adapter_turn():
             keys = self.server.registry.close_all(self.session_id)
             if keys:
                 self.server.adapter.close_sequences(keys)
@@ -689,6 +773,9 @@ class _ServerSession:
         self.verifier_instance_id = message.verifier_instance_id
         self.num_speculative_tokens = message.num_speculative_tokens
         adapter = self.server.adapter
+        self.max_pending_frames = _MAX_INPUT_FRAMES + len(
+            adapter.feature_schema().slots
+        )
         self._send(
             HelloAck(
                 server_id=self.server.server_id,
@@ -807,10 +894,14 @@ class _ServerSession:
                 message.batch_id,
             )
         elif isinstance(message, Ping):
-            with self.server.lock:
-                active = self.server.registry.count(self.verifier_instance_id)
             self._send(
-                Pong(nonce=message.nonce, queue_depth=0, active_sequences=active),
+                Pong(
+                    nonce=message.nonce,
+                    queue_depth=self.server.queue_depth,
+                    active_sequences=self.server.registry.count(
+                        self.verifier_instance_id
+                    ),
+                ),
                 request_id,
             )
         else:
@@ -851,7 +942,7 @@ class _ServerSession:
             )
             return
         server = self.server
-        with server.lock:
+        with server.adapter_turn():
             registry = server.registry
             if (
                 not registry.has_identity(key)
@@ -914,7 +1005,7 @@ class _ServerSession:
                 "payload checksum does not match the chunk header",
             )
             return
-        with self.server.lock:
+        with self.server.adapter_turn():
             status, detail, apply = self.server.registry.prefill(
                 key,
                 owner=self.session_id,
@@ -1003,12 +1094,13 @@ class _ServerSession:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
 
-        with self.server.lock:
+        with self.server.adapter_turn():
             registry = self.server.registry
-            row_statuses = [
+            begun = [
                 registry.begin_round(key, message.batch_id, owner=self.session_id)[0]
                 for key in message.keys
             ]
+            row_statuses = list(begun)
             max_model_len = self.server.limits.max_model_len
             for i, seq_key in enumerate(message.keys):
                 if row_statuses[i] is not SpeculatorStatusCode.OK:
@@ -1077,6 +1169,9 @@ class _ServerSession:
                     shape=(num_rows, num_tokens),
                 )
                 valid = ints_to_frame(0, [0] * num_rows)
+            for seq_key, began, status in zip(message.keys, begun, row_statuses):
+                if began is SpeculatorStatusCode.OK and status is not began:
+                    registry.desync(seq_key, owner=self.session_id)
 
         base = self.next_result_slot
         self.next_result_slot += _RESULT_FRAMES
@@ -1102,7 +1197,7 @@ class _ServerSession:
 
     def _close(self, message: CloseSequence, request_id: int) -> None:
         removed: list[SequenceKey] = []
-        with self.server.lock:
+        with self.server.adapter_turn():
             for key in message.keys:
                 if not self._owns(key):
                     continue

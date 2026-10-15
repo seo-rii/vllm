@@ -3,6 +3,7 @@
 """Standalone draft server driven over the raw wire protocol: handshake
 gating, idempotent sequence commands, batch ordering, and error replies."""
 
+import dataclasses
 import socket
 import threading
 import time
@@ -11,6 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.v1.spec_decode.remote import server as server_module
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
 from vllm.v1.spec_decode.remote.protocol import (
     AdvanceAndPropose,
@@ -33,6 +35,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     encode_message,
 )
 from vllm.v1.spec_decode.remote.server import (
+    _MAX_INPUT_FRAMES,
     DEFAULT_LIMITS,
     FakeDraftAdapter,
     RemoteDraftServer,
@@ -731,6 +734,33 @@ def test_prefill_and_rounds_respect_advertised_limits():
         server.stop()
 
 
+def test_failed_row_is_refused_by_later_rounds(client, adapter, monkeypatch):
+    # The adapter did not advance a failed row. A verifier that keeps
+    # sending it (e.g. after abandoning that batch) must get a desync
+    # instead of silently extending stale draft state.
+    client.hello()
+    client.ready(key(70))
+    propose = adapter.advance_and_propose
+
+    def fail_rows(batch):
+        result = propose(dataclasses.replace(batch, active_rows=()))
+        return dataclasses.replace(
+            result,
+            row_statuses=(SpeculatorStatusCode.INTERNAL_ERROR,) * len(batch.keys),
+        )
+
+    monkeypatch.setattr(adapter, "advance_and_propose", fail_rows)
+    _, valid, statuses = client.result(client.propose(0, [key(70)], recovery=[1]))
+    assert statuses == [SpeculatorStatusCode.INTERNAL_ERROR]
+    assert valid == [0]
+
+    monkeypatch.undo()
+    _, valid, statuses = client.result(client.propose(1, [key(70)], recovery=[2]))
+    assert statuses == [SpeculatorStatusCode.SEQUENCE_DESYNC]
+    assert valid == [0]
+    assert adapter.prefix(key(70)) == [1, 2, 3]
+
+
 def test_cancel_is_accepted_without_reply(client):
     client.hello()
     client.send(CancelBatch(batch_id=123))
@@ -764,6 +794,92 @@ def test_unexpected_message_type_rejected(client):
     reply = client.call(Pong(nonce=1))
     assert isinstance(reply, ErrorReply)
     assert "unexpected pong" in reply.detail
+
+
+def test_frames_left_behind_by_a_message_are_dropped(client):
+    client.hello()
+    k = key(53)
+    assert client.open(k).status is OK
+    slot = client.reserve(1)
+    stray = ints_to_frame(slot, [1, 2])
+    assert isinstance(client.call(Ping(nonce=1), frames=[stray]), Pong)
+    chunk = PrefillChunk(
+        key=k,
+        offset=0,
+        num_tokens=2,
+        is_final=True,
+        feature_slot=slot,
+        checksum=checksum(stray),
+    )
+    reply = client.call(chunk)
+    assert reply.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    assert "missing" in reply.detail
+
+
+def test_data_frames_without_a_control_message_are_bounded(client, adapter):
+    client.hello()
+    limit = _MAX_INPUT_FRAMES + len(adapter.feature_schema().slots)
+    for slot in range(limit + 1):
+        client.conn.send_data(ints_to_frame(slot, [1]))
+    _, reply = client.recv()
+    assert isinstance(reply, ErrorReply)
+    assert "without a control message" in reply.detail
+    with pytest.raises(ConnectionClosed):
+        client.recv(timeout=5.0)
+
+
+def test_ping_answers_while_the_adapter_is_busy(server, adapter, client):
+    client.hello()
+    client.ready(key(52))
+    adapter.hold_batches.add(0)
+    held = threading.Thread(target=client.propose, args=(0, [key(52)], [1]))
+    held.start()
+    prober = RawClient(server.endpoint)
+    try:
+        prober.hello(verifier_instance_id="verifier-b")
+        assert wait_until(lambda: server.queue_depth == 1)
+        started = time.monotonic()
+        pong = prober.call(Ping(nonce=5))
+        assert isinstance(pong, Pong)
+        assert pong.queue_depth == 1
+        assert time.monotonic() - started < 2.0
+    finally:
+        adapter.release()
+        held.join()
+        prober.close()
+    assert server.queue_depth == 0
+
+
+def test_warmup_runs_before_the_endpoint_accepts():
+    seen: list[str | None] = []
+
+    class WarmAdapter(FakeDraftAdapter):
+        def warmup(self):
+            seen.append(server.endpoint)
+
+    server = RemoteDraftServer(WarmAdapter(vocab_size=VOCAB))
+    server.start("tcp://127.0.0.1:0")
+    try:
+        assert seen == [None]
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "warns"), [("tcp://127.0.0.1:0", False), ("tcp://0.0.0.0:0", True)]
+)
+def test_listener_reachable_from_other_hosts_warns(
+    adapter, monkeypatch, endpoint, warns
+):
+    warning = Mock()
+    monkeypatch.setattr(server_module.logger, "warning", warning)
+    server = RemoteDraftServer(adapter)
+    server.start(endpoint)
+    try:
+        messages = [c.args[0] for c in warning.call_args_list]
+        assert any("no authentication" in m for m in messages) is warns
+    finally:
+        server.stop()
 
 
 def test_ping_reports_active_sequences(client):
@@ -997,6 +1113,20 @@ def test_registry_prefill_and_rounds():
     entry = registry.get(key(1))
     assert entry is not None
     assert entry.prefix_length == 4 + 3
+
+
+def test_registry_counts_track_open_sequences():
+    registry = SequenceRegistry()
+    registry.open(key(1), owner="s1")
+    registry.open(key(1, generation=1), owner="s1")
+    registry.open(key(2), owner="s1")
+    registry.open(key(3, verifier="other"), owner="s2")
+    assert registry.count(VERIFIER) == 2
+    assert registry.count("other") == 1
+    registry.close(key(2), owner="s1")
+    registry.close_all("s2")
+    assert registry.count(VERIFIER) == 1
+    assert registry.count("other") == 0
 
 
 def test_registry_close_all_releases_only_owned_entries():
