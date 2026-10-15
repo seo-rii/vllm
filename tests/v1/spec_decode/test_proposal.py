@@ -51,7 +51,7 @@ def test_non_integer_dtype_rejected():
         )
 
 
-def test_default_dispatch_collect_is_synchronous_propose():
+def test_default_dispatch_collect_is_synchronous_propose(monkeypatch):
     proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
     draft = torch.tensor([[7, 8], [9, 10]])
     seen_kwargs = {}
@@ -60,7 +60,7 @@ def test_default_dispatch_collect_is_synchronous_propose():
         seen_kwargs.update(kwargs)
         return draft
 
-    proposer.propose = fake_propose
+    monkeypatch.setattr(proposer, "propose", fake_propose)
 
     handle = proposer.dispatch_proposal(num_speculative_tokens=2)
     assert isinstance(handle, ProposalHandle)

@@ -230,6 +230,7 @@ def test_semantic_range_violation_rejected(message_type, payload):
 
 def test_degenerate_feature_shape_rejected():
     ack = ALL_MESSAGES[1]
+    assert isinstance(ack, HelloAck)
     bad_ack = HelloAck(
         server_id=ack.server_id,
         session_id=ack.session_id,
@@ -261,6 +262,7 @@ def test_unknown_feature_kind_stays_decodable():
     # know; the handshake must decode so the capability check can reject
     # them by name instead of dying with a codec error.
     ack = ALL_MESSAGES[1]
+    assert isinstance(ack, HelloAck)
     future_capabilities = SpeculatorPlacementCapabilities(
         state_dependency="own_kv",
         required_features=(TargetFeatureKind.TOKEN_IDS, "rope_scales"),
