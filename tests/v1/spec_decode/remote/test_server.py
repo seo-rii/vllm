@@ -192,6 +192,7 @@ class RawClient:
 
     def result(self, response: ProposalResponse):
         base = response.result_slot
+        assert base is not None
         tokens = self.frames.pop(base)
         valid = self.frames.pop(base + 1)
         statuses = self.frames.pop(base + 2)
@@ -993,7 +994,9 @@ def test_registry_prefill_and_rounds():
         is SpeculatorStatusCode.ROUND_MISMATCH
     )
     registry.advance(key(1), 2, owner="s1")
-    assert registry.get(key(1)).prefix_length == 4 + 3
+    entry = registry.get(key(1))
+    assert entry is not None
+    assert entry.prefix_length == 4 + 3
 
 
 def test_registry_close_all_releases_only_owned_entries():
