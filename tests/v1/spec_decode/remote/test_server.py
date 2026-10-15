@@ -193,6 +193,27 @@ class RawClient:
             frames=frames,
         )
 
+    def propose_ragged(self, batch_id, keys, query_lens, token_ids, *, lens=True):
+        base = self.reserve(4)
+        frames = [
+            ints_to_frame(base, [0] * len(keys)),
+            ints_to_frame(base + 1, [1] * len(keys)),
+            ints_to_frame(base + 3, token_ids),
+        ]
+        if lens:
+            frames.append(ints_to_frame(base + 2, query_lens))
+        return self.call(
+            AdvanceAndPropose(
+                batch_id=batch_id,
+                keys=tuple(keys),
+                accepted_counts_slot=base,
+                recovery_tokens_slot=base + 1,
+                feature_slot=base + 3,
+                query_lens_slot=base + 2,
+            ),
+            frames=frames,
+        )
+
     def result(self, response: ProposalResponse):
         base = response.result_slot
         assert base is not None
@@ -680,6 +701,43 @@ def test_rejected_batch_frames_are_not_read_by_a_later_round(client):
     assert fresh.status is OK
     tokens, _, _ = client.result(fresh)
     assert tokens == [expected_row(20)]
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "token_ids", "lens", "detail"),
+    [
+        ([1, 1], [1, 2], False, "query_lens frame is missing"),
+        ([1], [1], True, "query_lens frame is missing or does not match"),
+        ([-1, 2], [1], True, "negative query_lens"),
+        ([1, 2], [1, 2], True, "expected 3 rows"),
+    ],
+)
+def test_proposal_rejects_inconsistent_query_lens(
+    client, adapter, query_lens, token_ids, lens, detail
+):
+    client.hello()
+    client.ready(key(81))
+    client.ready(key(82))
+    response = client.propose_ragged(
+        0, [key(81), key(82)], query_lens, token_ids, lens=lens
+    )
+    assert response.status is SpeculatorStatusCode.PROTOCOL_ERROR
+    assert adapter.proposed_batches == []
+
+
+def test_proposal_routes_ragged_token_features(client, adapter):
+    client.hello()
+    client.ready(key(83))
+    # Never prefilled: the registry rejects the row but its segment still
+    # occupies rows in the frame.
+    assert client.open(key(84)).status is OK
+    client.ready(key(85))
+    response = client.propose_ragged(
+        0, [key(83), key(84), key(85)], [2, 2, 0], [10, 11, 20, 21]
+    )
+    _, _, statuses = client.result(response)
+    assert statuses == [OK, SpeculatorStatusCode.SEQUENCE_DESYNC, OK]
+    assert adapter.round_tokens == {key(83): [10, 11], key(85): []}
 
 
 def test_accepted_counts_out_of_range_rejected(client, adapter):
