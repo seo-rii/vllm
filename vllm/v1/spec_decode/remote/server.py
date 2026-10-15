@@ -55,6 +55,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     decode_envelope,
     decode_payload,
     encode_message,
+    limit_shortfalls,
 )
 from vllm.v1.spec_decode.remote.state import SequenceState
 from vllm.v1.spec_decode.remote.transport import (
@@ -829,6 +830,7 @@ class _ServerSession:
                 f"{hello.draft_checkpoint_fingerprint!r} does not match the "
                 f"server's {expected_draft!r}"
             )
+        reasons.extend(limit_shortfalls(hello, server.limits))
         if not any(t in SUPPORTED_TRANSPORTS for t in hello.supported_transports):
             reasons.append(
                 f"no common transport: verifier offers "

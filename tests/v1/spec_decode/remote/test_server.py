@@ -299,6 +299,12 @@ def test_hello_ack_reports_adapter_capabilities(server, adapter, client):
         ({"tokenizer_fingerprint": "other"}, "tokenizer fingerprint"),
         ({"method": "ngram"}, "method 'ngram'"),
         ({"supported_transports": ("cuda_ipc",)}, "no common transport"),
+        ({"max_num_seqs": DEFAULT_LIMITS.max_batch_size + 1}, "max_num_seqs"),
+        (
+            {"max_num_batched_tokens": DEFAULT_LIMITS.max_feature_tokens + 1},
+            "max_num_batched_tokens",
+        ),
+        ({"max_model_len": DEFAULT_LIMITS.max_model_len + 1}, "max_model_len"),
     ],
 )
 def test_hello_rejections_close_the_connection(client, overrides, reason):
