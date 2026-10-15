@@ -1228,3 +1228,11 @@ def test_registry_rejects_other_owner_and_future_close():
     assert registry.close(key(1, generation=2), owner="s1") is None
     assert registry.close(current, owner="s2") is None
     assert registry.get(current) is not None
+
+
+def test_entrypoints_alias_exposes_server_main():
+    """`python -m vllm.entrypoints.remote_draft_server` is the documented CLI."""
+    from vllm.entrypoints.remote_draft_server import main as alias_main
+    from vllm.v1.spec_decode.remote.server import main as server_main
+
+    assert alias_main is server_main
