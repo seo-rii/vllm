@@ -13,11 +13,16 @@ from vllm.v1.spec_decode.remote.capabilities import (
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import (
+    HelloAck,
     RemoteServerLimits,
     SequenceKey,
     SpeculatorStatusCode,
 )
-from vllm.v1.spec_decode.remote.server import FakeDraftAdapter, RemoteDraftServer
+from vllm.v1.spec_decode.remote.server import (
+    DEFAULT_LIMITS,
+    FakeDraftAdapter,
+    RemoteDraftServer,
+)
 from vllm.v1.spec_decode.remote.session import (
     RemoteDraftError,
     RemoteDraftSession,
@@ -45,6 +50,9 @@ IDENTITY = VerifierIdentity(
     num_speculative_tokens=NUM_SPEC_TOKENS,
     parallel_drafting=False,
     provided_features=(TargetFeatureKind.TOKEN_IDS.value,),
+    max_num_seqs=8,
+    max_num_batched_tokens=64,
+    max_model_len=64,
 )
 
 
@@ -195,6 +203,37 @@ def test_handshake_timeout_is_reported():
             session.connect()
     finally:
         listener.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("max_num_seqs", 300, "max_batch_size=256"),
+        ("max_num_batched_tokens", 20000, "max_feature_tokens=16384"),
+        ("max_model_len", 40000, "max_model_len=32768"),
+    ],
+)
+def test_handshake_rejects_limits_below_verifier_config(
+    make_session, field, value, reason
+):
+    # Both sides check: the server refuses the HELLO, and a server that
+    # does not check is still rejected by the verifier.
+    identity = dataclasses.replace(IDENTITY, **{field: value})
+    with pytest.raises(RemoteDraftError, match=reason):
+        make_session(identity)
+    session = make_session(connect=False, identity=identity)
+    ack = HelloAck(
+        server_id="srv",
+        session_id="s",
+        session_epoch=1,
+        selected_transport="inline",
+        capabilities=FakeDraftAdapter().capabilities(),
+        feature_schema=FakeDraftAdapter().feature_schema(),
+        limits=DEFAULT_LIMITS,
+    )
+    assert any(
+        reason in r for r in session._handshake_rejections(session._hello(), ack)
+    )
 
 
 def test_explicit_inline_transport_connects(make_session):
@@ -481,6 +520,63 @@ def test_failure_policy_error_raises_after_latching(make_session, adapter, clock
         session.collect(handle)
     assert session.sequence_state(a) is SequenceState.TARGET_ONLY
     adapter.release()
+
+
+def limited_server(**limits):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    fields = dict(
+        max_batch_size=8, max_feature_tokens=64, max_sequences=64, max_model_len=64
+    )
+    fields.update(limits)
+    server = RemoteDraftServer(adapter, limits=RemoteServerLimits(**fields))
+    server.start("tcp://127.0.0.1:0")
+    return server, adapter
+
+
+def test_rows_beyond_max_batch_size_degrade_instead_of_raising(clock):
+    # Reachable only when the runner sends more rows than it declared; the
+    # overflow must fall back to target-only rather than kill the engine.
+    server, adapter = limited_server(max_batch_size=2)
+    identity = dataclasses.replace(IDENTITY, max_num_seqs=2)
+    session = RemoteDraftSession(server.endpoint, identity, clock=clock)
+    try:
+        session.connect()
+        keys = [ready(session, i) for i in range(3)]
+        result = round_trip(session, batch(0, keys, recovery=[1, 2, 3]))
+        assert result.row_statuses == (OK, OK, SpeculatorStatusCode.QUEUE_FULL)
+        assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS] * 2 + [0]
+        assert session.sequence_state(keys[2]) is SequenceState.TARGET_ONLY
+    finally:
+        session.close()
+        server.stop()
+
+
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+def test_prefill_beyond_server_limits_follows_failure_policy(clock, policy):
+    server, adapter = limited_server(max_feature_tokens=4, max_model_len=6)
+    identity = dataclasses.replace(IDENTITY, max_num_batched_tokens=4, max_model_len=6)
+    session = RemoteDraftSession(
+        server.endpoint, identity, failure_policy=policy, clock=clock
+    )
+    try:
+        session.connect()
+        too_big = session.open_sequence(1)
+        too_long = session.open_sequence(2)
+        session.prefill(too_long, features([1, 2, 3, 4]), is_final=False)
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="max_feature_tokens"):
+                session.prefill(too_big, features([1] * 5), is_final=True)
+            with pytest.raises(RemoteDraftError, match="max_model_len"):
+                session.prefill(too_long, features([5, 6, 7]), is_final=True)
+        else:
+            session.prefill(too_big, features([1] * 5), is_final=True)
+            session.prefill(too_long, features([5, 6, 7]), is_final=True)
+        assert session.sequence_state(too_big) is SequenceState.TARGET_ONLY
+        assert session.sequence_state(too_long) is SequenceState.TARGET_ONLY
+        assert adapter.prefix(too_long) == [1, 2, 3, 4]
+    finally:
+        session.close()
+        server.stop()
 
 
 def test_stale_generation_desyncs_then_reopen_recovers(session, server, adapter):

@@ -101,7 +101,11 @@ class TargetFeatureSchema(msgspec.Struct, frozen=True):  # type: ignore[call-arg
 
 
 class RemoteServerLimits(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
-    """Hard limits negotiated down to the smaller common value."""
+    """Hard limits the server enforces.
+
+    Both peers reject the session at handshake when these cannot hold the
+    verifier's declared scheduler limits (see Hello).
+    """
 
     max_batch_size: PositiveInt
     max_feature_tokens: PositiveInt
@@ -121,6 +125,12 @@ class Hello(msgspec.Struct):
     parallel_drafting: bool
     supported_transports: tuple[str, ...]
     draft_checkpoint_fingerprint: str = ""
+    max_num_seqs: NonNegativeInt = 0
+    """Largest batch the verifier may send; 0 means undeclared."""
+    max_num_batched_tokens: NonNegativeInt = 0
+    """Largest feature token count per message; 0 means undeclared."""
+    max_model_len: NonNegativeInt = 0
+    """Longest sequence the verifier may grow; 0 means undeclared."""
 
 
 class HelloAck(msgspec.Struct):
@@ -298,6 +308,30 @@ def decode_envelope(data: bytes) -> MessageEnvelope:
             f"expected {PROTOCOL_MAJOR}"
         )
     return envelope
+
+
+def limit_shortfalls(hello: Hello, limits: RemoteServerLimits) -> list[str]:
+    """Reasons ``limits`` cannot serve the scheduler limits in ``hello``.
+
+    Undeclared (zero) verifier limits are not checked.
+    """
+    reasons = []
+    for server_name, offered, verifier_name, needed in (
+        ("max_batch_size", limits.max_batch_size, "max_num_seqs", hello.max_num_seqs),
+        (
+            "max_feature_tokens",
+            limits.max_feature_tokens,
+            "max_num_batched_tokens",
+            hello.max_num_batched_tokens,
+        ),
+        ("max_model_len", limits.max_model_len, "max_model_len", hello.max_model_len),
+    ):
+        if offered < needed:
+            reasons.append(
+                f"server {server_name}={offered} cannot hold the verifier's "
+                f"{verifier_name}={needed}"
+            )
+    return reasons
 
 
 def decode_payload(envelope: MessageEnvelope) -> msgspec.Struct:

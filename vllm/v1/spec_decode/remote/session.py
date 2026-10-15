@@ -52,6 +52,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     decode_envelope,
     decode_payload,
     encode_message,
+    limit_shortfalls,
 )
 from vllm.v1.spec_decode.remote.state import (
     FeatureBatch,
@@ -148,6 +149,9 @@ class VerifierIdentity:
     parallel_drafting: bool
     provided_features: tuple[str, ...]
     """TargetFeatureKind values the verifier can transport every round."""
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    max_model_len: int
     draft_sample_method: str = "greedy"
     draft_checkpoint_fingerprint: str = ""
     uses_multi_module: bool = False
@@ -323,17 +327,7 @@ class RemoteDraftSession:
             raise RemoteDraftError(
                 f"cannot connect to remote draft server at {self._endpoint}: {e}"
             ) from e
-        identity = self._identity
-        hello = Hello(
-            verifier_instance_id=identity.verifier_instance_id,
-            target_fingerprint=identity.target_fingerprint,
-            tokenizer_fingerprint=identity.tokenizer_fingerprint,
-            method=identity.method,
-            num_speculative_tokens=identity.num_speculative_tokens,
-            parallel_drafting=identity.parallel_drafting,
-            supported_transports=self._offered_transports,
-            draft_checkpoint_fingerprint=identity.draft_checkpoint_fingerprint,
-        )
+        hello = self._hello()
         try:
             request_id = self._send(hello, deadline=deadline)
             _, ack = self._await(
@@ -351,7 +345,7 @@ class RemoteDraftSession:
         except (TransportError, RemoteDraftError) as e:
             self._drop_connection()
             raise RemoteDraftError(f"HELLO handshake failed: {e}") from e
-        reasons = self._handshake_rejections(ack)
+        reasons = self._handshake_rejections(hello, ack)
         if reasons:
             self._drop_connection()
             raise RemoteDraftError(
@@ -397,9 +391,25 @@ class RemoteDraftSession:
         self._inbound.clear()
         self._abandoned_batches.clear()
 
-    def _handshake_rejections(self, ack: HelloAck) -> list[str]:
+    def _hello(self) -> Hello:
         identity = self._identity
-        reasons: list[str] = []
+        return Hello(
+            verifier_instance_id=identity.verifier_instance_id,
+            target_fingerprint=identity.target_fingerprint,
+            tokenizer_fingerprint=identity.tokenizer_fingerprint,
+            method=identity.method,
+            num_speculative_tokens=identity.num_speculative_tokens,
+            parallel_drafting=identity.parallel_drafting,
+            supported_transports=self._offered_transports,
+            draft_checkpoint_fingerprint=identity.draft_checkpoint_fingerprint,
+            max_num_seqs=identity.max_num_seqs,
+            max_num_batched_tokens=identity.max_num_batched_tokens,
+            max_model_len=identity.max_model_len,
+        )
+
+    def _handshake_rejections(self, hello: Hello, ack: HelloAck) -> list[str]:
+        identity = self._identity
+        reasons = limit_shortfalls(hello, ack.limits)
         if ack.selected_transport not in self._offered_transports:
             reasons.append(
                 f"server selected transport {ack.selected_transport!r} which "
@@ -466,10 +476,7 @@ class RemoteDraftSession:
                 # A rejected open left no server state to retry against;
                 # latch target-only so prefill and dispatch stay quiet
                 # no-ops instead of wedging the sequence in OPENING.
-                record.last_status = status
-                record.state = transition_sequence(
-                    record.state, SequenceState.TARGET_ONLY
-                )
+                self._latch_target_only(record, status)
             else:
                 self._apply_status(record, status)
             self._raise_if_strict(
@@ -502,16 +509,25 @@ class RemoteDraftSession:
         schema = self.feature_schema
         limits = self.limits
         num_tokens = self._chunk_length(features)
+        overflow = None
         if num_tokens > limits.max_feature_tokens:
-            raise ValueError(
-                f"prefill chunk of {num_tokens} tokens exceeds the negotiated "
-                f"max_feature_tokens={limits.max_feature_tokens}"
+            overflow = (
+                SpeculatorStatusCode.QUEUE_FULL,
+                f"chunk of {num_tokens} tokens exceeds the server "
+                f"max_feature_tokens={limits.max_feature_tokens}",
             )
-        if record.prefilled_tokens + num_tokens > limits.max_model_len:
-            raise ValueError(
-                f"sequence {key.sequence_id} would exceed the server "
-                f"max_model_len={limits.max_model_len}"
+        elif record.prefilled_tokens + num_tokens > limits.max_model_len:
+            overflow = (
+                SpeculatorStatusCode.OUT_OF_MEMORY,
+                f"prefill would exceed the server max_model_len={limits.max_model_len}",
             )
+        if overflow is not None:
+            status, detail = overflow
+            self._latch_target_only(record, status)
+            self._raise_if_strict(
+                f"prefill of sequence {key.sequence_id} failed: {detail}"
+            )
+            return
         base = self._reserve_slots(len(schema.slots))
         frames = self._feature_frames(base, features, num_tokens, rows=None)
         checksum = _checksum(frames)
@@ -620,8 +636,9 @@ class RemoteDraftSession:
             session_id=self._session_id,
             batch_id=batch.batch_id,
             keys=batch.keys,
-            active_rows=tuple(
-                i for i, key in enumerate(batch.keys) if self._is_ready(key)
+            active_rows=self._admit(
+                batch.keys,
+                [i for i, key in enumerate(batch.keys) if self._is_ready(key)],
             ),
             num_speculative_tokens=self._identity.num_speculative_tokens,
             device=batch.recovery_tokens.device,
@@ -637,11 +654,6 @@ class RemoteDraftSession:
                 f"negotiated schema {schema.schema_id}"
             )
         num_active = len(handle.active_rows)
-        if num_active > self.limits.max_batch_size:
-            raise RemoteDraftError(
-                f"{num_active} active rows exceed the negotiated "
-                f"max_batch_size={self.limits.max_batch_size}"
-            )
         rows = None
         if num_active != batch_size:
             rows = torch.tensor(handle.active_rows, dtype=torch.long)
@@ -1031,6 +1043,33 @@ class RemoteDraftSession:
             return
         # QUEUE_FULL also drops this round's advancement; a later recovery
         # token cannot restore the skipped verifier context.
+        self._latch_target_only(record, status)
+
+    def _admit(self, keys: tuple[SequenceKey, ...], rows: list[int]) -> tuple[int, ...]:
+        """Keep the rows the server limits allow; latch the rest target-only.
+
+        The handshake already checked the verifier's declared limits, so
+        this only triggers when the runner exceeds what it declared.
+        """
+        if self._limits is None or len(rows) <= self._limits.max_batch_size:
+            return tuple(rows)
+        admitted = rows[: self._limits.max_batch_size]
+        for i in rows[len(admitted) :]:
+            self._latch_target_only(
+                self._records[keys[i].sequence_id], SpeculatorStatusCode.QUEUE_FULL
+            )
+        logger.warning(
+            "Remote draft batch of %d ready rows exceeds the server "
+            "max_batch_size=%d; the rest decode target-only",
+            len(rows),
+            self._limits.max_batch_size,
+        )
+        return tuple(admitted)
+
+    def _latch_target_only(
+        self, record: _SequenceRecord, status: SpeculatorStatusCode
+    ) -> None:
+        record.last_status = status
         if can_transition_sequence(record.state, SequenceState.TARGET_ONLY):
             record.state = SequenceState.TARGET_ONLY
 
