@@ -66,6 +66,7 @@ IDENTITY = VerifierIdentity(
     max_num_seqs=8,
     max_num_batched_tokens=64,
     max_model_len=64,
+    vocab_size=VOCAB,
 )
 
 
@@ -281,6 +282,57 @@ def test_round_trip_matches_fake_formula(session, adapter):
     result = round_trip(session, batch(1, [b], recovery=[48]))
     assert result.output.token_ids.tolist() == [expected_row(48)]
     assert adapter.proposed_batches == [0, 1]
+
+
+class PaddedAdapter(FakeDraftAdapter):
+    """Proposes one valid token per row and pads the rest with junk."""
+
+    def __init__(self, padding: int, first: int):
+        super().__init__(vocab_size=VOCAB)
+        self.padding = padding
+        self.first = first
+
+    def advance_and_propose(self, batch_):
+        result = super().advance_and_propose(batch_)
+        rows = len(batch_.keys)
+        row = [self.first] + [self.padding] * (NUM_SPEC_TOKENS - 1)
+        return dataclasses.replace(
+            result,
+            token_ids=tensor_to_frame(0, torch.tensor([row] * rows)),
+            valid_lengths=tensor_to_frame(0, torch.ones(rows, dtype=torch.int32)),
+        )
+
+
+@pytest.mark.parametrize(
+    ("padding", "first", "status", "expected"),
+    [
+        (-1, 7, OK, [7, 0, 0]),
+        (7, VOCAB, SpeculatorStatusCode.INTERNAL_ERROR, [0, 0, 0]),
+        (7, -3, SpeculatorStatusCode.INTERNAL_ERROR, [0, 0, 0]),
+    ],
+    ids=["junk-padding-is-zeroed", "too-large", "negative"],
+)
+def test_draft_tokens_are_checked_against_the_target_vocab(
+    clock, padding, first, status, expected
+):
+    adapter = PaddedAdapter(padding, first)
+    server = RemoteDraftServer(adapter)
+    server.start("tcp://127.0.0.1:0")
+    session = RemoteDraftSession(server.endpoint, IDENTITY, clock=clock)
+    try:
+        session.connect()
+        a = ready(session, 1)
+        result = round_trip(session, batch(0, [a], recovery=[4]))
+        assert result.row_statuses == (status,)
+        assert result.output.token_ids.tolist() == [expected]
+        if status is OK:
+            assert result.output.valid_lengths.tolist() == [1]
+        else:
+            assert result.output.valid_lengths.tolist() == [0]
+            assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    finally:
+        session.close()
+        server.stop()
 
 
 def test_handle_records_dispatch_metadata(session):

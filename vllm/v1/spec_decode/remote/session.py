@@ -163,6 +163,8 @@ class VerifierIdentity:
     max_num_seqs: int
     max_num_batched_tokens: int
     max_model_len: int
+    vocab_size: int
+    """Target vocabulary size; draft tokens outside it are rejected."""
     draft_sample_method: str = "greedy"
     draft_checkpoint_fingerprint: str = ""
     uses_multi_module: bool = False
@@ -942,9 +944,27 @@ class RemoteDraftSession:
                 None,
                 None,
             )
+        # Fail rows that propose ids outside the target vocab, which would
+        # otherwise index out of bounds on the verifier GPU. Only the first
+        # valid_length tokens are consumed; the rest is zeroed later.
+        usable = _usable_positions(valid, handle.num_speculative_tokens)
+        out_of_vocab = (
+            ((tokens < 0) | (tokens >= self._identity.vocab_size)) & usable
+        ).any(dim=1)
         statuses: dict[int, SpeculatorStatusCode] = {}
-        for row, code in zip(handle.active_rows, status_codes):
+        for row, code, bad in zip(
+            handle.active_rows, status_codes, out_of_vocab.tolist()
+        ):
             status = _status_from_wire(code)
+            if bad and status is SpeculatorStatusCode.OK:
+                logger.warning(
+                    "Batch %d row %d proposed token ids outside the target "
+                    "vocabulary of %d",
+                    handle.batch_id,
+                    row,
+                    self._identity.vocab_size,
+                )
+                status = SpeculatorStatusCode.INTERNAL_ERROR
             statuses[row] = status
             record = self._records.get(handle.keys[row].sequence_id)
             if record is not None and record.key == handle.keys[row]:
@@ -974,6 +994,7 @@ class RemoteDraftSession:
                 [statuses[i] is SpeculatorStatusCode.OK for i in handle.active_rows]
             )
             valid = torch.where(ok, valid.to(torch.int32), 0).clamp_(0, num_tokens)
+            tokens = torch.where(_usable_positions(valid, num_tokens), tokens, 0)
             token_ids.index_copy_(
                 0, rows.to(handle.device), tokens.to(handle.device, torch.int64)
             )
@@ -1383,6 +1404,12 @@ class RemoteDraftSession:
         conn, self._conn = self._conn, None
         if conn is not None:
             conn.close()
+
+
+def _usable_positions(valid: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """[rows, num_tokens] mask of the draft positions each row may use."""
+    lengths = valid.to(torch.int64).clamp(0, num_tokens).unsqueeze(1)
+    return torch.arange(num_tokens) < lengths
 
 
 def _query_lens(batch: RemoteProposalBatch) -> list[int]:
