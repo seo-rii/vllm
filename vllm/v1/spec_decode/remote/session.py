@@ -13,15 +13,17 @@ doubt (timeout, desync, stale generation) stops receiving remote proposals
 for the rest of the request and reports ``valid_length=0`` every round.
 Automatic re-prefill recovery is a later step; ``open_sequence`` on a
 desynced sequence already bumps the generation so that step can build on
-it.
+it. A lost connection is re-established with backoff when new sequences
+are opened, so only requests that were running at the time lose
+speculation.
 """
 
 import itertools
 import math
 import time
 import zlib
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -87,6 +89,14 @@ logger = init_logger(__name__)
 # A completed round is delivered as three data frames at consecutive slots:
 # draft tokens, per-row valid lengths, per-row status codes.
 RESULT_FRAMES = 3
+
+# Writes get at least this throughput's worth of time on top of the request
+# budget, so a large prefill chunk is not cut off mid-frame (which would
+# close the connection) merely because copying it takes longer than a
+# decode round's deadline.
+_MIN_WRITE_BYTES_PER_S = 256 << 20
+_RECONNECT_BACKOFF_S = 1.0
+_MAX_RECONNECT_BACKOFF_S = 30.0
 
 _DESYNC_STATUSES = frozenset(
     {
@@ -182,6 +192,8 @@ class RemoteProposalHandle(ProposalHandle):
     request_id: int = -1
     input_slot: int = -1
     state: HandleState = HandleState.CREATED
+    failed_rows: dict[int, SpeculatorStatusCode] = field(default_factory=dict)
+    """Rows that failed at dispatch, reported once by collect."""
 
 
 class RemoteDraftSession:
@@ -217,6 +229,8 @@ class RemoteDraftSession:
         self._request_timeout_s = request_timeout_ms / 1000.0
         self._startup_timeout_s = startup_timeout_ms / 1000.0
         self._clock = clock
+        self._reconnect_at = -math.inf
+        self._reconnect_backoff_s = _RECONNECT_BACKOFF_S
 
         self._conn: FramedConnection | None = None
         self._alive = False
@@ -309,21 +323,22 @@ class RemoteDraftSession:
     # Handshake
     # ------------------------------------------------------------------
 
-    def connect(self) -> None:
+    def connect(self, *, timeout_s: float | None = None) -> None:
         """Connect and run the HELLO handshake; raises on any rejection.
 
         May be called again after the connection is lost; sequence numbers,
         slots, and batch ids restart with the new connection, and handles
         dispatched on the old one are fenced off at collect time.
+        ``timeout_s`` defaults to the configured startup timeout.
         """
         if self._conn is not None:
             raise RemoteDraftError("session is already connected")
         self._reset_connection_state()
-        deadline = self._clock() + self._startup_timeout_s
+        if timeout_s is None:
+            timeout_s = self._startup_timeout_s
+        deadline = self._clock() + timeout_s
         try:
-            self._conn = transport_connect(
-                self._endpoint, timeout=self._startup_timeout_s
-            )
+            self._conn = transport_connect(self._endpoint, timeout=timeout_s)
         except TransportError as e:
             raise RemoteDraftError(
                 f"cannot connect to remote draft server at {self._endpoint}: {e}"
@@ -336,12 +351,13 @@ class RemoteDraftSession:
                     isinstance(msg, HelloAck) and env.request_id == request_id
                 ),
                 deadline,
+                request_ids=(request_id,),
             )
         except TransportTimeout:
             self._drop_connection()
             raise RemoteDraftError(
                 f"HELLO handshake with {self._endpoint} timed out after "
-                f"{self._startup_timeout_s:.1f}s"
+                f"{timeout_s:.1f}s"
             ) from None
         except (TransportError, RemoteDraftError) as e:
             self._drop_connection()
@@ -369,6 +385,35 @@ class RemoteDraftSession:
             ack.feature_schema.schema_id,
             len(ack.feature_schema.slots),
         )
+
+    def maybe_reconnect(self) -> bool:
+        """Re-establish a lost connection, at most once per backoff period.
+
+        Returns whether the session is connected. Call it between rounds;
+        sequences opened on the old connection stay INVALID until they are
+        closed or re-opened. Each attempt is bounded by the request timeout
+        because it runs on the runner thread.
+        """
+        if self._alive:
+            return True
+        if self._inflight_batch_id is not None or self._clock() < self._reconnect_at:
+            return False
+        try:
+            self.connect(timeout_s=self._request_timeout_s)
+        except RemoteDraftError as e:
+            self._reconnect_at = self._clock() + self._reconnect_backoff_s
+            logger.warning(
+                "Remote draft server at %s is unavailable; retrying in %.0fs: %s",
+                self._endpoint,
+                self._reconnect_backoff_s,
+                e,
+            )
+            self._reconnect_backoff_s = min(
+                2 * self._reconnect_backoff_s, _MAX_RECONNECT_BACKOFF_S
+            )
+            return False
+        self._reconnect_backoff_s = _RECONNECT_BACKOFF_S
+        return True
 
     def _reset_connection_state(self) -> None:
         """Drop bookkeeping scoped to the previous connection.
@@ -445,6 +490,15 @@ class RemoteDraftSession:
         so the server discards anything it still holds for the old one.
         """
         self._require_no_inflight("open a sequence")
+        self.maybe_reconnect()
+        key = self._open(sequence_id)
+        if self.sequence_state(key) is SequenceState.INVALID and self.maybe_reconnect():
+            # The open found the connection dead (e.g. a restarted server)
+            # and reconnecting worked, so this request can use the new one.
+            key = self._open(sequence_id)
+        return key
+
+    def _open(self, sequence_id: int) -> SequenceKey:
         record = self._records.get(sequence_id)
         if record is not None and record.state not in (
             SequenceState.DESYNCED,
@@ -465,11 +519,13 @@ class RemoteDraftSession:
         if not self._alive:
             record.state = SequenceState.INVALID
             record.last_status = SpeculatorStatusCode.INTERNAL_ERROR
+            # The connection loss and each reconnect attempt already warned.
             self._raise_if_strict(
-                f"cannot open sequence {sequence_id}: session is not connected"
+                f"cannot open sequence {sequence_id}: session is not connected",
+                quiet=True,
             )
             return key
-        status, detail = self._sequence_rpc(OpenSequence(key=key), key)
+        ((status, detail),) = self._sequence_rpcs([(OpenSequence(key=key), key, None)])
         if status is SpeculatorStatusCode.OK:
             record.state = transition_sequence(record.state, SequenceState.PREFILLING)
         else:
@@ -488,72 +544,88 @@ class RemoteDraftSession:
     def prefill(
         self, key: SequenceKey, features: FeatureBatch, *, is_final: bool
     ) -> None:
-        """Send one prompt chunk; ``is_final`` makes the sequence READY.
+        """Send one prompt chunk; ``is_final`` makes the sequence READY."""
+        self.prefill_many([(key, features, is_final)])
 
-        Chunks are applied in order with client-tracked offsets. A sequence
-        that is already latched target-only silently ignores prefill so the
-        request keeps running without speculation.
+    def prefill_many(
+        self, chunks: Sequence[tuple[SequenceKey, FeatureBatch, bool]]
+    ) -> None:
+        """Send one prompt chunk for each of several sequences.
+
+        Each entry is ``(key, features, is_final)``; ``is_final`` makes the
+        sequence READY. All chunks are written back to back and acknowledged
+        together, so a step that prefills N requests pays one round trip
+        instead of N. Chunks are applied in order with client-tracked
+        offsets. A sequence that is already latched target-only silently
+        ignores prefill so the request keeps running without speculation.
         """
         self._require_no_inflight("prefill a sequence")
-        record = self._current_record(key)
-        if record.state is not SequenceState.PREFILLING:
-            if record.state in (
-                SequenceState.TARGET_ONLY,
-                SequenceState.INVALID,
-                SequenceState.DESYNCED,
-            ):
-                return
-            raise RemoteDraftError(
-                f"sequence {key.sequence_id} cannot accept prefill in state "
-                f"{record.state.value}"
+        if len({key for key, _, _ in chunks}) != len(chunks):
+            raise ValueError("at most one prefill chunk per sequence per call")
+        prepared: list[tuple[_SequenceRecord, PrefillChunk, list[DataFrame]]] = []
+        failures: list[str] = []
+        for key, features, is_final in chunks:
+            record = self._current_record(key)
+            if record.state is not SequenceState.PREFILLING:
+                if record.state in (
+                    SequenceState.TARGET_ONLY,
+                    SequenceState.INVALID,
+                    SequenceState.DESYNCED,
+                ):
+                    continue
+                raise RemoteDraftError(
+                    f"sequence {key.sequence_id} cannot accept prefill in state "
+                    f"{record.state.value}"
+                )
+            num_tokens = self._chunk_length(features)
+            self._check_features(features, num_tokens=num_tokens, num_sequences=1)
+            limits = self.limits
+            if num_tokens > limits.max_feature_tokens:
+                self._latch_target_only(record, SpeculatorStatusCode.QUEUE_FULL)
+                failures.append(
+                    f"sequence {key.sequence_id}: chunk of {num_tokens} tokens "
+                    "exceeds the server max_feature_tokens="
+                    f"{limits.max_feature_tokens}"
+                )
+                continue
+            if record.prefilled_tokens + num_tokens > limits.max_model_len:
+                self._latch_target_only(record, SpeculatorStatusCode.OUT_OF_MEMORY)
+                failures.append(
+                    f"sequence {key.sequence_id}: prefill would exceed the "
+                    f"server max_model_len={limits.max_model_len}"
+                )
+                continue
+            base = self._reserve_slots(len(self.feature_schema.slots))
+            frames = self._feature_frames(
+                base, features, token_rows=None, sequence_rows=None
             )
-        schema = self.feature_schema
-        limits = self.limits
-        num_tokens = self._chunk_length(features)
-        self._check_features(features, num_tokens=num_tokens, num_sequences=1)
-        overflow = None
-        if num_tokens > limits.max_feature_tokens:
-            overflow = (
-                SpeculatorStatusCode.QUEUE_FULL,
-                f"chunk of {num_tokens} tokens exceeds the server "
-                f"max_feature_tokens={limits.max_feature_tokens}",
+            chunk = PrefillChunk(
+                key=key,
+                offset=record.prefilled_tokens,
+                num_tokens=num_tokens,
+                is_final=is_final,
+                feature_slot=base,
+                checksum=_checksum(frames),
             )
-        elif record.prefilled_tokens + num_tokens > limits.max_model_len:
-            overflow = (
-                SpeculatorStatusCode.OUT_OF_MEMORY,
-                f"prefill would exceed the server max_model_len={limits.max_model_len}",
-            )
-        if overflow is not None:
-            status, detail = overflow
-            self._latch_target_only(record, status)
-            self._raise_if_strict(
-                f"prefill of sequence {key.sequence_id} failed: {detail}"
-            )
-            return
-        base = self._reserve_slots(len(schema.slots))
-        frames = self._feature_frames(
-            base, features, token_rows=None, sequence_rows=None
+            prepared.append((record, chunk, frames))
+        replies = self._sequence_rpcs(
+            [(chunk, chunk.key, frames) for _, chunk, frames in prepared]
         )
-        checksum = _checksum(frames)
-        chunk = PrefillChunk(
-            key=key,
-            offset=record.prefilled_tokens,
-            num_tokens=num_tokens,
-            is_final=is_final,
-            feature_slot=base,
-            checksum=checksum,
-        )
-        status, detail = self._sequence_rpc(chunk, key, frames=frames)
-        if status is SpeculatorStatusCode.OK:
-            record.prefilled_tokens += num_tokens
-            if is_final:
-                record.state = transition_sequence(record.state, SequenceState.READY)
-            return
-        self._apply_status(record, status)
-        self._raise_if_strict(
-            f"prefill of sequence {key.sequence_id} at offset "
-            f"{chunk.offset} failed: {status.name} {detail}"
-        )
+        for (record, chunk, _), (status, detail) in zip(prepared, replies):
+            if status is SpeculatorStatusCode.OK:
+                record.prefilled_tokens += chunk.num_tokens
+                if chunk.is_final:
+                    record.state = transition_sequence(
+                        record.state, SequenceState.READY
+                    )
+                continue
+            self._apply_status(record, status)
+            failures.append(
+                f"sequence {chunk.key.sequence_id} at offset {chunk.offset}: "
+                f"{status.name} {detail}"
+            )
+        if failures:
+            self._raise_if_strict("prefill failed for " + "; ".join(failures))
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
         """Release remote state; unknown, stale, and closed keys are no-ops."""
@@ -570,14 +642,20 @@ class RemoteDraftSession:
                 continue
             record.state = transition_sequence(record.state, SequenceState.CLOSING)
             pending.append(key)
+        acked: set[SequenceKey] = set()
         if pending and self._alive:
-            self._close_remote(tuple(pending))
+            acked = self._close_remote(tuple(pending))
         for key in pending:
             record = self._records.pop(key.sequence_id, None)
             if record is not None and record.state is SequenceState.CLOSING:
                 record.state = transition_sequence(record.state, SequenceState.CLOSED)
+            if key in acked:
+                # The server no longer holds this sequence, so a reused ID
+                # can start over; unacknowledged closes keep bumping it.
+                self._generations.pop(key.sequence_id, None)
 
-    def _close_remote(self, keys: tuple[SequenceKey, ...]) -> None:
+    def _close_remote(self, keys: tuple[SequenceKey, ...]) -> set[SequenceKey]:
+        """Close ``keys`` on the server; returns the acknowledged ones."""
         deadline = self._clock() + self._request_timeout_s
         remaining = set(keys)
         try:
@@ -588,6 +666,7 @@ class RemoteDraftSession:
                         isinstance(msg, SequenceAck) and env.request_id == request_id
                     ),
                     deadline,
+                    request_ids=(request_id,),
                 )
                 remaining.discard(ack.key)
         except TransportTimeout:
@@ -600,6 +679,7 @@ class RemoteDraftSession:
             self._invalidate(f"connection lost while closing sequences: {e}")
         except RemoteDraftError as e:
             logger.warning("Remote draft server rejected close: %s", e)
+        return set(keys) - remaining
 
     # ------------------------------------------------------------------
     # Proposal rounds
@@ -640,19 +720,22 @@ class RemoteDraftSession:
                 batch.features, num_tokens=sum(query_lens), num_sequences=batch_size
             )
         self._last_batch_id = batch.batch_id
+        ready_rows = [i for i, key in enumerate(batch.keys) if self._is_ready(key)]
         handle = RemoteProposalHandle(
             session_epoch=self._session_epoch,
             session_id=self._session_id,
             batch_id=batch.batch_id,
             keys=batch.keys,
-            active_rows=self._admit(
-                batch.keys,
-                [i for i, key in enumerate(batch.keys) if self._is_ready(key)],
-                query_lens,
-            ),
+            active_rows=self._admit(batch.keys, ready_rows, query_lens),
             num_speculative_tokens=self._identity.num_speculative_tokens,
             device=batch.recovery_tokens.device,
             deadline=self._clock() + self._request_timeout_s,
+        )
+        handle.failed_rows.update(
+            dict.fromkeys(
+                set(ready_rows).difference(handle.active_rows),
+                SpeculatorStatusCode.QUEUE_FULL,
+            )
         )
         if not handle.active_rows or not self._alive:
             handle.state = transition_handle(handle.state, HandleState.COMPLETED)
@@ -688,12 +771,23 @@ class RemoteDraftSession:
             feature_slot=base + num_inputs,
             query_lens_slot=None if batch.query_lens is None else base + 2,
         )
-        try:
-            handle.request_id = self._send(
-                message, frames=frames, deadline=handle.deadline
-            )
-        except TransportError as e:
-            self._invalidate(f"connection lost while dispatching: {e}")
+        failure = None
+        if self._clock() >= handle.deadline:
+            failure = SpeculatorStatusCode.TIMEOUT
+        else:
+            try:
+                handle.request_id = self._send(
+                    message, frames=frames, deadline=handle.deadline
+                )
+            except TransportTimeout:
+                failure = SpeculatorStatusCode.TIMEOUT
+            except TransportError as e:
+                self._invalidate(f"connection lost while dispatching: {e}")
+                failure = SpeculatorStatusCode.INTERNAL_ERROR
+        if failure is not None:
+            # Either nothing reached the server or the connection is gone,
+            # so the round is complete without a response to wait for.
+            handle.failed_rows.update(self._fail_rows(handle, failure))
             handle.state = transition_handle(handle.state, HandleState.COMPLETED)
             return handle
         for i in handle.active_rows:
@@ -723,9 +817,9 @@ class RemoteDraftSession:
                 f"(epoch {self._session_epoch})"
             )
         if handle.state is HandleState.COMPLETED:
-            # Nothing was dispatched: every row was skipped locally.
+            # Nothing was dispatched: rows were skipped or failed locally.
             handle.state = transition_handle(handle.state, HandleState.COLLECTED)
-            return self._finalize(handle, {}, None, None)
+            return self._finalize(handle, dict(handle.failed_rows), None, None)
         if handle.state is not HandleState.DISPATCHED:
             raise InvalidStateTransition(
                 f"cannot collect a {handle.state.value} handle "
@@ -740,6 +834,7 @@ class RemoteDraftSession:
                     and msg.batch_id == handle.batch_id
                 ),
                 handle.deadline,
+                request_ids=(handle.request_id,),
             )
         except TransportTimeout:
             # The deadline is exhausted. Do not delay fallback with an
@@ -763,7 +858,7 @@ class RemoteDraftSession:
             self._inflight_batch_id = None
         handle.state = transition_handle(handle.state, outcome)
         handle.state = transition_handle(handle.state, HandleState.COLLECTED)
-        return self._finalize(handle, statuses, tokens, valid)
+        return self._finalize(handle, {**handle.failed_rows, **statuses}, tokens, valid)
 
     def _finalize(
         self,
@@ -773,11 +868,13 @@ class RemoteDraftSession:
         valid: torch.Tensor | None,
     ) -> RemoteProposalResult:
         result = self._build_result(handle, statuses, tokens, valid)
-        failed = [
+        # Only rows decided this round: rows latched earlier report their
+        # old status every round and must not warn every decode step.
+        failed = sorted(
             (i, status.name)
-            for i, status in enumerate(result.row_statuses)
+            for i, status in statuses.items()
             if status is not SpeculatorStatusCode.OK
-        ]
+        )
         if failed:
             self._raise_if_strict(f"batch {handle.batch_id} has failed rows: {failed}")
         return result
@@ -908,10 +1005,11 @@ class RemoteDraftSession:
         nonce = self._next_request_id
         deadline = self._clock() + self._request_timeout_s
         try:
-            self._send(Ping(nonce=nonce), deadline=deadline)
+            request_id = self._send(Ping(nonce=nonce), deadline=deadline)
             _, pong = self._await(
                 lambda env, msg: isinstance(msg, Pong) and msg.nonce == nonce,
                 deadline,
+                request_ids=(request_id,),
             )
         except TransportTimeout:
             raise RemoteDraftError("ping timed out") from None
@@ -938,11 +1036,14 @@ class RemoteDraftSession:
         conn = self._require_connection()
         request_id = self._next_request_id
         self._next_request_id += 1
+        frames = frames or []
+        num_bytes = sum(len(frame.payload) for frame in frames)
         # Translate the injectable session clock to the transport's monotonic
         # clock once, so every frame consumes the same remaining budget.
-        wire_deadline = time.monotonic() + (deadline - self._clock())
+        budget = max(deadline - self._clock(), num_bytes / _MIN_WRITE_BYTES_PER_S)
+        wire_deadline = time.monotonic() + budget
         try:
-            for frame in frames or ():
+            for frame in frames:
                 conn.send_data(frame, deadline=wire_deadline)
             conn.send_control(
                 encode_message(
@@ -951,7 +1052,10 @@ class RemoteDraftSession:
                 deadline=wire_deadline,
             )
         except TransportTimeout:
-            self._invalidate("timed out while sending")
+            # Only a partially written frame breaks the stream; frames the
+            # server received without their message are dropped by it.
+            if conn.closed:
+                self._invalidate("timed out while sending")
             raise
         return request_id
 
@@ -959,12 +1063,16 @@ class RemoteDraftSession:
         self,
         matches: Callable[[MessageEnvelope, Any], bool],
         deadline: float,
+        *,
+        request_ids: Collection[int],
     ) -> tuple[MessageEnvelope, Any]:
         """Read frames until a control message satisfies ``matches``.
 
         Data frames are buffered by slot. Stale proposal responses are
         discarded together with their result frames so a later round can
-        never read them by accident.
+        never read them by accident. Error replies fail the wait only when
+        they answer one of ``request_ids`` or are session-level (request 0),
+        so a late error for an abandoned request cannot fail a newer one.
         """
         conn = self._require_connection()
         while True:
@@ -986,9 +1094,16 @@ class RemoteDraftSession:
                 self._invalidate(f"protocol error from server: {e}")
                 raise ConnectionClosed(f"protocol error from server: {e}") from e
             if isinstance(message, ErrorReply):
-                raise RemoteDraftError(
-                    f"server error {message.status.name}: {message.detail}"
+                if envelope.request_id == 0 or envelope.request_id in request_ids:
+                    raise RemoteDraftError(
+                        f"server error {message.status.name}: {message.detail}"
+                    )
+                logger.debug(
+                    "Ignoring error reply to earlier request %d: %s",
+                    envelope.request_id,
+                    message.detail,
                 )
+                continue
             if isinstance(message, ProposalResponse) and not self._accept_response(
                 message
             ):
@@ -1019,32 +1134,64 @@ class RemoteDraftSession:
     def _take_frames(self, base: int, count: int) -> list[DataFrame | None]:
         return [self._inbound.pop(base + i, None) for i in range(count)]
 
-    def _sequence_rpc(
-        self,
-        message: Any,
-        key: SequenceKey,
-        *,
-        frames: list[DataFrame] | None = None,
-    ) -> tuple[SpeculatorStatusCode, str]:
+    def _sequence_rpcs(
+        self, calls: list[tuple[Any, SequenceKey, list[DataFrame] | None]]
+    ) -> list[tuple[SpeculatorStatusCode, str]]:
+        """Write sequence commands back to back, then await all their acks.
+
+        Writes share one request budget; the acknowledgements get a fresh
+        one once everything is written, so the time spent copying large
+        chunks does not count against the server.
+        """
+        results = [
+            (SpeculatorStatusCode.TIMEOUT, "not sent before the deadline")
+        ] * len(calls)
+        pending: dict[int, int] = {}
         deadline = self._clock() + self._request_timeout_s
+        lost = ""
         try:
-            request_id = self._send(message, frames=frames, deadline=deadline)
-            _, ack = self._await(
-                lambda env, msg: (
-                    isinstance(msg, SequenceAck)
-                    and env.request_id == request_id
-                    and msg.key == key
-                ),
-                deadline,
-            )
+            for index, (message, _, frames) in enumerate(calls):
+                pending[self._send(message, frames=frames, deadline=deadline)] = index
         except TransportTimeout:
-            return SpeculatorStatusCode.TIMEOUT, "no acknowledgement before deadline"
+            pass
         except TransportError as e:
             self._invalidate(f"connection lost: {e}")
-            return SpeculatorStatusCode.INTERNAL_ERROR, str(e)
-        except RemoteDraftError as e:
-            return SpeculatorStatusCode.INTERNAL_ERROR, str(e)
-        return ack.status, ack.detail
+            lost = str(e)
+        deadline = self._clock() + self._request_timeout_s
+        unanswered = (
+            SpeculatorStatusCode.TIMEOUT,
+            "no acknowledgement before deadline",
+        )
+        while pending:
+            if not self._alive:
+                unanswered = (
+                    SpeculatorStatusCode.INTERNAL_ERROR,
+                    lost or "connection lost",
+                )
+                break
+            try:
+                envelope, ack = self._await(
+                    lambda env, msg: (
+                        isinstance(msg, SequenceAck)
+                        and env.request_id in pending
+                        and msg.key == calls[pending[env.request_id]][1]
+                    ),
+                    deadline,
+                    request_ids=pending,
+                )
+            except TransportTimeout:
+                break
+            except TransportError as e:
+                self._invalidate(f"connection lost: {e}")
+                lost = str(e)
+                continue
+            except RemoteDraftError as e:
+                unanswered = (SpeculatorStatusCode.INTERNAL_ERROR, str(e))
+                break
+            results[pending.pop(envelope.request_id)] = (ack.status, ack.detail)
+        for index in pending.values():
+            results[index] = unanswered
+        return results
 
     def _apply_status(
         self, record: _SequenceRecord, status: SpeculatorStatusCode
@@ -1210,10 +1357,11 @@ class RemoteDraftSession:
                 "still in flight; collect it first"
             )
 
-    def _raise_if_strict(self, detail: str) -> None:
+    def _raise_if_strict(self, detail: str, *, quiet: bool = False) -> None:
         if self._failure_policy == "error":
             raise RemoteDraftError(detail)
-        logger.warning("Remote draft falling back to target-only: %s", detail)
+        log = logger.debug if quiet else logger.warning
+        log("Remote draft falling back to target-only: %s", detail)
 
     def _invalidate(self, reason: str) -> None:
         if not self._alive and self._conn is None:
