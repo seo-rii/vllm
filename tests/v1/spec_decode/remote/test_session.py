@@ -50,7 +50,11 @@ from vllm.v1.spec_decode.remote.state import (
     RemoteProposalBatch,
     SequenceState,
 )
-from vllm.v1.spec_decode.remote.transport import TransportError, listen
+from vllm.v1.spec_decode.remote.transport import (
+    TransportError,
+    TransportTimeout,
+    listen,
+)
 
 VOCAB = 50
 NUM_SPEC_TOKENS = 3
@@ -674,6 +678,76 @@ def test_large_writes_get_a_size_proportional_budget(session, monkeypatch):
     session.prefill(a, features(list(range(1000))), is_final=True)
     assert budgets and budgets[0] > 3.0
     assert session.sequence_state(a) is SequenceState.READY
+
+
+def timeout_after_frames(monkeypatch, conn, completed_frames):
+    send_data = conn.send_data
+    sent = 0
+
+    def send(frame, *, deadline=None):
+        nonlocal sent
+        if sent == completed_frames:
+            raise TransportTimeout("deadline elapsed before the next frame")
+        send_data(frame, deadline=deadline)
+        sent += 1
+
+    def reject_control(*args, **kwargs):
+        raise TransportTimeout("deadline elapsed before the control message")
+
+    monkeypatch.setattr(conn, "send_data", send)
+    monkeypatch.setattr(conn, "send_control", reject_control)
+
+
+@pytest.mark.parametrize("completed_frames", [0, 1, 3])
+def test_request_timeout_preserves_only_an_untouched_stream(
+    session, adapter, monkeypatch, completed_frames
+):
+    a = ready(session, 1)
+    b = ready(session, 2)
+    conn = session._conn
+    timeout_after_frames(monkeypatch, conn, completed_frames)
+
+    result = round_trip(session, batch(0, [a], recovery=[4]))
+    assert result.row_statuses == (SpeculatorStatusCode.TIMEOUT,)
+    assert result.output.valid_lengths.tolist() == [0]
+    assert adapter.proposed_batches == []
+    assert session.connected is (completed_frames == 0)
+    assert conn.closed is (completed_frames != 0)
+
+    monkeypatch.undo()
+    if completed_frames:
+        assert session.sequence_state(b) is SequenceState.INVALID
+        session.connect()
+        b = ready(session, 3)
+    assert round_trip(session, batch(1, [b], recovery=[5])).row_statuses == (OK,)
+
+
+@pytest.mark.parametrize("completed_frames", [0, 1, 3])
+def test_result_timeout_closes_stream_and_allows_reconnect(
+    server, monkeypatch, completed_frames
+):
+    session = RemoteDraftSession(server.endpoint, IDENTITY, request_timeout_ms=1000)
+    try:
+        session.connect()
+        a = ready(session, 1)
+        conn = next(iter(server._connections))
+        timeout_after_frames(monkeypatch, conn, completed_frames)
+
+        result = round_trip(session, batch(0, [a], recovery=[4]))
+        assert result.output.valid_lengths.tolist() == [0]
+        assert not session.connected
+        assert conn.closed
+        assert session.pending_frames == 0
+
+        monkeypatch.undo()
+        session.connect()
+        b = ready(session, 2)
+        result = round_trip(session, batch(0, [b], recovery=[5]))
+        assert result.row_statuses == (OK,)
+        assert result.output.token_ids[0].tolist() == expected_row(5)
+        assert session.pending_frames == 0
+    finally:
+        session.close()
 
 
 def test_collect_timeout_does_not_write_after_deadline(

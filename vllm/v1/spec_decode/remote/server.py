@@ -864,25 +864,27 @@ class _ServerSession:
     # -- request loop ----------------------------------------------------
 
     def _send(
-        self, message: Any, request_id: int, *, deadline: float | None = None
+        self,
+        message: Any,
+        request_id: int,
+        *,
+        deadline: float | None = None,
+        frames: list[DataFrame] | None = None,
     ) -> None:
         if deadline is None:
             deadline = time.monotonic() + self.server.send_timeout_s
-        with contextlib.suppress(TransportError):
+        try:
+            for frame in frames or ():
+                self.conn.send_data(frame, deadline=deadline)
             self.conn.send_control(
                 encode_message(
                     message, session_id=self.session_id, request_id=request_id
                 ),
                 deadline=deadline,
             )
-
-    def _send_frames(self, frames: list[DataFrame], *, deadline: float) -> bool:
-        try:
-            for frame in frames:
-                self.conn.send_data(frame, deadline=deadline)
         except TransportError:
-            return False
-        return True
+            if frames is not None:
+                self.conn.close()
 
     def _handle_control(self, body: bytes) -> None:
         try:
@@ -1226,25 +1228,19 @@ class _ServerSession:
 
         base = self.next_result_slot
         self.next_result_slot += _RESULT_FRAMES
-        deadline = time.monotonic() + self.server.send_timeout_s
-        sent = self._send_frames(
-            [
+        self._send(
+            ProposalResponse(
+                batch_id=message.batch_id,
+                sequence_number=sequence_number,
+                result_slot=base,
+            ),
+            request_id,
+            frames=[
                 msgspec.structs.replace(tokens, slot=base),
                 msgspec.structs.replace(valid, slot=base + 1),
                 ints_to_frame(base + 2, [int(s) for s in row_statuses]),
             ],
-            deadline=deadline,
         )
-        if sent:
-            self._send(
-                ProposalResponse(
-                    batch_id=message.batch_id,
-                    sequence_number=sequence_number,
-                    result_slot=base,
-                ),
-                request_id,
-                deadline=deadline,
-            )
 
     def _close(self, message: CloseSequence, request_id: int) -> None:
         removed: list[SequenceKey] = []

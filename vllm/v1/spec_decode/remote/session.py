@@ -1063,9 +1063,11 @@ class RemoteDraftSession:
         # clock once, so every frame consumes the same remaining budget.
         budget = max(deadline - self._clock(), num_bytes / _MIN_WRITE_BYTES_PER_S)
         wire_deadline = time.monotonic() + budget
+        sent_frames = False
         try:
             for frame in frames:
                 conn.send_data(frame, deadline=wire_deadline)
+                sent_frames = True
             conn.send_control(
                 encode_message(
                     message, session_id=self._session_id, request_id=request_id
@@ -1073,9 +1075,9 @@ class RemoteDraftSession:
                 deadline=wire_deadline,
             )
         except TransportTimeout:
-            # Only a partially written frame breaks the stream; frames the
-            # server received without their message are dropped by it.
-            if conn.closed:
+            # Completed data frames also need their final control message;
+            # without it, the peer cannot discard the unfinished request.
+            if sent_frames or conn.closed:
                 self._invalidate("timed out while sending")
             raise
         return request_id
