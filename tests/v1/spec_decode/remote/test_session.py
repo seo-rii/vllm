@@ -162,6 +162,36 @@ def round_trip(session, batch_):
     return session.collect(session.dispatch(batch_))
 
 
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("pending_ipc", [False, True])
+def test_local_failure_is_terminal_before_policy_or_ipc_cleanup(
+    make_session, policy, pending_ipc
+):
+    session = make_session(failure_policy=policy)
+    key = ready(session, 1)
+    exporter = Mock()
+    if pending_ipc:
+        session._ipc_exporter = exporter
+        session._ipc_pending.append(Mock())
+    expectation = (
+        pytest.raises(RemoteDraftError, match="feature allocation failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expectation:
+        session.fail_sequences((key,), detail="feature allocation failed")
+    assert session.sequence_state(key) is SequenceState.TARGET_ONLY
+    assert session.connected is not pending_ipc
+    assert session._records[key.sequence_id].last_status is (
+        SpeculatorStatusCode.OUT_OF_MEMORY
+    )
+    if pending_ipc:
+        exporter.close.assert_called_once_with()
+        exporter.release.assert_not_called()
+        assert session._ipc_poisoned
+        assert not session._ipc_pending
+
+
 # ----------------------------------------------------------------------
 # Handshake
 # ----------------------------------------------------------------------

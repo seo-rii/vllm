@@ -762,6 +762,28 @@ class RemoteDraftSession:
     # Proposal rounds
     # ------------------------------------------------------------------
 
+    def fail_sequences(
+        self,
+        keys: Collection[SequenceKey],
+        *,
+        status: SpeculatorStatusCode = SpeculatorStatusCode.OUT_OF_MEMORY,
+        detail: str,
+    ) -> None:
+        """Latch local preparation failures until the affected requests close.
+
+        Preparation can advance the verifier's bookkeeping before the peer
+        receives its context. Keeping the records terminal prevents a later
+        step from resuming with stale own-KV. Unacknowledged IPC features use
+        the same connection teardown and quarantine as a transport failure.
+        """
+        for key in keys:
+            record = self._records.get(key.sequence_id)
+            if record is not None and record.key == key:
+                self._latch_target_only(record, status)
+        if self._ipc_pending or self._inflight_batch_id is not None:
+            self._invalidate(detail)
+        self._raise_if_strict(detail)
+
     def dispatch(self, batch: RemoteProposalBatch) -> RemoteProposalHandle:
         """Send one round to the server without waiting for the result.
 

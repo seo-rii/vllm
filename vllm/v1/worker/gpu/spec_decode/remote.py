@@ -16,7 +16,7 @@ from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
-from vllm.v1.spec_decode.remote.protocol import SequenceKey
+from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.session import RemoteDraftSession, VerifierIdentity
 from vllm.v1.spec_decode.remote.state import (
@@ -207,15 +207,33 @@ class RemoteSpeculator(BaseSpeculator):
                     raise ValueError(
                         "remote drafter currently requires greedy target sampling"
                     )
-                tokens = self._propose(
-                    input_batch,
-                    last_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    last_sampled,
-                    next_prefill_tokens,
-                ).tolist()
+                try:
+                    tokens = self._propose(
+                        input_batch,
+                        last_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        last_sampled,
+                        next_prefill_tokens,
+                    ).tolist()
+                except torch.OutOfMemoryError as exc:
+                    # Feature preparation can advance local request positions
+                    # before all chunks reach the drafter. Never resume these
+                    # own-KV sequences after dropping the failed round.
+                    assert self._session is not None
+                    self._session.fail_sequences(
+                        tuple(
+                            self._requests[req_id].key
+                            for req_id in input_batch.req_ids
+                            if req_id in self._requests
+                        ),
+                        status=SpeculatorStatusCode.OUT_OF_MEMORY,
+                        detail=f"remote feature preparation failed: {exc}",
+                    )
+                    tokens = [
+                        [-1] * self.num_speculative_steps for _ in input_batch.req_ids
+                    ]
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             finally:

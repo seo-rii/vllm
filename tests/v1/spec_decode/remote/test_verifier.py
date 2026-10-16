@@ -174,7 +174,7 @@ def propose(verifier, batch, sampled, rejected, recovery, lookahead=None, **kwar
         {},
         {},
         torch.zeros(batch.num_tokens, 4),
-        None,
+        kwargs.pop("aux_hidden_states", None),
         torch.tensor(sampled),
         torch.tensor(rejected),
         last_sampled,
@@ -497,6 +497,149 @@ def test_auxiliary_features_are_selected_before_concatenation(monkeypatch):
     )
     assert concatenated == [[[2], [12]]]
     assert features["aux_hidden_states"].shape == (1, 8)
+
+
+@pytest.mark.parametrize("verifier", ["target_only", "error"], indirect=True)
+@pytest.mark.parametrize("stage", ["aux_cat", "prefill_select", "decode_select"])
+def test_remote_feature_oom_latches_affected_rows_and_shares_policy(
+    verifier, monkeypatch, stage
+):
+    instance, executor, settings, group = verifier
+    group.rank_in_group = 1
+    peer = remote.RemoteSpeculator(settings, torch.device("cpu"))
+    group.rank_in_group = 0
+    policy = settings.speculative_config.remote_draft.failure_policy
+    aux = None
+    if stage == "decode_select":
+        first = inputs(["a"], [[1]], [[0]], [1])
+        drafts = propose(instance, first, [1], [0], [2])[0].tolist()
+        batch = inputs(["a"], [[2, *drafts]], [[1, 2, 3, 4]], [0])
+        sampled, rejected, recovery = [1], [3], [3]
+        expected_computed = [2]
+    elif stage == "prefill_select":
+        batch = inputs(["a", "b"], [[1], [3]], [[0], [0]], [4, 4])
+        sampled, rejected, recovery = [0, 0], [0, 0], [0, 0]
+        expected_computed = [1, 0]
+    else:
+        batch = inputs(["a"], [[1]], [[0]], [1])
+        sampled, rejected, recovery = [1], [0], [2]
+        expected_computed = [0]
+        aux = [torch.zeros(1, 4), torch.zeros(1, 4)]
+    plan_count = len(executor.plans)
+    original_select = instance._select
+    select_calls = 0
+
+    def fail_cat(*args, **kwargs):
+        raise torch.OutOfMemoryError("remote feature allocation failed")
+
+    def select_with_allocation_failure(features, token_rows, sequence_rows):
+        nonlocal select_calls
+        select_calls += 1
+        fail_on_call = 2 if stage == "prefill_select" else 1
+        if select_calls != fail_on_call:
+            return original_select(features, token_rows, sequence_rows)
+        getitem = torch.Tensor.__getitem__
+
+        def fail_feature_index(tensor, index):
+            if any(tensor is feature for feature in features.values()):
+                raise torch.OutOfMemoryError("remote feature allocation failed")
+            return getitem(tensor, index)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "__getitem__", fail_feature_index)
+            return original_select(features, token_rows, sequence_rows)
+
+    with monkeypatch.context() as patch:
+        if stage == "aux_cat":
+            # Failure happens in the real _features before any tensor is sent;
+            # the real session/server keep their negotiated contract unchanged.
+            patch.setattr(
+                instance,
+                "_contract",
+                SimpleNamespace(
+                    schema=TargetFeatureSchema(
+                        1,
+                        (
+                            *SCHEMA.slots,
+                            FeatureSlot("aux_hidden_states", "float32", (8,)),
+                        ),
+                    )
+                ),
+            )
+            patch.setattr(torch, "cat", fail_cat)
+        else:
+            patch.setattr(instance, "_select", select_with_allocation_failure)
+        if policy == "error":
+            with pytest.raises(RuntimeError, match="remote feature allocation failed"):
+                propose(
+                    instance, batch, sampled, rejected, recovery, aux_hidden_states=aux
+                )
+        else:
+            assert propose(
+                instance, batch, sampled, rejected, recovery, aux_hidden_states=aux
+            ).tolist() == [[-1] * K for _ in batch.req_ids]
+    assert len(executor.plans) == plan_count
+    assert [
+        instance._requests[req_id].num_computed for req_id in batch.req_ids
+    ] == expected_computed
+    assert all(
+        instance._session.sequence_state(instance._requests[req_id].key)
+        is remote.SequenceState.TARGET_ONLY
+        for req_id in batch.req_ids
+    )
+    group.rank_in_group = 1
+    try:
+        if policy == "error":
+            with pytest.raises(RuntimeError, match="remote feature allocation failed"):
+                propose(peer, batch, sampled, rejected, recovery)
+        else:
+            assert propose(peer, batch, sampled, rejected, recovery).tolist() == [
+                [-1] * K for _ in batch.req_ids
+            ]
+    finally:
+        group.rank_in_group = 0
+
+    # Do not resume an own-KV sequence after skipping its verified context.
+    # A separate request can still use the healthy connection and clean up.
+    with monkeypatch.context() as patch:
+
+        def reject_features(*args, **kwargs):
+            pytest.fail("an allocation-failed request resumed remote decoding")
+
+        patch.setattr(instance, "_features", reject_features)
+        next_batch = inputs(
+            batch.req_ids,
+            [[7]] * batch.num_reqs,
+            [[8]] * batch.num_reqs,
+            [0] * batch.num_reqs,
+        )
+        assert propose(
+            instance,
+            next_batch,
+            [1] * batch.num_reqs,
+            [0] * batch.num_reqs,
+            [8] * batch.num_reqs,
+        ).tolist() == [[-1] * K for _ in batch.req_ids]
+    fresh = inputs(["fresh"], [[11]], [[0]], [1])
+    assert propose(instance, fresh, [1], [0], [12]).tolist() == [digest_row([11], 12)]
+    instance.close_requests({*batch.req_ids, "fresh"})
+    assert instance._requests == {}
+
+
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+def test_remote_feature_cuda_context_error_is_shared_and_not_fallback(
+    verifier, monkeypatch
+):
+    instance, _, _, group = verifier
+
+    def fail_features(*args, **kwargs):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(instance, "_features", fail_features)
+    batch = inputs(["a"], [[1]], [[0]], [1])
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        propose(instance, batch, [1], [0], [2])
+    assert group.payload[1] is None
 
 
 @pytest.mark.parametrize("option", ["prefix", "async", "tp4", "pp2", "embeddings"])
