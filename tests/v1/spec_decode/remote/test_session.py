@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
+from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcError
 from vllm.v1.spec_decode.remote.protocol import (
     ErrorReply,
     FeatureSlot,
@@ -263,6 +264,259 @@ def test_explicit_inline_transport_connects(make_session):
 def test_unimplemented_transport_is_rejected():
     with pytest.raises(NotImplementedError):
         RemoteDraftSession("tcp://127.0.0.1:1", IDENTITY, transport="zmq")
+
+
+def test_cuda_ipc_requires_unix_socket_before_connecting():
+    with pytest.raises(ValueError, match="UNIX socket"):
+        RemoteDraftSession("tcp://127.0.0.1:1", IDENTITY, transport="cuda_ipc")
+
+
+def test_ipc_prefill_releases_leases_only_after_all_acknowledgements(
+    session, monkeypatch
+):
+    keys = (session.open_sequence(1), session.open_sequence(2))
+    exporter = Mock()
+    leases = [Mock(), Mock()]
+    session._ipc_exporter = exporter
+    session._ipc_pending.extend(leases)
+    original = session._await
+    seen = 0
+
+    def await_ack(*args, **kwargs):
+        nonlocal seen
+        exporter.release.assert_not_called()
+        reply = original(*args, **kwargs)
+        seen += 1
+        return reply
+
+    monkeypatch.setattr(session, "_await", await_ack)
+    session.prefill_many([(key, features([1]), True) for key in keys])
+    assert seen == 2
+    assert [call.args[0] for call in exporter.release.call_args_list] == leases
+    assert not session._ipc_pending
+
+
+def test_ipc_prefill_timeout_quarantines_instead_of_reusing_lease(session, monkeypatch):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    key = session.open_sequence(1)
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    monkeypatch.setattr(session, "_await", Mock(side_effect=TransportTimeout("late")))
+    session.prefill(key, features([1]), is_final=True)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert not session.connected
+    assert not session.maybe_reconnect()
+
+
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("failed_cleanup", ["connection", "exporter", "both"])
+def test_ipc_cleanup_errors_preserve_failure_policy_and_block_reconnect(
+    make_session, monkeypatch, caplog, policy, failed_cleanup
+):
+    from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcError
+
+    session = make_session(failure_policy=policy)
+    conn = session._conn
+    original_close = conn.close
+
+    def close_connection():
+        original_close()
+        if failed_cleanup in ("connection", "both"):
+            raise OSError("injected socket close failure")
+
+    connection_close = Mock(side_effect=close_connection)
+    monkeypatch.setattr(conn, "close", connection_close)
+    exporter = Mock()
+    if failed_cleanup in ("exporter", "both"):
+        exporter.close.side_effect = CudaIpcError("injected CUDA close failure")
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    monkeypatch.setattr(
+        session, "_send", Mock(side_effect=TransportError("connection lost"))
+    )
+
+    expected = (
+        pytest.raises(RemoteDraftError, match="open_sequence.*failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expected:
+        key = session.open_sequence(1)
+
+    assert not session.connected
+    assert not session.maybe_reconnect()
+    assert session._ipc_exporter is None
+    assert not session._ipc_pending
+    if policy == "target_only":
+        result = round_trip(session, batch(0, [key], recovery=[1]))
+        assert result.output.valid_lengths.tolist() == [0]
+    if failed_cleanup in ("connection", "both"):
+        assert "injected socket close failure" in caplog.text
+    if failed_cleanup in ("exporter", "both"):
+        assert "injected CUDA close failure" in caplog.text
+
+    session.close()
+    connection_close.assert_called_once_with()
+    exporter.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("is_final", [True, False])
+def test_partial_ipc_prefill_ack_cannot_revive_invalidated_sequences(
+    make_session, adapter, monkeypatch, policy, is_final
+):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    session = make_session(failure_policy=policy)
+    keys = (session.open_sequence(1), session.open_sequence(2))
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.extend([Mock(), Mock()])
+    original_await = session._await
+    acknowledged = False
+
+    def acknowledge_then_timeout(*args, **kwargs):
+        nonlocal acknowledged
+        if acknowledged:
+            raise TransportTimeout("second acknowledgement lost")
+        reply = original_await(*args, **kwargs)
+        assert reply[1].key == keys[0]
+        assert reply[1].status is OK
+        acknowledged = True
+        return reply
+
+    monkeypatch.setattr(session, "_await", acknowledge_then_timeout)
+    expected = (
+        pytest.raises(RemoteDraftError, match="prefill failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expected:
+        session.prefill_many([(key, features([1]), is_final) for key in keys])
+
+    assert acknowledged
+    assert all(session.sequence_state(key) is SequenceState.INVALID for key in keys)
+    assert all(session._records[key.sequence_id].prefilled_tokens == 0 for key in keys)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert not session.connected
+    assert not session.maybe_reconnect()
+    if policy == "target_only":
+        # Both rows keep generating on the target without touching the lost peer.
+        monkeypatch.setattr(session, "_send", Mock(side_effect=AssertionError))
+        session.prefill_many([(key, features([2]), True) for key in keys])
+        result = round_trip(session, batch(0, keys, recovery=[2, 3]))
+        assert result.output.valid_lengths.tolist() == [0, 0]
+        assert all(status is not OK for status in result.row_statuses)
+        assert adapter.proposed_batches == []
+
+
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("phase", ["prefill", "dispatch"])
+@pytest.mark.parametrize("error_type", [CudaIpcError, RuntimeError])
+def test_first_ipc_export_failure_obeys_policy(
+    make_session, adapter, policy, phase, error_type
+):
+    session = make_session(failure_policy=policy)
+    key = ready(session, 1) if phase == "dispatch" else session.open_sequence(1)
+    session._selected_transport = "cuda_ipc"
+    session._feature_schema = TargetFeatureSchema(
+        1, (FeatureSlot("last_hidden_states", "float32", (2,)),)
+    )
+    exporter = Mock()
+    exporter.export.side_effect = error_type("injected export failure")
+    session._ipc_exporter = exporter
+    tensor = Mock(spec=torch.Tensor)
+    tensor.ndim, tensor.shape = 2, (1, 2)
+    tensor.device, tensor.dtype = torch.device("cuda:0"), torch.float32
+    tensor.is_floating_point.return_value = True
+    tensor.numel.return_value = 2
+    inputs = FeatureBatch(1, (tensor,))
+    proposal = dataclasses.replace(batch(0, [key], recovery=[4]), features=inputs)
+
+    if phase == "prefill":
+        expected = (
+            pytest.raises(RemoteDraftError, match="prefill.*export failure")
+            if policy == "error"
+            else contextlib.nullcontext()
+        )
+        with expected:
+            session.prefill(key, inputs, is_final=True)
+    else:
+        handle = session.dispatch(proposal)
+        assert handle.state is HandleState.COMPLETED
+        expected = (
+            pytest.raises(RemoteDraftError, match="INTERNAL_ERROR")
+            if policy == "error"
+            else contextlib.nullcontext()
+        )
+        with expected:
+            result = session.collect(handle)
+            assert result.row_statuses == (SpeculatorStatusCode.INTERNAL_ERROR,)
+            assert result.output.valid_lengths.tolist() == [0]
+        assert handle.state is HandleState.COLLECTED
+
+    assert not session.connected
+    assert not session.maybe_reconnect()
+    assert session.sequence_state(key) is SequenceState.INVALID
+    assert session._ipc_exporter is None
+    assert not session._ipc_pending
+    assert session._inflight_batch_id is None
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    # Future rounds quietly skip the invalid sequence without touching CUDA or wire.
+    session.prefill(key, inputs, is_final=True)
+    result = round_trip(session, dataclasses.replace(proposal, batch_id=1))
+    assert result.output.valid_lengths.tolist() == [0]
+    exporter.export.assert_called_once_with(tensor)
+    assert adapter.proposed_batches == []
+    with pytest.raises(ValueError, match="not newer"):
+        session.dispatch(dataclasses.replace(proposal, batch_id=1))
+
+
+def test_ipc_cpu_feature_validation_is_not_absorbed(session):
+    key = session.open_sequence(1)
+    session._selected_transport = "cuda_ipc"
+    session._feature_schema = TargetFeatureSchema(
+        1, (FeatureSlot("last_hidden_states", "float32", (2,)),)
+    )
+    with pytest.raises(ValueError, match="must remain on CUDA"):
+        session.prefill(key, FeatureBatch(1, (torch.zeros(1, 2),)), is_final=True)
+    assert session.connected
+    assert session.sequence_state(key) is SequenceState.PREFILLING
+
+
+def test_ipc_decode_releases_only_after_proposal_response(session, monkeypatch):
+    key = ready(session, 1)
+    exporter = Mock()
+    lease = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(lease)
+    handle = session.dispatch(batch(0, [key], recovery=[4]))
+    exporter.release.assert_not_called()
+    result = session.collect(handle)
+    exporter.release.assert_called_once_with(lease)
+    assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS]
+
+
+def test_ipc_decode_timeout_invalidates_and_quarantines(session, monkeypatch):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    key = ready(session, 1)
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    handle = session.dispatch(batch(0, [key], recovery=[4]))
+    monkeypatch.setattr(session, "_await", Mock(side_effect=TransportTimeout("late")))
+    result = session.collect(handle)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert result.output.valid_lengths.tolist() == [0]
+    assert not session.connected
+    assert not session.maybe_reconnect()
 
 
 # ----------------------------------------------------------------------
@@ -1192,6 +1446,42 @@ def test_unacknowledged_close_fences_server_state_without_retaining_history(
     assert adapter.prefix(second) == [4, 5]
     session.close_sequences((first,))
     assert session.sequence_state(second) is SequenceState.READY
+
+
+@pytest.mark.parametrize("target_only", [False, True])
+def test_poisoned_ipc_close_forgets_completed_generations(
+    session, monkeypatch, target_only
+):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    first = ready(session, 1)
+    if target_only:
+        # A timeout before any request bytes latches just this sequence.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session, "_send", Mock(side_effect=TransportTimeout("not sent"))
+            )
+            result = round_trip(session, batch(0, [first], recovery=[4]))
+        assert result.output.valid_lengths.tolist() == [0]
+        assert session.sequence_state(first) is SequenceState.TARGET_ONLY
+
+    # CPU tests exercise the real session lifecycle with a mock CUDA arena.
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session.close()
+    exporter.close.assert_called_once_with()
+    assert not session.maybe_reconnect()
+    session.close_sequences((first,))
+    assert not session._records
+
+    for sequence_id in range(100):
+        key = session.open_sequence(sequence_id)
+        assert session.sequence_state(key) is SequenceState.INVALID
+        result = round_trip(session, batch(sequence_id + 1, [key], recovery=[4]))
+        assert result.output.valid_lengths.tolist() == [0]
+        session.close_sequences((key,))
+        assert not session._records
+    assert not session.maybe_reconnect()
 
 
 def test_close_is_idempotent(session, server, adapter):

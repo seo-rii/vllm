@@ -56,6 +56,22 @@ CONTRACT = RuntimeContract(
 )
 
 
+def test_ipc_features_do_not_materialize_hidden_states_on_host():
+    instance = object.__new__(remote.RemoteSpeculator)
+    instance.device = torch.device("meta")
+    instance._contract = CONTRACT
+    instance._session = SimpleNamespace(selected_transport="cuda_ipc")
+    batch = inputs(["a"], [[1, 2]], [[0, 1]], [2])
+    hidden = torch.empty(2, 4, device="meta")
+    # A meta tensor cannot be copied to CPU. This catches an accidental host
+    # materialization without requiring a GPU in the protocol test suite.
+    features = instance._features(batch, hidden, None, torch.tensor([[3]]))
+    assert features["last_hidden_states"].device.type == "meta"
+    assert features["token_ids"].tolist() == [1, 2]
+    assert features["positions"].tolist() == [0, 1]
+    assert features["next_prefill_tokens"].tolist() == [[3]]
+
+
 class TPGroup:
     def __init__(self):
         self.rank_in_group = 0

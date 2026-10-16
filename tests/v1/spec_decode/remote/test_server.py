@@ -12,14 +12,17 @@ import zlib
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm.v1.spec_decode.remote import server as server_module
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
+from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcDescriptor
 from vllm.v1.spec_decode.remote.protocol import (
     AdvanceAndPropose,
     CancelBatch,
     CloseSequence,
     ErrorReply,
+    FeatureSlot,
     Hello,
     HelloAck,
     OpenSequence,
@@ -31,6 +34,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     SequenceAck,
     SequenceKey,
     SpeculatorStatusCode,
+    TargetFeatureSchema,
     decode_envelope,
     decode_payload,
     encode_message,
@@ -48,9 +52,11 @@ from vllm.v1.spec_decode.remote.transport import (
     FRAME_DATA,
     ConnectionClosed,
     DataFrame,
+    DeviceFeature,
     Listener,
     connect,
     decode_data_frame,
+    frame_checksum,
     frame_to_ints,
     ints_to_frame,
 )
@@ -79,17 +85,25 @@ def key(sequence_id: int, generation: int = 0, verifier: str = VERIFIER):
     )
 
 
-def test_cleanup_failure_releases_session_state_and_connection(monkeypatch):
+@pytest.mark.parametrize("failure_stage", ["ipc", "adapter"])
+def test_cleanup_failure_releases_session_state_and_connection(
+    monkeypatch, failure_stage
+):
     adapter = FakeDraftAdapter(vocab_size=VOCAB)
     server = RemoteDraftServer(adapter)
     conn = Mock()
     server._connections.add(conn)
     owned, other = key(1), key(2)
+    receiver = Mock()
+    failure = RuntimeError(f"injected {failure_stage} cleanup failure")
+    if failure_stage == "ipc":
+        receiver.close.side_effect = failure
     close_sequences = adapter.close_sequences
 
     def close_with_failure(keys):
         close_sequences(keys)
-        raise RuntimeError("injected adapter cleanup failure")
+        if failure_stage == "adapter":
+            raise failure
 
     close_adapter = Mock(side_effect=close_with_failure)
     monkeypatch.setattr(adapter, "close_sequences", close_adapter)
@@ -98,6 +112,7 @@ def test_cleanup_failure_releases_session_state_and_connection(monkeypatch):
 
     def run(session):
         session.session_id = "closing-session"
+        session.ipc_receiver = receiver
         for sequence, owner in ((owned, session.session_id), (other, "other-session")):
             assert server.registry.open(sequence, owner=owner).status == OK
             adapter.open_sequence(sequence)
@@ -105,6 +120,7 @@ def test_cleanup_failure_releases_session_state_and_connection(monkeypatch):
     monkeypatch.setattr(server_module._ServerSession, "run", run)
     server._serve_connection(conn)
 
+    receiver.close.assert_called_once_with()
     close_adapter.assert_called_once_with((owned,))
     assert server.registry.get(owned) is None
     assert adapter.prefix(owned) is None
@@ -358,6 +374,77 @@ def test_hello_ack_reports_adapter_capabilities(server, adapter, client):
     assert ack.feature_schema == adapter.feature_schema()
     assert ack.limits == DEFAULT_LIMITS
     assert ack.feature_schema.slots[0].kind == TargetFeatureKind.TOKEN_IDS.value
+
+
+@pytest.mark.parametrize("fail_import", [False, True])
+def test_cuda_ipc_prefill_ack_requires_completed_import(
+    tmp_path, monkeypatch, fail_import
+):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    monkeypatch.setattr(adapter, "cuda_ipc_device", lambda: torch.device("cuda:0"))
+    monkeypatch.setattr(
+        adapter,
+        "feature_schema",
+        lambda: TargetFeatureSchema(
+            1, (FeatureSlot("last_hidden_states", "float32", (2,)),)
+        ),
+    )
+    observed: list[DataFrame | DeviceFeature | None] = []
+    monkeypatch.setattr(
+        adapter, "prefill", lambda key, inputs: observed.extend(inputs.features)
+    )
+    received = torch.tensor([[1.0, 2.0]])
+    receiver = Mock()
+    receiver.receive.return_value = received
+    if fail_import:
+        receiver.receive.side_effect = RuntimeError("copy completion unknown")
+    monkeypatch.setattr(server_module, "CudaIpcReceiver", Mock(return_value=receiver))
+    server = RemoteDraftServer(adapter)
+    server.start(f"unix://{tmp_path}/draft.sock")
+    client = RawClient(server.endpoint)
+    try:
+        ack = client.hello(supported_transports=("cuda_ipc",))
+        assert isinstance(ack, HelloAck)
+        assert ack.selected_transport == "cuda_ipc"
+        sequence = key(1)
+        assert client.open(sequence).status is OK
+        descriptor = CudaIpcDescriptor(
+            buffer_id=1,
+            generation=1,
+            device_uuid="GPU-00000000-0000-0000-0000-000000000000",
+            memory_handle=b"m" * 64,
+            ready_event_handle=b"e" * 64,
+            nbytes=8,
+            capacity_bytes=8,
+        )
+        feature = DataFrame(100, "float32", (1, 2), b"", descriptor)
+        message = PrefillChunk(sequence, 0, 1, True, 100, frame_checksum([feature]))
+        if fail_import:
+            with pytest.raises(ConnectionClosed):
+                client.call(message, frames=(feature,))
+            assert observed == []
+        else:
+            reply = client.call(message, frames=(feature,))
+            assert reply.status is OK
+            assert len(observed) == 1 and isinstance(observed[0], DeviceFeature)
+            assert observed[0].tensor is received
+        receiver.receive.assert_called_once_with(descriptor, "float32", (1, 2))
+    finally:
+        client.close()
+        server.stop()
+    receiver.close.assert_called_once_with()
+
+
+def test_duplicate_wire_slots_close_connection(client):
+    client.hello()
+    frame = ints_to_frame(5, [1])
+    client.conn.send_data(frame)
+    client.conn.send_data(frame)
+    _, reply = client.recv()
+    assert isinstance(reply, ErrorReply)
+    assert "duplicate data slot" in reply.detail
+    with pytest.raises(ConnectionClosed):
+        client.recv()
 
 
 @pytest.mark.parametrize(

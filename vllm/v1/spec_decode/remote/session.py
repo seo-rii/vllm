@@ -21,7 +21,6 @@ speculation.
 import itertools
 import math
 import time
-import zlib
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -34,6 +33,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     placement_incompatibilities,
 )
+from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcDescriptor, CudaIpcExporter
 from vllm.v1.spec_decode.remote.protocol import (
     AdvanceAndPropose,
     CloseSequence,
@@ -69,15 +69,19 @@ from vllm.v1.spec_decode.remote.state import (
     transition_sequence,
 )
 from vllm.v1.spec_decode.remote.transport import (
+    CUDA_IPC_TRANSPORT,
     FRAME_DATA,
     INLINE_TRANSPORT,
     ConnectionClosed,
     DataFrame,
+    DeviceFeature,
     FramedConnection,
     TransportError,
     TransportTimeout,
     decode_data_frame,
+    frame_checksum,
     frame_to_ints,
+    validate_frame,
 )
 from vllm.v1.spec_decode.remote.transport import connect as transport_connect
 
@@ -111,6 +115,10 @@ class RemoteDraftError(Exception):
     """Remote speculator failure the configured policy does not absorb."""
 
 
+class _CudaIpcExportError(RemoteDraftError):
+    """A feature export failed before its lease could be tracked."""
+
+
 def tensor_to_frame(slot: int, tensor: torch.Tensor) -> DataFrame:
     """Serialize a tensor into an inline data frame (host copy)."""
     flat = tensor.detach().reshape(-1)
@@ -127,9 +135,13 @@ def tensor_to_frame(slot: int, tensor: torch.Tensor) -> DataFrame:
 
 
 def frame_to_tensor(
-    frame: DataFrame, device: torch.device | str | None = None
+    frame: DataFrame | DeviceFeature, device: torch.device | str | None = None
 ) -> torch.Tensor:
-    """Materialize an inline data frame as a tensor on ``device``."""
+    """Materialize a validated feature as a tensor on ``device``."""
+    if isinstance(frame, DeviceFeature):
+        return frame.tensor if device is None else frame.tensor.to(device)
+    if frame.cuda_ipc is not None:
+        raise TransportError("CUDA IPC frame must be resolved by its receiver")
     dtype = getattr(torch, frame.dtype, None)
     if not isinstance(dtype, torch.dtype):
         raise TransportError(f"unknown dtype {frame.dtype!r} in data frame")
@@ -217,16 +229,20 @@ class RemoteDraftSession:
         startup_timeout_ms: int = 30_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if transport not in ("auto", INLINE_TRANSPORT):
+        if transport not in ("auto", INLINE_TRANSPORT, CUDA_IPC_TRANSPORT):
             raise NotImplementedError(
                 f"remote_draft.transport={transport!r} has no data-plane "
-                "implementation yet; use 'auto' or 'inline'"
+                "implementation yet; use 'auto', 'inline', or 'cuda_ipc'"
             )
+        if transport == CUDA_IPC_TRANSPORT and not endpoint.startswith("unix://"):
+            raise ValueError("CUDA IPC requires a UNIX socket")
         if failure_policy not in ("error", "target_only"):
             raise ValueError(f"unknown failure_policy {failure_policy!r}")
         self._endpoint = endpoint
         self._identity = identity
-        self._offered_transports = (INLINE_TRANSPORT,)
+        self._offered_transports = (
+            CUDA_IPC_TRANSPORT if transport == CUDA_IPC_TRANSPORT else INLINE_TRANSPORT,
+        )
         self._failure_policy = failure_policy
         self._request_timeout_s = request_timeout_ms / 1000.0
         self._startup_timeout_s = startup_timeout_ms / 1000.0
@@ -253,6 +269,9 @@ class RemoteDraftSession:
         # Survives reconnects so closed requests need no per-id tombstones.
         self._next_generation = 0
         self._abandoned_batches: set[int] = set()
+        self._ipc_exporter: CudaIpcExporter | None = None
+        self._ipc_pending: list[CudaIpcDescriptor] = []
+        self._ipc_poisoned = False
 
     @classmethod
     def from_config(
@@ -310,6 +329,44 @@ class RemoteDraftSession:
             raise RemoteDraftError("session is not connected")
         return self._limits
 
+    def prepare_cuda_ipc(self, device: torch.device) -> None:
+        """Reserve export memory before the runner profiles available KV memory."""
+        if (
+            self._selected_transport != CUDA_IPC_TRANSPORT
+            or self._ipc_exporter is not None
+        ):
+            return
+        floating = [
+            spec
+            for spec in self.feature_schema.slots
+            if not spec.per_sequence
+            and spec.dtype in ("float16", "bfloat16", "float32", "float64")
+        ]
+        max_buffers = min(
+            4096, max(16, (self._identity.max_num_seqs + 1) * len(floating))
+        )
+        num_bytes = (
+            sum(
+                self._identity.max_num_batched_tokens
+                * math.prod(spec.trailing_shape)
+                * getattr(torch, spec.dtype).itemsize
+                for spec in floating
+            )
+            + 256 * max_buffers
+        )
+        capacity = max(16 << 20, 1 << (num_bytes - 1).bit_length())
+        if capacity > 1 << 30:
+            raise RemoteDraftError(
+                "CUDA IPC feature arena exceeds the 1 GiB session limit"
+            )
+        self._ipc_exporter = CudaIpcExporter(
+            device, max_buffers=max_buffers, max_bytes=capacity
+        )
+
+    @property
+    def cuda_ipc_reserved_bytes(self) -> int:
+        return 0 if self._ipc_exporter is None else self._ipc_exporter.reserved_bytes
+
     def sequence_state(self, key: SequenceKey) -> SequenceState | None:
         """Current client-side state of ``key``, or None if unknown/stale."""
         record = self._records.get(key.sequence_id)
@@ -336,6 +393,10 @@ class RemoteDraftSession:
         """
         if self._conn is not None:
             raise RemoteDraftError("session is already connected")
+        if self._ipc_poisoned:
+            raise RemoteDraftError(
+                "CUDA IPC connection cannot reconnect after teardown"
+            )
         self._reset_connection_state()
         if timeout_s is None:
             timeout_s = self._startup_timeout_s
@@ -349,7 +410,7 @@ class RemoteDraftSession:
         hello = self._hello()
         try:
             request_id = self._send(hello, deadline=deadline)
-            _, ack = self._await(
+            envelope, ack = self._await(
                 lambda env, msg: (
                     isinstance(msg, HelloAck) and env.request_id == request_id
                 ),
@@ -366,6 +427,8 @@ class RemoteDraftSession:
             self._drop_connection()
             raise RemoteDraftError(f"HELLO handshake failed: {e}") from e
         reasons = self._handshake_rejections(hello, ack)
+        if ack.selected_transport == CUDA_IPC_TRANSPORT and envelope.protocol_minor < 1:
+            reasons.append("CUDA IPC requires protocol minor 1 or newer")
         if reasons:
             self._drop_connection()
             raise RemoteDraftError(
@@ -399,6 +462,8 @@ class RemoteDraftSession:
         """
         if self._alive:
             return True
+        if self._ipc_poisoned:
+            return False
         if self._inflight_batch_id is not None or self._clock() < self._reconnect_at:
             return False
         try:
@@ -562,6 +627,20 @@ class RemoteDraftSession:
         offsets. A sequence that is already latched target-only silently
         ignores prefill so the request keeps running without speculation.
         """
+        try:
+            self._prefill_many(chunks)
+        except _CudaIpcExportError as exc:
+            detail = f"CUDA IPC prefill failed: {exc}"
+            self._invalidate(detail)
+            self._raise_if_strict(detail)
+        except Exception:
+            if self._ipc_pending:
+                self._invalidate("prefill failed with outstanding CUDA IPC buffers")
+            raise
+
+    def _prefill_many(
+        self, chunks: Sequence[tuple[SequenceKey, FeatureBatch, bool]]
+    ) -> None:
         self._require_no_inflight("prefill a sequence")
         if len({key for key, _, _ in chunks}) != len(chunks):
             raise ValueError("at most one prefill chunk per sequence per call")
@@ -693,6 +772,14 @@ class RemoteDraftSession:
         At most one proposal may be in flight per session: collect the
         previous handle before dispatching the next round.
         """
+        try:
+            return self._dispatch(batch)
+        except Exception:
+            if self._ipc_pending:
+                self._invalidate("dispatch failed with outstanding CUDA IPC buffers")
+            raise
+
+    def _dispatch(self, batch: RemoteProposalBatch) -> RemoteProposalHandle:
         self._require_no_inflight(f"dispatch batch {batch.batch_id}")
         if batch.batch_id <= self._last_batch_id:
             raise ValueError(
@@ -753,14 +840,22 @@ class RemoteDraftSession:
             frames.append(
                 tensor_to_frame(base + 2, torch.tensor(active_lens, dtype=torch.int32))
             )
-        frames.extend(
-            self._feature_frames(
-                base + num_inputs,
-                batch.features,
-                token_rows=token_rows,
-                sequence_rows=rows,
+        try:
+            frames.extend(
+                self._feature_frames(
+                    base + num_inputs,
+                    batch.features,
+                    token_rows=token_rows,
+                    sequence_rows=rows,
+                )
             )
-        )
+        except _CudaIpcExportError as exc:
+            self._invalidate(f"CUDA IPC dispatch failed: {exc}")
+            handle.failed_rows.update(
+                self._fail_rows(handle, SpeculatorStatusCode.INTERNAL_ERROR)
+            )
+            handle.state = transition_handle(handle.state, HandleState.COMPLETED)
+            return handle
         message = AdvanceAndPropose(
             batch_id=batch.batch_id,
             keys=tuple(batch.keys[i] for i in handle.active_rows),
@@ -783,6 +878,8 @@ class RemoteDraftSession:
                 self._invalidate(f"connection lost while dispatching: {e}")
                 failure = SpeculatorStatusCode.INTERNAL_ERROR
         if failure is not None:
+            if self._ipc_pending:
+                self._invalidate("CUDA IPC dispatch did not complete")
             # Either nothing reached the server or the connection is gone,
             # so the round is complete without a response to wait for.
             handle.failed_rows.update(self._fail_rows(handle, failure))
@@ -838,6 +935,8 @@ class RemoteDraftSession:
             # The deadline is exhausted. Do not delay fallback with an
             # advisory cancellation write; discard the late result instead.
             self._abandoned_batches.add(handle.batch_id)
+            if self._ipc_pending:
+                self._invalidate("CUDA IPC proposal timed out")
             outcome = HandleState.TIMED_OUT
             statuses = self._fail_rows(handle, SpeculatorStatusCode.TIMEOUT)
         except TransportError as e:
@@ -846,11 +945,14 @@ class RemoteDraftSession:
             )
             statuses = self._fail_rows(handle, SpeculatorStatusCode.INTERNAL_ERROR)
         except RemoteDraftError as e:
+            if self._ipc_pending:
+                self._invalidate("CUDA IPC proposal failed without a completion")
             logger.warning(
                 "Batch %d failed with a session-level error: %s", handle.batch_id, e
             )
             statuses = self._fail_rows(handle, SpeculatorStatusCode.INTERNAL_ERROR)
         else:
+            self._release_ipc()
             statuses, tokens, valid = self._apply_response(handle, response)
         if self._inflight_batch_id == handle.batch_id:
             self._inflight_batch_id = None
@@ -1108,6 +1210,9 @@ class RemoteDraftSession:
                 continue
             if frame.kind == FRAME_DATA:
                 data = decode_data_frame(frame.body)
+                validate_frame(data)
+                if data.cuda_ipc is not None or data.slot in self._inbound:
+                    raise TransportError("unexpected IPC result or duplicate data slot")
                 self._inbound[data.slot] = data
                 continue
             try:
@@ -1170,6 +1275,7 @@ class RemoteDraftSession:
             (SpeculatorStatusCode.TIMEOUT, "not sent before the deadline")
         ] * len(calls)
         pending: dict[int, int] = {}
+        acknowledged = 0
         deadline = self._clock() + self._request_timeout_s
         lost = ""
         try:
@@ -1218,8 +1324,22 @@ class RemoteDraftSession:
                 unanswered = (SpeculatorStatusCode.INTERNAL_ERROR, str(e))
                 break
             results[pending.pop(envelope.request_id)] = (ack.status, ack.detail)
+            acknowledged += 1
         for index in pending.values():
             results[index] = unanswered
+        if self._ipc_pending:
+            if acknowledged == len(calls):
+                self._release_ipc()
+            else:
+                self._invalidate("CUDA IPC prefill did not acknowledge every buffer")
+        if not self._alive:
+            # Earlier ACKs cannot restore state invalidated by a later failure.
+            for index, (status, _) in enumerate(results):
+                if status is SpeculatorStatusCode.OK:
+                    results[index] = (
+                        SpeculatorStatusCode.INTERNAL_ERROR,
+                        "session invalidated after acknowledgement",
+                    )
         return results
 
     def _apply_status(
@@ -1353,8 +1473,43 @@ class RemoteDraftSession:
         ):
             if tensor is not None:
                 rows = sequence_rows if spec.per_sequence else token_rows
-                frames.append(tensor_to_frame(base + i, _select_rows(tensor, rows)))
+                selected = _select_rows(tensor, rows)
+                if (
+                    self._selected_transport == CUDA_IPC_TRANSPORT
+                    and not spec.per_sequence
+                    and selected.is_floating_point()
+                    and selected.numel()
+                ):
+                    if selected.device.type != "cuda":
+                        raise ValueError(
+                            "CUDA IPC floating features must remain on CUDA"
+                        )
+                    try:
+                        if self._ipc_exporter is None:
+                            self.prepare_cuda_ipc(selected.device)
+                        assert self._ipc_exporter is not None
+                        descriptor = self._ipc_exporter.export(selected)
+                    except Exception as exc:
+                        raise _CudaIpcExportError(str(exc)) from exc
+                    self._ipc_pending.append(descriptor)
+                    frames.append(
+                        DataFrame(
+                            slot=base + i,
+                            dtype=str(selected.dtype).removeprefix("torch."),
+                            shape=tuple(selected.shape),
+                            payload=b"",
+                            cuda_ipc=descriptor,
+                        )
+                    )
+                else:
+                    frames.append(tensor_to_frame(base + i, selected))
         return frames
+
+    def _release_ipc(self) -> None:
+        if self._ipc_exporter is not None:
+            for descriptor in self._ipc_pending:
+                self._ipc_exporter.release(descriptor)
+        self._ipc_pending.clear()
 
     def _chunk_length(self, features: FeatureBatch) -> int:
         lengths = {
@@ -1410,11 +1565,22 @@ class RemoteDraftSession:
 
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
+        exporter, self._ipc_exporter = self._ipc_exporter, None
+        if exporter is not None:
+            # A socket close does not prove the peer closed its CUDA mappings.
+            # Keep this bounded pool alive, and prohibit reconnect allocations.
+            self._ipc_pending.clear()
+            self._ipc_poisoned = True
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 logger.exception("Failed to close remote draft connection")
+        if exporter is not None:
+            try:
+                exporter.close()
+            except Exception:
+                logger.exception("Failed to close remote draft CUDA IPC exporter")
 
 
 def _usable_positions(valid: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -1451,10 +1617,7 @@ def _select_rows(tensor: torch.Tensor, rows: torch.Tensor | None) -> torch.Tenso
 
 
 def _checksum(frames: list[DataFrame]) -> int:
-    value = 0
-    for frame in frames:
-        value = zlib.crc32(frame.payload, value)
-    return value & 0x7FFFFFFF
+    return frame_checksum(frames)
 
 
 def _status_from_wire(code: int) -> SpeculatorStatusCode:
