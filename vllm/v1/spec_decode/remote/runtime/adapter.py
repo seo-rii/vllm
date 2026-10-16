@@ -55,6 +55,11 @@ Features = list[torch.Tensor | None]
 class DraftStepExecutor(ABC):
     """Runs planned draft steps on the drafter's device."""
 
+    @property
+    def max_num_tokens(self) -> int | None:
+        """Maximum tokens per execution, or None for an unbounded executor."""
+        return None
+
     @abstractmethod
     def execute(self, plan: DraftStepPlan, features: Features) -> torch.Tensor:
         """Run one draft step and return ``[plan.num_reqs, K]`` draft tokens.
@@ -191,16 +196,33 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             batch_rows.append(i)
             sources.append(source)
 
-        plan, failures = self.planner.plan(rows)
-        for index, (status, _) in failures.items():
-            statuses[batch_rows[index]] = status
-        planned = [
-            (batch_rows[i], sources[i]) for i in range(len(rows)) if i not in failures
-        ]
+        max_num_tokens = self.executor.max_num_tokens
+        groups: list[list[int]] = [[]]
+        num_tokens = 0
+        for i, row in enumerate(rows):
+            if max_num_tokens is not None:
+                if row.num_tokens > max_num_tokens:
+                    statuses[batch_rows[i]] = SpeculatorStatusCode.OUT_OF_MEMORY
+                    continue
+                if num_tokens + row.num_tokens > max_num_tokens:
+                    groups.append([])
+                    num_tokens = 0
+            groups[-1].append(i)
+            num_tokens += row.num_tokens
         token_ids = torch.zeros(
             num_rows, batch.num_speculative_tokens, dtype=torch.int64
         )
-        if planned:
+        for group in groups:
+            plan, failures = self.planner.plan([rows[i] for i in group])
+            for index, (status, _) in failures.items():
+                statuses[batch_rows[group[index]]] = status
+            planned = [
+                (batch_rows[i], sources[i])
+                for index, i in enumerate(group)
+                if index not in failures
+            ]
+            if not planned:
+                continue
             drafts = self.executor.execute(plan, self._step_features(features, planned))
             self.planner.commit(plan)
             row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
