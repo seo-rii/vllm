@@ -3,6 +3,7 @@
 """Standalone own-KV runtime: draft KV pool, step planning, and the
 target-conditioned adapter driven end to end through the server."""
 
+import threading
 from collections import defaultdict
 from dataclasses import replace
 
@@ -15,6 +16,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import (
+    CloseSequence,
     FeatureSlot,
     RemoteServerLimits,
     SequenceKey,
@@ -541,6 +543,50 @@ def test_exhausted_draft_kv_degrades_only_that_request(runtime):
     session.prefill(b, chunk([5]), is_final=True)
     result = round_(session, 0, [b], [0], [], [0], [6])
     assert result.row_statuses == (OK,)
+
+
+def test_repeated_unsent_close_timeouts_return_all_owned_kv(runtime, monkeypatch):
+    session, executor = runtime
+    pool = executor.pool
+    free_blocks = pool.num_free_blocks
+    reclaimed = threading.Event()
+    release = pool.release
+
+    def release_blocks(req_index):
+        release(req_index)
+        if pool.num_free_blocks == free_blocks:
+            reclaimed.set()
+
+    monkeypatch.setattr(pool, "release", release_blocks)
+    send = session._send
+
+    def expire_before_send(message, **kwargs):
+        if isinstance(message, CloseSequence):
+            kwargs["deadline"] = session._clock() - 1
+        return send(message, **kwargs)
+
+    previous_generation = -1
+    for _ in range(3):
+        key = session.open_sequence(1)
+        assert key.generation > previous_generation
+        previous_generation = key.generation
+        session.prefill(key, chunk([1, 2, 3], lookahead=4), is_final=False)
+        assert pool.num_free_blocks < free_blocks
+        reclaimed.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "_send", expire_before_send)
+            session.close_sequences((key,))
+        assert not session.connected
+        assert reclaimed.wait(2), "connection cleanup retained draft KV"
+        assert pool.num_free_blocks == free_blocks
+        session.connect()
+
+    fresh = session.open_sequence(1)
+    session.prefill(fresh, chunk(list(range(20)), lookahead=20), is_final=False)
+    assert session.sequence_state(fresh) is SequenceState.PREFILLING
+    assert executor.plans[-1].num_tokens == 20
+    session.close_sequences((fresh,))
+    assert pool.num_free_blocks == free_blocks
 
 
 def test_request_slots_beyond_the_runtime_are_queue_full(runtime):
