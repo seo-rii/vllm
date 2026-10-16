@@ -3,9 +3,9 @@
 """Standalone speculator server: sessions, sequence registry, and the
 adapter contract a concrete drafter implements.
 
-The server never operates on tensors, so protocol and registry logic can
-be tested without a GPU; adapters receive and return data-plane frames and
-do their own device handling. Requests on one connection are processed serially,
+Protocol and registry logic can be tested without a GPU. An adapter may opt
+into CUDA IPC features, copied into receiver-owned tensors before delivery.
+Requests on one connection are processed serially,
 which yields the initial invariants directly: no two proposals run on the
 same sequence at once, batch IDs increase monotonically per session, and
 a response is only sent after its result frames.
@@ -17,11 +17,10 @@ import itertools
 import threading
 import time
 import uuid
-import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterator
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 
@@ -31,6 +30,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
+from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcReceiver
 from vllm.v1.spec_decode.remote.protocol import (
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
@@ -59,15 +59,18 @@ from vllm.v1.spec_decode.remote.protocol import (
 )
 from vllm.v1.spec_decode.remote.state import SequenceState
 from vllm.v1.spec_decode.remote.transport import (
+    CUDA_IPC_TRANSPORT,
     FRAME_CONTROL,
     INLINE_TRANSPORT,
     ConnectionClosed,
     DataFrame,
+    DeviceFeature,
     FramedConnection,
     Listener,
     TransportError,
     TransportTimeout,
     decode_data_frame,
+    frame_checksum,
     frame_to_ints,
     ints_to_frame,
     is_local_endpoint,
@@ -75,6 +78,9 @@ from vllm.v1.spec_decode.remote.transport import (
     validate_frame,
     validate_integer_frame,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 logger = init_logger(__name__)
 
@@ -84,8 +90,6 @@ DEFAULT_LIMITS = RemoteServerLimits(
     max_sequences=1024,
     max_model_len=32768,
 )
-SUPPORTED_TRANSPORTS = (INLINE_TRANSPORT,)
-
 _ACCEPT_POLL_S = 0.2
 _RESULT_FRAMES = 3
 # Input frames an AdvanceAndPropose may reference besides its feature
@@ -157,7 +161,7 @@ class PrefillInputs:
     offset: int
     num_tokens: int
     is_final: bool
-    features: tuple[DataFrame | None, ...]
+    features: tuple[DataFrame | DeviceFeature | None, ...]
 
 
 @dataclass(frozen=True)
@@ -180,7 +184,7 @@ class StandaloneProposalBatch:
     num_speculative_tokens: int
     accepted_counts: DataFrame
     recovery_tokens: DataFrame
-    features: tuple[DataFrame | None, ...]
+    features: tuple[DataFrame | DeviceFeature | None, ...]
     query_lens: tuple[int, ...]
     effective_num_speculative_tokens: int | None = None
     """This round's budget; num_speculative_tokens remains the result width."""
@@ -216,6 +220,10 @@ class StandaloneDraftAdapter(ABC):
 
     def draft_checkpoint_fingerprint(self) -> str:
         return ""
+
+    def cuda_ipc_device(self) -> "torch.device | None":
+        """Opt into CUDA feature imports on this adapter's device."""
+        return None
 
     def warmup(self) -> None:  # noqa: B027
         """Compile and capture before the server accepts connections, so the
@@ -306,7 +314,7 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
 
     def prefill(self, key: SequenceKey, inputs: PrefillInputs) -> None:
         tokens = inputs.features[0]
-        assert tokens is not None
+        assert isinstance(tokens, DataFrame)
         self._prefixes[key].extend(frame_to_ints(tokens))
 
     def advance_and_propose(
@@ -317,6 +325,7 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
         self.proposed_batches.append(batch.batch_id)
         token_ids = batch.features[0]
         if token_ids is not None:
+            assert isinstance(token_ids, DataFrame)
             values = frame_to_ints(token_ids)
             start = 0
             for i, length in enumerate(batch.query_lens):
@@ -626,6 +635,16 @@ class RemoteDraftServer:
         return self._listener.endpoint if self._listener is not None else None
 
     @property
+    def supported_transports(self) -> tuple[str, ...]:
+        if (
+            self.endpoint is not None
+            and self.endpoint.startswith("unix://")
+            and self.adapter.cuda_ipc_device() is not None
+        ):
+            return (INLINE_TRANSPORT, CUDA_IPC_TRANSPORT)
+        return (INLINE_TRANSPORT,)
+
+    @property
     def queue_depth(self) -> int:
         """Adapter calls running or waiting for their turn."""
         return self._queue_depth
@@ -692,7 +711,7 @@ class RemoteDraftServer:
             sorted(self.adapter.supported_methods()),
             self.adapter.draft_checkpoint_fingerprint(),
             list(capabilities.required_features),
-            list(SUPPORTED_TRANSPORTS),
+            list(self.supported_transports),
             self.limits.max_batch_size,
             self.limits.max_model_len,
         )
@@ -779,6 +798,10 @@ class _ServerSession:
         self.next_result_slot = 0
         self.cancelled_batches = 0
         self.max_pending_frames = 0
+        self.selected_transport = ""
+        self.ipc_receiver: CudaIpcReceiver | None = None
+        self._ipc_buffers: set[tuple[str, int]] = set()
+        self._ipc_ranges: dict[tuple[str, bytes], list[tuple[int, int]]] = {}
 
     def run(self) -> None:
         if not self._handshake():
@@ -798,12 +821,40 @@ class _ServerSession:
                 # Frames precede the message that consumes them, so whatever
                 # it left behind can never be referenced again.
                 self.inbound.clear()
+                self._ipc_buffers.clear()
+                self._ipc_ranges.clear()
                 continue
             try:
                 data = decode_data_frame(frame.body)
+                if data.slot in self.inbound:
+                    raise TransportError(f"duplicate data slot {data.slot}")
+                if (
+                    data.cuda_ipc is not None
+                    and self.selected_transport != CUDA_IPC_TRANSPORT
+                ):
+                    raise TransportError("CUDA IPC was not negotiated")
+                if data.cuda_ipc is not None:
+                    validate_frame(data)
+                    descriptor = data.cuda_ipc
+                    buffer = (descriptor.device_uuid, descriptor.buffer_id)
+                    if buffer in self._ipc_buffers:
+                        raise TransportError("duplicate CUDA IPC buffer in one message")
+                    self._ipc_buffers.add(buffer)
+                    allocation = (descriptor.device_uuid, descriptor.memory_handle)
+                    ranges = self._ipc_ranges.setdefault(allocation, [])
+                    start = descriptor.offset_bytes
+                    end = start + descriptor.nbytes
+                    if any(
+                        start < old_end and old_start < end
+                        for old_start, old_end in ranges
+                    ):
+                        raise TransportError(
+                            "overlapping CUDA IPC buffers in one message"
+                        )
+                    ranges.append((start, end))
             except TransportError as e:
                 self._send(ErrorReply(SpeculatorStatusCode.PROTOCOL_ERROR, str(e)), 0)
-                continue
+                return
             self.inbound[data.slot] = data
             if len(self.inbound) > self.max_pending_frames:
                 self._send(
@@ -817,12 +868,16 @@ class _ServerSession:
                 return
 
     def cleanup(self) -> None:
-        if not self.session_id:
-            return
-        with self.server.adapter_turn():
-            keys = self.server.registry.close_all(self.session_id)
-            if keys and self.server.healthy:
-                self.server.adapter.close_sequences(keys)
+        receiver, self.ipc_receiver = self.ipc_receiver, None
+        try:
+            if receiver is not None:
+                receiver.close()
+        finally:
+            if self.session_id:
+                with self.server.adapter_turn():
+                    keys = self.server.registry.close_all(self.session_id)
+                    if keys and self.server.healthy:
+                        self.server.adapter.close_sequences(keys)
 
     # -- handshake -------------------------------------------------------
 
@@ -870,8 +925,11 @@ class _ServerSession:
             )
             return False
         selected = next(
-            t for t in message.supported_transports if t in SUPPORTED_TRANSPORTS
+            t
+            for t in message.supported_transports
+            if t in self.server.supported_transports
         )
+        self.selected_transport = selected
         self.session_id = uuid.uuid4().hex
         self.session_epoch = self.server.next_epoch()
         self.verifier_instance_id = message.verifier_instance_id
@@ -934,11 +992,13 @@ class _ServerSession:
                 f"server's {expected_draft!r}"
             )
         reasons.extend(limit_shortfalls(hello, server.limits))
-        if not any(t in SUPPORTED_TRANSPORTS for t in hello.supported_transports):
+        if not any(
+            t in server.supported_transports for t in hello.supported_transports
+        ):
             reasons.append(
                 f"no common transport: verifier offers "
                 f"{list(hello.supported_transports)}, server supports "
-                f"{list(SUPPORTED_TRANSPORTS)}"
+                f"{list(server.supported_transports)}"
             )
         return reasons
 
@@ -1130,19 +1190,25 @@ class _ServerSession:
                 status = SpeculatorStatusCode.INTERNAL_ERROR
                 detail, apply = "draft runtime is unhealthy", False
             if apply:
-                failure = self._call_adapter(
-                    self.server.adapter.prefill,
-                    key,
-                    PrefillInputs(
-                        offset=message.offset,
-                        num_tokens=message.num_tokens,
-                        is_final=message.is_final,
-                        features=tuple(frames),
-                    ),
-                )
-                if failure is not None:
+                try:
+                    resolved = self._resolve_features(frames)
+                except (TransportError, RuntimeError) as e:
                     self._discard_owned_sequences((key,))
-                    status, detail = failure
+                    status, detail = SpeculatorStatusCode.INTERNAL_ERROR, str(e)
+                else:
+                    failure = self._call_adapter(
+                        self.server.adapter.prefill,
+                        key,
+                        PrefillInputs(
+                            offset=message.offset,
+                            num_tokens=message.num_tokens,
+                            is_final=message.is_final,
+                            features=resolved,
+                        ),
+                    )
+                    if failure is not None:
+                        self._discard_owned_sequences((key,))
+                        status, detail = failure
         self._ack(key, request_id, status, detail)
 
     def _call_adapter(
@@ -1308,7 +1374,7 @@ class _ServerSession:
                             num_speculative_tokens=num_tokens,
                             accepted_counts=accepted,
                             recovery_tokens=recovery,
-                            features=tuple(frames),
+                            features=self._resolve_features(frames),
                             query_lens=tuple(query_lens),
                             effective_num_speculative_tokens=effective_k,
                         )
@@ -1418,6 +1484,38 @@ class _ServerSession:
     def _take_frames(self, base: int, count: int) -> list[DataFrame | None]:
         return [self.inbound.pop(base + i, None) for i in range(count)]
 
+    def _resolve_features(
+        self, frames: list[DataFrame | None]
+    ) -> tuple[DataFrame | DeviceFeature | None, ...]:
+        resolved: list[DataFrame | DeviceFeature | None] = []
+        for frame in frames:
+            if frame is None or frame.cuda_ipc is None:
+                resolved.append(frame)
+                continue
+            if self.ipc_receiver is None:
+                device = self.server.adapter.cuda_ipc_device()
+                if device is None or self.selected_transport != CUDA_IPC_TRANSPORT:
+                    raise TransportError("CUDA IPC is unavailable for this adapter")
+                slots = len(self.server.adapter.feature_schema().slots)
+                self.ipc_receiver = CudaIpcReceiver(
+                    device,
+                    max_buffers=min(
+                        4096, max(16, (self.server.limits.max_batch_size + 1) * slots)
+                    ),
+                    max_bytes=1 << 30,
+                )
+            try:
+                tensor = self.ipc_receiver.receive(
+                    frame.cuda_ipc, frame.dtype, frame.shape
+                )
+            except Exception:
+                # Do not acknowledge a lease when completion of a device copy
+                # is uncertain. The exporter must quarantine it on disconnect.
+                self.conn.close()
+                raise
+            resolved.append(DeviceFeature(frame.slot, frame.dtype, frame.shape, tensor))
+        return tuple(resolved)
+
 
 def _frame_problems(
     frames: list[DataFrame | None],
@@ -1477,11 +1575,7 @@ def _result_well_formed(
 
 
 def _checksum(frames: list[DataFrame | None]) -> int:
-    value = 0
-    for frame in frames:
-        if frame is not None:
-            value = zlib.crc32(frame.payload, value)
-    return value & 0x7FFFFFFF
+    return frame_checksum(frames)
 
 
 # ----------------------------------------------------------------------
