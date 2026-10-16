@@ -950,6 +950,98 @@ def test_ping_answers_while_the_adapter_is_busy(server, adapter, client):
     assert server.queue_depth == 0
 
 
+@pytest.mark.parametrize("failure", ["queue_full", "adapter", "malformed_result"])
+def test_slow_error_reply_does_not_block_another_session_cleanup(
+    server, adapter, client, monkeypatch, failure
+):
+    client.hello()
+    failed_key = key(80)
+    if failure != "queue_full":
+        client.ready(failed_key)
+    other = RawClient(server.endpoint)
+    other.hello(verifier_instance_id="verifier-b")
+    other_key = key(81, verifier="verifier-b")
+    other.ready(other_key)
+    if failure == "queue_full":
+        server.limits = RemoteServerLimits(
+            max_batch_size=DEFAULT_LIMITS.max_batch_size,
+            max_feature_tokens=DEFAULT_LIMITS.max_feature_tokens,
+            max_sequences=1,
+            max_model_len=DEFAULT_LIMITS.max_model_len,
+        )
+    else:
+        propose = adapter.advance_and_propose
+
+        def fail_proposal(batch):
+            if failure == "adapter":
+                raise RuntimeError("injected adapter failure")
+            result = propose(batch)
+            return dataclasses.replace(result, valid_lengths=ints_to_frame(0, []))
+
+        monkeypatch.setattr(adapter, "advance_and_propose", fail_proposal)
+
+    sending = threading.Event()
+    release = threading.Event()
+    cleaned = threading.Event()
+    replies = []
+    errors = []
+    send = server_module._ServerSession._send
+
+    def slow_error_reply(session, message, request_id, **kwargs):
+        if session.session_id == client.session_id and message.status is not OK:
+            sending.set()
+            if not release.wait(timeout=5.0):
+                raise TimeoutError("error reply was not released")
+        return send(session, message, request_id, **kwargs)
+
+    monkeypatch.setattr(server_module._ServerSession, "_send", slow_error_reply)
+
+    def reject():
+        try:
+            replies.append(
+                client.open(failed_key)
+                if failure == "queue_full"
+                else client.propose(0, [failed_key], recovery=[1])
+            )
+        except Exception as error:
+            errors.append(error)
+
+    def cleanup():
+        try:
+            reply = other.call(CloseSequence(keys=(other_key,)))
+            assert reply.status is OK
+            cleaned.set()
+        except Exception as error:
+            errors.append(error)
+
+    rejected = threading.Thread(target=reject)
+    closing = threading.Thread(target=cleanup)
+    try:
+        rejected.start()
+        assert sending.wait(timeout=5.0)
+        if failure != "queue_full":
+            assert server.registry.get(failed_key) is None
+            assert adapter.prefix(failed_key) is None
+        closing.start()
+        assert cleaned.wait(timeout=2.0)
+        assert server.registry.get(other_key) is None
+        assert adapter.prefix(other_key) is None
+    finally:
+        release.set()
+        rejected.join(timeout=5.0)
+        if closing.ident is not None:
+            closing.join(timeout=5.0)
+        other.close()
+    assert not rejected.is_alive() and not closing.is_alive()
+    assert not errors
+    expected = (
+        SpeculatorStatusCode.QUEUE_FULL
+        if failure == "queue_full"
+        else SpeculatorStatusCode.INTERNAL_ERROR
+    )
+    assert len(replies) == 1 and replies[0].status is expected
+
+
 def test_warmup_runs_before_the_endpoint_accepts():
     seen: list[str | None] = []
 

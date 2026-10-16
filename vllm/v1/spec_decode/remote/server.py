@@ -982,19 +982,16 @@ class _ServerSession:
                 not registry.has_identity(key)
                 and len(registry) >= server.limits.max_sequences
             ):
-                self._ack(
-                    key,
-                    request_id,
-                    SpeculatorStatusCode.QUEUE_FULL,
-                    f"max_sequences={server.limits.max_sequences} reached",
-                )
-                return
-            outcome = registry.open(key, owner=self.session_id)
-            if outcome.created:
-                if outcome.replaced is not None:
-                    server.adapter.close_sequences((outcome.replaced,))
-                server.adapter.open_sequence(key)
-        self._ack(key, request_id, outcome.status, outcome.detail)
+                status = SpeculatorStatusCode.QUEUE_FULL
+                detail = f"max_sequences={server.limits.max_sequences} reached"
+            else:
+                outcome = registry.open(key, owner=self.session_id)
+                status, detail = outcome.status, outcome.detail
+                if outcome.created:
+                    if outcome.replaced is not None:
+                        server.adapter.close_sequences((outcome.replaced,))
+                    server.adapter.open_sequence(key)
+        self._ack(key, request_id, status, detail)
 
     def _prefill(self, message: PrefillChunk, request_id: int) -> None:
         key = message.key
@@ -1154,6 +1151,7 @@ class _ServerSession:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
 
+        failure: str | None = None
         with self.server.adapter_turn():
             registry = self.server.registry
             begun = [
@@ -1196,32 +1194,29 @@ class _ServerSession:
                         self.session_id,
                         message.batch_id,
                     )
-                    self._discard_owned_sequences(active_keys)
-                    fail(SpeculatorStatusCode.INTERNAL_ERROR, "adapter raised")
-                    return
-                if not _result_well_formed(result, num_rows, num_tokens):
-                    self._discard_owned_sequences(active_keys)
-                    fail(
-                        SpeculatorStatusCode.INTERNAL_ERROR,
-                        "adapter returned a malformed result",
-                    )
-                    return
-                for i in active:
-                    row_statuses[i] = result.row_statuses[i]
-                    if row_statuses[i] is SpeculatorStatusCode.OK:
-                        registry.advance(
-                            message.keys[i],
-                            accepted_counts[i],
-                            owner=self.session_id,
+                    failure = "adapter raised"
+                else:
+                    if not _result_well_formed(result, num_rows, num_tokens):
+                        failure = "adapter returned a malformed result"
+                    else:
+                        for i in active:
+                            row_statuses[i] = result.row_statuses[i]
+                            if row_statuses[i] is SpeculatorStatusCode.OK:
+                                registry.advance(
+                                    message.keys[i],
+                                    accepted_counts[i],
+                                    owner=self.session_id,
+                                )
+                        valid_lengths = frame_to_ints(result.valid_lengths)
+                        for i, status in enumerate(row_statuses):
+                            if status is not SpeculatorStatusCode.OK:
+                                valid_lengths[i] = 0
+                        tokens = result.token_ids
+                        valid = ints_to_frame(
+                            0, valid_lengths, dtype=result.valid_lengths.dtype
                         )
-                valid_lengths = frame_to_ints(result.valid_lengths)
-                for i, status in enumerate(row_statuses):
-                    if status is not SpeculatorStatusCode.OK:
-                        valid_lengths[i] = 0
-                tokens = result.token_ids
-                valid = ints_to_frame(
-                    0, valid_lengths, dtype=result.valid_lengths.dtype
-                )
+                if failure is not None:
+                    self._discard_owned_sequences(active_keys)
             else:
                 tokens = ints_to_frame(
                     0,
@@ -1234,6 +1229,9 @@ class _ServerSession:
                 if began is SpeculatorStatusCode.OK and status is not began:
                     registry.desync(seq_key, owner=self.session_id)
 
+        if failure is not None:
+            fail(SpeculatorStatusCode.INTERNAL_ERROR, failure)
+            return
         base = self.next_result_slot
         self.next_result_slot += _RESULT_FRAMES
         self._send(
