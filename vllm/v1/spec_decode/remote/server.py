@@ -1397,7 +1397,7 @@ def _checksum(frames: list[DataFrame | None]) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Serve a fake drafter; model adapters register here once they exist."""
+    """Serve a test adapter or a standalone GPU speculator."""
     parser = argparse.ArgumentParser(
         description="Standalone speculator server for remote draft placement."
     )
@@ -1405,7 +1405,10 @@ def main(argv: list[str] | None = None) -> None:
         "--endpoint", required=True, help="tcp://host:port or unix:///path"
     )
     parser.add_argument(
-        "--adapter", choices=("fake",), default="fake", help="drafter adapter to serve"
+        "--adapter",
+        choices=("fake", "gpu"),
+        default="fake",
+        help="drafter adapter to serve",
     )
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--target-fingerprint", default="")
@@ -1416,15 +1419,45 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--max-model-len", type=int, default=DEFAULT_LIMITS.max_model_len
     )
+    parser.add_argument(
+        "--max-feature-tokens", type=int, default=DEFAULT_LIMITS.max_feature_tokens
+    )
+    parser.add_argument("--target-model")
+    parser.add_argument("--draft-model")
+    parser.add_argument("--method", choices=("eagle3", "mtp"), default="eagle3")
+    parser.add_argument("--num-speculative-tokens", type=int, default=3)
+    parser.add_argument("--target-revision")
+    parser.add_argument("--draft-revision")
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--draft-kv-cache-gib", type=float, default=4.0)
+    parser.add_argument("--shared-weights-source", default="auto")
+    parser.add_argument("--attention-backend", default="FLASH_ATTN")
+    parser.add_argument("--target-attention-backend")
+    parser.add_argument("--moe-backend", default="auto")
+    parser.add_argument("--block-size", type=int, default=16)
     args = parser.parse_args(argv)
     limits = RemoteServerLimits(
         max_batch_size=args.max_batch_size,
-        max_feature_tokens=DEFAULT_LIMITS.max_feature_tokens,
-        max_sequences=DEFAULT_LIMITS.max_sequences,
+        max_feature_tokens=args.max_feature_tokens,
+        max_sequences=(
+            args.max_batch_size
+            if args.adapter == "gpu"
+            else DEFAULT_LIMITS.max_sequences
+        ),
         max_model_len=args.max_model_len,
     )
+    adapter: StandaloneDraftAdapter
+    if args.adapter == "gpu":
+        from vllm.v1.spec_decode.remote.runtime.cli import create_gpu_adapter
+
+        adapter, contract = create_gpu_adapter(args)
+        args.target_fingerprint = contract.target_fingerprint
+        args.tokenizer_fingerprint = contract.tokenizer_fingerprint
+    else:
+        adapter = FakeDraftAdapter(vocab_size=args.vocab_size)
     server = RemoteDraftServer(
-        FakeDraftAdapter(vocab_size=args.vocab_size),
+        adapter,
         limits=limits,
         target_fingerprint=args.target_fingerprint,
         tokenizer_fingerprint=args.tokenizer_fingerprint,
@@ -1442,4 +1475,8 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Adapters import the canonical module's AdapterError. Use its main too,
+    # so `python -m` does not catch a distinct __main__.AdapterError class.
+    from vllm.v1.spec_decode.remote.server import main as canonical_main
+
+    canonical_main()
