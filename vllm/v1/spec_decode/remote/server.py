@@ -709,9 +709,17 @@ class RemoteDraftServer:
         except Exception:
             logger.exception("Remote draft session %s crashed", session.session_id)
         finally:
-            session.cleanup()
-            conn.close()
-            self._connections.discard(conn)
+            try:
+                session.cleanup()
+            except Exception:
+                logger.exception(
+                    "Failed to clean up remote draft session %s", session.session_id
+                )
+            finally:
+                try:
+                    conn.close()
+                finally:
+                    self._connections.discard(conn)
 
 
 class _ServerSession:
@@ -800,15 +808,16 @@ class _ServerSession:
                 return
 
     def cleanup(self) -> None:
-        if self.ipc_receiver is not None:
-            self.ipc_receiver.close()
-            self.ipc_receiver = None
-        if not self.session_id:
-            return
-        with self.server.adapter_turn():
-            keys = self.server.registry.close_all(self.session_id)
-            if keys:
-                self.server.adapter.close_sequences(keys)
+        receiver, self.ipc_receiver = self.ipc_receiver, None
+        try:
+            if receiver is not None:
+                receiver.close()
+        finally:
+            if self.session_id:
+                with self.server.adapter_turn():
+                    keys = self.server.registry.close_all(self.session_id)
+                    if keys:
+                        self.server.adapter.close_sequences(keys)
 
     # -- handshake -------------------------------------------------------
 

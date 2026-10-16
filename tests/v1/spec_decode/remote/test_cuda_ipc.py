@@ -206,6 +206,128 @@ def test_even_acknowledged_arena_survives_disconnect_until_peer_closed(runtime):
         exporter.export(_Tensor())
 
 
+@pytest.mark.parametrize("fail_operation", ["destroy_event", "free"])
+def test_exporter_cleanup_attempts_all_resources_and_quarantines_failures(
+    runtime, monkeypatch, fail_operation
+):
+    exporter = ipc.CudaIpcExporter("cuda:0", max_bytes=1024)
+    first = exporter.export(_Tensor())
+    second = exporter.export(_Tensor())
+    exporter.release(first)
+    exporter.release(second)
+    events = [buffer.event for buffer in exporter.buffers]
+    original = getattr(runtime, fail_operation)
+
+    def fail_once(handle):
+        original(handle)
+        if fail_operation == "free" or handle == events[0]:
+            raise ipc.CudaIpcError("injected release failure")
+
+    monkeypatch.setattr(runtime, fail_operation, fail_once)
+    runtime.calls.clear()
+    with pytest.raises(ipc.CudaIpcError, match="injected release failure"):
+        exporter.close(peer_closed=True)
+    assert runtime.calls == [
+        *(("destroy_event", event) for event in events),
+        ("free", 65536),
+    ]
+    assert exporter.closed
+    failed_handle = events[0] if fail_operation == "destroy_event" else 65536
+    assert [
+        (runtime, exporter.device, [(fail_operation, failed_handle)])
+    ] == ipc._QUARANTINE
+    # CUDA release may have partially succeeded; never retry an uncertain handle.
+    calls = runtime.calls.copy()
+    exporter.close(peer_closed=True)
+    assert runtime.calls == calls
+
+
+@pytest.mark.parametrize("fail_operation", ["destroy_event", "close_memory"])
+def test_receiver_cleanup_attempts_all_resources_and_quarantines_failures(
+    runtime, monkeypatch, fail_operation
+):
+    receiver = ipc.CudaIpcReceiver("cuda:0", max_bytes=1024)
+    receiver.receive(_descriptor(), "float32", (2, 4))
+    original = getattr(runtime, fail_operation)
+
+    def fail_once(handle):
+        original(handle)
+        if fail_operation == "close_memory" or handle == 100:
+            raise ipc.CudaIpcError("injected release failure")
+
+    monkeypatch.setattr(runtime, fail_operation, fail_once)
+    runtime.calls.clear()
+    with pytest.raises(ipc.CudaIpcError, match="injected release failure"):
+        receiver.close()
+    assert runtime.calls == [
+        ("destroy_event", 100),
+        ("close_memory", 131072),
+        ("destroy_event", receiver.done_event),
+    ]
+    assert receiver.closed
+    failed_handle = 100 if fail_operation == "destroy_event" else 131072
+    assert [
+        (runtime, receiver.device, [(fail_operation, failed_handle)])
+    ] == ipc._QUARANTINE
+    calls = runtime.calls.copy()
+    receiver.close()
+    assert runtime.calls == calls
+
+
+def test_receiver_cleanup_reports_multiple_failures_after_attempting_every_release(
+    runtime, monkeypatch
+):
+    receiver = ipc.CudaIpcReceiver("cuda:0", max_bytes=1024)
+    receiver.receive(_descriptor(), "float32", (2, 4))
+
+    def fail_event(event):
+        runtime.calls.append(("destroy_event", event))
+        raise ipc.CudaIpcError("event release failed")
+
+    def fail_memory(ptr):
+        runtime.calls.append(("close_memory", ptr))
+        raise ipc.CudaIpcError("memory release failed")
+
+    monkeypatch.setattr(runtime, "destroy_event", fail_event)
+    monkeypatch.setattr(runtime, "close_memory", fail_memory)
+    runtime.calls.clear()
+    with pytest.raises(ipc.CudaIpcError) as error:
+        receiver.close()
+    assert "event release failed" in str(error.value)
+    assert "memory release failed" in str(error.value)
+    assert runtime.calls == [
+        ("destroy_event", 100),
+        ("close_memory", 131072),
+        ("destroy_event", receiver.done_event),
+    ]
+    assert [(runtime, receiver.device, runtime.calls)] == ipc._QUARANTINE
+
+
+@pytest.mark.parametrize("owner", ["exporter", "receiver"])
+def test_cleanup_device_context_failure_quarantines_unreleased_resources(
+    runtime, monkeypatch, owner
+):
+    pool: ipc.CudaIpcExporter | ipc.CudaIpcReceiver
+    if owner == "exporter":
+        pool = ipc.CudaIpcExporter("cuda:0", max_bytes=1024)
+    else:
+        pool = ipc.CudaIpcReceiver("cuda:0", max_bytes=1024)
+        pool.receive(_descriptor(), "float32", (2, 4))
+
+    @contextlib.contextmanager
+    def unavailable_device(*_):
+        raise ipc.CudaIpcError("device unavailable during close")
+        yield
+
+    monkeypatch.setattr(torch.accelerator, "device_index", unavailable_device)
+    runtime.calls.clear()
+    with pytest.raises(ipc.CudaIpcError, match="device unavailable"):
+        pool.close()
+    assert runtime.calls == []
+    assert pool.closed
+    assert len(ipc._QUARANTINE) == 1
+
+
 def test_receive_copies_into_independent_storage_and_reuses_imports(runtime):
     receiver = ipc.CudaIpcReceiver("cuda:0", max_bytes=1024)
     first = receiver.receive(_descriptor(), "float32", (2, 4))

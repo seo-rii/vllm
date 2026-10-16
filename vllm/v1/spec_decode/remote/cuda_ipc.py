@@ -246,6 +246,35 @@ def _limits(max_buffers: int, max_bytes: int) -> None:
         raise ValueError("invalid CUDA IPC pool limits")
 
 
+def _close_resources(
+    torch: Any,
+    device: Any,
+    runtime: _CudaRuntime,
+    resources: list[tuple[str, int]],
+) -> None:
+    """Release independent, idle resources and retain uncertain handles."""
+    remaining = resources.copy()
+    errors: list[tuple[str, Exception]] = []
+    try:
+        with torch.accelerator.device_index(device.index):
+            for operation, handle in resources:
+                try:
+                    getattr(runtime, operation)(handle)
+                except Exception as exc:
+                    errors.append((operation, exc))
+                else:
+                    remaining.remove((operation, handle))
+    finally:
+        if remaining:
+            # A failing CUDA release may have partially succeeded. Do not retry
+            # uncertain handles, but retain them and any unattempted resources
+            # until context teardown, including when entering the device fails.
+            _QUARANTINE.append((runtime, device, remaining))
+    if errors:
+        detail = "; ".join(f"{operation}: {exc}" for operation, exc in errors)
+        raise CudaIpcError(f"CUDA IPC cleanup failed: {detail}") from errors[0][1]
+
+
 @dataclass
 class _ExportBuffer:
     buffer_id: int
@@ -380,14 +409,11 @@ class CudaIpcExporter:
         ):
             self.quarantine()
             return
-        with self.torch.accelerator.device_index(self.device.index):
-            try:
-                for buffer in self.buffers:
-                    self.runtime.destroy_event(buffer.event)
-                self.runtime.free(self.ptr)
-            finally:
-                self.closed = True
-                self.buffers = []
+        resources = [("destroy_event", buffer.event) for buffer in self.buffers]
+        resources.append(("free", self.ptr))
+        self.closed = True
+        self.buffers = []
+        _close_resources(self.torch, self.device, self.runtime, resources)
 
 
 @dataclass
@@ -498,13 +524,12 @@ class CudaIpcReceiver:
     def close(self) -> None:
         if self.closed:
             return
-        with self.torch.accelerator.device_index(self.device.index):
-            try:
-                for buffer in self.buffers.values():
-                    self.runtime.destroy_event(buffer.event)
-                if self.ptr is not None:
-                    self.runtime.close_memory(self.ptr)
-                self.runtime.destroy_event(self.done_event)
-            finally:
-                self.buffers = {}
-                self.closed = True
+        resources = [
+            ("destroy_event", buffer.event) for buffer in self.buffers.values()
+        ]
+        if self.ptr is not None:
+            resources.append(("close_memory", self.ptr))
+        resources.append(("destroy_event", self.done_event))
+        self.closed = True
+        self.buffers = {}
+        _close_resources(self.torch, self.device, self.runtime, resources)
