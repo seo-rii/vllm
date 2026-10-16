@@ -260,6 +260,81 @@ def test_unimplemented_transport_is_rejected():
         RemoteDraftSession("tcp://127.0.0.1:1", IDENTITY, transport="zmq")
 
 
+def test_cuda_ipc_requires_unix_socket_before_connecting():
+    with pytest.raises(ValueError, match="UNIX socket"):
+        RemoteDraftSession("tcp://127.0.0.1:1", IDENTITY, transport="cuda_ipc")
+
+
+def test_ipc_prefill_releases_leases_only_after_all_acknowledgements(
+    session, monkeypatch
+):
+    keys = (session.open_sequence(1), session.open_sequence(2))
+    exporter = Mock()
+    leases = [Mock(), Mock()]
+    session._ipc_exporter = exporter
+    session._ipc_pending.extend(leases)
+    original = session._await
+    seen = 0
+
+    def await_ack(*args, **kwargs):
+        nonlocal seen
+        exporter.release.assert_not_called()
+        reply = original(*args, **kwargs)
+        seen += 1
+        return reply
+
+    monkeypatch.setattr(session, "_await", await_ack)
+    session.prefill_many([(key, features([1]), True) for key in keys])
+    assert seen == 2
+    assert [call.args[0] for call in exporter.release.call_args_list] == leases
+    assert not session._ipc_pending
+
+
+def test_ipc_prefill_timeout_quarantines_instead_of_reusing_lease(session, monkeypatch):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    key = session.open_sequence(1)
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    monkeypatch.setattr(session, "_await", Mock(side_effect=TransportTimeout("late")))
+    session.prefill(key, features([1]), is_final=True)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert not session.connected
+    assert not session.maybe_reconnect()
+
+
+def test_ipc_decode_releases_only_after_proposal_response(session, monkeypatch):
+    key = ready(session, 1)
+    exporter = Mock()
+    lease = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(lease)
+    handle = session.dispatch(batch(0, [key], recovery=[4]))
+    exporter.release.assert_not_called()
+    result = session.collect(handle)
+    exporter.release.assert_called_once_with(lease)
+    assert result.output.valid_lengths.tolist() == [NUM_SPEC_TOKENS]
+
+
+def test_ipc_decode_timeout_invalidates_and_quarantines(session, monkeypatch):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    key = ready(session, 1)
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    handle = session.dispatch(batch(0, [key], recovery=[4]))
+    monkeypatch.setattr(session, "_await", Mock(side_effect=TransportTimeout("late")))
+    result = session.collect(handle)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert result.output.valid_lengths.tolist() == [0]
+    assert not session.connected
+    assert not session.maybe_reconnect()
+
+
 # ----------------------------------------------------------------------
 # Proposal rounds
 # ----------------------------------------------------------------------

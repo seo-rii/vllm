@@ -25,7 +25,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR = 1
 
 # Field-level range constraints are enforced by msgspec on decode, so a
 # peer cannot deliver negative identifiers or degenerate shapes. Checks
