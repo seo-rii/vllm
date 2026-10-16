@@ -123,6 +123,11 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             )
 
     def prefill(self, key: SequenceKey, inputs: PrefillInputs) -> None:
+        if inputs.num_tokens <= 0:
+            raise AdapterError(
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                "a prompt chunk must contain at least one token",
+            )
         features = _tensors(inputs.features)
         if inputs.is_final:
             self._last_chunks[key] = (inputs.num_tokens, features)

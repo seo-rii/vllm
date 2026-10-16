@@ -455,6 +455,26 @@ def test_prompt_chunk_without_lookahead_is_refused(runtime):
     assert session.sequence_state(a) is SequenceState.TARGET_ONLY
 
 
+@pytest.mark.parametrize("is_final", [False, True])
+def test_empty_prompt_chunk_only_degrades_that_request(runtime, is_final):
+    session, executor = runtime
+    a, b = session.open_sequence(1), session.open_sequence(2)
+    session.prefill_many(
+        [
+            (a, chunk([], lookahead=None if is_final else 9), is_final),
+            (b, chunk([11, 12]), True),
+        ]
+    )
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    assert session.sequence_state(b) is SequenceState.READY
+
+    result = round_(session, 0, [a, b], [0, 0], [], [0, 0], [30, 40])
+    assert result.row_statuses == (SpeculatorStatusCode.PROTOCOL_ERROR, OK)
+    assert result.output.valid_lengths.tolist() == [0, K]
+    assert result.output.token_ids[1].tolist() == digest_row([11, 12], 40)
+    assert [plan.num_tokens for plan in executor.plans] == [2]
+
+
 def test_exhausted_draft_kv_degrades_only_that_request(runtime):
     session, _ = runtime
     a = session.open_sequence(1)
