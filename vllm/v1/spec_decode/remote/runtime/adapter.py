@@ -64,7 +64,13 @@ class DraftStepExecutor(ABC):
         return None
 
     @abstractmethod
-    def execute(self, plan: DraftStepPlan, features: Features) -> torch.Tensor:
+    def execute(
+        self,
+        plan: DraftStepPlan,
+        features: Features,
+        *,
+        num_speculative_tokens: int | None = None,
+    ) -> torch.Tensor:
         """Run one draft step and return ``[plan.num_reqs, K]`` draft tokens.
 
         ``features`` follow the negotiated schema: token-level tensors hold
@@ -72,6 +78,10 @@ class DraftStepExecutor(ABC):
         ``plan.num_reqs`` rows, and omitted optional slots are None. The
         executor applies ``plan.block_table_updates`` to its block tables
         before running the step.
+
+        ``num_speculative_tokens`` limits draft generation without skipping
+        context updates; None uses the configured maximum. Return width stays
+        at that maximum even when the effective budget is zero.
         """
 
 
@@ -150,17 +160,22 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_sampled=0,
             next_prefill_tokens=tuple(int(t) for t in lookahead[0].tolist()),
         )
-        plan, failures = self.planner.plan([row])
+        plan, failures = self.planner.plan([row], num_speculative_tokens=0)
         if failures:
             raise AdapterError(*failures[0])
         # A prompt chunk only fills draft KV; its drafts are never used.
-        self.executor.execute(plan, features)
+        self.executor.execute(plan, features, num_speculative_tokens=0)
         self.planner.commit(plan)
 
     def advance_and_propose(
         self, batch: StandaloneProposalBatch
     ) -> StandaloneProposalResult:
         num_rows = len(batch.keys)
+        effective_k = batch.effective_num_speculative_tokens
+        if effective_k is None:
+            effective_k = batch.num_speculative_tokens
+        if not 0 <= effective_k <= batch.num_speculative_tokens:
+            raise ValueError("round draft budget exceeds the negotiated maximum")
         accepted = frame_to_ints(batch.accepted_counts)
         recovery = frame_to_ints(batch.recovery_tokens)
         features = _tensors(batch.features)
@@ -220,7 +235,9 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_rows, batch.num_speculative_tokens, dtype=torch.int64
         )
         for group in groups:
-            plan, failures = self.planner.plan([rows[i] for i in group])
+            plan, failures = self.planner.plan(
+                [rows[i] for i in group], num_speculative_tokens=effective_k
+            )
             for index, (status, _) in failures.items():
                 statuses[batch_rows[group[index]]] = status
             planned = [
@@ -230,15 +247,21 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             ]
             if not planned:
                 continue
-            drafts = self.executor.execute(plan, self._step_features(features, planned))
+            drafts = self.executor.execute(
+                plan,
+                self._step_features(features, planned),
+                num_speculative_tokens=effective_k,
+            )
             self.planner.commit(plan)
             row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
-            token_ids[row_index] = drafts.to("cpu", torch.int64)
+            token_ids[row_index, :effective_k] = drafts[:, :effective_k].to(
+                "cpu", torch.int64
+            )
             for row in plan.rows:
                 self._last_chunks.pop(row.key, None)
         valid_lengths = torch.tensor(
             [
-                batch.num_speculative_tokens if status is SpeculatorStatusCode.OK else 0
+                effective_k if status is SpeculatorStatusCode.OK else 0
                 for status in statuses
             ],
             dtype=torch.int32,

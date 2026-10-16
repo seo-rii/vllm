@@ -400,7 +400,13 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             torch.accelerator.synchronize(self.device)
 
     @torch.inference_mode()
-    def execute(self, plan: DraftStepPlan, features: Features) -> torch.Tensor:
+    def execute(
+        self,
+        plan: DraftStepPlan,
+        features: Features,
+        *,
+        num_speculative_tokens: int | None = None,
+    ) -> torch.Tensor:
         from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
         if plan.num_tokens > self.max_num_tokens:
@@ -475,6 +481,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                 self.lookahead,
                 self.temperature,
                 self.seeds,
+                num_speculative_tokens=num_speculative_tokens,
             )
             # The return copy completes the step before another client uses
             # the shared runner buffers or acknowledges committed KV.
