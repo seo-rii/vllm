@@ -1538,15 +1538,22 @@ class RemoteDraftSession:
 
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
-        if conn is not None:
-            conn.close()
-        if self._ipc_exporter is not None:
+        exporter, self._ipc_exporter = self._ipc_exporter, None
+        if exporter is not None:
             # A socket close does not prove the peer closed its CUDA mappings.
             # Keep this bounded pool alive, and prohibit reconnect allocations.
-            self._ipc_exporter.close()
-            self._ipc_exporter = None
             self._ipc_pending.clear()
             self._ipc_poisoned = True
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Failed to close remote draft connection")
+        if exporter is not None:
+            try:
+                exporter.close()
+            except Exception:
+                logger.exception("Failed to close remote draft CUDA IPC exporter")
 
 
 def _usable_positions(valid: torch.Tensor, num_tokens: int) -> torch.Tensor:

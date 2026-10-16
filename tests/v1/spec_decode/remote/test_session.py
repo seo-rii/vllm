@@ -306,6 +306,58 @@ def test_ipc_prefill_timeout_quarantines_instead_of_reusing_lease(session, monke
 
 
 @pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("failed_cleanup", ["connection", "exporter", "both"])
+def test_ipc_cleanup_errors_preserve_failure_policy_and_block_reconnect(
+    make_session, monkeypatch, caplog, policy, failed_cleanup
+):
+    from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcError
+
+    session = make_session(failure_policy=policy)
+    conn = session._conn
+    original_close = conn.close
+
+    def close_connection():
+        original_close()
+        if failed_cleanup in ("connection", "both"):
+            raise OSError("injected socket close failure")
+
+    connection_close = Mock(side_effect=close_connection)
+    monkeypatch.setattr(conn, "close", connection_close)
+    exporter = Mock()
+    if failed_cleanup in ("exporter", "both"):
+        exporter.close.side_effect = CudaIpcError("injected CUDA close failure")
+    session._ipc_exporter = exporter
+    session._ipc_pending.append(Mock())
+    monkeypatch.setattr(
+        session, "_send", Mock(side_effect=TransportError("connection lost"))
+    )
+
+    expected = (
+        pytest.raises(RemoteDraftError, match="open_sequence.*failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expected:
+        key = session.open_sequence(1)
+
+    assert not session.connected
+    assert not session.maybe_reconnect()
+    assert session._ipc_exporter is None
+    assert not session._ipc_pending
+    if policy == "target_only":
+        result = round_trip(session, batch(0, [key], recovery=[1]))
+        assert result.output.valid_lengths.tolist() == [0]
+    if failed_cleanup in ("connection", "both"):
+        assert "injected socket close failure" in caplog.text
+    if failed_cleanup in ("exporter", "both"):
+        assert "injected CUDA close failure" in caplog.text
+
+    session.close()
+    connection_close.assert_called_once_with()
+    exporter.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("is_final", [True, False])
 def test_partial_ipc_prefill_ack_cannot_revive_invalidated_sequences(
     make_session, adapter, monkeypatch, policy, is_final
