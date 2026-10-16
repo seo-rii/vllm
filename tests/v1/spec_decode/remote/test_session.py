@@ -1035,14 +1035,14 @@ def test_open_after_a_silent_restart_uses_the_new_server(make_session, server):
     # open fails on it; that request must still get the new connection.
     session = make_session()
     endpoint = server.endpoint
-    ready(session, 1)
+    old = ready(session, 1)
     server.stop()
     restarted = RemoteDraftServer(FakeDraftAdapter(vocab_size=VOCAB))
     restarted.start(endpoint)
     try:
         key = session.open_sequence(2)
         assert session.connected
-        assert key.generation == 1
+        assert key.generation > old.generation
         assert session.sequence_state(key) is SequenceState.PREFILLING
     finally:
         session.close()
@@ -1120,14 +1120,12 @@ def test_open_twice_is_an_error(session):
 
 
 def test_acknowledged_close_forgets_the_sequence(session, adapter):
-    # Generations exist to fence server state that may still be around; once
-    # the server acknowledged the close there is none, and remembering every
-    # sequence id ever opened would grow without bound.
     for sequence_id in range(50):
-        session.close_sequences((ready(session, sequence_id),))
-    assert session._generations == {}
+        previous = ready(session, sequence_id)
+        session.close_sequences((previous,))
+    assert not session._records
     reopened = ready(session, 1)
-    assert reopened.generation == 0
+    assert reopened.generation > previous.generation
     result = round_trip(session, batch(0, [reopened], recovery=[4]))
     assert result.row_statuses == (OK,)
 
@@ -1139,6 +1137,61 @@ def test_unacknowledged_close_keeps_bumping_the_generation(session):
     session.connect()
     second = session.open_sequence(1)
     assert second.generation == first.generation + 1
+
+
+def test_disconnected_sequence_churn_does_not_retain_request_ids(
+    make_session, server, clock
+):
+    session = make_session()
+    first = ready(session, 1)
+    endpoint = server.endpoint
+    server.stop()
+    round_trip(session, batch(0, [first], recovery=[4]))
+    session.close_sequences((first,))
+
+    # The fake clock holds reconnect backoff steady during the outage.
+    for sequence_id in range(10_000):
+        key = session.open_sequence(sequence_id)
+        assert session.sequence_state(key) is SequenceState.INVALID
+        session.close_sequences((key,))
+    assert not session._records
+    retained = {
+        name: len(value)
+        for name, value in vars(session).items()
+        if isinstance(value, dict) and value
+    }
+    assert not retained, f"closed requests retained in session bookkeeping: {retained}"
+
+    restarted = RemoteDraftServer(FakeDraftAdapter(vocab_size=VOCAB))
+    restarted.start(endpoint)
+    try:
+        clock.advance(1.0)
+        fresh = ready(session, first.sequence_id)
+        assert fresh.generation > key.generation
+        session.close_sequences((first,))
+        assert session.sequence_state(fresh) is SequenceState.READY
+        result = round_trip(session, batch(0, [fresh], recovery=[5]))
+        assert result.row_statuses == (OK,)
+    finally:
+        session.close()
+        restarted.stop()
+
+
+def test_unacknowledged_close_fences_server_state_without_retaining_history(
+    session, adapter, monkeypatch
+):
+    first = ready(session, 1)
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "_close_remote", Mock(return_value=set()))
+        session.close_sequences((first,))
+    assert adapter.prefix(first) == [1, 2, 3]
+
+    second = ready(session, first.sequence_id, prompt=(4, 5))
+    assert second.generation > first.generation
+    assert adapter.prefix(first) is None
+    assert adapter.prefix(second) == [4, 5]
+    session.close_sequences((first,))
+    assert session.sequence_state(second) is SequenceState.READY
 
 
 def test_close_is_idempotent(session, server, adapter):

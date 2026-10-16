@@ -250,7 +250,8 @@ class RemoteDraftSession:
         self._inflight_batch_id: int | None = None
         self._inbound: dict[int, DataFrame] = {}
         self._records: dict[int, _SequenceRecord] = {}
-        self._generations: dict[int, int] = {}
+        # Survives reconnects so closed requests need no per-id tombstones.
+        self._next_generation = 0
         self._abandoned_batches: set[int] = set()
 
     @classmethod
@@ -509,8 +510,8 @@ class RemoteDraftSession:
             raise RemoteDraftError(
                 f"sequence {sequence_id} is already open ({record.state.value})"
             )
-        generation = self._generations.get(sequence_id, -1) + 1
-        self._generations[sequence_id] = generation
+        generation = self._next_generation
+        self._next_generation += 1
         key = SequenceKey(
             verifier_instance_id=self._identity.verifier_instance_id,
             sequence_id=sequence_id,
@@ -644,17 +645,12 @@ class RemoteDraftSession:
                 continue
             record.state = transition_sequence(record.state, SequenceState.CLOSING)
             pending.append(key)
-        acked: set[SequenceKey] = set()
         if pending and self._alive:
-            acked = self._close_remote(tuple(pending))
+            self._close_remote(tuple(pending))
         for key in pending:
             record = self._records.pop(key.sequence_id, None)
             if record is not None and record.state is SequenceState.CLOSING:
                 record.state = transition_sequence(record.state, SequenceState.CLOSED)
-            if key in acked:
-                # The server no longer holds this sequence, so a reused ID
-                # can start over; unacknowledged closes keep bumping it.
-                self._generations.pop(key.sequence_id, None)
 
     def _close_remote(self, keys: tuple[SequenceKey, ...]) -> set[SequenceKey]:
         """Close ``keys`` on the server; returns the acknowledged ones."""
