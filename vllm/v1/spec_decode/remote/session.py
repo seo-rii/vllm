@@ -1415,7 +1415,10 @@ class RemoteDraftSession:
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
         if conn is not None:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Failed to close remote draft connection")
 
 
 def _usable_positions(valid: torch.Tensor, num_tokens: int) -> torch.Tensor:

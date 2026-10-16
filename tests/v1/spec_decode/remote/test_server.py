@@ -68,6 +68,42 @@ def key(sequence_id: int, generation: int = 0, verifier: str = VERIFIER):
     )
 
 
+def test_cleanup_failure_releases_session_state_and_connection(monkeypatch):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(adapter)
+    conn = Mock()
+    server._connections.add(conn)
+    owned, other = key(1), key(2)
+    close_sequences = adapter.close_sequences
+
+    def close_with_failure(keys):
+        close_sequences(keys)
+        raise RuntimeError("injected adapter cleanup failure")
+
+    close_adapter = Mock(side_effect=close_with_failure)
+    monkeypatch.setattr(adapter, "close_sequences", close_adapter)
+    report_error = Mock()
+    monkeypatch.setattr(server_module.logger, "exception", report_error)
+
+    def run(session):
+        session.session_id = "closing-session"
+        for sequence, owner in ((owned, session.session_id), (other, "other-session")):
+            assert server.registry.open(sequence, owner=owner).status == OK
+            adapter.open_sequence(sequence)
+
+    monkeypatch.setattr(server_module._ServerSession, "run", run)
+    server._serve_connection(conn)
+
+    close_adapter.assert_called_once_with((owned,))
+    assert server.registry.get(owned) is None
+    assert adapter.prefix(owned) is None
+    assert server.registry.get(other) is not None
+    assert adapter.prefix(other) == []
+    conn.close.assert_called_once_with()
+    assert conn not in server._connections
+    report_error.assert_called_once()
+
+
 def checksum(*frames) -> int:
     value = 0
     for frame in frames:

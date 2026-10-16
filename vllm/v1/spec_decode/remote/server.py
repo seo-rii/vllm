@@ -677,9 +677,17 @@ class RemoteDraftServer:
         except Exception:
             logger.exception("Remote draft session %s crashed", session.session_id)
         finally:
-            session.cleanup()
-            conn.close()
-            self._connections.discard(conn)
+            try:
+                session.cleanup()
+            except Exception:
+                logger.exception(
+                    "Failed to clean up remote draft session %s", session.session_id
+                )
+            finally:
+                try:
+                    conn.close()
+                finally:
+                    self._connections.discard(conn)
 
 
 class _ServerSession:
