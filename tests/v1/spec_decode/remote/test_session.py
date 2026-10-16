@@ -305,6 +305,57 @@ def test_ipc_prefill_timeout_quarantines_instead_of_reusing_lease(session, monke
     assert not session.maybe_reconnect()
 
 
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("is_final", [True, False])
+def test_partial_ipc_prefill_ack_cannot_revive_invalidated_sequences(
+    make_session, adapter, monkeypatch, policy, is_final
+):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    session = make_session(failure_policy=policy)
+    keys = (session.open_sequence(1), session.open_sequence(2))
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session._ipc_pending.extend([Mock(), Mock()])
+    original_await = session._await
+    acknowledged = False
+
+    def acknowledge_then_timeout(*args, **kwargs):
+        nonlocal acknowledged
+        if acknowledged:
+            raise TransportTimeout("second acknowledgement lost")
+        reply = original_await(*args, **kwargs)
+        assert reply[1].key == keys[0]
+        assert reply[1].status is OK
+        acknowledged = True
+        return reply
+
+    monkeypatch.setattr(session, "_await", acknowledge_then_timeout)
+    expected = (
+        pytest.raises(RemoteDraftError, match="prefill failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expected:
+        session.prefill_many([(key, features([1]), is_final) for key in keys])
+
+    assert acknowledged
+    assert all(session.sequence_state(key) is SequenceState.INVALID for key in keys)
+    assert all(session._records[key.sequence_id].prefilled_tokens == 0 for key in keys)
+    exporter.release.assert_not_called()
+    exporter.close.assert_called_once_with()
+    assert not session.connected
+    assert not session.maybe_reconnect()
+    if policy == "target_only":
+        # Both rows keep generating on the target without touching the lost peer.
+        monkeypatch.setattr(session, "_send", Mock(side_effect=AssertionError))
+        session.prefill_many([(key, features([2]), True) for key in keys])
+        result = round_trip(session, batch(0, keys, recovery=[2, 3]))
+        assert result.output.valid_lengths.tolist() == [0, 0]
+        assert all(status is not OK for status in result.row_statuses)
+        assert adapter.proposed_batches == []
+
+
 def test_ipc_decode_releases_only_after_proposal_response(session, monkeypatch):
     key = ready(session, 1)
     exporter = Mock()

@@ -1308,6 +1308,14 @@ class RemoteDraftSession:
                 self._release_ipc()
             else:
                 self._invalidate("CUDA IPC prefill did not acknowledge every buffer")
+        if not self._alive:
+            # Earlier ACKs cannot restore state invalidated by a later failure.
+            for index, (status, _) in enumerate(results):
+                if status is SpeculatorStatusCode.OK:
+                    results[index] = (
+                        SpeculatorStatusCode.INTERNAL_ERROR,
+                        "session invalidated after acknowledgement",
+                    )
         return results
 
     def _apply_status(
