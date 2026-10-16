@@ -149,7 +149,10 @@ class DraftStepPlanner:
             self._free_slots.append(sequence.req_index)
 
     def plan(
-        self, rows: Sequence[DraftStepRow]
+        self,
+        rows: Sequence[DraftStepRow],
+        *,
+        num_speculative_tokens: int | None = None,
     ) -> tuple[DraftStepPlan, dict[int, tuple[SpeculatorStatusCode, str]]]:
         """Admit rows into one step and reserve their KV.
 
@@ -158,6 +161,10 @@ class DraftStepPlanner:
         raise ValueError: they indicate a bug in the caller, not a
         per-sequence condition.
         """
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_tokens
+        if not 0 <= num_speculative_tokens <= self.num_speculative_tokens:
+            raise ValueError("round draft budget exceeds the configured maximum")
         if len({row.key for row in rows}) != len(rows):
             raise ValueError("a draft step cannot cover a sequence twice")
         admitted: list[DraftStepRow] = []
@@ -180,7 +187,7 @@ class DraftStepPlanner:
             start = len(self.block_pool.blocks(sequence.req_index))
             try:
                 blocks = self.block_pool.ensure(
-                    sequence.req_index, seq_len + self.num_speculative_tokens
+                    sequence.req_index, seq_len + num_speculative_tokens
                 )
             except DraftKVExhausted as e:
                 failures[i] = (SpeculatorStatusCode.OUT_OF_MEMORY, str(e))

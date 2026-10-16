@@ -24,8 +24,10 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
 )
 
-PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 1
+# v2 requires peers to honor the per-round draft budget, including zero.
+# A v1 server would silently ignore it and still generate the maximum K.
+PROTOCOL_MAJOR = 2
+PROTOCOL_MINOR = 0
 
 # Field-level range constraints are enforced by msgspec on decode, so a
 # peer cannot deliver negative identifiers or degenerate shapes. Checks
@@ -190,6 +192,12 @@ class AdvanceAndPropose(msgspec.Struct):
     round_ids_slot: NonNegativeInt | None = None
     query_lens_slot: NonNegativeInt | None = None
     """Integer frame [len(keys)] of token-level feature rows per key."""
+    num_speculative_tokens: NonNegativeInt | None = None
+    """This round's draft budget; None uses the maximum negotiated by Hello.
+
+    Zero still applies verified context but produces no usable drafts. Results
+    retain the negotiated maximum width, with valid lengths bounded by this K.
+    """
 
 
 class ProposalResponse(msgspec.Struct):

@@ -343,6 +343,35 @@ def test_profile_allocation_failure_is_not_hidden_by_target_only(verifier, monke
     assert instance._requests == {}
 
 
+@pytest.mark.parametrize("effective_k", [0, 1, K])
+def test_effective_k_reaches_executor_and_preserves_context(verifier, effective_k):
+    instance, executor, _, _ = verifier
+    batch = inputs(["a"], [[11, 12]], [[0, 1]], [2])
+    output = propose(
+        instance, batch, [1], [0], [13], num_speculative_tokens=effective_k
+    ).tolist()[0]
+    expected = digest_row([11, 12], 13)[:effective_k]
+    assert output == expected + [-1] * (K - effective_k)
+    assert executor.effective_ks == [effective_k]
+    assert instance._requests["a"].num_computed == 2
+    verified = [13, *expected]
+    batch = inputs(["a"], [verified], [list(range(2, 2 + len(verified)))], [0])
+    assert propose(instance, batch, [len(verified)], [0], [14]).tolist() == [
+        digest_row([11, 12, *verified], 14)
+    ]
+    assert executor.effective_ks == [effective_k, K]
+
+
+@pytest.mark.parametrize("effective_k", [-1, K + 1])
+def test_invalid_effective_k_does_not_open_or_advance_requests(verifier, effective_k):
+    instance, executor, _, _ = verifier
+    batch = inputs(["a"], [[1]], [[0]], [1])
+    with pytest.raises(RuntimeError, match="draft budget"):
+        propose(instance, batch, [1], [0], [2], num_speculative_tokens=effective_k)
+    assert instance._requests == {}
+    assert executor.plans == []
+
+
 def test_nonzero_tp_rank_receives_cpu_tokens_without_gpu_collective(verifier):
     instance, executor, settings, group = verifier
     group.rank_in_group = 1
@@ -451,7 +480,7 @@ def test_failed_remote_row_stays_target_only_without_reusing_stale_kv(
     instance, executor, _, _ = verifier
     calls = []
 
-    def fail(plan, features):
+    def fail(plan, features, *, num_speculative_tokens=None):
         calls.append(plan)
         raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "draft KV exhausted")
 
@@ -469,7 +498,7 @@ def test_target_only_round_skips_feature_preparation_and_still_closes(
 ):
     instance, executor, _, _ = verifier
 
-    def fail(plan, features):
+    def fail(plan, features, *, num_speculative_tokens=None):
         raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "draft KV exhausted")
 
     monkeypatch.setattr(executor, "execute", fail)
@@ -525,7 +554,7 @@ def test_mixed_target_only_batch_transfers_only_active_ragged_features(
     instance, executor, _, _ = verifier
     execute = executor.execute
 
-    def fail(plan, features):
+    def fail(plan, features, *, num_speculative_tokens=None):
         raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "draft KV exhausted")
 
     monkeypatch.setattr(executor, "execute", fail)

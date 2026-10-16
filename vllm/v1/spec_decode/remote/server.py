@@ -151,6 +151,8 @@ class StandaloneProposalBatch:
     recovery_tokens: DataFrame
     features: tuple[DataFrame | DeviceFeature | None, ...]
     query_lens: tuple[int, ...]
+    effective_num_speculative_tokens: int | None = None
+    """This round's budget; num_speculative_tokens remains the result width."""
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,9 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
         recovery = frame_to_ints(batch.recovery_tokens)
         num_rows = len(batch.keys)
         num_tokens = batch.num_speculative_tokens
+        effective_k = batch.effective_num_speculative_tokens
+        if effective_k is None:
+            effective_k = num_tokens
         flat: list[int] = []
         for i in range(num_rows):
             last = recovery[i]
@@ -308,7 +313,7 @@ class FakeDraftAdapter(StandaloneDraftAdapter):
             token_ids=ints_to_frame(
                 0, flat, dtype="int64", shape=(num_rows, num_tokens)
             ),
-            valid_lengths=ints_to_frame(0, [num_tokens] * num_rows),
+            valid_lengths=ints_to_frame(0, [effective_k] * num_rows),
             row_statuses=(SpeculatorStatusCode.OK,) * num_rows,
         )
 
@@ -855,11 +860,6 @@ class _ServerSession:
             )
             return False
         reasons = self._hello_rejections(message)
-        if (
-            CUDA_IPC_TRANSPORT in message.supported_transports
-            and envelope.protocol_minor < 1
-        ):
-            reasons.append("CUDA IPC requires protocol minor 1 or newer")
         if reasons:
             self._send(
                 ErrorReply(
@@ -1229,6 +1229,15 @@ class _ServerSession:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, f"integer input frame: {e}")
             return
         num_tokens = self.num_speculative_tokens
+        effective_k = message.num_speculative_tokens
+        if effective_k is None:
+            effective_k = num_tokens
+        if not 0 <= effective_k <= num_tokens:
+            fail(
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                f"round draft budget must be within 0..{num_tokens}",
+            )
+            return
         if any(not 0 <= count <= num_tokens for count in accepted_counts):
             fail(
                 SpeculatorStatusCode.PROTOCOL_ERROR,
@@ -1299,6 +1308,7 @@ class _ServerSession:
                             recovery_tokens=recovery,
                             features=self._resolve_features(frames),
                             query_lens=tuple(query_lens),
+                            effective_num_speculative_tokens=effective_k,
                         )
                     )
                 except Exception:
@@ -1326,6 +1336,13 @@ class _ServerSession:
                             owner=self.session_id,
                         )
                 valid_lengths = frame_to_ints(result.valid_lengths)
+                if any(length > effective_k for length in valid_lengths):
+                    self._discard_owned_sequences(active_keys)
+                    fail(
+                        SpeculatorStatusCode.INTERNAL_ERROR,
+                        "adapter exceeded the round draft budget",
+                    )
+                    return
                 for i, status in enumerate(row_statuses):
                     if status is not SpeculatorStatusCode.OK:
                         valid_lengths[i] = 0

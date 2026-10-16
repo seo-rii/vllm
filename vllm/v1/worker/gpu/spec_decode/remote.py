@@ -210,6 +210,12 @@ class RemoteSpeculator(BaseSpeculator):
         if self._tp.rank_in_group == 0:
             started = time.perf_counter()
             try:
+                if num_speculative_tokens is not None and not (
+                    0 <= num_speculative_tokens <= self.num_speculative_steps
+                ):
+                    raise ValueError(
+                        "round draft budget exceeds the configured maximum"
+                    )
                 if torch.any(temperature[input_batch.idx_mapping] != 0).item():
                     raise ValueError(
                         "remote drafter currently requires greedy target sampling"
@@ -223,6 +229,7 @@ class RemoteSpeculator(BaseSpeculator):
                         num_rejected,
                         last_sampled,
                         next_prefill_tokens,
+                        num_speculative_tokens,
                     ).tolist()
                 except torch.OutOfMemoryError as exc:
                     # Feature preparation can advance local request positions
@@ -286,6 +293,7 @@ class RemoteSpeculator(BaseSpeculator):
         num_rejected: torch.Tensor,
         last_sampled: torch.Tensor,
         next_prefill_tokens: torch.Tensor,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         session = self._session
         assert session is not None
@@ -385,6 +393,7 @@ class RemoteSpeculator(BaseSpeculator):
                 recovery_tokens=recovery[rows],
                 features=self._select(features, token_indices, sequence_rows),
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
+                num_speculative_tokens=num_speculative_tokens,
             )
             result = session.collect(session.dispatch(proposal)).output
             valid = (

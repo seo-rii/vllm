@@ -427,8 +427,6 @@ class RemoteDraftSession:
             self._drop_connection()
             raise RemoteDraftError(f"HELLO handshake failed: {e}") from e
         reasons = self._handshake_rejections(hello, ack)
-        if ack.selected_transport == CUDA_IPC_TRANSPORT and envelope.protocol_minor < 1:
-            reasons.append("CUDA IPC requires protocol minor 1 or newer")
         if reasons:
             self._drop_connection()
             raise RemoteDraftError(
@@ -803,6 +801,11 @@ class RemoteDraftSession:
 
     def _dispatch(self, batch: RemoteProposalBatch) -> RemoteProposalHandle:
         self._require_no_inflight(f"dispatch batch {batch.batch_id}")
+        effective_k = batch.num_speculative_tokens
+        if effective_k is None:
+            effective_k = self._identity.num_speculative_tokens
+        if not 0 <= effective_k <= self._identity.num_speculative_tokens:
+            raise ValueError("round draft budget must be within the negotiated maximum")
         if batch.batch_id <= self._last_batch_id:
             raise ValueError(
                 f"batch_id {batch.batch_id} is not newer than "
@@ -885,6 +888,7 @@ class RemoteDraftSession:
             recovery_tokens_slot=base + 1,
             feature_slot=base + num_inputs,
             query_lens_slot=None if batch.query_lens is None else base + 2,
+            num_speculative_tokens=effective_k,
         )
         failure = None
         if self._clock() >= handle.deadline:

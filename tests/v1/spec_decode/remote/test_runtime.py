@@ -219,12 +219,15 @@ class KVDigestExecutor(DraftStepExecutor):
         self.kv = np.full(pool.num_blocks * pool.block_size, -1, dtype=np.int64)
         self.block_tables: dict[int, list[int]] = defaultdict(list)
         self.plans: list[DraftStepPlan] = []
+        self.effective_ks: list[int] = []
 
     @property
     def max_num_tokens(self):
         return self._max_num_tokens
 
-    def execute(self, plan, features):
+    def execute(self, plan, features, *, num_speculative_tokens=None):
+        effective_k = K if num_speculative_tokens is None else num_speculative_tokens
+        self.effective_ks.append(effective_k)
         if self.max_num_tokens is not None and plan.num_tokens > self.max_num_tokens:
             raise ValueError("draft step exceeds the configured feature-token budget")
         self.plans.append(plan)
@@ -247,7 +250,10 @@ class KVDigestExecutor(DraftStepExecutor):
                 if plan.num_sampled[i]
                 else plan.next_prefill_tokens[i][0]
             )
-            drafts.append(digest_row((values % STRIDE).tolist(), int(next_token)))
+            drafts.append(
+                digest_row((values % STRIDE).tolist(), int(next_token))[:effective_k]
+                + [0] * (K - effective_k)
+            )
         return torch.tensor(drafts)
 
 
@@ -335,7 +341,17 @@ def chunk(tokens, lookahead=None):
     )
 
 
-def round_(session, batch_id, keys, query_lens, tokens, accepted, recovery):
+def round_(
+    session,
+    batch_id,
+    keys,
+    query_lens,
+    tokens,
+    accepted,
+    recovery,
+    *,
+    num_speculative_tokens=None,
+):
     return session.collect(
         session.dispatch(
             RemoteProposalBatch(
@@ -345,6 +361,7 @@ def round_(session, batch_id, keys, query_lens, tokens, accepted, recovery):
                 recovery_tokens=torch.tensor(recovery, dtype=torch.int64),
                 features=chunk(tokens),
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
+                num_speculative_tokens=num_speculative_tokens,
             )
         )
     )
@@ -395,6 +412,45 @@ def test_adapter_drafts_from_the_verified_prefix(runtime):
     assert result.output.valid_lengths.tolist() == [K, K]
     c_update = executor.plans[-1].block_table_updates[1]
     assert c_update.start == 0
+
+
+@pytest.mark.parametrize("effective_k", [0, 1, K])
+def test_round_budget_limits_generation_without_losing_own_kv(runtime, effective_k):
+    session, executor = runtime
+    a = session.open_sequence(1)
+    session.prefill(a, chunk([11], lookahead=12), is_final=False)
+    assert executor.effective_ks == [0]
+    session.prefill(a, chunk([12, 13]), is_final=True)
+
+    result = round_(
+        session, 0, [a], [0], [], [0], [14], num_speculative_tokens=effective_k
+    )
+    used_drafts = digest_row([11, 12, 13], 14)[:effective_k]
+    assert result.row_statuses == (OK,)
+    assert result.output.valid_lengths.tolist() == [effective_k]
+    assert result.output.token_ids.tolist() == [used_drafts + [0] * (K - effective_k)]
+    assert session.sequence_state(a) is SequenceState.READY
+    assert executor.effective_ks == [0, effective_k]
+
+    # Even K=0 consumed the final prompt and committed its own-KV. Resume at
+    # the first target-only query instead of skipping those context updates.
+    verified = [14, *used_drafts]
+    result = round_(session, 1, [a], [len(verified)], verified, [effective_k], [15])
+    assert result.output.token_ids.tolist() == [digest_row([11, 12, 13, *verified], 15)]
+    assert result.output.valid_lengths.tolist() == [K]
+    assert executor.plans[-1].num_computed_tokens.tolist() == [3]
+    assert executor.effective_ks == [0, effective_k, K]
+
+
+def test_zero_budget_needs_context_kv_without_unused_draft_headroom():
+    planner = make_planner(num_blocks=2)
+    planner.open(key(1))
+    row = DraftStepRow(key(1), 2, num_sampled=1)
+    assert planner.plan([row])[1][0][0] is SpeculatorStatusCode.OUT_OF_MEMORY
+    plan, failures = planner.plan([row], num_speculative_tokens=0)
+    assert not failures
+    planner.commit(plan)
+    assert planner.num_computed(key(1)) == 2
 
 
 def test_round_must_not_resend_a_buffered_prompt_chunk(runtime):
@@ -478,8 +534,8 @@ def test_empty_prompt_chunk_only_degrades_that_request(runtime, is_final):
 def test_exhausted_draft_kv_degrades_only_that_request(runtime):
     session, _ = runtime
     a = session.open_sequence(1)
-    # 11 usable blocks of 2 slots; this prompt plus K lookahead needs 12.
-    session.prefill(a, chunk(list(range(20)), lookahead=99), is_final=False)
+    # 11 usable blocks of 2 slots cannot hold this prompt even at K=0.
+    session.prefill(a, chunk(list(range(23)), lookahead=99), is_final=False)
     assert session.sequence_state(a) is SequenceState.TARGET_ONLY
     b = session.open_sequence(2)
     session.prefill(b, chunk([5]), is_final=True)

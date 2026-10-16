@@ -162,6 +162,41 @@ def round_trip(session, batch_):
     return session.collect(session.dispatch(batch_))
 
 
+@pytest.mark.parametrize("effective_k", [-1, NUM_SPEC_TOKENS + 1])
+def test_invalid_round_budget_fails_before_sending(session, monkeypatch, effective_k):
+    key = ready(session, 1)
+    send = Mock()
+    monkeypatch.setattr(session, "_send", send)
+    with pytest.raises(ValueError, match="draft budget"):
+        session.dispatch(
+            dataclasses.replace(
+                batch(0, [key], [7]), num_speculative_tokens=effective_k
+            )
+        )
+    send.assert_not_called()
+    assert session.sequence_state(key) is SequenceState.READY
+
+
+def test_adapter_cannot_exceed_the_requested_round_budget(
+    session, adapter, monkeypatch
+):
+    key = ready(session, 1)
+    propose = adapter.advance_and_propose
+
+    def ignore_budget(batch_):
+        return propose(
+            dataclasses.replace(batch_, effective_num_speculative_tokens=None)
+        )
+
+    monkeypatch.setattr(adapter, "advance_and_propose", ignore_budget)
+    result = round_trip(
+        session, dataclasses.replace(batch(0, [key], [7]), num_speculative_tokens=0)
+    )
+    assert result.row_statuses == (SpeculatorStatusCode.INTERNAL_ERROR,)
+    assert result.output.valid_lengths.tolist() == [0]
+    assert session.sequence_state(key) is SequenceState.TARGET_ONLY
+
+
 @pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("pending_ipc", [False, True])
 def test_local_failure_is_terminal_before_policy_or_ipc_cleanup(
