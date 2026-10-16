@@ -4,6 +4,7 @@
 gating, idempotent sequence commands, batch ordering, and error replies."""
 
 import dataclasses
+import runpy
 import socket
 import threading
 import time
@@ -58,6 +59,16 @@ VERIFIER = "verifier-a"
 NUM_SPEC_TOKENS = 4
 VOCAB = 50
 OK = SpeculatorStatusCode.OK
+
+
+def test_module_entrypoint_reuses_canonical_adapter_exception_class(monkeypatch):
+    canonical_main = Mock()
+    monkeypatch.setattr(server_module, "main", canonical_main)
+    # runpy reproduces `python -m`; the warning is expected because this
+    # test already imported the module to replace its canonical entrypoint.
+    with pytest.warns(RuntimeWarning, match="found in sys.modules"):
+        runpy.run_module(server_module.__name__, run_name="__main__")
+    canonical_main.assert_called_once_with()
 
 
 def key(sequence_id: int, generation: int = 0, verifier: str = VERIFIER):
