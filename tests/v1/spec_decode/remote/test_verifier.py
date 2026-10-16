@@ -23,12 +23,14 @@ from vllm.config.speculative import RemoteDraftConfig
 from vllm.v1.spec_decode.remote.capabilities import SpeculatorPlacementCapabilities
 from vllm.v1.spec_decode.remote.protocol import (
     FeatureSlot,
+    SequenceAck,
     SpeculatorStatusCode,
     TargetFeatureSchema,
 )
 from vllm.v1.spec_decode.remote.runtime.adapter import TargetConditionedDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.schema import RuntimeContract
 from vllm.v1.spec_decode.remote.server import AdapterError, RemoteDraftServer
+from vllm.v1.spec_decode.remote.transport import ConnectionClosed
 from vllm.v1.worker.gpu.spec_decode import remote
 
 SCHEMA = TargetFeatureSchema(
@@ -472,6 +474,79 @@ def test_failed_remote_row_stays_target_only_without_reusing_stale_kv(
     batch = inputs(["a"], [[2]], [[1]], [0])
     assert propose(instance, batch, [1], [0], [3]).tolist() == [[-1] * K]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("verifier", ["target_only", "error"], indirect=True)
+def test_partial_prefill_ack_disconnect_preserves_fallback_and_shares_policy(
+    verifier, monkeypatch
+):
+    instance, executor, settings, group = verifier
+    group.rank_in_group = 1
+    peer = remote.RemoteSpeculator(settings, torch.device("cpu"))
+    group.rank_in_group = 0
+    session = instance._session
+    prefill_many = session.prefill_many
+    acknowledged: list[SequenceAck] = []
+
+    def disconnect_after_first_ack(chunks):
+        await_ack = session._await
+
+        def receive(*args, **kwargs):
+            if acknowledged:
+                raise ConnectionClosed("connection lost after first prefill ACK")
+            envelope, ack = await_ack(*args, **kwargs)
+            assert isinstance(ack, SequenceAck)
+            assert ack.status is SpeculatorStatusCode.OK
+            acknowledged.append(ack)
+            return envelope, ack
+
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "_await", receive)
+            return prefill_many(chunks)
+
+    monkeypatch.setattr(session, "prefill_many", disconnect_after_first_ack)
+    batch = inputs(["a", "b"], [[1, 2], [11, 12]], [[0, 1], [0, 1]], [2, 2])
+    policy = settings.speculative_config.remote_draft.failure_policy
+    error = "RemoteDraftError: prefill failed for"
+    if policy == "error":
+        with pytest.raises(RuntimeError, match=error):
+            propose(instance, batch, [1, 1], [0, 0], [3, 13])
+    else:
+        assert propose(instance, batch, [1, 1], [0, 0], [3, 13]).tolist() == [
+            [-1] * K,
+            [-1] * K,
+        ]
+    assert len(acknowledged) == 1
+    assert not session.connected
+    assert all(
+        session.sequence_state(instance._requests[req_id].key)
+        is remote.SequenceState.INVALID
+        for req_id in batch.req_ids
+    )
+    assert executor.plans == []
+
+    group.rank_in_group = 1
+    try:
+        if policy == "error":
+            with pytest.raises(RuntimeError, match=error):
+                propose(peer, batch, [1, 1], [0, 0], [3, 13])
+        else:
+            assert propose(peer, batch, [1, 1], [0, 0], [3, 13]).tolist() == [
+                [-1] * K,
+                [-1] * K,
+            ]
+    finally:
+        group.rank_in_group = 0
+
+    def reject_features(*args, **kwargs):
+        pytest.fail("disconnected own-KV requests resumed remote decoding")
+
+    monkeypatch.setattr(instance, "_features", reject_features)
+    batch = inputs(["a", "b"], [[3], [13]], [[2], [2]], [0, 0])
+    assert propose(instance, batch, [1, 1], [0, 0], [4, 14]).tolist() == [
+        [-1] * K,
+        [-1] * K,
+    ]
 
 
 @pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
