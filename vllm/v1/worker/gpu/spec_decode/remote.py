@@ -19,7 +19,11 @@ from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.session import RemoteDraftSession, VerifierIdentity
-from vllm.v1.spec_decode.remote.state import FeatureBatch, RemoteProposalBatch
+from vllm.v1.spec_decode.remote.state import (
+    FeatureBatch,
+    RemoteProposalBatch,
+    SequenceState,
+)
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
@@ -230,29 +234,66 @@ class RemoteSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         session = self._session
         assert session is not None
-        sampled = num_sampled.cpu().tolist()
-        rejected = num_rejected.cpu().tolist()
-        recovery = last_sampled[batch.idx_mapping].reshape(-1).cpu()
-        features = self._features(batch, hidden, aux, next_prefill_tokens)
-        starts = batch.query_start_loc_np
-        positions = features[TargetFeatureKind.POSITIONS.value]
-        chunks = []
-        rows, keys, query_lens, accepted = [], [], [], []
-        token_indices: list[int] = []
         session_started = time.perf_counter()
+        starts = batch.query_start_loc_np
         for row, req_id in enumerate(batch.req_ids):
-            start, end = int(starts[row]), int(starts[row + 1])
-            request = self._requests.get(req_id)
-            if request is None:
-                if int(positions[start]) != 0 or not batch.is_prefilling_np[row]:
+            if req_id not in self._requests:
+                if (
+                    not batch.is_prefilling_np[row]
+                    or int(batch.positions[int(starts[row])]) != 0
+                ):
                     raise ValueError(
                         "new remote sequence requires prefill from position zero"
                     )
-                request = _Request(session.open_sequence(next(self._sequence_ids)))
-                self._requests[req_id] = request
+                self._requests[req_id] = _Request(
+                    session.open_sequence(next(self._sequence_ids))
+                )
+        active_rows = [
+            row
+            for row, req_id in enumerate(batch.req_ids)
+            if session.sequence_state(self._requests[req_id].key)
+            in (SequenceState.PREFILLING, SequenceState.READY)
+        ]
+        output = torch.full(
+            (batch.num_reqs, self.num_speculative_steps), -1, dtype=torch.int64
+        )
+        if not active_rows:
+            self._stats["session_seconds"] += time.perf_counter() - session_started
+            return output
+        session_seconds = time.perf_counter() - session_started
+        active_tokens = (
+            None
+            if len(active_rows) == batch.num_reqs
+            else [
+                token
+                for row in active_rows
+                for token in range(int(starts[row]), int(starts[row + 1]))
+            ]
+        )
+        features = self._features(
+            batch,
+            hidden,
+            aux,
+            next_prefill_tokens,
+            token_rows=active_tokens,
+            sequence_rows=(None if active_tokens is None else active_rows),
+        )
+        positions = features[TargetFeatureKind.POSITIONS.value]
+        sampled = num_sampled.cpu().tolist()
+        rejected = num_rejected.cpu().tolist()
+        recovery = last_sampled[batch.idx_mapping].reshape(-1).cpu()
+        session_started = time.perf_counter()
+        chunks = []
+        rows, keys, query_lens, accepted, sequence_rows = [], [], [], [], []
+        token_indices: list[int] = []
+        end = 0
+        for feature_row, row in enumerate(active_rows):
+            req_id = batch.req_ids[row]
+            request = self._requests[req_id]
+            query_len = int(starts[row + 1]) - int(starts[row])
+            start, end = end, end + query_len
             if int(positions[start]) != request.num_computed:
                 raise ValueError(f"remote context discontinuity for request {req_id}")
-            query_len = end - start
             if batch.is_prefilling_np[row]:
                 is_final = int(positions[end - 1]) + 1 >= int(batch.prefill_len_np[row])
                 if rejected[row] != 0 or sampled[row] != int(is_final):
@@ -260,7 +301,7 @@ class RemoteSpeculator(BaseSpeculator):
                 chunks.append(
                     (
                         request.key,
-                        self._select(features, range(start, end), [row]),
+                        self._select(features, range(start, end), [feature_row]),
                         is_final,
                     )
                 )
@@ -279,17 +320,15 @@ class RemoteSpeculator(BaseSpeculator):
             keys.append(request.key)
             query_lens.append(query_len)
             accepted.append(sampled[row] - 1)
+            sequence_rows.append(feature_row)
         session.prefill_many(chunks)
-        output = torch.full(
-            (batch.num_reqs, self.num_speculative_steps), -1, dtype=torch.int64
-        )
         if rows:
             proposal = RemoteProposalBatch(
                 batch_id=next(self._batch_ids),
                 keys=tuple(keys),
                 accepted_counts=torch.tensor(accepted, dtype=torch.int32),
                 recovery_tokens=recovery[rows],
-                features=self._select(features, token_indices, rows),
+                features=self._select(features, token_indices, sequence_rows),
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
             )
             result = session.collect(session.dispatch(proposal)).output
@@ -298,7 +337,9 @@ class RemoteSpeculator(BaseSpeculator):
                 < result.valid_lengths[:, None]
             )
             output[rows] = torch.where(valid, result.token_ids, -1)
-        self._stats["session_seconds"] += time.perf_counter() - session_started
+        self._stats["session_seconds"] += (
+            session_seconds + time.perf_counter() - session_started
+        )
         return output
 
     def _features(
@@ -307,22 +348,39 @@ class RemoteSpeculator(BaseSpeculator):
         hidden: torch.Tensor,
         aux: list[torch.Tensor] | None,
         next_prefill_tokens: torch.Tensor,
+        *,
+        token_rows: Collection[int] | None = None,
+        sequence_rows: Collection[int] | None = None,
     ) -> dict[str, torch.Tensor]:
+        token_rows = None if token_rows is None else list(token_rows)
+        sequence_rows = None if sequence_rows is None else list(sequence_rows)
         source = {
             TargetFeatureKind.TOKEN_IDS.value: batch.input_ids[: batch.num_tokens],
             TargetFeatureKind.POSITIONS.value: batch.positions[: batch.num_tokens],
             TargetFeatureKind.LAST_HIDDEN_STATES.value: hidden[: batch.num_tokens],
-            TargetFeatureKind.NEXT_PREFILL_TOKENS.value: next_prefill_tokens[
-                :1, batch.idx_mapping
-            ].T,
         }
-        if aux is not None:
-            source[TargetFeatureKind.AUX_HIDDEN_STATES.value] = torch.cat(
-                [state[: batch.num_tokens] for state in aux], dim=-1
-            )
         result = {}
         for slot in self._contract.schema.slots:
-            tensor = source[slot.kind]
+            if slot.kind == TargetFeatureKind.AUX_HIDDEN_STATES.value:
+                assert aux is not None
+                tensor = torch.cat(
+                    [
+                        state[: batch.num_tokens]
+                        if token_rows is None
+                        else state[token_rows]
+                        for state in aux
+                    ],
+                    dim=-1,
+                )
+            elif slot.kind == TargetFeatureKind.NEXT_PREFILL_TOKENS.value:
+                mapping = batch.idx_mapping
+                if sequence_rows is not None:
+                    mapping = mapping[sequence_rows]
+                tensor = next_prefill_tokens[:1, mapping].T
+            else:
+                tensor = source[slot.kind]
+                if token_rows is not None:
+                    tensor = tensor[token_rows]
             if tuple(tensor.shape[1:]) != slot.trailing_shape:
                 raise ValueError(
                     f"unexpected remote feature shape for {slot.kind}: {tensor.shape}"

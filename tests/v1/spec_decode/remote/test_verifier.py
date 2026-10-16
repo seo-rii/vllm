@@ -354,6 +354,135 @@ def test_failed_remote_row_stays_target_only_without_reusing_stale_kv(
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+def test_target_only_round_skips_feature_preparation_and_still_closes(
+    verifier, monkeypatch
+):
+    instance, executor, _, _ = verifier
+
+    def fail(plan, features):
+        raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "draft KV exhausted")
+
+    monkeypatch.setattr(executor, "execute", fail)
+    batch = inputs(["a"], [[1]], [[0]], [1])
+    propose(instance, batch, [1], [0], [2])
+
+    def reject_features(*args, **kwargs):
+        pytest.fail("target-only round prepared remote features")
+
+    monkeypatch.setattr(instance, "_features", reject_features)
+    batch = inputs(["a"], [[2]], [[1]], [0])
+    assert propose(instance, batch, [1], [0], [3]).tolist() == [[-1] * K]
+    key = instance._requests["a"].key
+    instance.close_requests({"a"})
+    assert instance._requests == {}
+    assert instance._session.sequence_state(key) is None
+
+
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+@pytest.mark.parametrize("reconnect", [False, True])
+def test_disconnected_new_request_attempts_reconnect_before_feature_preparation(
+    verifier, monkeypatch, reconnect
+):
+    instance, _, _, _ = verifier
+    session = instance._session
+    session._invalidate("test connection loss")
+    attempts = []
+    maybe_reconnect = session.maybe_reconnect
+
+    def unavailable():
+        attempts.append(True)
+        return maybe_reconnect() if reconnect else False
+
+    def reject_features(*args, **kwargs):
+        pytest.fail("disconnected request prepared remote features")
+
+    monkeypatch.setattr(session, "maybe_reconnect", unavailable)
+    if not reconnect:
+        monkeypatch.setattr(instance, "_features", reject_features)
+    batch = inputs(["new"], [[1, 2]], [[0, 1]], [2])
+    expected = digest_row([1, 2], 3) if reconnect else [-1] * K
+    assert propose(instance, batch, [1], [0], [3]).tolist() == [expected]
+    assert attempts
+    key = instance._requests["new"].key
+    instance.close_requests({"new"})
+    assert session.sequence_state(key) is None
+
+
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+def test_mixed_target_only_batch_transfers_only_active_ragged_features(
+    verifier, monkeypatch
+):
+    instance, executor, _, _ = verifier
+    execute = executor.execute
+
+    def fail(plan, features):
+        raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "draft KV exhausted")
+
+    monkeypatch.setattr(executor, "execute", fail)
+    propose(instance, inputs(["dead"], [[1]], [[0]], [1]), [1], [0], [2])
+    monkeypatch.setattr(executor, "execute", execute)
+    transferred = []
+    tensor_to = torch.Tensor.to
+
+    def track_hidden(tensor, *args, **kwargs):
+        if tensor.ndim == 2 and tensor.dtype == torch.float32:
+            transferred.append(tensor[:, 0].tolist())
+        return tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", track_hidden)
+    batch = inputs(
+        ["b", "dead", "c"],
+        [[11, 12], [2], [21, 22, 23]],
+        [[0, 1], [1], [0, 1, 2]],
+        [4, 0, 3],
+        [3, 0, 1],
+    )
+    result = instance._propose(
+        batch,
+        torch.arange(6, dtype=torch.float32)[:, None].expand(-1, 4),
+        None,
+        torch.tensor([0, 1, 1]),
+        torch.tensor([0, 0, 0]),
+        torch.tensor([[3], [30], [0], [0]]),
+        torch.tensor([[0, 0, 0, 13]]),
+    )
+    assert result.tolist() == [[-1] * K, [-1] * K, digest_row([21, 22, 23], 30)]
+    assert transferred == [[0, 1, 3, 4, 5]]
+    assert executor.plans[-2].next_prefill_tokens.tolist() == [[13]]
+
+
+def test_auxiliary_features_are_selected_before_concatenation(monkeypatch):
+    instance = object.__new__(remote.RemoteSpeculator)
+    instance.device = torch.device("cpu")
+    instance._session = SimpleNamespace(selected_transport="inline")
+    instance._contract = SimpleNamespace(
+        schema=TargetFeatureSchema(
+            1, (FeatureSlot("aux_hidden_states", "float32", (8,)),)
+        )
+    )
+    batch = inputs(["a", "b"], [[1, 2], [3]], [[0, 1], [0]], [2, 1])
+    concatenated = []
+    tensor_cat = torch.cat
+
+    def track_aux(tensors, **kwargs):
+        concatenated.append([tensor[:, 0].tolist() for tensor in tensors])
+        return tensor_cat(tensors, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", track_aux)
+    state = torch.arange(3, dtype=torch.float32)[:, None].expand(-1, 4)
+    features = instance._features(
+        batch,
+        state,
+        [state, state + 10],
+        torch.zeros(1, 2, dtype=torch.int64),
+        token_rows=[2],
+        sequence_rows=[1],
+    )
+    assert concatenated == [[[2], [12]]]
+    assert features["aux_hidden_states"].shape == (1, 8)
+
+
 @pytest.mark.parametrize("option", ["prefix", "async", "tp4", "pp2", "embeddings"])
 def test_unsupported_placement_fails_before_connecting(option, monkeypatch):
     settings = config("tcp://127.0.0.1:1")
