@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
+from vllm.v1.spec_decode.remote.runtime.adapter import TargetConditionedDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.gpu import (
     GPUDraftStepExecutor,
     make_input_batch,
@@ -18,6 +19,7 @@ from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.step import DraftStepPlanner, DraftStepRow
 from vllm.v1.spec_decode.remote.runtime.weights import selected_checkpoint_weights
+from vllm.v1.spec_decode.remote.server import RemoteDraftServer
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 
 
@@ -85,6 +87,110 @@ def _config(*, use_aux=False):
             draft_sample_method="greedy",
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("method", "aux", "max_model_len", "num_blocks", "block_size"),
+    [
+        ("eagle3", False, 32, 16, 4),
+        ("eagle3", True, 32, 16, 4),
+        ("mtp", False, 32, 16, 4),
+        ("mtp", False, 1, 2, 2),
+    ],
+)
+@pytest.mark.parametrize("failure", [None, "decode", "synchronize"])
+def test_gpu_warmup_completes_before_listening_without_live_request_state(
+    method, aux, max_model_len, num_blocks, block_size, failure, monkeypatch
+):
+    import vllm.v1.spec_decode.remote.runtime.gpu as gpu
+
+    config = _config(use_aux=aux)
+    config.model_config.max_model_len = max_model_len
+    if method == "mtp":
+        config.speculative_config.method = "mtp"
+        config.speculative_config.num_speculative_tokens = 1
+        config.speculative_config.draft_model_config.hf_config.architectures = [
+            "MiMoMTP"
+        ]
+    num_drafts = config.speculative_config.num_speculative_tokens
+    executor = object.__new__(GPUDraftStepExecutor)
+    executor.vllm_config = config
+    executor.contract = create_runtime_contract(config)
+    executor.device = torch.device("cpu")
+    executor.num_blocks = num_blocks
+    executor.block_size = block_size
+    executor.input_buffers = InputBuffers(2, 16, executor.device)
+    executor._init_sampling_buffers(2)
+    planner = DraftStepPlanner(
+        DraftBlockPool(executor.num_blocks, executor.block_size),
+        max_num_reqs=2,
+        max_model_len=max_model_len,
+        num_speculative_tokens=num_drafts,
+    )
+    adapter = TargetConditionedDraftAdapter(
+        executor,
+        planner,
+        capabilities=executor.contract.capabilities,
+        feature_schema=executor.contract.schema,
+        methods={method},
+    )
+    server = RemoteDraftServer(adapter)
+    calls = []
+    warmup_planners = []
+
+    def warmup_planner(*args, **kwargs):
+        result = DraftStepPlanner(*args, **kwargs)
+        warmup_planners.append(result)
+        return result
+
+    def execute(plan, features):
+        assert server.endpoint is None
+        assert planner.num_open == 0
+        batch = make_input_batch(plan, features[0], executor.input_buffers)
+        phase = "prefill" if batch.has_prefill else "decode"
+        calls.append(phase)
+        assert bool(plan.num_computed_tokens[0]) is (
+            phase == "decode" and max_model_len > 1
+        )
+        for slot, tensor in zip(executor.contract.schema.slots, features):
+            count = plan.num_reqs if slot.per_sequence else plan.num_tokens
+            assert tensor.shape == (count, *slot.trailing_shape)
+            assert tensor.dtype == getattr(torch, slot.dtype)
+        assert torch.equal(features[1], torch.from_numpy(plan.positions))
+        executor.last_sampled.fill_(17)
+        executor.lookahead.fill_(19)
+        if phase == failure:
+            raise RuntimeError("warmup failed")
+        return torch.zeros(plan.num_reqs, num_drafts, dtype=torch.int64)
+
+    def synchronize(device):
+        assert server.endpoint is None
+        assert device == executor.device
+        calls.append("synchronize")
+        if failure == "synchronize":
+            raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(gpu, "DraftStepPlanner", warmup_planner)
+    monkeypatch.setattr(executor, "execute", execute)
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    try:
+        if failure:
+            with pytest.raises(RuntimeError, match="warmup failed"):
+                server.start("tcp://127.0.0.1:0")
+            assert server.endpoint is None
+        else:
+            server.start("tcp://127.0.0.1:0")
+            assert server.endpoint is not None
+        assert calls == ["prefill", "decode", "synchronize"]
+        assert len(warmup_planners) == 1
+        assert warmup_planners[0].num_open == 0
+        assert warmup_planners[0].block_pool.num_free_blocks == num_blocks - 1
+        assert planner.num_open == 0
+        assert planner.block_pool.num_free_blocks == num_blocks - 1
+        assert not executor.last_sampled.any()
+        assert not executor.lookahead.any()
+    finally:
+        server.stop()
 
 
 @pytest.mark.parametrize("aux", [False, True])

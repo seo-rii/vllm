@@ -14,6 +14,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.adapter import (
     DraftStepExecutor,
     Features,
@@ -21,7 +22,11 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
-from vllm.v1.spec_decode.remote.runtime.step import DraftStepPlan, DraftStepPlanner
+from vllm.v1.spec_decode.remote.runtime.step import (
+    DraftStepPlan,
+    DraftStepPlanner,
+    DraftStepRow,
+)
 from vllm.v1.spec_decode.remote.runtime.weights import materialize_target_shell
 
 if TYPE_CHECKING:
@@ -325,6 +330,74 @@ class GPUDraftStepExecutor(DraftStepExecutor):
     @property
     def max_num_tokens(self) -> int:
         return self.input_buffers.max_num_tokens
+
+    @torch.inference_mode()
+    def warmup(self) -> None:
+        """Run real prefill/decode kernels before starting live RPC deadlines."""
+        config = self.vllm_config
+        spec = config.speculative_config
+        assert spec is not None
+        context_capacity = min(
+            config.model_config.max_model_len,
+            (self.num_blocks - 1) * self.block_size - spec.num_speculative_tokens,
+        )
+        if context_capacity < 1:
+            raise ValueError(
+                "draft KV budget cannot hold one token plus draft lookahead"
+            )
+        # A separate pool keeps synthetic request/KV ownership out of live state.
+        # Each new live request overwrites the warmed request slot's block table.
+        planner = DraftStepPlanner(
+            DraftBlockPool(self.num_blocks, self.block_size),
+            max_num_reqs=1,
+            max_model_len=config.model_config.max_model_len,
+            num_speculative_tokens=spec.num_speculative_tokens,
+        )
+        key = SequenceKey("warmup", 0, 0)
+        prefill_tokens = min(
+            self.block_size + 1, self.max_num_tokens, max(1, context_capacity - 1)
+        )
+        decode_tokens = min(
+            spec.num_speculative_tokens + 1,
+            self.max_num_tokens,
+            max(1, context_capacity - prefill_tokens),
+        )
+        planner.open(key)
+        try:
+            for prefill, num_tokens in (
+                (True, prefill_tokens),
+                (False, decode_tokens),
+            ):
+                if not prefill and context_capacity == 1:
+                    planner.close(key)
+                    planner.open(key)
+                row = DraftStepRow(
+                    key,
+                    num_tokens,
+                    num_sampled=0 if prefill else 1,
+                    num_rejected=0 if prefill else num_tokens - 1,
+                    next_prefill_tokens=(0,) if prefill else (),
+                )
+                plan, failures = planner.plan([row])
+                assert not failures
+                features: Features = []
+                for slot in self.contract.schema.slots:
+                    if slot.kind == "positions":
+                        tensor = torch.from_numpy(plan.positions)
+                    else:
+                        count = plan.num_reqs if slot.per_sequence else num_tokens
+                        tensor = torch.zeros(
+                            (count, *slot.trailing_shape),
+                            dtype=getattr(torch, slot.dtype),
+                        )
+                    features.append(tensor)
+                self.execute(plan, features)
+                planner.commit(plan)
+        finally:
+            planner.close(key)
+            self.last_sampled.zero_()
+            self.lookahead.zero_()
+            torch.accelerator.synchronize(self.device)
 
     @torch.inference_mode()
     def execute(self, plan: DraftStepPlan, features: Features) -> torch.Tensor:
