@@ -191,6 +191,13 @@ class RemoteSpeculator(BaseSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        if is_profile and self._tp.rank_in_group == 0:
+            self._profile_features(
+                input_batch,
+                last_hidden_states,
+                aux_hidden_states,
+                next_prefill_tokens,
+            )
         if dummy_run or is_profile:
             return torch.full(
                 (input_batch.num_reqs, self.num_speculative_steps),
@@ -247,6 +254,28 @@ class RemoteSpeculator(BaseSpeculator):
             raise RuntimeError(f"remote drafter proposal failed: {error}")
         assert tokens is not None
         return torch.tensor(tokens, dtype=torch.int64, device=self.device)
+
+    def _profile_features(
+        self,
+        batch: InputBatch,
+        hidden: torch.Tensor,
+        aux: list[torch.Tensor] | None,
+        next_prefill_tokens: torch.Tensor,
+    ) -> None:
+        # Full-size compaction bounds both all-active and mixed fallback batches.
+        tokens = list(range(batch.num_tokens))
+        rows = list(range(batch.num_reqs))
+        features = self._features(
+            batch,
+            hidden,
+            aux,
+            next_prefill_tokens,
+            token_rows=tokens,
+            sequence_rows=rows,
+        )
+        feature_bytes = self._stats["feature_bytes"]
+        self._select(features, tokens, rows)
+        self._stats["feature_bytes"] = feature_bytes
 
     def _propose(
         self,
