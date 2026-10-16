@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import save_file
+from transformers import PreTrainedConfig
 
+from vllm.config.speculative import SpeculativeConfig
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.adapter import TargetConditionedDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.gpu import (
@@ -47,7 +49,7 @@ class _Model(SimpleNamespace):
         return self.hf_config.vocab_size
 
 
-def _config(*, use_aux=False):
+def _config(*, use_aux=False, method="eagle3"):
     target = _Model(
         model="target",
         revision="target-sha",
@@ -77,12 +79,22 @@ def _config(*, use_aux=False):
             eagle_config={"use_aux_hidden_state": use_aux},
         ),
     )
+    if method == "mtp":
+        draft.hf_config = SpeculativeConfig.hf_config_override(
+            PreTrainedConfig(
+                model_type="mimo",
+                architectures=["MiMoForCausalLM"],
+                hidden_size=16,
+                vocab_size=32,
+                num_nextn_predict_layers=1,
+            )
+        )
     return SimpleNamespace(
         model_config=target,
         speculative_config=SimpleNamespace(
             draft_model_config=draft,
-            method="eagle3",
-            num_speculative_tokens=3,
+            method=method,
+            num_speculative_tokens=1 if method == "mtp" else 3,
             parallel_drafting=False,
             draft_sample_method="greedy",
         ),
@@ -104,14 +116,8 @@ def test_gpu_warmup_completes_before_listening_without_live_request_state(
 ):
     import vllm.v1.spec_decode.remote.runtime.gpu as gpu
 
-    config = _config(use_aux=aux)
+    config = _config(use_aux=aux, method=method)
     config.model_config.max_model_len = max_model_len
-    if method == "mtp":
-        config.speculative_config.method = "mtp"
-        config.speculative_config.num_speculative_tokens = 1
-        config.speculative_config.draft_model_config.hf_config.architectures = [
-            "MiMoMTP"
-        ]
     num_drafts = config.speculative_config.num_speculative_tokens
     executor = object.__new__(GPUDraftStepExecutor)
     executor.vllm_config = config
@@ -204,6 +210,25 @@ def test_contract_transports_only_the_checkpoint_hidden_state_kind(aux):
     lookahead = contract.schema.slots[-1]
     assert lookahead.optional and lookahead.per_sequence
     assert lookahead.trailing_shape == (1,)
+
+
+def test_contract_accepts_resolved_mimo_architecture():
+    config = _config(method="mtp")
+    draft = config.speculative_config.draft_model_config
+    assert draft.hf_config.architectures == ["MiMoMTPModel"]
+    contract = create_runtime_contract(config)
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (16,)
+
+
+@pytest.mark.parametrize("architecture", ["MiMoMTP", "MiMoV2MTPModel"])
+def test_contract_rejects_unsupported_mtp_architectures(architecture):
+    config = _config(method="mtp")
+    config.speculative_config.draft_model_config.hf_config.architectures = [
+        architecture
+    ]
+    with pytest.raises(ValueError, match="MiMoMTP only"):
+        create_runtime_contract(config)
 
 
 def test_contract_fingerprint_changes_with_weights_precision_and_feature_policy():

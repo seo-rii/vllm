@@ -57,7 +57,7 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         if target_type not in ("gpt_oss", "qwen3"):
             raise ValueError("standalone EAGLE3 currently supports GPT-OSS and Qwen3")
     elif spec.method == "mtp":
-        if "MiMoMTP" not in draft.hf_config.architectures:
+        if "MiMoMTPModel" not in draft.hf_config.architectures:
             raise ValueError("standalone MTP currently supports MiMoMTP only")
         if spec.num_speculative_tokens != 1:
             raise ValueError("MiMoMTP supports exactly one speculative token")
