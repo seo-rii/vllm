@@ -55,6 +55,9 @@ Features = list[torch.Tensor | None]
 class DraftStepExecutor(ABC):
     """Runs planned draft steps on the drafter's device."""
 
+    def warmup(self) -> None:  # noqa: B027
+        """Complete device initialization before the server accepts requests."""
+
     @property
     def max_num_tokens(self) -> int | None:
         """Maximum tokens per execution, or None for an unbounded executor."""
@@ -105,6 +108,9 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
 
     def capabilities(self) -> SpeculatorPlacementCapabilities:
         return self._capabilities
+
+    def warmup(self) -> None:
+        self.executor.warmup()
 
     def feature_schema(self) -> TargetFeatureSchema:
         return self._schema
