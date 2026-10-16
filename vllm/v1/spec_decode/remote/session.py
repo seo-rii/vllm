@@ -1220,6 +1220,14 @@ class RemoteDraftSession:
             results[pending.pop(envelope.request_id)] = (ack.status, ack.detail)
         for index in pending.values():
             results[index] = unanswered
+        if not self._alive:
+            # Earlier ACKs cannot restore state invalidated by a later failure.
+            for index, (status, _) in enumerate(results):
+                if status is SpeculatorStatusCode.OK:
+                    results[index] = (
+                        SpeculatorStatusCode.INTERNAL_ERROR,
+                        "session invalidated after acknowledgement",
+                    )
         return results
 
     def _apply_status(

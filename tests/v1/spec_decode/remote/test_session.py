@@ -1238,6 +1238,58 @@ def test_prefill_many_drains_acks_under_socket_backpressure(
         server.stop()
 
 
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("is_final", [True, False])
+@pytest.mark.parametrize("disconnect", [True, False])
+def test_prefill_acknowledgements_cannot_revive_a_lost_connection(
+    make_session, adapter, monkeypatch, policy, is_final, disconnect
+):
+    session = make_session(failure_policy=policy)
+    keys = (session.open_sequence(1), session.open_sequence(2))
+    original_await = session._await
+    acknowledged = 0
+
+    def acknowledge_then_disconnect(*args, **kwargs):
+        nonlocal acknowledged
+        if acknowledged and disconnect:
+            raise TransportError("connection lost after first prefill ACK")
+        reply = original_await(*args, **kwargs)
+        assert reply[1].key == keys[acknowledged]
+        assert reply[1].status is OK
+        acknowledged += 1
+        return reply
+
+    monkeypatch.setattr(session, "_await", acknowledge_then_disconnect)
+    expected = (
+        pytest.raises(RemoteDraftError, match="prefill failed")
+        if disconnect and policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expected:
+        session.prefill_many([(key, features([1]), is_final) for key in keys])
+
+    if not disconnect:
+        assert acknowledged == 2
+        expected_state = SequenceState.READY if is_final else SequenceState.PREFILLING
+        assert all(session.sequence_state(key) is expected_state for key in keys)
+        assert all(
+            session._records[key.sequence_id].prefilled_tokens == 1 for key in keys
+        )
+        return
+
+    assert acknowledged == 1
+    assert not session.connected
+    assert all(session.sequence_state(key) is SequenceState.INVALID for key in keys)
+    assert all(session._records[key.sequence_id].prefilled_tokens == 0 for key in keys)
+    if policy == "target_only":
+        monkeypatch.setattr(session, "_send", Mock(side_effect=AssertionError))
+        session.prefill_many([(key, features([2]), True) for key in keys])
+        result = round_trip(session, batch(0, keys, recovery=[2, 3]))
+        assert result.output.valid_lengths.tolist() == [0, 0]
+        assert all(status is not OK for status in result.row_statuses)
+        assert adapter.proposed_batches == []
+
+
 def test_prefill_many_writes_every_chunk_before_waiting(
     session, server, adapter, monkeypatch
 ):
