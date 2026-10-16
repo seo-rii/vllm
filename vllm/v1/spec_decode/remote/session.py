@@ -712,6 +712,8 @@ class RemoteDraftSession:
                 continue
             if record.state is SequenceState.INVALID:
                 del self._records[key.sequence_id]
+                if self._ipc_poisoned:
+                    self._generations.pop(key.sequence_id, None)
                 continue
             record.state = transition_sequence(record.state, SequenceState.CLOSING)
             pending.append(key)
@@ -722,9 +724,9 @@ class RemoteDraftSession:
             record = self._records.pop(key.sequence_id, None)
             if record is not None and record.state is SequenceState.CLOSING:
                 record.state = transition_sequence(record.state, SequenceState.CLOSED)
-            if key in acked:
-                # The server no longer holds this sequence, so a reused ID
-                # can start over; unacknowledged closes keep bumping it.
+            if key in acked or self._ipc_poisoned:
+                # Acknowledged closes and permanently disabled IPC sessions
+                # need no generation fence; reconnectable sessions still do.
                 self._generations.pop(key.sequence_id, None)
 
     def _close_remote(self, keys: tuple[SequenceKey, ...]) -> set[SequenceKey]:

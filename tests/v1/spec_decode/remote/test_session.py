@@ -1192,6 +1192,44 @@ def test_unacknowledged_close_keeps_bumping_the_generation(session):
     assert second.generation == first.generation + 1
 
 
+@pytest.mark.parametrize("target_only", [False, True])
+def test_poisoned_ipc_close_forgets_completed_generations(
+    session, monkeypatch, target_only
+):
+    from vllm.v1.spec_decode.remote.transport import TransportTimeout
+
+    first = ready(session, 1)
+    if target_only:
+        # A timeout before any request bytes latches just this sequence.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session, "_send", Mock(side_effect=TransportTimeout("not sent"))
+            )
+            result = round_trip(session, batch(0, [first], recovery=[4]))
+        assert result.output.valid_lengths.tolist() == [0]
+        assert session.sequence_state(first) is SequenceState.TARGET_ONLY
+
+    # CPU tests exercise the real session lifecycle with a mock CUDA arena.
+    exporter = Mock()
+    session._ipc_exporter = exporter
+    session.close()
+    exporter.close.assert_called_once_with()
+    assert not session.maybe_reconnect()
+    session.close_sequences((first,))
+    assert not session._records
+    assert not session._generations
+
+    for sequence_id in range(100):
+        key = session.open_sequence(sequence_id)
+        assert session.sequence_state(key) is SequenceState.INVALID
+        result = round_trip(session, batch(sequence_id + 1, [key], recovery=[4]))
+        assert result.output.valid_lengths.tolist() == [0]
+        session.close_sequences((key,))
+        assert not session._records
+        assert not session._generations
+    assert not session.maybe_reconnect()
+
+
 def test_close_is_idempotent(session, server, adapter):
     a = ready(session, 1)
     b = ready(session, 2)
