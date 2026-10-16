@@ -322,11 +322,15 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         )
         self.seeds = torch.zeros(max_num_reqs, dtype=torch.int64, device=self.device)
 
+    @property
+    def max_num_tokens(self) -> int:
+        return self.input_buffers.max_num_tokens
+
     @torch.inference_mode()
     def execute(self, plan: DraftStepPlan, features: Features) -> torch.Tensor:
         from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
-        if plan.num_tokens > self.input_buffers.max_num_tokens:
+        if plan.num_tokens > self.max_num_tokens:
             raise ValueError("draft step exceeds the configured feature-token budget")
         values = {
             slot.kind: tensor

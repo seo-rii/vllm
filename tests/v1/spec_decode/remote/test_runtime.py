@@ -4,6 +4,7 @@
 target-conditioned adapter driven end to end through the server."""
 
 from collections import defaultdict
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 from vllm.v1.spec_decode.remote.protocol import (
     FeatureSlot,
+    RemoteServerLimits,
     SequenceKey,
     SpeculatorStatusCode,
     TargetFeatureSchema,
@@ -211,13 +213,20 @@ class KVDigestExecutor(DraftStepExecutor):
     in the runtime changes the drafts.
     """
 
-    def __init__(self, pool: DraftBlockPool):
+    def __init__(self, pool: DraftBlockPool, max_num_tokens=None):
         self.pool = pool
+        self._max_num_tokens = max_num_tokens
         self.kv = np.full(pool.num_blocks * pool.block_size, -1, dtype=np.int64)
         self.block_tables: dict[int, list[int]] = defaultdict(list)
         self.plans: list[DraftStepPlan] = []
 
+    @property
+    def max_num_tokens(self):
+        return self._max_num_tokens
+
     def execute(self, plan, features):
+        if self.max_num_tokens is not None and plan.num_tokens > self.max_num_tokens:
+            raise ValueError("draft step exceeds the configured feature-token budget")
         self.plans.append(plan)
         for req_index, update in plan.block_table_updates.items():
             table = self.block_tables[req_index][: update.start]
@@ -282,9 +291,10 @@ IDENTITY = VerifierIdentity(
 
 
 @pytest.fixture
-def runtime():
+def runtime(request):
+    executor_budget, wire_budget = getattr(request, "param", (None, 64))
     planner = make_planner(num_blocks=12)
-    executor = KVDigestExecutor(planner.block_pool)
+    executor = KVDigestExecutor(planner.block_pool, executor_budget)
     adapter = TargetConditionedDraftAdapter(
         executor,
         planner,
@@ -292,9 +302,21 @@ def runtime():
         feature_schema=SCHEMA,
         methods={"mtp"},
     )
-    server = RemoteDraftServer(adapter)
+    server = RemoteDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            max_batch_size=4,
+            max_feature_tokens=wire_budget,
+            max_sequences=5,
+            max_model_len=64,
+        ),
+    )
     server.start("tcp://127.0.0.1:0")
-    session = RemoteDraftSession(server.endpoint, IDENTITY, request_timeout_ms=5000)
+    session = RemoteDraftSession(
+        server.endpoint,
+        replace(IDENTITY, max_num_batched_tokens=wire_budget),
+        request_timeout_ms=5000,
+    )
     session.connect()
     yield session, executor
     session.close()
@@ -328,6 +350,7 @@ def round_(session, batch_id, keys, query_lens, tokens, accepted, recovery):
     )
 
 
+@pytest.mark.parametrize("runtime", [(None, 64), (4, 8)], indirect=True)
 def test_adapter_drafts_from_the_verified_prefix(runtime):
     session, executor = runtime
     a = session.open_sequence(1)
@@ -381,6 +404,48 @@ def test_round_must_not_resend_a_buffered_prompt_chunk(runtime):
     result = round_(session, 0, [a], [2], [11, 12], [0], [30])
     assert result.row_statuses == (SpeculatorStatusCode.SEQUENCE_DESYNC,)
     assert session.sequence_state(a) is SequenceState.DESYNCED
+
+
+@pytest.mark.parametrize("runtime", [(4, 4)], indirect=True)
+def test_buffered_final_chunks_fit_executor_budget_and_commit_each_row(runtime):
+    session, executor = runtime
+    a, b = session.open_sequence(1), session.open_sequence(2)
+    session.prefill(a, chunk([1, 2, 3, 4]), is_final=True)
+    session.prefill(b, chunk([5, 6, 7, 8]), is_final=True)
+
+    result = round_(session, 0, [a, b], [0, 0], [], [0, 0], [9, 10])
+    a_drafts, b_drafts = digest_row([1, 2, 3, 4], 9), digest_row([5, 6, 7, 8], 10)
+    assert result.row_statuses == (OK, OK)
+    assert result.output.valid_lengths.tolist() == [K, K]
+    assert result.output.token_ids.tolist() == [a_drafts, b_drafts]
+    assert [plan.num_tokens for plan in executor.plans] == [4, 4]
+
+    # Each separate execution commits its prefix before the next round.
+    result = round_(
+        session, 1, [b, a], [2, 2], [10, b_drafts[0], 9, a_drafts[0]], [1, 0], [11, 12]
+    )
+    assert result.row_statuses == (OK, OK)
+    assert result.output.valid_lengths.tolist() == [K, K]
+    assert result.output.token_ids.tolist() == [
+        digest_row([5, 6, 7, 8, 10, b_drafts[0]], 11),
+        digest_row([1, 2, 3, 4, 9], 12),
+    ]
+    assert executor.plans[-1].num_tokens == 4
+
+
+@pytest.mark.parametrize("runtime", [(4, 8)], indirect=True)
+def test_individually_oversized_buffered_chunk_only_degrades_that_row(runtime):
+    session, executor = runtime
+    a, b = session.open_sequence(1), session.open_sequence(2)
+    session.prefill(a, chunk([1, 2, 3, 4, 5]), is_final=True)
+    session.prefill(b, chunk([6, 7]), is_final=True)
+
+    result = round_(session, 0, [a, b], [0, 0], [], [0, 0], [8, 9])
+    assert result.row_statuses == (SpeculatorStatusCode.OUT_OF_MEMORY, OK)
+    assert result.output.valid_lengths.tolist() == [0, K]
+    assert result.output.token_ids[1].tolist() == digest_row([6, 7], 9)
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    assert [plan.num_tokens for plan in executor.plans] == [2]
 
 
 def test_prompt_chunk_without_lookahead_is_refused(runtime):
