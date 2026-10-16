@@ -234,6 +234,97 @@ def test_dummy_and_profile_do_not_contact_or_advance_server(
     assert executor.plans == []
 
 
+@pytest.mark.parametrize("auxiliary", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_profile_budgets_feature_copies_without_mutating_remote_state(
+    verifier, monkeypatch, auxiliary, mixed
+):
+    instance, executor, _, group = verifier
+    aux = [torch.zeros(3, 4), torch.ones(3, 4)] if auxiliary else None
+    if auxiliary:
+        monkeypatch.setattr(
+            instance,
+            "_contract",
+            SimpleNamespace(
+                schema=TargetFeatureSchema(
+                    1,
+                    (
+                        *SCHEMA.slots[:2],
+                        FeatureSlot("aux_hidden_states", "float32", (8,)),
+                        *SCHEMA.slots[3:],
+                    ),
+                )
+            ),
+        )
+    feature_calls, selected = [], []
+    prepare = instance._features
+    select = instance._select
+
+    def prepare_features(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        feature_calls.append(kwargs)
+        return result
+
+    def select_features(features, tokens, rows):
+        result = select(features, tokens, rows)
+        source, copy = (
+            features[instance._contract.schema.slots[2].kind],
+            result.slots[2],
+        )
+        assert source.untyped_storage().data_ptr() != copy.untyped_storage().data_ptr()
+        assert torch.equal(source, copy)
+        selected.append(tuple(copy.shape))
+        return result
+
+    def reject_network(*args, **kwargs):
+        pytest.fail("profiling contacted the remote session")
+
+    monkeypatch.setattr(instance, "_features", prepare_features)
+    monkeypatch.setattr(instance, "_select", select_features)
+    monkeypatch.setattr(instance._session, "open_sequence", reject_network)
+    monkeypatch.setattr(instance._session, "prefill_many", reject_network)
+    monkeypatch.setattr(instance._session, "dispatch", reject_network)
+    batch = inputs(
+        ["a", "b"], [[1, 2], [3]], [[0, 1], [2 if mixed else 0]], [2, 0 if mixed else 1]
+    )
+    before_stats = dict(instance._stats)
+    output = propose(
+        instance,
+        batch,
+        [1, 1],
+        [0, 0],
+        [4, 5],
+        aux_hidden_states=aux,
+        is_profile=True,
+        dummy_run=True,
+    )
+    assert output.tolist() == [[-1] * K, [-1] * K]
+    assert feature_calls == [{"token_rows": [0, 1, 2], "sequence_rows": [0, 1]}]
+    assert selected == [(3, 8 if auxiliary else 4)]
+    assert instance._stats == before_stats
+    assert instance._requests == {}
+    assert executor.plans == []
+    # Only rank zero owns and profiles the transferred features.
+    group.rank_in_group = 1
+    propose(instance, batch, [1, 1], [0, 0], [4, 5], is_profile=True)
+    assert len(feature_calls) == 1
+    group.rank_in_group = 0
+
+
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+def test_profile_allocation_failure_is_not_hidden_by_target_only(verifier, monkeypatch):
+    instance, _, _, _ = verifier
+
+    def fail_features(*args, **kwargs):
+        raise torch.OutOfMemoryError("profile feature allocation")
+
+    monkeypatch.setattr(instance, "_features", fail_features)
+    batch = inputs(["a"], [[1]], [[0]], [1])
+    with pytest.raises(torch.OutOfMemoryError, match="profile feature allocation"):
+        propose(instance, batch, [1], [0], [2], is_profile=True)
+    assert instance._requests == {}
+
+
 def test_nonzero_tp_rank_receives_cpu_tokens_without_gpu_collective(verifier):
     instance, executor, settings, group = verifier
     group.rank_in_group = 1
