@@ -162,6 +162,24 @@ def round_trip(session, batch_):
     return session.collect(session.dispatch(batch_))
 
 
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+def test_local_failure_is_terminal_before_policy(make_session, policy):
+    session = make_session(failure_policy=policy)
+    key = ready(session, 1)
+    expectation = (
+        pytest.raises(RemoteDraftError, match="feature allocation failed")
+        if policy == "error"
+        else contextlib.nullcontext()
+    )
+    with expectation:
+        session.fail_sequences((key,), detail="feature allocation failed")
+    assert session.sequence_state(key) is SequenceState.TARGET_ONLY
+    assert session.connected
+    assert session._records[key.sequence_id].last_status is (
+        SpeculatorStatusCode.OUT_OF_MEMORY
+    )
+
+
 # ----------------------------------------------------------------------
 # Handshake
 # ----------------------------------------------------------------------
