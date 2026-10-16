@@ -205,7 +205,15 @@ class RawClient:
         assert self.open(k).status is OK
         assert self.prefill(k, list(tokens), offset=0).status is OK
 
-    def propose(self, batch_id: int, keys, recovery, accepted=None):
+    def propose(
+        self,
+        batch_id: int,
+        keys,
+        recovery,
+        accepted=None,
+        *,
+        num_speculative_tokens=None,
+    ):
         accepted = accepted or [0] * len(keys)
         base = self.reserve(3)
         frames = [
@@ -219,6 +227,7 @@ class RawClient:
             accepted_counts_slot=base,
             recovery_tokens_slot=base + 1,
             feature_slot=base + 2,
+            num_speculative_tokens=num_speculative_tokens,
         )
         return self.call(message, frames=frames)
 
@@ -961,7 +970,9 @@ def test_ping_answers_while_the_adapter_is_busy(server, adapter, client):
     assert server.queue_depth == 0
 
 
-@pytest.mark.parametrize("failure", ["queue_full", "adapter", "malformed_result"])
+@pytest.mark.parametrize(
+    "failure", ["queue_full", "adapter", "malformed_result", "draft_budget"]
+)
 def test_slow_error_reply_does_not_block_another_session_cleanup(
     server, adapter, client, monkeypatch, failure
 ):
@@ -986,6 +997,10 @@ def test_slow_error_reply_does_not_block_another_session_cleanup(
         def fail_proposal(batch):
             if failure == "adapter":
                 raise RuntimeError("injected adapter failure")
+            if failure == "draft_budget":
+                return propose(
+                    dataclasses.replace(batch, effective_num_speculative_tokens=None)
+                )
             result = propose(batch)
             return dataclasses.replace(result, valid_lengths=ints_to_frame(0, []))
 
@@ -1012,7 +1027,12 @@ def test_slow_error_reply_does_not_block_another_session_cleanup(
             replies.append(
                 client.open(failed_key)
                 if failure == "queue_full"
-                else client.propose(0, [failed_key], recovery=[1])
+                else client.propose(
+                    0,
+                    [failed_key],
+                    recovery=[1],
+                    num_speculative_tokens=0 if failure == "draft_budget" else None,
+                )
             )
         except Exception as error:
             errors.append(error)
