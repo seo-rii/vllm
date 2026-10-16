@@ -656,8 +656,10 @@ class RemoteDraftSession:
         """Close ``keys`` on the server; returns the acknowledged ones."""
         deadline = self._clock() + self._request_timeout_s
         remaining = set(keys)
+        sent_close = False
         try:
             request_id = self._send(CloseSequence(keys=keys), deadline=deadline)
+            sent_close = True
             while remaining:
                 _, ack = self._await(
                     lambda env, msg: (
@@ -668,11 +670,14 @@ class RemoteDraftSession:
                 )
                 remaining.discard(ack.key)
         except TransportTimeout:
-            logger.warning(
-                "Remote draft server did not acknowledge closing %d sequences "
-                "before the deadline; releasing them locally",
-                len(remaining),
-            )
+            if not sent_close:
+                self._invalidate("close request did not finish sending before deadline")
+            else:
+                logger.warning(
+                    "Remote draft server did not acknowledge closing %d sequences "
+                    "before the deadline; releasing them locally",
+                    len(remaining),
+                )
         except TransportError as e:
             self._invalidate(f"connection lost while closing sequences: {e}")
         except RemoteDraftError as e:

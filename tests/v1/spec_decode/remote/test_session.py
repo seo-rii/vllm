@@ -19,6 +19,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import (
+    CloseSequence,
     ErrorReply,
     FeatureSlot,
     HelloAck,
@@ -1128,6 +1129,81 @@ def test_acknowledged_close_forgets_the_sequence(session, adapter):
     assert reopened.generation > previous.generation
     result = round_trip(session, batch(0, [reopened], recovery=[4]))
     assert result.row_statuses == (OK,)
+
+
+@pytest.mark.parametrize("failure_policy", ["target_only", "error"])
+def test_unsent_close_timeout_disconnects_and_reclaims_server_requests(
+    make_session, server, adapter, clock, monkeypatch, failure_policy
+):
+    session = make_session(failure_policy=failure_policy)
+    a, b = ready(session, 1), ready(session, 2)
+    conn = session._conn
+    cleaned = threading.Event()
+    close = adapter.close_sequences
+
+    def close_sequences(keys):
+        close(keys)
+        if set(keys) == {a, b}:
+            cleaned.set()
+
+    monkeypatch.setattr(adapter, "close_sequences", close_sequences)
+    send = session._send
+
+    def expire_before_send(message, **kwargs):
+        if isinstance(message, CloseSequence):
+            clock.advance(0.101)
+        return send(message, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "_send", expire_before_send)
+        session.close_sequences((a,))
+    assert not session.connected
+    assert conn.closed
+    assert session.sequence_state(a) is None
+    assert session.sequence_state(b) is SequenceState.INVALID
+    assert cleaned.wait(2), "disconnect did not release server-owned requests"
+    assert len(server.registry) == 0
+    assert adapter.prefix(a) is None and adapter.prefix(b) is None
+    session.connect()
+    fresh = ready(session, a.sequence_id)
+    assert fresh.generation > a.generation
+    assert round_trip(session, batch(0, [fresh], [4])).row_statuses == (OK,)
+
+
+@pytest.mark.parametrize("failure_policy", ["target_only", "error"])
+def test_sent_close_ack_timeout_keeps_other_requests_usable(
+    make_session, adapter, clock, monkeypatch, failure_policy
+):
+    session = make_session(failure_policy=failure_policy)
+    a, b = ready(session, 1), ready(session, 2)
+    conn = session._conn
+    closed = threading.Event()
+    close = adapter.close_sequences
+
+    def close_sequences(keys):
+        close(keys)
+        if a in keys:
+            closed.set()
+
+    monkeypatch.setattr(adapter, "close_sequences", close_sequences)
+    send = session._send
+
+    def expire_after_send(message, **kwargs):
+        request_id = send(message, **kwargs)
+        if isinstance(message, CloseSequence):
+            clock.advance(0.101)
+        return request_id
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "_send", expire_after_send)
+        session.close_sequences((a,))
+    assert session.connected and not conn.closed
+    assert closed.wait(2), "sent close did not reach the adapter"
+    assert adapter.prefix(a) is None
+    assert session.sequence_state(b) is SequenceState.READY
+    result = round_trip(session, batch(0, [b], [4]))
+    assert result.row_statuses == (OK,)
+    assert result.output.token_ids.tolist() == [expected_row(4)]
 
 
 def test_unacknowledged_close_keeps_bumping_the_generation(session):
