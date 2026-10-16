@@ -5,6 +5,7 @@ rounds, failure latching, stale-response discard, and shutdown recovery."""
 
 import contextlib
 import dataclasses
+import socket
 import threading
 import time
 from unittest.mock import Mock
@@ -668,9 +669,9 @@ def test_large_writes_get_a_size_proportional_budget(session, monkeypatch):
     budgets = []
     send_data = session._conn.send_data
 
-    def record(frame, *, deadline=None):
+    def record(frame, *, deadline=None, drain_incoming=False):
         budgets.append(deadline - time.monotonic())
-        send_data(frame, deadline=deadline)
+        send_data(frame, deadline=deadline, drain_incoming=drain_incoming)
 
     monkeypatch.setattr(session._conn, "send_data", record)
     # 1000 int32 tokens at 1000 B/s is a 4 s write budget, far beyond the
@@ -684,11 +685,11 @@ def timeout_after_frames(monkeypatch, conn, completed_frames):
     send_data = conn.send_data
     sent = 0
 
-    def send(frame, *, deadline=None):
+    def send(frame, *, deadline=None, drain_incoming=False):
         nonlocal sent
         if sent == completed_frames:
             raise TransportTimeout("deadline elapsed before the next frame")
-        send_data(frame, deadline=deadline)
+        send_data(frame, deadline=deadline, drain_incoming=drain_incoming)
         sent += 1
 
     def reject_control(*args, **kwargs):
@@ -1152,6 +1153,36 @@ def test_close_is_idempotent(session, server, adapter):
     assert session.sequence_state(b) is None
     assert len(server.registry) == 0
     assert adapter.prefix(a) is None
+
+
+@pytest.mark.parametrize(
+    "num_requests,num_tokens,send_buffer", [(256, 1, None), (32, 64, 4096)]
+)
+@pytest.mark.timeout(15)
+def test_prefill_many_drains_acks_under_socket_backpressure(
+    tmp_path_factory, adapter, num_requests, num_tokens, send_buffer
+):
+    server = RemoteDraftServer(adapter)
+    server.start(f"unix://{tmp_path_factory.mktemp('pf')}/prefill.sock")
+    identity = dataclasses.replace(IDENTITY, max_num_seqs=num_requests)
+    session = RemoteDraftSession(server.endpoint, identity, request_timeout_ms=2000)
+    try:
+        session.connect()
+        keys = [session.open_sequence(i) for i in range(num_requests)]
+        if send_buffer is not None:
+            peer = next(iter(server._connections))
+            for conn in (session._conn, peer):
+                assert conn is not None
+                conn._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buffer)
+        prompt = [1] * num_tokens
+        session.prefill_many([(key, features(prompt), True) for key in keys])
+        assert session.connected
+        assert all(session.sequence_state(key) is SequenceState.READY for key in keys)
+        assert all(adapter.prefix(key) == prompt for key in keys)
+        assert session.ping().active_sequences == num_requests
+    finally:
+        session.close()
+        server.stop()
 
 
 def test_prefill_many_writes_every_chunk_before_waiting(

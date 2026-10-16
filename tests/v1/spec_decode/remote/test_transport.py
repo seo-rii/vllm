@@ -7,6 +7,7 @@ import socket
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, call
 
 import pytest
@@ -242,8 +243,9 @@ def test_control_and_data_frames_roundtrip(pair):
     assert (frame.kind, frame.body) == (FRAME_CONTROL, b"")
 
 
+@pytest.mark.parametrize("drain_incoming", [False, True])
 @pytest.mark.timeout(5)
-def test_send_deadline_closes_connection_when_peer_does_not_read():
+def test_send_deadline_closes_connection_when_peer_does_not_read(drain_incoming):
     sock, peer = socket.socketpair()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
     connection = FramedConnection(sock)
@@ -253,6 +255,7 @@ def test_send_deadline_closes_connection_when_peer_does_not_read():
             connection.send_data(
                 DataFrame(0, "int32", (1 << 18,), bytes(1 << 20)),
                 deadline=started + 0.05,
+                drain_incoming=drain_incoming,
             )
         assert time.monotonic() - started < 2.0
         assert connection.closed
@@ -288,15 +291,65 @@ def test_send_frames_share_absolute_deadline(monkeypatch):
     assert connection.closed
 
 
-def test_expired_deadline_before_frame_keeps_stream_usable(pair):
+@pytest.mark.parametrize("drain_incoming", [False, True])
+def test_expired_deadline_before_frame_keeps_stream_usable(pair, drain_incoming):
     # Nothing reached the wire, so frame boundaries are intact and the
     # connection must not be torn down.
     client, server = pair
     with pytest.raises(TransportTimeout, match="before sending"):
-        client.send_control(b"too late", deadline=time.monotonic() - 1.0)
+        client.send_control(
+            b"too late", deadline=time.monotonic() - 1.0, drain_incoming=drain_incoming
+        )
     assert not client.closed
     client.send_control(b"next")
     assert server.recv(timeout=1.0).body == b"next"
+
+
+@pytest.mark.timeout(10)
+def test_duplex_send_buffers_large_reply_before_peer_reads_request():
+    sockets = socket.socketpair()
+    for sock in sockets:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    client, server = (FramedConnection(sock) for sock in sockets)
+    request, reply = b"q" * (1 << 20), b"a" * (1 << 20)
+
+    def exchange():
+        server.send_control(reply, deadline=time.monotonic() + 5)
+        return server.recv(timeout=5).body
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        received = pool.submit(exchange)
+        try:
+            client.send_control(
+                request, deadline=time.monotonic() + 5, drain_incoming=True
+            )
+            assert client.recv(timeout=5).body == reply
+            assert received.result(timeout=5) == request
+        finally:
+            client.close()
+            server.close()
+
+
+@pytest.mark.parametrize("close_at", ["register", "select"])
+@pytest.mark.timeout(5)
+def test_duplex_send_close_races_raise_connection_closed(monkeypatch, close_at):
+    sock, peer = socket.socketpair()
+    connection = FramedConnection(sock)
+    selector = transport.selectors.DefaultSelector()
+    original = getattr(selector, close_at)
+
+    def close_then_call(*args, **kwargs):
+        connection.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(selector, close_at, close_then_call)
+    monkeypatch.setattr(transport.selectors, "DefaultSelector", lambda: selector)
+    try:
+        with pytest.raises(ConnectionClosed):
+            connection.send_control(b"request", drain_incoming=True)
+    finally:
+        connection.close()
+        peer.close()
 
 
 def test_send_without_deadline_resets_previous_receive_timeout(pair):

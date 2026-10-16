@@ -19,6 +19,7 @@ import contextlib
 import ipaddress
 import math
 import os
+import selectors
 import socket
 import struct
 import sys
@@ -219,13 +220,39 @@ class FramedConnection:
     def closed(self) -> bool:
         return self._closed
 
-    def send_control(self, data: bytes, *, deadline: float | None = None) -> None:
-        self._send(FRAME_CONTROL, data, deadline=deadline)
+    def send_control(
+        self,
+        data: bytes,
+        *,
+        deadline: float | None = None,
+        drain_incoming: bool = False,
+    ) -> None:
+        self._send(
+            FRAME_CONTROL, data, deadline=deadline, drain_incoming=drain_incoming
+        )
 
-    def send_data(self, frame: DataFrame, *, deadline: float | None = None) -> None:
-        self._send(FRAME_DATA, _frame_encoder.encode(frame), deadline=deadline)
+    def send_data(
+        self,
+        frame: DataFrame,
+        *,
+        deadline: float | None = None,
+        drain_incoming: bool = False,
+    ) -> None:
+        self._send(
+            FRAME_DATA,
+            _frame_encoder.encode(frame),
+            deadline=deadline,
+            drain_incoming=drain_incoming,
+        )
 
-    def _send(self, kind: int, body: bytes, *, deadline: float | None = None) -> None:
+    def _send(
+        self,
+        kind: int,
+        body: bytes,
+        *,
+        deadline: float | None = None,
+        drain_incoming: bool = False,
+    ) -> None:
         if self._closed:
             raise ConnectionClosed("connection is closed")
         if len(body) > MAX_FRAME_BYTES:
@@ -235,6 +262,9 @@ class FramedConnection:
         if deadline is not None and deadline <= time.monotonic():
             raise TransportTimeout("deadline elapsed before sending a frame")
         try:
+            if drain_incoming:
+                self._send_duplex((_HEADER.pack(kind, len(body)), body), deadline)
+                return
             for part in (_HEADER.pack(kind, len(body)), body):
                 if not part:
                     continue
@@ -251,6 +281,52 @@ class FramedConnection:
         except OSError as e:
             self.close()
             raise ConnectionClosed(f"send failed: {e}") from e
+
+    def _send_duplex(self, parts: tuple[bytes, bytes], deadline: float | None) -> None:
+        """Buffer replies while writing so pipelined peers cannot block each other."""
+        self._sock.setblocking(False)
+        with selectors.DefaultSelector() as selector:
+            try:
+                selector.register(
+                    self._sock, selectors.EVENT_READ | selectors.EVENT_WRITE
+                )
+            except ValueError:
+                if self._closed:
+                    raise OSError("connection is closed") from None
+                raise
+            for part in parts:
+                pending = memoryview(part)
+                while pending:
+                    if self._closed:
+                        raise OSError("connection is closed")
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError
+                    # Closing a socket can remove it from epoll without waking
+                    # the selector. Periodically check close() even without a deadline.
+                    events = selector.select(
+                        0.1 if remaining is None else min(remaining, 0.1)
+                    )
+                    for _, mask in events:
+                        if mask & selectors.EVENT_READ:
+                            try:
+                                chunk = self._sock.recv(_RECV_CHUNK)
+                            except BlockingIOError:
+                                pass
+                            else:
+                                if not chunk:
+                                    raise OSError("peer closed the connection")
+                                self._buffer.extend(chunk)
+                        if mask & selectors.EVENT_WRITE:
+                            try:
+                                sent = self._sock.send(pending)
+                            except BlockingIOError:
+                                continue
+                            if not sent:
+                                raise OSError("peer closed the connection")
+                            pending = pending[sent:]
 
     def recv(self, timeout: float | None = None) -> Frame:
         """Receive one frame, waiting at most ``timeout`` seconds."""

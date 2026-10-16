@@ -1053,6 +1053,7 @@ class RemoteDraftSession:
         *,
         deadline: float,
         frames: list[DataFrame] | None = None,
+        drain_incoming: bool = False,
     ) -> int:
         conn = self._require_connection()
         request_id = self._next_request_id
@@ -1066,13 +1067,16 @@ class RemoteDraftSession:
         sent_frames = False
         try:
             for frame in frames:
-                conn.send_data(frame, deadline=wire_deadline)
+                conn.send_data(
+                    frame, deadline=wire_deadline, drain_incoming=drain_incoming
+                )
                 sent_frames = True
             conn.send_control(
                 encode_message(
                     message, session_id=self._session_id, request_id=request_id
                 ),
                 deadline=wire_deadline,
+                drain_incoming=drain_incoming,
             )
         except TransportTimeout:
             # Completed data frames also need their final control message;
@@ -1160,7 +1164,7 @@ class RemoteDraftSession:
     def _sequence_rpcs(
         self, calls: list[tuple[Any, SequenceKey, list[DataFrame] | None]]
     ) -> list[tuple[SpeculatorStatusCode, str]]:
-        """Write sequence commands back to back, then await all their acks.
+        """Pipeline sequence commands while buffering their acknowledgements.
 
         Writes share one request budget; the acknowledgements get a fresh
         one once everything is written, so the time spent copying large
@@ -1174,7 +1178,13 @@ class RemoteDraftSession:
         lost = ""
         try:
             for index, (message, _, frames) in enumerate(calls):
-                pending[self._send(message, frames=frames, deadline=deadline)] = index
+                request_id = self._send(
+                    message,
+                    frames=frames,
+                    deadline=deadline,
+                    drain_incoming=len(calls) > 1,
+                )
+                pending[request_id] = index
         except TransportTimeout:
             pass
         except TransportError as e:
