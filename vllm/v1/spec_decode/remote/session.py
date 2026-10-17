@@ -18,6 +18,7 @@ are opened, so only requests that were running at the time lose
 speculation.
 """
 
+import contextlib
 import itertools
 import math
 import time
@@ -250,6 +251,7 @@ class RemoteDraftSession:
         self._inflight_batch_id: int | None = None
         self._inbound: dict[int, DataFrame] = {}
         self._records: dict[int, _SequenceRecord] = {}
+        self._retiring: set[SequenceKey] = set()
         # Survives reconnects so closed requests need no per-id tombstones.
         self._next_generation = 0
         self._abandoned_batches: set[int] = set()
@@ -439,6 +441,7 @@ class RemoteDraftSession:
         self._inflight_batch_id = None
         self._inbound.clear()
         self._abandoned_batches.clear()
+        self._retiring.clear()
 
     def _hello(self) -> Hello:
         identity = self._identity
@@ -642,10 +645,12 @@ class RemoteDraftSession:
                 continue
             if record.state is SequenceState.INVALID:
                 del self._records[key.sequence_id]
+                self._retiring.discard(key)
                 continue
             record.state = transition_sequence(record.state, SequenceState.CLOSING)
             pending.append(key)
         if pending and self._alive:
+            self._retiring.difference_update(pending)
             self._close_remote(tuple(pending))
         for key in pending:
             record = self._records.pop(key.sequence_id, None)
@@ -688,6 +693,55 @@ class RemoteDraftSession:
     # Proposal rounds
     # ------------------------------------------------------------------
 
+    def preparation_deadline(self) -> float:
+        """Capture the existing request budget before preparing remote features."""
+        return self._clock() + self._request_timeout_s
+
+    def fail_sequences(
+        self,
+        keys: Collection[SequenceKey],
+        *,
+        status: SpeculatorStatusCode = SpeculatorStatusCode.OUT_OF_MEMORY,
+        detail: str,
+        deadline: float | None = None,
+    ) -> None:
+        """Latch local preparation failures until the affected requests close.
+
+        Preparation can advance the verifier's bookkeeping before the peer
+        receives its context. Keeping the records terminal prevents a later
+        step from resuming with stale own-KV. An outstanding proposal uses
+        the same connection teardown as a transport failure. Idle remote state
+        is retired without waiting for ACKs, using only the preparation budget
+        captured by the caller before the failed work.
+        """
+        for key in keys:
+            record = self._records.get(key.sequence_id)
+            if record is not None and record.key == key:
+                self._latch_target_only(record, status)
+        if self._inflight_batch_id is not None:
+            self._invalidate(detail)
+        elif self._alive and self._retiring:
+            remaining = 0.0 if deadline is None else deadline - self._clock()
+            if remaining > 0:
+                # A send failure already tears down connection-owned peer KV.
+                with contextlib.suppress(TransportError):
+                    self._send_retirements(
+                        self._require_connection(), time.monotonic() + remaining
+                    )
+            elif not any(
+                record.state
+                in (
+                    SequenceState.OPENING,
+                    SequenceState.PREFILLING,
+                    SequenceState.READY,
+                )
+                for record in self._records.values()
+            ):
+                self._invalidate("terminal cleanup exhausted the preparation budget")
+            # With healthy siblings, defer the bounded queue until their next
+            # RPC rather than extending the failed preparation's deadline.
+        self._raise_if_strict(detail)
+
     def dispatch(self, batch: RemoteProposalBatch) -> RemoteProposalHandle:
         """Send one round to the server without waiting for the result.
 
@@ -699,6 +753,11 @@ class RemoteDraftSession:
         previous handle before dispatching the next round.
         """
         self._require_no_inflight(f"dispatch batch {batch.batch_id}")
+        effective_k = batch.num_speculative_tokens
+        if effective_k is None:
+            effective_k = self._identity.num_speculative_tokens
+        if not 0 <= effective_k <= self._identity.num_speculative_tokens:
+            raise ValueError("round draft budget must be within the negotiated maximum")
         if batch.batch_id <= self._last_batch_id:
             raise ValueError(
                 f"batch_id {batch.batch_id} is not newer than "
@@ -773,6 +832,7 @@ class RemoteDraftSession:
             recovery_tokens_slot=base + 1,
             feature_slot=base + num_inputs,
             query_lens_slot=None if batch.query_lens is None else base + 2,
+            num_speculative_tokens=effective_k,
         )
         failure = None
         if self._clock() >= handle.deadline:
@@ -1057,14 +1117,15 @@ class RemoteDraftSession:
         drain_incoming: bool = False,
     ) -> int:
         conn = self._require_connection()
-        request_id = self._next_request_id
-        self._next_request_id += 1
         frames = frames or []
         num_bytes = sum(len(frame.payload) for frame in frames)
         # Translate the injectable session clock to the transport's monotonic
         # clock once, so every frame consumes the same remaining budget.
         budget = max(deadline - self._clock(), num_bytes / _MIN_WRITE_BYTES_PER_S)
         wire_deadline = time.monotonic() + budget
+        self._send_retirements(conn, wire_deadline)
+        request_id = self._next_request_id
+        self._next_request_id += 1
         sent_frames = False
         try:
             for frame in frames:
@@ -1086,6 +1147,28 @@ class RemoteDraftSession:
                 self._invalidate("timed out while sending")
             raise
         return request_id
+
+    def _send_retirements(self, conn: FramedConnection, wire_deadline: float) -> None:
+        """Release unused peer KV before later commands, without an ACK wait."""
+        if not self._retiring:
+            return
+        keys = tuple(self._retiring)
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        try:
+            conn.send_control(
+                encode_message(
+                    CloseSequence(keys=keys),
+                    session_id=self._session_id,
+                    request_id=request_id,
+                ),
+                deadline=wire_deadline,
+                drain_incoming=True,
+            )
+        except TransportError:
+            self._invalidate("terminal sequence cleanup did not finish sending")
+            raise
+        self._retiring.difference_update(keys)
 
     def _await(
         self,
@@ -1294,6 +1377,7 @@ class RemoteDraftSession:
         record.last_status = status
         if can_transition_sequence(record.state, SequenceState.TARGET_ONLY):
             record.state = SequenceState.TARGET_ONLY
+            self._retiring.add(record.key)
 
     def _is_ready(self, key: SequenceKey) -> bool:
         record = self._records.get(key.sequence_id)
@@ -1420,6 +1504,7 @@ class RemoteDraftSession:
         self._inflight_batch_id = None
         self._inbound.clear()
         self._drop_connection()
+        self._retiring.clear()
 
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
