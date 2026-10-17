@@ -843,14 +843,15 @@ def test_prefill_and_rounds_respect_advertised_limits():
         assert client.prefill(k, [5, 6], offset=4, is_final=True).status is OK
 
         # The prefix sits at max_model_len: even accepted=0 grows it by the
-        # bonus token, so the row must come back OUT_OF_MEMORY untouched.
+        # bonus token, so the row must come back OUT_OF_MEMORY and retire.
         response = client.propose(0, [k], recovery=[9])
         assert response.status is OK
         _, valid, statuses = client.result(response)
         assert statuses == [SpeculatorStatusCode.OUT_OF_MEMORY]
         assert valid == [0]
         assert adapter.proposed_batches == []
-        assert adapter.prefix(k) == [1, 2, 3, 4, 5, 6]
+        assert adapter.prefix(k) is None
+        assert server.registry.get(k) is None
     finally:
         client.close()
         adapter.release()
@@ -881,7 +882,7 @@ def test_failed_row_is_refused_by_later_rounds(client, adapter, monkeypatch):
     _, valid, statuses = client.result(client.propose(1, [key(70)], recovery=[2]))
     assert statuses == [SpeculatorStatusCode.SEQUENCE_DESYNC]
     assert valid == [0]
-    assert adapter.prefix(key(70)) == [1, 2, 3]
+    assert adapter.prefix(key(70)) is None
 
 
 def test_cancel_is_accepted_without_reply(client):

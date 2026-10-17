@@ -1354,9 +1354,13 @@ class _ServerSession:
                     shape=(num_rows, num_tokens),
                 )
                 valid = ints_to_frame(0, [0] * num_rows)
-            for seq_key, began, status in zip(message.keys, begun, row_statuses):
-                if began is SpeculatorStatusCode.OK and status is not began:
-                    registry.desync(seq_key, owner=self.session_id)
+            self._discard_owned_sequences(
+                tuple(
+                    seq_key
+                    for seq_key, began, status in zip(message.keys, begun, row_statuses)
+                    if began is SpeculatorStatusCode.OK and status is not began
+                )
+            )
 
         if failure is not None:
             fail(SpeculatorStatusCode.INTERNAL_ERROR, failure)

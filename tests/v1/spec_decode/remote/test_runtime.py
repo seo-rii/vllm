@@ -597,6 +597,30 @@ def test_exhausted_draft_kv_degrades_only_that_request(runtime):
     assert result.row_statuses == (OK,)
 
 
+def test_terminal_row_failure_returns_kv_without_disturbing_healthy_sibling(runtime):
+    session, executor = runtime
+    pool = executor.pool
+    a, b = session.open_sequence(1), session.open_sequence(2)
+    session.prefill(a, chunk(list(range(16)), lookahead=16), is_final=False)
+    owned_before_failure = pool.num_free_blocks
+    session.prefill(a, chunk(list(range(16, 24))), is_final=True)
+    session.prefill(b, chunk([30]), is_final=True)
+
+    result = round_(session, 0, [a, b], [0, 0], [], [0, 0], [24, 31])
+    assert result.row_statuses == (SpeculatorStatusCode.OUT_OF_MEMORY, OK)
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    assert session.sequence_state(b) is SequenceState.READY
+    assert session.connected
+    assert pool.num_free_blocks > owned_before_failure
+
+    c = session.open_sequence(3)
+    session.prefill(c, chunk(list(range(8))), is_final=True)
+    assert round_(session, 1, [c], [0], [], [0], [8]).row_statuses == (OK,)
+    assert round_(
+        session, 2, [a], [0], [], [0], [25]
+    ).output.valid_lengths.tolist() == [0]
+
+
 def test_repeated_unsent_close_timeouts_return_all_owned_kv(runtime, monkeypatch):
     session, executor = runtime
     pool = executor.pool

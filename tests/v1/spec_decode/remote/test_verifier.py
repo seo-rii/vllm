@@ -6,6 +6,7 @@ These tests exercise the public propose/lifecycle boundary without CUDA. The
 KV digest makes missing, duplicated and rejected context observable in drafts.
 """
 
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -803,6 +804,48 @@ def test_remote_feature_oom_latches_affected_rows_and_shares_policy(
     assert propose(instance, fresh, [1], [0], [12]).tolist() == [digest_row([11], 12)]
     instance.close_requests({*batch.req_ids, "fresh"})
     assert instance._requests == {}
+
+
+@pytest.mark.parametrize("verifier", ["target_only"], indirect=True)
+def test_feature_failure_retires_remote_kv_without_waiting_for_an_ack(
+    verifier, monkeypatch
+):
+    instance, executor, _, _ = verifier
+    session = instance._session
+    free_blocks = executor.pool.num_free_blocks
+    propose(instance, inputs(["a"], [[1, 2]], [[0, 1]], [2]), [1], [0], [3])
+    key = instance._requests["a"].key
+    assert executor.pool.num_free_blocks < free_blocks
+    released = threading.Event()
+    release = executor.pool.release
+
+    def release_blocks(req_index):
+        release(req_index)
+        released.set()
+
+    def fail_features(*args, **kwargs):
+        raise torch.OutOfMemoryError("remote feature allocation failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(executor.pool, "release", release_blocks)
+        patch.setattr(instance, "_features", fail_features)
+        patch.setattr(
+            session,
+            "_await",
+            lambda *args, **kwargs: pytest.fail("cleanup waited for ACK"),
+        )
+        batch = inputs(["a"], [[3]], [[2]], [0])
+        assert propose(instance, batch, [1], [0], [4]).tolist() == [[-1] * K]
+        assert released.wait(2), "terminal fallback retained remote draft KV"
+    assert executor.pool.num_free_blocks == free_blocks
+    assert session.sequence_state(key) is remote.SequenceState.TARGET_ONLY
+    assert session.connected
+    assert instance._requests["a"].key == key
+
+    # The late close ACK must not interfere with a healthy new request.
+    assert propose(
+        instance, inputs(["b"], [[11]], [[0]], [1]), [1], [0], [12]
+    ).tolist() == [digest_row([11], 12)]
 
 
 @pytest.mark.parametrize("verifier", ["target_only"], indirect=True)

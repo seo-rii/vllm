@@ -202,6 +202,8 @@ class RemoteSpeculator(BaseSpeculator):
         if self._tp.rank_in_group == 0:
             started = time.perf_counter()
             try:
+                assert self._session is not None
+                preparation_deadline = self._session.preparation_deadline()
                 if num_speculative_tokens is not None and not (
                     0 <= num_speculative_tokens <= self.num_speculative_steps
                 ):
@@ -236,6 +238,7 @@ class RemoteSpeculator(BaseSpeculator):
                         ),
                         status=SpeculatorStatusCode.OUT_OF_MEMORY,
                         detail=f"remote feature preparation failed: {exc}",
+                        deadline=preparation_deadline,
                     )
                     tokens = [
                         [-1] * self.num_speculative_steps for _ in input_batch.req_ids

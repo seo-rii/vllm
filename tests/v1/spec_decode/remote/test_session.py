@@ -207,12 +207,133 @@ def test_local_failure_is_terminal_before_policy(make_session, policy):
         else contextlib.nullcontext()
     )
     with expectation:
-        session.fail_sequences((key,), detail="feature allocation failed")
+        session.fail_sequences(
+            (key,),
+            detail="feature allocation failed",
+            deadline=session.preparation_deadline(),
+        )
     assert session.sequence_state(key) is SequenceState.TARGET_ONLY
     assert session.connected
     assert session._records[key.sequence_id].last_status is (
         SpeculatorStatusCode.OUT_OF_MEMORY
     )
+
+
+def test_terminal_retirement_uses_only_the_remaining_preparation_budget(
+    session, adapter, clock, monkeypatch
+):
+    key = ready(session, 1)
+    deadline = session.preparation_deadline()
+    clock.advance(0.075)
+    sent_deadlines = []
+    send = session._conn.send_control
+
+    def send_control(payload, **kwargs):
+        message = decode_payload(decode_envelope(payload))
+        assert isinstance(message, CloseSequence)
+        sent_deadlines.append(kwargs["deadline"])
+        send(payload, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session_module.time, "monotonic", lambda: 5000.0)
+        patch.setattr(session._conn, "send_control", send_control)
+        patch.setattr(
+            session,
+            "_await",
+            lambda *a, **k: pytest.fail("retirement waited for an ACK"),
+        )
+        session.fail_sequences((key,), detail="feature OOM", deadline=deadline)
+    assert sent_deadlines == [pytest.approx(5000.025)]
+    assert session.sequence_state(key) is SequenceState.TARGET_ONLY
+    assert session.connected
+    assert not session._retiring
+
+
+@pytest.mark.parametrize("healthy_sibling", [False, True])
+def test_expired_preparation_budget_reclaims_idle_connection_or_defers_to_sibling(
+    session, adapter, server, clock, monkeypatch, healthy_sibling
+):
+    a = ready(session, 1)
+    b = ready(session, 2) if healthy_sibling else None
+    closed = threading.Event()
+    close = adapter.close_sequences
+
+    def close_sequences(keys):
+        close(keys)
+        if a in keys:
+            closed.set()
+
+    monkeypatch.setattr(adapter, "close_sequences", close_sequences)
+    deadline = session.preparation_deadline()
+    clock.advance(0.101)
+    with monkeypatch.context() as patch:
+        send = Mock(wraps=session._conn.send_control)
+        patch.setattr(session._conn, "send_control", send)
+        session.fail_sequences((a,), detail="feature OOM", deadline=deadline)
+        send.assert_not_called()
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    if healthy_sibling:
+        assert session.connected and session._retiring == {a}
+        result = round_trip(session, batch(0, [b], [4]))
+        assert result.row_statuses == (OK,)
+        assert session.sequence_state(b) is SequenceState.READY
+        assert session.connected
+    else:
+        assert not session.connected
+    assert closed.wait(2), "terminal remote state was not retired"
+    assert adapter.prefix(a) is None
+    assert server.registry.get(a) is None
+    assert not session._retiring
+
+
+@pytest.mark.parametrize("send_failure", [TransportTimeout, TransportError])
+def test_unsent_terminal_retirement_drops_connection_and_releases_peer_state(
+    session, adapter, server, monkeypatch, send_failure
+):
+    a, b = ready(session, 1), ready(session, 2)
+    closed = threading.Event()
+    close = adapter.close_sequences
+
+    def close_sequences(keys):
+        close(keys)
+        if a in keys:
+            closed.set()
+
+    def fail_send(payload, **kwargs):
+        assert isinstance(decode_payload(decode_envelope(payload)), CloseSequence)
+        raise send_failure("injected retirement send failure")
+
+    monkeypatch.setattr(adapter, "close_sequences", close_sequences)
+    monkeypatch.setattr(session._conn, "send_control", fail_send)
+    session.fail_sequences(
+        (a,), detail="feature OOM", deadline=session.preparation_deadline()
+    )
+    assert not session.connected
+    assert session.sequence_state(a) is SequenceState.TARGET_ONLY
+    assert session.sequence_state(b) is SequenceState.INVALID
+    assert closed.wait(2)
+    assert server.registry.get(a) is None
+    assert not session._retiring
+
+
+def test_normal_close_removes_deferred_terminal_retirement(session, clock, monkeypatch):
+    a, _ = ready(session, 1), ready(session, 2)
+    deadline = session.preparation_deadline()
+    clock.advance(0.101)
+    session.fail_sequences((a,), detail="feature OOM", deadline=deadline)
+    assert session._retiring == {a}
+    sent = []
+    send = session._conn.send_control
+
+    def send_control(payload, **kwargs):
+        sent.append(decode_payload(decode_envelope(payload)))
+        send(payload, **kwargs)
+
+    monkeypatch.setattr(session._conn, "send_control", send_control)
+    session.close_sequences((a,))
+    assert len(sent) == 1 and isinstance(sent[0], CloseSequence)
+    assert session.sequence_state(a) is None
+    assert not session._retiring
 
 
 # ----------------------------------------------------------------------
@@ -657,7 +778,7 @@ def test_queue_full_latches_target_only_without_skipping_recovery(
     assert result.row_statuses == (SpeculatorStatusCode.QUEUE_FULL,)
     assert result.output.valid_lengths.tolist() == [0]
     assert adapter.proposed_batches == [0]
-    assert adapter.prefix(a) == [1, 2, 3]
+    assert adapter.prefix(a) is None
 
 
 def test_timeout_latches_target_only_and_purges_stale_result(session, adapter, clock):
