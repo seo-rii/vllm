@@ -93,6 +93,41 @@ _RESULT_FRAMES = 3
 _MAX_INPUT_FRAMES = 4
 
 
+def _cuda_context_fatal(error: BaseException) -> bool:
+    """Recognize CUDA errors documented to require a process restart."""
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        message = str(error).lower().replace("_", "")
+        if "cuda" in message and any(
+            detail in message
+            for detail in (
+                "illegal memory access",
+                "device-side assert triggered",
+                "unspecified launch failure",
+                "the launch timed out and was terminated",
+                "illegal instruction",
+                "misaligned address",
+                "invalid address space",
+                "invalid program counter",
+                "cudaerrorillegaladdress",
+                "cudaerrorassert",
+                "cudaerrorlaunchfailure",
+                "cudaerrorlaunchtimeout",
+                "cudaerrorillegalinstruction",
+                "cudaerrormisalignedaddress",
+                "cudaerrorinvalidaddressspace",
+                "cudaerrorinvalidpc",
+            )
+        ):
+            return True
+        cause = error.__cause__ or error.__context__
+        if cause is None:
+            break
+        error = cause
+    return False
+
+
 # ----------------------------------------------------------------------
 # Adapter contract
 # ----------------------------------------------------------------------
@@ -584,6 +619,7 @@ class RemoteDraftServer:
         self._workers: list[threading.Thread] = []
         self._connections: set[FramedConnection] = set()
         self._stopping = threading.Event()
+        self._unhealthy = threading.Event()
 
     @property
     def endpoint(self) -> str | None:
@@ -594,6 +630,16 @@ class RemoteDraftServer:
         """Adapter calls running or waiting for their turn."""
         return self._queue_depth
 
+    @property
+    def healthy(self) -> bool:
+        return not self._unhealthy.is_set()
+
+    def _adapter_failed(self, error: BaseException) -> None:
+        if self.healthy and _cuda_context_fatal(error):
+            self._unhealthy.set()
+            self._stopping.set()
+            logger.error("Remote draft CUDA context failed; process restart required")
+
     @contextlib.contextmanager
     def adapter_turn(self) -> Iterator[None]:
         """Hold the adapter and registry lock, counted in ``queue_depth``."""
@@ -601,7 +647,11 @@ class RemoteDraftServer:
             self._queue_depth += 1
         try:
             with self.lock:
-                yield
+                try:
+                    yield
+                except Exception as error:
+                    self._adapter_failed(error)
+                    raise
         finally:
             with self._queue_lock:
                 self._queue_depth -= 1
@@ -614,6 +664,8 @@ class RemoteDraftServer:
         """
         if self._listener is not None:
             raise RuntimeError("server is already running")
+        if not self.healthy:
+            raise RuntimeError("unhealthy draft runtime requires a process restart")
         self.adapter.warmup()
         self._listener = listen(endpoint)
         if not is_local_endpoint(self._listener.endpoint):
@@ -647,7 +699,10 @@ class RemoteDraftServer:
         return self._listener.endpoint
 
     def wait(self, timeout: float | None = None) -> bool:
-        """Block until ``stop`` is called; returns False on timeout."""
+        """Wait for stop or a fatal adapter failure; False on timeout.
+
+        The owner must call ``stop`` to join workers before exiting.
+        """
         return self._stopping.wait(timeout)
 
     def stop(self) -> None:
@@ -766,7 +821,7 @@ class _ServerSession:
             return
         with self.server.adapter_turn():
             keys = self.server.registry.close_all(self.session_id)
-            if keys:
+            if keys and self.server.healthy:
                 self.server.adapter.close_sequences(keys)
 
     # -- handshake -------------------------------------------------------
@@ -953,6 +1008,7 @@ class _ServerSession:
                     active_sequences=self.server.registry.count(
                         self.verifier_instance_id
                     ),
+                    healthy=self.server.healthy,
                 ),
                 request_id,
             )
@@ -996,7 +1052,10 @@ class _ServerSession:
         server = self.server
         with server.adapter_turn():
             registry = server.registry
-            if (
+            if not server.healthy:
+                status = SpeculatorStatusCode.INTERNAL_ERROR
+                detail = "draft runtime is unhealthy"
+            elif (
                 not registry.has_identity(key)
                 and len(registry) >= server.limits.max_sequences
             ):
@@ -1058,14 +1117,18 @@ class _ServerSession:
             )
             return
         with self.server.adapter_turn():
-            status, detail, apply = self.server.registry.prefill(
-                key,
-                owner=self.session_id,
-                offset=message.offset,
-                num_tokens=message.num_tokens,
-                checksum=message.checksum,
-                is_final=message.is_final,
-            )
+            if self.server.healthy:
+                status, detail, apply = self.server.registry.prefill(
+                    key,
+                    owner=self.session_id,
+                    offset=message.offset,
+                    num_tokens=message.num_tokens,
+                    checksum=message.checksum,
+                    is_final=message.is_final,
+                )
+            else:
+                status = SpeculatorStatusCode.INTERNAL_ERROR
+                detail, apply = "draft runtime is unhealthy", False
             if apply:
                 failure = self._call_adapter(
                     self.server.adapter.prefill,
@@ -1086,11 +1149,15 @@ class _ServerSession:
         self, method: Any, key: SequenceKey, *args: Any
     ) -> tuple[SpeculatorStatusCode, str] | None:
         """Run a per-sequence adapter command; returns the failure, if any."""
+        if not self.server.healthy:
+            return SpeculatorStatusCode.INTERNAL_ERROR, "draft runtime is unhealthy"
         try:
             method(key, *args)
         except AdapterError as e:
+            self.server._adapter_failed(e)
             return e.status, e.detail
-        except Exception:
+        except Exception as e:
+            self.server._adapter_failed(e)
             logger.exception(
                 "Session %s: adapter failed on sequence %d",
                 self.session_id,
@@ -1205,10 +1272,16 @@ class _ServerSession:
         failure: str | None = None
         with self.server.adapter_turn():
             registry = self.server.registry
-            begun = [
-                registry.begin_round(key, message.batch_id, owner=self.session_id)[0]
-                for key in message.keys
-            ]
+            if self.server.healthy:
+                begun = [
+                    registry.begin_round(key, message.batch_id, owner=self.session_id)[
+                        0
+                    ]
+                    for key in message.keys
+                ]
+            else:
+                failure = "draft runtime is unhealthy"
+                begun = [SpeculatorStatusCode.INTERNAL_ERROR] * num_rows
             row_statuses = list(begun)
             max_model_len = self.server.limits.max_model_len
             for i, seq_key in enumerate(message.keys):
@@ -1240,7 +1313,8 @@ class _ServerSession:
                             effective_num_speculative_tokens=effective_k,
                         )
                     )
-                except Exception:
+                except Exception as e:
+                    self.server._adapter_failed(e)
                     logger.exception(
                         "Session %s: adapter failed on batch %d",
                         self.session_id,
@@ -1312,7 +1386,7 @@ class _ServerSession:
                 closed = self.server.registry.close(key, owner=self.session_id)
                 if closed is not None:
                     removed.append(closed)
-            if removed:
+            if removed and self.server.healthy:
                 self.server.adapter.close_sequences(tuple(removed))
         deadline = time.monotonic() + self.server.send_timeout_s
         for key in message.keys:
@@ -1334,7 +1408,7 @@ class _ServerSession:
             closed = self.server.registry.close(key, owner=self.session_id)
             if closed is not None:
                 removed.append(closed)
-        if removed:
+        if removed and self.server.healthy:
             self.server.adapter.close_sequences(tuple(removed))
 
     def _take_frames(self, base: int, count: int) -> list[DataFrame | None]:
@@ -1487,6 +1561,8 @@ def main(argv: list[str] | None = None) -> None:
         pass
     finally:
         server.stop()
+    if not server.healthy:
+        raise RuntimeError("remote draft CUDA context failed; restart required")
 
 
 if __name__ == "__main__":

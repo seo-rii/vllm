@@ -3,6 +3,7 @@
 """Standalone draft server driven over the raw wire protocol: handshake
 gating, idempotent sequence commands, batch ordering, and error replies."""
 
+import contextlib
 import dataclasses
 import runpy
 import socket
@@ -12,6 +13,7 @@ import zlib
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm.v1.spec_decode.remote import server as server_module
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
@@ -38,6 +40,7 @@ from vllm.v1.spec_decode.remote.protocol import (
 from vllm.v1.spec_decode.remote.server import (
     _MAX_INPUT_FRAMES,
     DEFAULT_LIMITS,
+    AdapterError,
     FakeDraftAdapter,
     RemoteDraftServer,
     SequenceRegistry,
@@ -1113,6 +1116,123 @@ def test_ping_reports_active_sequences(client):
     assert isinstance(pong, Pong)
     assert pong.nonce == 77
     assert pong.active_sequences == 2
+
+
+@pytest.mark.parametrize("stage", ["open_sequence", "prefill", "advance_and_propose"])
+@pytest.mark.parametrize(
+    "fault",
+    ["oom", "ordinary", "illegal_address", "assert", "wrapped_assert", "driver_code"],
+)
+def test_adapter_fault_health_fences_context_fatal_errors(
+    server, adapter, client, monkeypatch, stage, fault
+):
+    client.hello()
+    failed_key, sibling = key(90), key(91)
+    client.ready(sibling)
+    if stage != "open_sequence":
+        assert client.open(failed_key).status is OK
+    if stage == "advance_and_propose":
+        assert client.prefill(failed_key, [1], offset=0).status is OK
+    errors = {
+        "oom": torch.OutOfMemoryError("CUDA out of memory"),
+        "ordinary": RuntimeError("ordinary adapter failure"),
+        "illegal_address": RuntimeError(
+            "CUDA error: an illegal memory access was encountered"
+        ),
+        "assert": RuntimeError("CUDA error: device-side assert triggered"),
+        "driver_code": RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS"),
+    }
+    wrapped = AdapterError(SpeculatorStatusCode.INTERNAL_ERROR, "executor failed")
+    wrapped.__cause__ = errors["assert"]
+    errors["wrapped_assert"] = wrapped
+    operation = getattr(adapter, stage)
+    calls = 0
+
+    def fail_once(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise errors[fault]
+        return operation(*args)
+
+    monkeypatch.setattr(adapter, stage, fail_once)
+    if stage == "open_sequence":
+        response = client.open(failed_key)
+    elif stage == "prefill":
+        response = client.prefill(failed_key, [1], offset=0)
+    else:
+        response = client.propose(0, [failed_key], [2])
+    assert response.status is SpeculatorStatusCode.INTERNAL_ERROR
+    fatal = fault in ("illegal_address", "assert", "wrapped_assert", "driver_code")
+    assert client.call(Ping(nonce=23)).healthy is not fatal
+    assert server.wait(0) is fatal
+    if fatal:
+        assert client.open(key(92)).status is SpeculatorStatusCode.INTERNAL_ERROR
+        assert (
+            client.prefill(sibling, [4], offset=3).status
+            is SpeculatorStatusCode.INTERNAL_ERROR
+        )
+        assert (
+            client.propose(1, [sibling], [4]).status
+            is SpeculatorStatusCode.INTERNAL_ERROR
+        )
+        assert calls == 1
+    else:
+        client.ready(key(92))
+        assert client.propose(1, [key(92)], [4]).status is OK
+        assert calls >= 2
+
+
+def test_fatal_adapter_error_wakes_main_and_joins_workers(monkeypatch):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(adapter)
+    monkeypatch.setattr(server_module, "RemoteDraftServer", lambda *a, **kw: server)
+    started = threading.Event()
+    start = server.start
+
+    def start_and_notify(endpoint):
+        resolved = start(endpoint)
+        started.set()
+        return resolved
+
+    monkeypatch.setattr(server, "start", start_and_notify)
+    errors = []
+
+    def run_main():
+        try:
+            server_module.main(["--endpoint", "tcp://127.0.0.1:0"])
+        except Exception as error:
+            errors.append(error)
+
+    owner = threading.Thread(target=run_main)
+    owner.start()
+    client = None
+    try:
+        assert started.wait(5.0)
+        client = RawClient(server.endpoint)
+        client.hello()
+        client.ready(key(93))
+        close = Mock(wraps=adapter.close_sequences)
+        monkeypatch.setattr(adapter, "close_sequences", close)
+        monkeypatch.setattr(
+            adapter,
+            "open_sequence",
+            Mock(side_effect=RuntimeError("CUDA error: device-side assert triggered")),
+        )
+        with contextlib.suppress(ConnectionClosed):
+            client.open(key(94))
+        owner.join(timeout=5.0)
+        assert not owner.is_alive()
+        assert len(errors) == 1 and "restart required" in str(errors[0])
+        assert not server.healthy
+        assert not server._workers and not server._connections
+        assert len(server.registry) == 0
+        close.assert_not_called()
+    finally:
+        if client is not None:
+            client.close()
+        server.stop()
+        owner.join(timeout=5.0)
 
 
 def test_disconnect_releases_sequences(server, adapter, client):
