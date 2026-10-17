@@ -889,7 +889,10 @@ class RemoteDraftSession:
         rows = token_rows = None
         if len(handle.active_rows) != batch_size:
             rows = torch.tensor(handle.active_rows, dtype=torch.long)
-            token_rows = _token_rows(query_lens, handle.active_rows)
+            # Admission preserves row order. Dropping only zero-length queries
+            # changes sequence metadata but leaves all token features unchanged.
+            if sum(query_lens[i] for i in handle.active_rows) != sum(query_lens):
+                token_rows = _token_rows(query_lens, handle.active_rows)
         num_inputs = 2 if batch.query_lens is None else 3
         base = self._reserve_slots(num_inputs + len(self.feature_schema.slots))
         frames = [

@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.remote.protocol import (
 )
 from vllm.v1.spec_decode.remote.server import (
     DEFAULT_LIMITS,
+    AdapterError,
     FakeDraftAdapter,
     RemoteDraftServer,
 )
@@ -977,6 +978,81 @@ def test_per_sequence_slots_hold_one_row_per_key(clock):
     finally:
         session.close()
         adapter.release()
+        server.stop()
+
+
+@pytest.mark.parametrize("skipped_tokens", [0, 1])
+def test_failed_prefill_filters_metadata_without_copying_unchanged_token_features(
+    clock, monkeypatch, skipped_tokens
+):
+    schema = TargetFeatureSchema(
+        1,
+        (
+            FeatureSlot("token_ids", "int32", ()),
+            FeatureSlot("aux_hidden_states", "float32", (3,)),
+            FeatureSlot("temperature", "float32", (), per_sequence=True),
+        ),
+    )
+    adapter = FakeDraftAdapter(vocab_size=VOCAB, feature_schema=schema)
+    server = RemoteDraftServer(adapter)
+    server.start("tcp://127.0.0.1:0")
+    identity = dataclasses.replace(
+        IDENTITY, provided_features=tuple(slot.kind for slot in schema.slots)
+    )
+    session = RemoteDraftSession(server.endpoint, identity, clock=clock)
+
+    def inputs(values, temperatures):
+        return FeatureBatch(
+            1,
+            (
+                tokens(values),
+                torch.arange(len(values) * 3, dtype=torch.float32).reshape(-1, 3),
+                torch.tensor(temperatures),
+            ),
+        )
+
+    try:
+        session.connect()
+        a, skipped, b = (session.open_sequence(i) for i in (1, 2, 3))
+        prefill = adapter.prefill
+
+        def reject_one(key, chunk):
+            if key == skipped:
+                raise AdapterError(SpeculatorStatusCode.OUT_OF_MEMORY, "prefill OOM")
+            prefill(key, chunk)
+
+        monkeypatch.setattr(adapter, "prefill", reject_one)
+        session.prefill_many([(k, inputs([1], [0.0]), True) for k in (a, skipped, b)])
+        selected = {}
+        serialize = session_module.tensor_to_frame
+
+        def capture(slot, tensor):
+            if tensor.is_floating_point():
+                selected[tensor.ndim] = tensor
+            return serialize(slot, tensor)
+
+        monkeypatch.setattr(session_module, "tensor_to_frame", capture)
+        data = inputs([10, 11, *([20] * skipped_tokens), 30, 31], [0.1, 0.2, 0.3])
+        result = round_trip(
+            session,
+            RemoteProposalBatch(
+                0,
+                (a, skipped, b),
+                tokens([0, 0, 0]),
+                tokens([1, 2, 3]),
+                data,
+                query_lens=tokens([2, skipped_tokens, 2]),
+            ),
+        )
+        assert result.row_statuses[0] is result.row_statuses[2] is OK
+        source, filtered = data.slots[1], selected[2]
+        assert (source.data_ptr() == filtered.data_ptr()) is (skipped_tokens == 0)
+        expected_rows = [0, 1, 2 + skipped_tokens, 3 + skipped_tokens]
+        assert torch.equal(filtered, source[expected_rows])
+        torch.testing.assert_close(selected[1], torch.tensor([0.1, 0.3]))
+        assert adapter.round_tokens == {a: [10, 11], b: [30, 31]}
+    finally:
+        session.close()
         server.stop()
 
 
