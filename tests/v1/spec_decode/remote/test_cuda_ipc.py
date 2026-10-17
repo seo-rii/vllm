@@ -390,6 +390,19 @@ def test_receiver_timeout_quarantines_inflight_copy_and_never_unmaps(runtime):
     assert not any(c[0] in ("close_memory", "destroy_event") for c in runtime.calls)
 
 
+def test_receiver_quarantine_after_fatal_context_makes_no_cuda_calls(runtime):
+    receiver = ipc.CudaIpcReceiver("cuda:0", max_bytes=1024)
+    receiver.receive(_descriptor(), "float32", (2, 4))
+    buffers = receiver.buffers
+    calls = list(runtime.calls)
+    receiver.quarantine()
+    receiver.close()
+    assert receiver.closed and not receiver.buffers
+    assert runtime.calls == calls
+    assert len(ipc._QUARANTINE) == 1
+    assert ipc._QUARANTINE[0][3] is buffers
+
+
 def test_unsupported_physical_peer_fails_before_opening_ipc_memory(
     runtime, monkeypatch
 ):

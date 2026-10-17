@@ -87,6 +87,43 @@ def key(sequence_id: int, generation: int = 0, verifier: str = VERIFIER):
     )
 
 
+@pytest.mark.parametrize("stage", ["prefill", "propose"])
+def test_fatal_feature_import_latches_health_and_quarantines_receiver(
+    monkeypatch, stage
+):
+    adapter = FakeDraftAdapter(vocab_size=VOCAB)
+    server = RemoteDraftServer(adapter)
+    client = None
+    receiver = Mock()
+
+    def fail_import(session, frames):
+        session.ipc_receiver = receiver
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        client = RawClient(server.start("tcp://127.0.0.1:0"))
+        client.hello()
+        client.ready(key(1))
+        monkeypatch.setattr(
+            server_module._ServerSession, "_resolve_features", fail_import
+        )
+        if stage == "prefill":
+            assert client.open(key(2)).status is OK
+            reply = client.prefill(key(2), [4], offset=0)
+        else:
+            reply = client.propose(0, [key(1)], [4])
+        assert reply.status is SpeculatorStatusCode.INTERNAL_ERROR
+        assert not client.call(Ping(nonce=42)).healthy
+        assert server.wait(0)
+        assert not server.healthy
+    finally:
+        if client is not None:
+            client.conn.close()
+        server.stop()
+    receiver.quarantine.assert_called_once_with()
+    receiver.close.assert_not_called()
+
+
 @pytest.mark.parametrize("failure_stage", ["ipc", "adapter"])
 def test_cleanup_failure_releases_session_state_and_connection(
     monkeypatch, failure_stage

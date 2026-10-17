@@ -869,12 +869,18 @@ class _ServerSession:
 
     def cleanup(self) -> None:
         receiver, self.ipc_receiver = self.ipc_receiver, None
-        try:
-            if receiver is not None:
-                receiver.close()
-        finally:
-            if self.session_id:
-                with self.server.adapter_turn():
+        with self.server.adapter_turn():
+            try:
+                if receiver is not None:
+                    if self.server.healthy:
+                        receiver.close()
+                    else:
+                        receiver.quarantine()
+            except Exception as error:
+                self.server._adapter_failed(error)
+                raise
+            finally:
+                if self.session_id:
                     keys = self.server.registry.close_all(self.session_id)
                     if keys and self.server.healthy:
                         self.server.adapter.close_sequences(keys)
@@ -1193,6 +1199,7 @@ class _ServerSession:
                 try:
                     resolved = self._resolve_features(frames)
                 except (TransportError, RuntimeError) as e:
+                    self.server._adapter_failed(e)
                     self._discard_owned_sequences((key,))
                     status, detail = SpeculatorStatusCode.INTERNAL_ERROR, str(e)
                 else:

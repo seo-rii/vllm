@@ -512,14 +512,26 @@ class CudaIpcReceiver:
                 self.runtime.synchronize(done, self.copy_timeout)
             except BaseException:
                 # Even a timeout cannot cancel an already enqueued CUDA copy.
-                _QUARANTINE.append(
-                    (self.runtime, self.device, self.ptr, self.buffers, tensor, done)
-                )
-                self.buffers = {}
-                self.closed = True
+                self.quarantine(tensor)
                 raise
             buffer.last_generation = descriptor.generation
             return tensor
+
+    def quarantine(self, *pending: Any) -> None:
+        """Retain imports without touching an untrustworthy CUDA context."""
+        if not self.closed:
+            _QUARANTINE.append(
+                (
+                    self.runtime,
+                    self.device,
+                    self.ptr,
+                    self.buffers,
+                    self.done_event,
+                    *pending,
+                )
+            )
+            self.buffers = {}
+            self.closed = True
 
     def close(self) -> None:
         if self.closed:
