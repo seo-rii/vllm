@@ -99,8 +99,7 @@ class DraftStepPlanner:
 
     ``max_num_reqs`` bounds open sequences, matching the per-request buffers
     a speculator allocates. Each sequence keeps KV blocks for its committed
-    length plus the rows of the next step and ``num_speculative_tokens`` of
-    draft lookahead.
+    length, the next query, and the positions used by additional draft forwards.
     """
 
     def __init__(
@@ -185,9 +184,13 @@ class DraftStepPlanner:
                 )
                 continue
             start = len(self.block_pool.blocks(sequence.req_index))
+            draft_extent = min(
+                self.max_model_len,
+                seq_len - row.num_rejected + max(num_speculative_tokens - 1, 0),
+            )
             try:
                 blocks = self.block_pool.ensure(
-                    sequence.req_index, seq_len + num_speculative_tokens
+                    sequence.req_index, max(seq_len, draft_extent)
                 )
             except DraftKVExhausted as e:
                 failures[i] = (SpeculatorStatusCode.OUT_OF_MEMORY, str(e))

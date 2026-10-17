@@ -119,10 +119,10 @@ def test_plan_mirrors_a_mixed_runner_step():
     assert plan.positions.tolist() == [0, 1, 2, 0, 1]
     assert plan.seq_lens.tolist() == [3, 2]
     assert plan.next_prefill_tokens.tolist() == [[9], [0]]
-    # Room for the step plus K draft positions, in fresh tables.
+    # The first draft comes from the query; only K-1 forwards need lookahead.
     assert plan.block_table_updates == {
         0: BlockTableUpdate(0, [1, 2, 3]),
-        1: BlockTableUpdate(0, [4, 5, 6]),
+        1: BlockTableUpdate(0, [4, 5]),
     }
     assert plan.slot_mapping.tolist() == [2, 3, 4, 8, 9]
 
@@ -140,7 +140,7 @@ def test_commit_keeps_only_the_accepted_prefix():
     assert planner.num_computed(key(1)) == 6
     plan, _ = planner.plan([DraftStepRow(key(1), 4, num_sampled=4)])
     assert plan.positions.tolist() == [6, 7, 8, 9]
-    assert plan.block_table_updates[0].start == 6
+    assert plan.block_table_updates[0].start == 4
 
 
 def test_rows_that_do_not_fit_fail_alone():
@@ -453,6 +453,58 @@ def test_zero_budget_needs_context_kv_without_unused_draft_headroom():
     assert not failures
     planner.commit(plan)
     assert planner.num_computed(key(1)) == 2
+
+
+@pytest.mark.parametrize("block_size", [4, 16, 32])
+@pytest.mark.parametrize("effective_k", [0, 1])
+def test_first_draft_does_not_need_kv_beyond_a_full_prompt_block(
+    block_size, effective_k
+):
+    pool = DraftBlockPool(num_blocks=2, block_size=block_size)
+    planner = DraftStepPlanner(
+        pool, max_num_reqs=1, max_model_len=64, num_speculative_tokens=K
+    )
+    a = key(1)
+    planner.open(a)
+    plan, failures = planner.plan(
+        [DraftStepRow(a, block_size, num_sampled=1)],
+        num_speculative_tokens=effective_k,
+    )
+    assert not failures
+    assert plan.positions.tolist() == list(range(block_size))
+    assert pool.num_free_blocks == 0
+    planner.commit(plan)
+    assert planner.num_computed(a) == block_size
+
+
+@pytest.mark.parametrize("rejected", [0, 2, 3])
+@pytest.mark.parametrize("max_model_len", [8, 16])
+def test_draft_kv_covers_query_and_only_executed_lookahead(rejected, max_model_len):
+    pool = DraftBlockPool(num_blocks=3, block_size=4)
+    planner = DraftStepPlanner(
+        pool, max_num_reqs=1, max_model_len=max_model_len, num_speculative_tokens=K
+    )
+    a = key(1)
+    planner.open(a)
+    first, failures = planner.plan(
+        [DraftStepRow(a, 4, num_sampled=1)], num_speculative_tokens=1
+    )
+    assert not failures
+    planner.commit(first)
+    plan, failures = planner.plan(
+        [DraftStepRow(a, 4, num_sampled=4 - rejected, num_rejected=rejected)]
+    )
+    if rejected == 0 and max_model_len == 16:
+        assert failures[0][0] is SpeculatorStatusCode.OUT_OF_MEMORY
+        assert not plan.rows
+        assert pool.blocks(planner.req_index(a)) == (1,)
+        assert planner.num_computed(a) == 4
+    else:
+        assert not failures
+        assert plan.positions.tolist() == [4, 5, 6, 7]
+        assert pool.num_free_blocks == 0
+        planner.commit(plan)
+        assert planner.num_computed(a) == 8 - rejected
 
 
 def test_round_must_not_resend_a_buffered_prompt_chunk(runtime):
