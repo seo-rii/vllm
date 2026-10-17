@@ -35,6 +35,36 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _resolve_local_rank(
+    device: torch.device, assigned_physical_gpu_ids: list[int] | None
+) -> int:
+    """Bind distributed groups to the same visible GPU as the draft model."""
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import (
+        get_assigned_physical_gpu_ids,
+        set_assigned_physical_gpu_ids,
+    )
+
+    if device.type != "cuda" or device.index is None:
+        raise ValueError("standalone drafter requires an indexed CUDA device")
+    if device.index >= torch.accelerator.device_count():
+        raise ValueError(
+            f"standalone drafter device {device} is not a visible CUDA GPU"
+        )
+    if assigned_physical_gpu_ids is not None:
+        set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
+    assigned = get_assigned_physical_gpu_ids()
+    if assigned is None:
+        return device.index
+    physical_device_id = current_platform.visible_device_id_to_physical_device_id(
+        device.index
+    )
+    try:
+        return assigned.index(physical_device_id)
+    except ValueError as e:
+        raise ValueError(f"standalone drafter device {device} is not assigned") from e
+
+
 def make_input_batch(
     plan: DraftStepPlan,
     input_ids: torch.Tensor,
@@ -150,8 +180,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             raise ValueError("standalone drafter requires world_size=1")
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("standalone drafter currently requires enforce_eager")
-        if device.type != "cuda":
-            raise ValueError("standalone GPU drafter requires a CUDA device")
+        local_rank = _resolve_local_rank(device, parallel.assigned_physical_gpu_ids)
         if kv_cache_bytes <= 0:
             raise ValueError("draft KV cache budget must be positive")
         torch.accelerator.set_device_index(device)
@@ -175,7 +204,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             init_distributed_environment(
                 world_size=1,
                 rank=0,
-                local_rank=0,
+                local_rank=local_rank,
                 distributed_init_method=init_method,
                 backend="nccl",
             )

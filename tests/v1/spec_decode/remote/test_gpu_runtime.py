@@ -3,6 +3,7 @@
 """CPU checks for the standalone host's wire, batch and partial-weight contracts."""
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,125 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 class _Config(SimpleNamespace):
     def to_dict(self):
         return vars(self).copy()
+
+
+@pytest.fixture
+def draft_gpu_startup(monkeypatch):
+    import vllm.distributed as distributed
+    import vllm.ir
+    import vllm.platforms as platforms
+    import vllm.platforms.interface as interface
+    import vllm.utils.torch_utils as torch_utils
+    import vllm.v1.spec_decode.remote.runtime.gpu as gpu
+    import vllm.v1.worker.workspace as workspace
+    from vllm.distributed.parallel_state import _init_process_group_for_split_group
+
+    class ProcessGroupCaptured(Exception):
+        pass
+
+    config = _config()
+    config.parallel_config = SimpleNamespace(
+        world_size=1, data_parallel_size=1, assigned_physical_gpu_ids=None
+    )
+    config.model_config.enforce_eager = True
+    config.model_config.seed = 0
+    config.kernel_config = SimpleNamespace(
+        ir_op_priority=SimpleNamespace(set_default=lambda: None)
+    )
+    config.compilation_config = SimpleNamespace(ir_enable_torch_wrap=False)
+    calls = []
+
+    def init_distributed(**kwargs):
+        _init_process_group_for_split_group(**kwargs, store=None, timeout=None)
+        raise ProcessGroupCaptured
+
+    monkeypatch.setattr(interface, "_assigned_physical_gpu_ids", None)
+    platform = platforms.current_platform
+    monkeypatch.setattr(
+        type(platform), "device_control_env_var", "CUDA_VISIBLE_DEVICES"
+    )
+    monkeypatch.setattr(platform, "check_if_supports_dtype", lambda dtype: None)
+    monkeypatch.setattr(platform, "import_kernels", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 3)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda device: None)
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda precision: None)
+    monkeypatch.setattr(
+        torch.distributed, "init_process_group", lambda **kw: calls.append(kw)
+    )
+    monkeypatch.setattr(distributed, "init_distributed_environment", init_distributed)
+    monkeypatch.setattr(torch_utils, "set_random_seed", lambda seed: None)
+    monkeypatch.setattr(torch_utils, "set_torch_threads_for_runtime", lambda: None)
+    monkeypatch.setattr(workspace, "init_workspace_manager", lambda *a, **kw: None)
+    monkeypatch.setattr(gpu, "set_current_vllm_config", lambda config: nullcontext())
+    monkeypatch.setattr(vllm.ir, "set_default_torch_wrap", lambda enable: None)
+
+    def start(device):
+        with pytest.raises(ProcessGroupCaptured):
+            GPUDraftStepExecutor(config, device=device, kv_cache_bytes=1024)
+        assert len(calls) == 1
+        assert calls[0]["world_size"] == 1
+        assert calls[0]["rank"] == 0
+        assert calls[0]["device_id"] == device
+
+    return config, start, calls
+
+
+@pytest.mark.parametrize("visible", [None, "2,0,1"])
+@pytest.mark.parametrize("assigned", [None, [2, 0, 1]])
+@pytest.mark.parametrize("device_index", [0, 1, 2])
+def test_draft_process_group_uses_selected_visible_gpu(
+    draft_gpu_startup, monkeypatch, visible, assigned, device_index
+):
+    import vllm.platforms.interface as interface
+
+    if visible is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    monkeypatch.setattr(interface, "_assigned_physical_gpu_ids", assigned)
+    _, start, _ = draft_gpu_startup
+    start(torch.device("cuda", device_index))
+
+
+def test_draft_process_group_honors_configured_gpu_assignment(
+    draft_gpu_startup, monkeypatch
+):
+    config, start, _ = draft_gpu_startup
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,0,1")
+    config.parallel_config.assigned_physical_gpu_ids = [1]
+    start(torch.device("cuda:2"))
+
+
+@pytest.mark.parametrize("device", ["cuda", "cuda:3", "cpu"])
+def test_draft_rejects_invalid_gpu_before_distributed_init(draft_gpu_startup, device):
+    config, _, calls = draft_gpu_startup
+    with pytest.raises(ValueError, match="CUDA device|visible CUDA"):
+        GPUDraftStepExecutor(config, device=torch.device(device), kv_cache_bytes=1024)
+    assert not calls
+
+
+def test_draft_rejects_unassigned_gpu_before_distributed_init(
+    draft_gpu_startup, monkeypatch
+):
+    config, _, calls = draft_gpu_startup
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    config.parallel_config.assigned_physical_gpu_ids = [1]
+    with pytest.raises(ValueError, match="not assigned"):
+        GPUDraftStepExecutor(config, device=torch.device("cuda:2"), kv_cache_bytes=1024)
+    assert not calls
+
+
+def test_draft_rejects_conflicting_gpu_assignment(draft_gpu_startup, monkeypatch):
+    import vllm.platforms.interface as interface
+
+    config, _, calls = draft_gpu_startup
+    monkeypatch.setattr(interface, "_assigned_physical_gpu_ids", [0])
+    config.parallel_config.assigned_physical_gpu_ids = [1]
+    with pytest.raises(RuntimeError, match="conflicting values"):
+        GPUDraftStepExecutor(config, device=torch.device("cuda:1"), kv_cache_bytes=1024)
+    assert interface.get_assigned_physical_gpu_ids() == [0]
+    assert not calls
 
 
 def test_sampling_buffers_match_mrv2_prefill_kernel_token_dtypes():
