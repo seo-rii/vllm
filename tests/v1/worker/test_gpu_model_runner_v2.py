@@ -164,7 +164,7 @@ def test_sample_tokens_preserves_native_hooks_and_workspace_order(monkeypatch, u
                 Mock(side_effect=record),
             )
     runner.draft_tokens_handler = Mock()
-    runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
+    runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
     runner.eplb = SimpleNamespace(step=Mock())
     runner.execute_model_state = ExecuteModelState(
         input_batch=batch,
