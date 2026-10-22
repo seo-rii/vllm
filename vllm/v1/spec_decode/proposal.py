@@ -21,6 +21,7 @@ class SpeculatorOutput:
     contributes ``token_ids[i, :valid_lengths[i]]`` draft tokens, and
     ``valid_lengths[i] == 0`` means the request continues with target-only
     decoding this round. Failures are never encoded as sentinel token IDs.
+    Native token buffers may be borrowed; consume them before the next dispatch.
     """
 
     token_ids: torch.Tensor
@@ -48,13 +49,20 @@ class SpeculatorOutput:
             ("token_ids", self.token_ids),
             ("valid_lengths", self.valid_lengths),
         ):
-            if tensor.is_floating_point() or tensor.is_complex():
-                raise ValueError(f"{name} must have an integer dtype")
+            if tensor.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{name} must have an int32 or int64 integer dtype")
         if self.token_ids.device != self.valid_lengths.device:
             raise ValueError(
                 f"token_ids ({self.token_ids.device}) and valid_lengths "
                 f"({self.valid_lengths.device}) must be on the same device"
             )
+
+    def to_legacy_tokens(self) -> torch.Tensor:
+        """Encode the valid prefix as the runner's existing -1 suffix format."""
+        usable = torch.arange(self.token_ids.shape[1], device=self.token_ids.device)
+        return torch.where(
+            usable[None, :] < self.valid_lengths[:, None], self.token_ids, -1
+        )
 
 
 class ProposalHandle:

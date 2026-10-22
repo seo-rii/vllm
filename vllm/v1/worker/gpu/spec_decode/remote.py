@@ -5,7 +5,7 @@
 import itertools
 import time
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -15,6 +15,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
+from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
+from vllm.v1.spec_decode.proposal import ProposalHandle, SpeculatorOutput
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
 from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
@@ -22,7 +24,11 @@ from vllm.v1.spec_decode.remote.errors import (
 )
 from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
-from vllm.v1.spec_decode.remote.session import RemoteDraftSession, VerifierIdentity
+from vllm.v1.spec_decode.remote.session import (
+    RemoteDraftSession,
+    RemoteProposalHandle,
+    VerifierIdentity,
+)
 from vllm.v1.spec_decode.remote.state import (
     FeatureBatch,
     RemoteProposalBatch,
@@ -41,6 +47,21 @@ class _Request:
     num_computed: int = 0
 
 
+@dataclass(eq=False)
+class _RemoteHandle(ProposalHandle):
+    owner: object
+    round_id: int
+    step: DraftStep
+    context: LocalExecutionContext | None
+    started: float
+    session_handle: RemoteProposalHandle | None = None
+    rows: tuple[int, ...] = ()
+    output: SpeculatorOutput | None = None
+    error: str | None = None
+    preparation_deadline: float | None = None
+    retained: tuple[Any, ...] = field(default_factory=tuple, repr=False)
+
+
 class RemoteSpeculator(BaseSpeculator):
     """Keep all draft weights and KV on the server; TP rank zero owns its session."""
 
@@ -50,7 +71,13 @@ class RemoteSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_config(vllm_config)
         spec = vllm_config.speculative_config
-        assert spec is not None and spec.remote_draft is not None
+        assert spec is not None
+        remote_config = (
+            spec.get_remote_draft_config()
+            if hasattr(spec, "get_remote_draft_config")
+            else spec.remote_draft
+        )
+        assert remote_config is not None
         assert spec.method is not None
         self.device = device
         self.num_speculative_steps = spec.num_speculative_tokens
@@ -59,8 +86,13 @@ class RemoteSpeculator(BaseSpeculator):
         self._session: RemoteDraftSession | None = None
         self._requests: dict[str, _Request] = {}
         self._terminal_requests: set[str] = set()
+        self._closing_requests: set[str] = set()
         self._sequence_ids = itertools.count()
         self._batch_ids = itertools.count()
+        self._owner = object()
+        self._rounds = itertools.count()
+        self._pending: _RemoteHandle | None = None
+        self._closed = False
         self._stats: dict[str, int | float] = {
             "proposal_calls": 0,
             "feature_bytes": 0,
@@ -83,7 +115,7 @@ class RemoteSpeculator(BaseSpeculator):
                 max_model_len=vllm_config.model_config.max_model_len,
                 vocab_size=vllm_config.model_config.get_vocab_size(),
             )
-            self._session = RemoteDraftSession.from_config(spec.remote_draft, identity)
+            self._session = RemoteDraftSession.from_config(remote_config, identity)
             try:
                 self._session.connect()
                 if self._session.feature_schema != self._contract.schema:
@@ -152,22 +184,43 @@ class RemoteSpeculator(BaseSpeculator):
             return
         self._terminal_requests.difference_update(req_ids)
         error = None
+        pending = self._pending
+        cancelled = pending is not None and bool(
+            set(req_ids).intersection(pending.step.request_ids)
+        )
         if self._session is not None:
             try:
-                keys = tuple(
-                    self._requests.pop(req_id).key
-                    for req_id in req_ids
-                    if req_id in self._requests
+                self._closing_requests.update(
+                    req_id for req_id in req_ids if req_id in self._requests
                 )
-                if keys:
-                    self._session.close_sequences(keys)
+                if cancelled:
+                    # A lost completion cannot prove that IPC readers finished.
+                    self._session.close()
+                if cancelled or pending is None or pending.session_handle is None:
+                    self._flush_request_closes()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+        if cancelled:
+            assert pending is not None
+            self._discard_handle(pending)
         error = self._tp.broadcast_object(error, src=0)
         if error is not None:
             raise RuntimeError(f"remote drafter request cleanup failed: {error}")
 
+    def _flush_request_closes(self, *, deadline: float | None = None) -> None:
+        if self._session is None or not self._closing_requests:
+            return
+        req_ids = tuple(self._closing_requests)
+        keys = tuple(self._requests[req_id].key for req_id in req_ids)
+        # Preserve ownership until the session has retired the keys. An unrelated
+        # close must not consume an in-flight proposal response as a close ACK.
+        self._session.close_sequences(keys, deadline=deadline)
+        for req_id in req_ids:
+            del self._requests[req_id]
+            self._closing_requests.remove(req_id)
+
     def close(self) -> None:
+        self._closed = True
         if self._session is not None:
             session = self._session
             self._session = None
@@ -178,7 +231,10 @@ class RemoteSpeculator(BaseSpeculator):
             finally:
                 self._requests.clear()
                 self._terminal_requests.clear()
+                self._closing_requests.clear()
                 logger.info("Remote drafter verifier statistics: %s", self._stats)
+        if self._pending is not None:
+            self._discard_handle(self._pending)
 
     def propose(
         self,
@@ -200,93 +256,241 @@ class RemoteSpeculator(BaseSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
-        if is_profile and self._tp.rank_in_group == 0:
-            self._profile_features(
-                input_batch,
-                last_hidden_states,
-                aux_hidden_states,
-                next_prefill_tokens,
-            )
-        if dummy_run or is_profile:
-            return torch.full(
-                (input_batch.num_reqs, self.num_speculative_steps),
-                -1,
-                dtype=torch.int64,
-                device=self.device,
-            )
-        error = None
-        tokens = None
+        context = LocalExecutionContext(
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dp_sync_state,
+            dummy_run,
+            skip_attn_for_dummy_run,
+            mm_inputs,
+            is_profile,
+        )
+        k = (
+            self.num_speculative_steps
+            if num_speculative_tokens is None
+            else num_speculative_tokens
+        )
+        step = DraftStep.from_batch(input_batch, k)
+        return self.collect(self.dispatch(step, context)).to_legacy_tokens()
+
+    def dispatch(
+        self, step: DraftStep, context: LocalExecutionContext
+    ) -> ProposalHandle:
+        if self._closed:
+            raise RuntimeError("remote draft backend is closed")
+        if self._pending is not None:
+            raise RuntimeError("remote draft proposal is still in flight")
+        handle = _RemoteHandle(
+            self._owner, next(self._rounds), step, context, time.perf_counter()
+        )
+        self._pending = handle
+        if context.dummy_run or context.is_profile:
+            try:
+                if context.is_profile and self._tp.rank_in_group == 0:
+                    self._profile_features(
+                        context.input_batch,
+                        context.last_hidden_states,
+                        context.aux_hidden_states,
+                        context.next_prefill_tokens,
+                    )
+                handle.output = self._empty_output(
+                    len(step.request_ids), device=self.device
+                )
+            except Exception:
+                self._discard_handle(handle)
+                raise
+            return handle
         if self._tp.rank_in_group == 0:
-            started = time.perf_counter()
+            self._stats["proposal_calls"] += 1
             try:
                 assert self._session is not None
-                preparation_deadline = self._session.preparation_deadline()
-                if num_speculative_tokens is not None and not (
-                    0 <= num_speculative_tokens <= self.num_speculative_steps
-                ):
+                handle.preparation_deadline = self._session.preparation_deadline()
+                if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(
                         "round draft budget exceeds the configured maximum"
                     )
-                if torch.any(temperature[input_batch.idx_mapping] != 0).item():
+                if step != DraftStep.from_batch(
+                    context.input_batch, step.num_speculative_tokens
+                ):
+                    raise ValueError(
+                        "draft step metadata no longer matches its local context"
+                    )
+                if torch.any(
+                    context.temperature[context.input_batch.idx_mapping] != 0
+                ).item():
                     raise ValueError(
                         "remote drafter currently requires greedy target sampling"
                     )
                 try:
-                    tokens = self._propose(
-                        input_batch,
-                        last_hidden_states,
-                        aux_hidden_states,
-                        num_sampled,
-                        num_rejected,
-                        last_sampled,
-                        next_prefill_tokens,
-                        num_speculative_tokens,
-                        preparation_deadline=preparation_deadline,
-                    ).tolist()
+                    self._dispatch_step(handle, context)
                 except Exception as exc:
-                    if cuda_context_fatal(exc) or not (
-                        isinstance(exc, torch.OutOfMemoryError)
-                        or host_allocation_failure(exc)
-                    ):
-                        raise
-                    # Feature preparation can advance local request positions
-                    # before all chunks reach the drafter. Never resume these
-                    # own-KV sequences after dropping the failed round.
-                    assert self._session is not None
-                    self._terminal_requests.update(input_batch.req_ids)
-                    self._session.fail_sequences(
-                        tuple(
-                            self._requests[req_id].key
-                            for req_id in input_batch.req_ids
-                            if req_id in self._requests
-                        ),
-                        status=SpeculatorStatusCode.OUT_OF_MEMORY,
-                        detail=f"remote feature preparation failed: {exc}",
-                        deadline=preparation_deadline,
-                    )
-                    tokens = [
-                        [-1] * self.num_speculative_steps for _ in input_batch.req_ids
-                    ]
+                    self._feature_failure(handle, exc)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            finally:
-                self._stats["proposal_calls"] += 1
-                self._stats["proposal_seconds"] += time.perf_counter() - started
-        # This small CPU message shares failures and tokens together. A device
-        # broadcast can initialize NCCL after KV profiling, exhausting the
-        # target GPU memory that profiling has already assigned to its cache.
-        error, tokens = self._tp.broadcast_object((error, tokens), src=0)
-        if error is not None:
-            raise RuntimeError(f"remote drafter proposal failed: {error}")
-        assert tokens is not None
-        return torch.tensor(tokens, dtype=torch.int64, device=self.device).reshape(
-            input_batch.num_reqs, self.num_speculative_steps
+                handle.error = f"{type(exc).__name__}: {exc}"
+        return handle
+
+    def cancel(self, handle: ProposalHandle, reason: str) -> None:
+        handle = self._owned_handle(handle)
+        error = None
+        try:
+            if self._session is not None:
+                try:
+                    # Session teardown quarantines IPC exports on uncertain completion.
+                    self._session.close()
+                    self._flush_request_closes()
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+            error = self._tp.broadcast_object(error, src=0)
+            if error is not None:
+                raise RuntimeError(f"remote drafter cancellation failed: {error}")
+            logger.debug("Cancelled remote draft round %d: %s", handle.round_id, reason)
+        finally:
+            self._discard_handle(handle)
+
+    def _owned_handle(self, handle: ProposalHandle) -> _RemoteHandle:
+        if not isinstance(handle, _RemoteHandle) or handle.owner is not self._owner:
+            raise RuntimeError("draft handle belongs to a different owner")
+        if self._pending is not handle or handle.context is None:
+            raise RuntimeError("stale, cancelled or already collected draft handle")
+        return handle
+
+    def collect(self, handle: ProposalHandle) -> SpeculatorOutput:
+        handle = self._owned_handle(handle)
+        context = handle.context
+        assert context is not None
+        try:
+            if context.dummy_run or context.is_profile:
+                assert handle.output is not None
+                return handle.output
+            payload = None
+            if self._tp.rank_in_group == 0:
+                try:
+                    if handle.error is None and handle.session_handle is not None:
+                        assert self._session is not None and handle.output is not None
+                        started = time.perf_counter()
+                        result = self._session.collect(handle.session_handle).output
+                        self._stats["session_seconds"] += time.perf_counter() - started
+                        handle.output.token_ids[list(handle.rows)] = result.token_ids
+                        handle.output.valid_lengths[list(handle.rows)] = (
+                            result.valid_lengths
+                        )
+                    output = handle.output if handle.error is None else None
+                    if output is not None:
+                        output.valid_lengths.clamp_(
+                            max=handle.step.num_speculative_tokens
+                        )
+                    payload = (
+                        handle.error,
+                        None if output is None else output.token_ids.tolist(),
+                        None if output is None else output.valid_lengths.tolist(),
+                    )
+                except Exception as exc:
+                    try:
+                        self._feature_failure(handle, exc)
+                        assert handle.output is not None
+                        payload = (
+                            None,
+                            handle.output.token_ids.tolist(),
+                            handle.output.valid_lengths.tolist(),
+                        )
+                    except Exception as failure:
+                        handle.error = f"{type(failure).__name__}: {failure}"
+                        if (
+                            self._session is not None
+                            and handle.session_handle is not None
+                        ):
+                            try:
+                                self._session.close()
+                            except Exception:
+                                logger.exception(
+                                    "Failed to close remote proposal session"
+                                )
+                        payload = (handle.error, None, None)
+                finally:
+                    try:
+                        # Deferred closes share the round budget instead of
+                        # delaying its result for another full request timeout.
+                        self._flush_request_closes(deadline=handle.preparation_deadline)
+                    except Exception as exc:
+                        cleanup_error = (
+                            f"request cleanup failed: {type(exc).__name__}: {exc}"
+                        )
+                        if payload is None or payload[0] is None:
+                            payload = (cleanup_error, None, None)
+                        else:
+                            logger.exception("Failed to retire closed remote requests")
+            # Every TP rank reaches the same CPU broadcast, including dispatch errors.
+            error, tokens, lengths = self._tp.broadcast_object(payload, src=0)
+            if error is not None:
+                raise RuntimeError(f"remote drafter proposal failed: {error}")
+            return SpeculatorOutput(
+                torch.tensor(tokens, dtype=torch.int64, device=self.device).reshape(
+                    len(handle.step.request_ids), self.num_speculative_steps
+                ),
+                torch.tensor(lengths, dtype=torch.int32, device=self.device),
+            )
+        finally:
+            self._discard_handle(handle)
+
+    def _empty_output(
+        self, num_reqs: int, *, device: torch.device | str = "cpu"
+    ) -> SpeculatorOutput:
+        return SpeculatorOutput(
+            torch.zeros(
+                (num_reqs, self.num_speculative_steps), dtype=torch.int64, device=device
+            ),
+            torch.zeros(num_reqs, dtype=torch.int32, device=device),
         )
+
+    def _feature_failure(self, handle: _RemoteHandle, exc: Exception) -> None:
+        if cuda_context_fatal(exc) or not (
+            isinstance(exc, torch.OutOfMemoryError) or host_allocation_failure(exc)
+        ):
+            raise exc
+        assert self._session is not None
+        self._terminal_requests.update(handle.step.request_ids)
+        self._session.fail_sequences(
+            tuple(
+                self._requests[req_id].key
+                for req_id in handle.step.request_ids
+                if req_id in self._requests
+            ),
+            status=SpeculatorStatusCode.OUT_OF_MEMORY,
+            detail=f"remote feature preparation failed: {exc}",
+            deadline=handle.preparation_deadline,
+        )
+        if handle.output is None:
+            handle.output = self._empty_output(len(handle.step.request_ids))
+        else:
+            handle.output.valid_lengths.zero_()
+        handle.session_handle = None
+
+    def _discard_handle(self, handle: _RemoteHandle) -> None:
+        if (
+            handle.context is not None
+            and not (handle.context.dummy_run or handle.context.is_profile)
+            and self._tp.rank_in_group == 0
+        ):
+            self._stats["proposal_seconds"] += time.perf_counter() - handle.started
+        handle.context = None
+        handle.retained = ()
+        handle.output = None
+        if self._pending is handle:
+            self._pending = None
 
     def _profile_features(
         self,
         batch: InputBatch,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor | None,
         aux: list[torch.Tensor] | None,
         next_prefill_tokens: torch.Tensor,
     ) -> None:
@@ -305,19 +509,18 @@ class RemoteSpeculator(BaseSpeculator):
         self._select(features, tokens, rows)
         self._stats["feature_bytes"] = feature_bytes
 
-    def _propose(
-        self,
-        batch: InputBatch,
-        hidden: torch.Tensor,
-        aux: list[torch.Tensor] | None,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        num_speculative_tokens: int | None = None,
-        *,
-        preparation_deadline: float | None = None,
-    ) -> torch.Tensor:
+    def _dispatch_step(
+        self, handle: _RemoteHandle, context: LocalExecutionContext
+    ) -> None:
+        batch = context.input_batch
+        hidden, aux = context.last_hidden_states, context.aux_hidden_states
+        num_sampled, num_rejected = context.num_sampled, context.num_rejected
+        last_sampled, next_prefill_tokens = (
+            context.last_sampled,
+            context.next_prefill_tokens,
+        )
+        num_speculative_tokens = handle.step.num_speculative_tokens
+        preparation_deadline = handle.preparation_deadline
         session = self._session
         assert session is not None
         session_started = time.perf_counter()
@@ -358,12 +561,10 @@ class RemoteSpeculator(BaseSpeculator):
             and session.sequence_state(self._requests[req_id].key)
             in (SequenceState.PREFILLING, SequenceState.READY)
         ]
-        output = torch.full(
-            (batch.num_reqs, self.num_speculative_steps), -1, dtype=torch.int64
-        )
+        handle.output = self._empty_output(batch.num_reqs)
         if not active_rows:
             self._stats["session_seconds"] += time.perf_counter() - session_started
-            return output
+            return
         session_seconds = time.perf_counter() - session_started
         active_tokens = (
             None
@@ -450,23 +651,21 @@ class RemoteSpeculator(BaseSpeculator):
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
                 num_speculative_tokens=num_speculative_tokens,
             )
-            result = session.collect(
-                session.dispatch(proposal, deadline=preparation_deadline)
-            ).output
-            valid = (
-                torch.arange(self.num_speculative_steps)[None, :]
-                < result.valid_lengths[:, None]
+            handle.session_handle = session.dispatch(
+                proposal, deadline=preparation_deadline
             )
-            output[rows] = torch.where(valid, result.token_ids, -1)
+            handle.rows = tuple(rows)
+            handle.retained = (features, chunks, proposal)
+        else:
+            handle.retained = (features, chunks)
         self._stats["session_seconds"] += (
             session_seconds + time.perf_counter() - session_started
         )
-        return output
 
     def _features(
         self,
         batch: InputBatch,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor | None,
         aux: list[torch.Tensor] | None,
         next_prefill_tokens: torch.Tensor,
         *,
@@ -478,7 +677,9 @@ class RemoteSpeculator(BaseSpeculator):
         source = {
             TargetFeatureKind.TOKEN_IDS.value: batch.input_ids[: batch.num_tokens],
             TargetFeatureKind.POSITIONS.value: batch.positions[: batch.num_tokens],
-            TargetFeatureKind.LAST_HIDDEN_STATES.value: hidden[: batch.num_tokens],
+            TargetFeatureKind.LAST_HIDDEN_STATES.value: (
+                None if hidden is None else hidden[: batch.num_tokens]
+            ),
         }
         result = {}
         for slot in self._contract.schema.slots:
@@ -500,6 +701,10 @@ class RemoteSpeculator(BaseSpeculator):
                 tensor = next_prefill_tokens[:1, mapping].T
             else:
                 tensor = source[slot.kind]
+                if tensor is None:
+                    raise ValueError(
+                        f"remote feature {slot.kind} requires target hidden states"
+                    )
                 if token_rows is not None:
                     tensor = tensor[token_rows]
             if tuple(tensor.shape[1:]) != slot.trailing_shape:

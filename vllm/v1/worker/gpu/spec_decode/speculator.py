@@ -59,6 +59,7 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 
 
 class BaseSpeculator(ABC):
+    num_speculative_steps: int
     num_query_per_req: int = 1
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
@@ -235,6 +236,9 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        self._finalize_model_load(target_attn_layer_names)
+
+    def _finalize_model_load(self, target_attn_layer_names: set[str]) -> None:
         self._validate_local_argmax_reduction()
 
         all_attn_layers = get_layers_from_vllm_config(

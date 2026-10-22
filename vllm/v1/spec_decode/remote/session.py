@@ -808,8 +808,13 @@ class RemoteDraftSession:
         if failures:
             self._raise_if_strict("prefill failed for " + "; ".join(failures))
 
-    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
-        """Release remote state; unknown, stale, and closed keys are no-ops."""
+    def close_sequences(
+        self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
+    ) -> None:
+        """Release remote state within the supplied or default request budget.
+
+        Unknown, stale, and closed keys are no-ops.
+        """
         self._require_no_inflight("close sequences")
         pending: list[SequenceKey] = []
         for key in keys:
@@ -826,15 +831,18 @@ class RemoteDraftSession:
             pending.append(key)
         if pending and self._alive:
             self._retiring.difference_update(pending)
-            self._close_remote(tuple(pending))
+            self._close_remote(tuple(pending), deadline=deadline)
         for key in pending:
             record = self._records.pop(key.sequence_id, None)
             if record is not None and record.state is SequenceState.CLOSING:
                 record.state = transition_sequence(record.state, SequenceState.CLOSED)
 
-    def _close_remote(self, keys: tuple[SequenceKey, ...]) -> set[SequenceKey]:
+    def _close_remote(
+        self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
+    ) -> set[SequenceKey]:
         """Close ``keys`` on the server; returns the acknowledged ones."""
-        deadline = self._clock() + self._request_timeout_s
+        if deadline is None:
+            deadline = self._clock() + self._request_timeout_s
         remaining = set(keys)
         sent_close = False
         try:

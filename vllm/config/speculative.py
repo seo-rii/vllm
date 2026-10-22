@@ -129,6 +129,58 @@ class RemoteDraftConfig:
         return self
 
 
+@config
+class SpeculativeExecutionConfig:
+    """Opt-in placement for the existing on-demand speculative methods."""
+
+    placement: Literal["local", "remote"] = "local"
+    """Use the existing in-process speculator or a standalone server."""
+    policy: Literal["on_demand"] = "on_demand"
+    """Generate proposals only after authoritative target outcomes."""
+    endpoints: tuple[str, ...] = ()
+    """Exactly one same-host endpoint for remote execution; none for local."""
+    transport: RemoteDraftTransport | None = None
+    """Remote transport override. Unset retains the inline default."""
+    failure_policy: RemoteDraftFailurePolicy | None = None
+    """Remote failure policy override. Unset retains target-only fallback."""
+    request_timeout_ms: int | None = Field(default=None, gt=0)
+    """Remote proposal deadline override; defaults to 100 milliseconds."""
+    startup_timeout_ms: int | None = Field(default=None, gt=0)
+    """Remote handshake deadline override; defaults to 30 seconds."""
+
+    @model_validator(mode="after")
+    def _validate_placement(self) -> Self:
+        if self.placement == "local":
+            if self.endpoints or any(
+                value is not None
+                for value in (
+                    self.transport,
+                    self.failure_policy,
+                    self.request_timeout_ms,
+                    self.startup_timeout_ms,
+                )
+            ):
+                raise ValueError("local execution cannot specify remote options")
+        else:
+            self.remote_config()
+        return self
+
+    def remote_config(self) -> RemoteDraftConfig:
+        if self.placement != "remote" or len(self.endpoints) != 1:
+            raise ValueError("remote execution requires exactly one endpoint")
+        return RemoteDraftConfig(
+            endpoint=self.endpoints[0],
+            transport=self.transport or "auto",
+            failure_policy=self.failure_policy or "target_only",
+            request_timeout_ms=(
+                100 if self.request_timeout_ms is None else self.request_timeout_ms
+            ),
+            startup_timeout_ms=(
+                30_000 if self.startup_timeout_ms is None else self.startup_timeout_ms
+            ),
+        )
+
+
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
         "Qwen3OmniMoeForConditionalGeneration",
@@ -541,6 +593,10 @@ class SpeculativeConfig:
     target-conditioned speculators that keep their own draft KV cache
     (EAGLE/EAGLE3/P-EAGLE and standard native MTP). `None` keeps the
     existing co-located behavior."""
+    execution: SpeculativeExecutionConfig | None = None
+    """Opt in to the common local/remote backend contract. Omitting both
+    execution and remote_draft preserves the native local fast path.
+    Cannot be combined with legacy remote_draft."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1229,6 +1285,8 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        if self.execution is not None and self.remote_draft is not None:
+            raise ValueError("execution and remote_draft cannot be combined")
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1635,10 +1693,7 @@ class SpeculativeConfig:
                         self.num_speculative_tokens,
                     )
 
-                if (
-                    self.remote_draft is not None
-                    and self.draft_tensor_parallel_size is None
-                ):
+                if self.use_remote_draft() and self.draft_tensor_parallel_size is None:
                     # A remote drafter runs in its own process; never
                     # inherit the target TP size as the default.
                     self.draft_tensor_parallel_size = 1
@@ -1686,7 +1741,7 @@ class SpeculativeConfig:
                 "materializes. Disable one of them."
             )
 
-        if self.remote_draft is not None:
+        if self.use_remote_draft():
             self._validate_remote_draft()
 
         return self
@@ -1695,6 +1750,24 @@ class SpeculativeConfig:
         from vllm.v1.spec_decode.remote.capabilities import (
             remote_draft_config_incompatibilities,
         )
+
+        if self.method == "draft_model" and self.execution is not None:
+            remote = self.get_remote_draft_config()
+            assert remote is not None
+            unsupported = []
+            if remote.transport not in ("auto", "inline"):
+                unsupported.append("token-only execution supports inline transport")
+            if self.draft_tensor_parallel_size not in (None, 1):
+                unsupported.append("draft_tensor_parallel_size must be 1")
+            if self.draft_sample_method != "greedy":
+                unsupported.append("draft_sample_method must be greedy")
+            if self.parallel_drafting:
+                unsupported.append("parallel_drafting is unsupported")
+            if self.use_heterogeneous_vocab:
+                unsupported.append("heterogeneous vocabularies are unsupported")
+            if unsupported:
+                raise ValueError("remote token-only draft: " + "; ".join(unsupported))
+            return
 
         if self.method == "mtp" and self.draft_model_config is None:
             # The MTP variant (and thus KV sharing) cannot be determined
@@ -2111,7 +2184,19 @@ class SpeculativeConfig:
         return self.method == "dflash"
 
     def use_remote_draft(self) -> bool:
-        return self.remote_draft is not None
+        return self.remote_draft is not None or (
+            self.execution is not None and self.execution.placement == "remote"
+        )
+
+    def get_remote_draft_config(self) -> RemoteDraftConfig | None:
+        if self.remote_draft is not None:
+            return self.remote_draft
+        if self.execution is not None and self.execution.placement == "remote":
+            return self.execution.remote_config()
+        return None
+
+    def use_unified_draft_backend(self) -> bool:
+        return self.execution is not None or self.use_remote_draft()
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
