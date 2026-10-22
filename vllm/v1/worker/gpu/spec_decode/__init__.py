@@ -21,6 +21,12 @@ def init_speculator(
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.use_remote_draft():
+        if speculative_config.use_gemma4_mtp():
+            from vllm.v1.worker.gpu.spec_decode.target_kv_remote import (
+                TargetKVRemoteSpeculator,
+            )
+
+            return TargetKVRemoteSpeculator(vllm_config, device)
         if speculative_config.method == "draft_model":
             from vllm.v1.worker.gpu.spec_decode.token_remote import (
                 TokenOnlyRemoteSpeculator,
