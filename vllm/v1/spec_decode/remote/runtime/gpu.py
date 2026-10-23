@@ -196,11 +196,9 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         from vllm.v1.worker.gpu.block_table import BlockTables
         from vllm.v1.worker.gpu.input_batch import InputBuffers
         from vllm.v1.worker.gpu.model_states.default import DefaultModelState
-        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
-        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
         from vllm.v1.worker.workspace import init_workspace_manager
 
-        self.contract = create_runtime_contract(vllm_config)
+        self.contract = self._create_contract(vllm_config)
         self.vllm_config = vllm_config
         self.device = device
         parallel = vllm_config.parallel_config
@@ -237,17 +235,11 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                 backend="nccl",
             )
             initialize_model_parallel()
-            target_shell = materialize_target_shell(
-                vllm_config.model_config,
-                device,
-                shared_weights_source=shared_weights_source,
-            )
             spec = vllm_config.speculative_config
             assert spec is not None
-            speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
-            self.speculator = speculator_cls(vllm_config, device)
-            self.speculator.load_model(target_shell)
-            del target_shell
+            self.speculator = self._load_speculator(
+                vllm_config, device, shared_weights_source
+            )
             self.speculator.model.eval()
 
             self.kv_config = initialize_standalone_kv_cache_config(
@@ -321,6 +313,23 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.num_blocks,
             self.block_size,
         )
+
+    def _create_contract(self, config):
+        return create_runtime_contract(config)
+
+    def _load_speculator(self, config, device, shared_weights_source):
+        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        target_shell = materialize_target_shell(
+            config.model_config, device, shared_weights_source=shared_weights_source
+        )
+        spec = config.speculative_config
+        assert spec is not None
+        speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
+        speculator = speculator_cls(config, device)
+        speculator.load_model(target_shell)
+        return speculator
 
     def _init_sampling_buffers(self, max_num_reqs: int) -> None:
         self.last_sampled = torch.zeros(

@@ -81,6 +81,7 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.spec_decode.contracts import DraftBackend, DraftStep, LocalExecutionContext
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -154,7 +155,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
-from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode import init_draft_backend, init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
@@ -296,11 +297,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        self.draft_backend: DraftBackend | None = None
         self.use_aux_hidden_state_outputs = False
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(
                     self.vllm_config, self.device, self.req_states
+                )
+                self.draft_backend = init_draft_backend(
+                    self.vllm_config, self.speculator
                 )
 
             self.use_aux_hidden_state_outputs = requires_aux_hidden_states(
@@ -965,28 +970,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
-                self.speculator.propose(
-                    input_batch=input_batch,
-                    attn_metadata=attn_metadata,
-                    slot_mappings=slot_mappings_by_layer,
-                    last_hidden_states=spec_hidden_states,
-                    aux_hidden_states=aux_hidden_states,
-                    num_sampled=torch.ones(
-                        input_batch.num_reqs, dtype=torch.int32, device=self.device
-                    ),
-                    num_rejected=torch.zeros(
-                        input_batch.num_reqs, dtype=torch.int32, device=self.device
-                    ),
-                    last_sampled=self.req_states.last_sampled_tokens,
-                    next_prefill_tokens=self.req_states.next_prefill_tokens,
-                    temperature=self.sampler.sampling_states.temperature.gpu,
-                    seeds=self.sampler.sampling_states.seeds.gpu,
-                    dp_sync_state=dp_sync_state,
-                    dummy_run=True,
-                    skip_attn_for_dummy_run=skip_attn,
-                    mm_inputs=mm_inputs,
-                    is_profile=is_profile,
-                )
+                backend = getattr(self, "draft_backend", None)
+                if backend is not None:
+                    step = DraftStep.from_batch(input_batch, self.num_speculative_steps)
+                    context = LocalExecutionContext(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        torch.ones(
+                            input_batch.num_reqs, dtype=torch.int32, device=self.device
+                        ),
+                        torch.zeros(
+                            input_batch.num_reqs, dtype=torch.int32, device=self.device
+                        ),
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        dp_sync_state=dp_sync_state,
+                        dummy_run=True,
+                        skip_attn_for_dummy_run=skip_attn,
+                        mm_inputs=mm_inputs,
+                        is_profile=is_profile,
+                    )
+                    handle = backend.dispatch(step, context)
+                    backend.collect(handle).to_legacy_tokens()
+                else:
+                    self.speculator.propose(
+                        input_batch=input_batch,
+                        attn_metadata=attn_metadata,
+                        slot_mappings=slot_mappings_by_layer,
+                        last_hidden_states=spec_hidden_states,
+                        aux_hidden_states=aux_hidden_states,
+                        num_sampled=torch.ones(
+                            input_batch.num_reqs, dtype=torch.int32, device=self.device
+                        ),
+                        num_rejected=torch.zeros(
+                            input_batch.num_reqs, dtype=torch.int32, device=self.device
+                        ),
+                        last_sampled=self.req_states.last_sampled_tokens,
+                        next_prefill_tokens=self.req_states.next_prefill_tokens,
+                        temperature=self.sampler.sampling_states.temperature.gpu,
+                        seeds=self.sampler.sampling_states.seeds.gpu,
+                        dp_sync_state=dp_sync_state,
+                        dummy_run=True,
+                        skip_attn_for_dummy_run=skip_attn,
+                        mm_inputs=mm_inputs,
+                        is_profile=is_profile,
+                    )
             self.step_timing.drafter_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
@@ -1185,7 +1218,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
         if self.speculator is not None:
-            self.speculator.close_requests(finished_req_ids)
+            backend = getattr(self, "draft_backend", None)
+            (self.speculator if backend is None else backend).close_requests(
+                finished_req_ids
+            )
         # Sorted so every TP rank frees request slots in the same order.
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
@@ -2289,22 +2325,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    num_speculative_tokens=num_spec_tokens,
-                    dp_sync_state=dp_sync_state,
-                    mm_inputs=mm_inputs,
-                )
+                backend = getattr(self, "draft_backend", None)
+                if backend is not None:
+                    step = DraftStep.from_batch(input_batch, num_spec_tokens)
+                    context = LocalExecutionContext(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        dp_sync_state=dp_sync_state,
+                        mm_inputs=mm_inputs,
+                    )
+                    handle = backend.dispatch(step, context)
+                    draft_tokens = backend.collect(handle).to_legacy_tokens()
+                else:
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        num_speculative_tokens=num_spec_tokens,
+                        dp_sync_state=dp_sync_state,
+                        mm_inputs=mm_inputs,
+                    )
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -2416,7 +2473,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # models; the model objects can outlive this runner.
         speculator = getattr(self, "speculator", None)
         if speculator is not None:
-            speculator.close()
+            backend = getattr(self, "draft_backend", None)
+            (speculator if backend is None else backend).close()
+            self.draft_backend = None
             if draft_model := getattr(speculator, "model", None):
                 clear_layer_kv_caches(draft_model.modules())
             self.speculator = None

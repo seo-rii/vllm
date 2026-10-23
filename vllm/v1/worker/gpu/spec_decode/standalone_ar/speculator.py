@@ -100,7 +100,7 @@ class StandaloneARSpeculator(DraftModelSpeculator):
 
     def load_draft_model(
         self,
-        target_model: nn.Module,
+        target_model: nn.Module | None,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         spec = self.speculative_config
@@ -125,6 +125,11 @@ class StandaloneARSpeculator(DraftModelSpeculator):
                 vllm_config=draft_vllm_config,
                 prefix="draft_model",
             )
+
+    def load_standalone_model(self) -> None:
+        """Load independent weights without constructing a target model shell."""
+        self.model = self.load_draft_model(None, set())
+        self._finalize_model_load(set())
 
     @torch.inference_mode()
     def _run_model(
