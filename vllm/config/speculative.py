@@ -138,7 +138,7 @@ class SpeculativeExecutionConfig:
     policy: Literal["on_demand"] = "on_demand"
     """Generate proposals only after authoritative target outcomes."""
     endpoints: tuple[str, ...] = ()
-    """Exactly one same-host endpoint for remote execution; none for local."""
+    """One endpoint, or 2..16 sticky token-only pool workers; none for local."""
     transport: RemoteDraftTransport | None = None
     """Remote transport override. Unset retains the inline default."""
     failure_policy: RemoteDraftFailurePolicy | None = None
@@ -162,12 +162,18 @@ class SpeculativeExecutionConfig:
             ):
                 raise ValueError("local execution cannot specify remote options")
         else:
+            if not 1 <= len(self.endpoints) <= 16 or len(set(self.endpoints)) != len(
+                self.endpoints
+            ):
+                raise ValueError("remote execution requires 1..16 distinct endpoints")
+            for endpoint in self.endpoints:
+                RemoteDraftConfig(endpoint=endpoint, transport=self.transport or "auto")
             self.remote_config()
         return self
 
     def remote_config(self) -> RemoteDraftConfig:
-        if self.placement != "remote" or len(self.endpoints) != 1:
-            raise ValueError("remote execution requires exactly one endpoint")
+        if self.placement != "remote" or not self.endpoints:
+            raise ValueError("remote execution requires at least one endpoint")
         return RemoteDraftConfig(
             endpoint=self.endpoints[0],
             transport=self.transport or "auto",
@@ -1751,6 +1757,15 @@ class SpeculativeConfig:
             remote_draft_config_incompatibilities,
         )
 
+        if (
+            self.execution is not None
+            and len(self.execution.endpoints) > 1
+            and self.method != "draft_model"
+        ):
+            raise ValueError(
+                "remote draft pools currently require token-only draft_model"
+            )
+
         if self.method == "draft_model" and self.execution is not None:
             remote = self.get_remote_draft_config()
             assert remote is not None
@@ -2213,6 +2228,12 @@ class SpeculativeConfig:
         if self.execution is not None and self.execution.placement == "remote":
             return self.execution.remote_config()
         return None
+
+    def get_remote_draft_endpoints(self) -> tuple[str, ...]:
+        """Resolve sticky workers without changing legacy single-server placement."""
+        if self.execution is not None and self.execution.placement == "remote":
+            return self.execution.endpoints
+        return (self.remote_draft.endpoint,) if self.remote_draft is not None else ()
 
     def use_unified_draft_backend(self) -> bool:
         return self.execution is not None or self.use_remote_draft()

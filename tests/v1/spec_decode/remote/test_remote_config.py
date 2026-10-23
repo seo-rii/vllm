@@ -81,10 +81,29 @@ def test_local_execution_rejects_remote_options(options):
         SpeculativeExecutionConfig(placement="local", **options)
 
 
-@pytest.mark.parametrize("endpoints", [[], ["unix:///a", "unix:///b"]])
-def test_remote_execution_requires_one_endpoint(endpoints):
-    with pytest.raises(ValidationError, match="exactly one endpoint"):
+@pytest.mark.parametrize(
+    "endpoints", [[], ["unix:///a", "unix:///a"], [f"unix:///{i}" for i in range(17)]]
+)
+def test_remote_execution_requires_bounded_distinct_endpoints(endpoints):
+    with pytest.raises(ValidationError, match="1..16 distinct endpoints"):
         SpeculativeExecutionConfig(placement="remote", endpoints=endpoints)
+
+
+def test_pool_validates_every_endpoint_and_rejects_other_remote_methods():
+    endpoints = ("unix:///draft0.sock", "tcp://127.0.0.1:5556")
+    execution = SpeculativeExecutionConfig(placement="remote", endpoints=endpoints)
+    assert execution.endpoints == endpoints
+    with pytest.raises(ValidationError, match="endpoint"):
+        SpeculativeExecutionConfig(
+            placement="remote", endpoints=(endpoints[0], "bad-endpoint")
+        )
+    with pytest.raises(ValidationError, match="token-only draft_model"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=3,
+            prompt_lookup_max=3,
+            execution={"placement": "remote", "endpoints": endpoints},
+        )
 
 
 @pytest.mark.parametrize("policy", ["outcome_cache", "shadow"])

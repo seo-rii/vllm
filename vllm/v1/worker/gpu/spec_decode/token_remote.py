@@ -22,6 +22,7 @@ from vllm.v1.spec_decode.remote.runtime.token_schema import (
     create_token_runtime_contract,
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+from vllm.v1.spec_decode.remote.token_pool import TokenDraftPool, TokenPoolHandle
 from vllm.v1.spec_decode.remote.token_protocol import TokenHello
 from vllm.v1.spec_decode.remote.token_session import (
     TokenOnlyRemoteSession,
@@ -43,7 +44,7 @@ class _TokenHandle(ProposalHandle):
     round_id: int
     step: DraftStep
     context: LocalExecutionContext | None
-    rpc: TokenProposalHandle | None = None
+    rpc: TokenProposalHandle | TokenPoolHandle | None = None
     rows: tuple[int, ...] = ()
     output: SpeculatorOutput | None = None
     error: str | None = None
@@ -73,7 +74,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         self._terminal_requests: set[str] = set()
         self._pending: _TokenHandle | None = None
         self._closed = False
-        self._session: TokenOnlyRemoteSession | None = None
+        self._session: TokenOnlyRemoteSession | TokenDraftPool | None = None
         error = None
         if self._tp.rank_in_group == 0:
             try:
@@ -89,13 +90,18 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     vllm_config.model_config.max_model_len,
                 )
-                self._session = TokenOnlyRemoteSession(
-                    remote.endpoint,
-                    hello,
+                endpoints = spec.get_remote_draft_endpoints()
+                options = dict(
                     failure_policy=remote.failure_policy,
                     request_timeout_ms=remote.request_timeout_ms,
                     startup_timeout_ms=remote.startup_timeout_ms,
                 )
+                if len(endpoints) > 1:
+                    self._session = TokenDraftPool(endpoints, hello, **options)
+                else:
+                    self._session = TokenOnlyRemoteSession(
+                        remote.endpoint, hello, **options
+                    )
                 self._session.connect()
             except Exception as exc:
                 self.close()
