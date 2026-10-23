@@ -158,12 +158,12 @@ class ConditionedDraftPool:
             self.invalidate()
             raise RemoteDraftError("all CUDA IPC pool workers must connect at startup")
 
-    def prepare_cuda_ipc(self, device):
+    def prepare_cuda_ipc(self, device: torch.device):
         self._idle()
         if self._transport != "cuda_ipc" or self._streams:
             return
         try:
-            with torch.accelerator.device_index(device):
+            with torch.accelerator.device_index(device.index):
                 self._streams = tuple(
                     torch.cuda.Stream(device=device) for _ in self._sessions
                 )
