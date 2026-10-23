@@ -2,7 +2,9 @@
 
 The native local speculator remains the default. An opt-in backend boundary
 adds local wrappers, same-step dispatch/collect and a token-only standalone
-draft. Predictive caching, N:M pooling, stochastic remote sampling, prefix
+draft. [N:M token-only pooling](../features/speculative_decoding/draft_pool.md)
+adds sticky routing and bounded cross-client batching. Predictive caching,
+stochastic remote sampling, prefix
 reuse, async scheduling, cross-node transport and draft TP expansion are
 outside this implementation.
 
@@ -65,7 +67,8 @@ a remote reader finished.
 ## Configuration and protocol boundaries
 
 Execution separates placement from the speculative method. Only `on_demand`
-policy and one endpoint are accepted. Local execution rejects remote endpoint,
+policy is accepted. Target-conditioned methods accept one endpoint; token-only
+execution also accepts a bounded pool of same-contract workers. Local execution rejects remote endpoint,
 transport, failure-policy, and timeout options. Supplying both legacy
 `remote_draft` and `execution` is an error. Legacy remote configuration keeps its
 existing defaults and v2 semantics; `transport="auto"` still means inline.
