@@ -111,7 +111,9 @@ when foreground admission is full so disconnects can retire their own state.
 
 Shutdown drains work under the existing grace period. If its GPU owner has not
 finished, the worker retains model and buffer ownership and requires process
-replacement; it does not free storage underneath executing work.
+replacement; it does not free storage underneath executing work. A cleanly
+stopped owner can be started again, including after a recoverable warmup or
+endpoint-bind failure. Fatal GPU errors still require process replacement.
 
 Sharing workers and batching do not by themselves establish a throughput gain.
 Measure accepted drafts, fallback causes, per-verifier queue latency and goodput,

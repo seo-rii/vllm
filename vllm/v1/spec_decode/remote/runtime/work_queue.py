@@ -95,8 +95,6 @@ class DraftWorkQueue:
             return self._bytes
 
     def start(self, initialize: Callable[[], None]) -> None:
-        if self._thread is not None:
-            raise RuntimeError("draft work queue is already started")
         ready = DraftWork("", initialize)
 
         def run() -> None:
@@ -109,11 +107,32 @@ class DraftWorkQueue:
             if ready.error is None:
                 self._run()
 
-        self._thread = threading.Thread(
-            target=run, name="token-draft-gpu-owner", daemon=True
-        )
-        self._thread.start()
-        ready.wait()
+        with self._condition:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("draft work queue is already started")
+            if (
+                self._jobs
+                or self._bytes
+                or self._cleanup_jobs
+                or self._queues
+                or self._ready
+                or self._credits
+            ):
+                raise RuntimeError("draft work queue retains unfinished work")
+            self._closing = False
+            thread = threading.Thread(
+                target=run, name="token-draft-gpu-owner", daemon=True
+            )
+            self._thread = thread
+            thread.start()
+        try:
+            ready.wait()
+        except BaseException as error:
+            if error is ready.error:
+                # Failed initialization has no work loop; finish its owner before
+                # exposing a recoverable error that permits an immediate retry.
+                thread.join()
+            raise
 
     def submit(self, work: DraftWork) -> DraftWork:
         if any(
@@ -250,10 +269,11 @@ class DraftWorkQueue:
     def stop(self, deadline: float) -> None:
         with self._condition:
             self._closing = True
+            thread = self._thread
             self._condition.notify_all()
-        if self._thread is not None:
-            self._thread.join(max(0, deadline - time.monotonic()))
-            if self._thread.is_alive():
+        if thread is not None:
+            thread.join(max(0, deadline - time.monotonic()))
+            if thread.is_alive():
                 raise ServerShutdownTimeout(
                     "token GPU owner is still running; process restart required"
                 )

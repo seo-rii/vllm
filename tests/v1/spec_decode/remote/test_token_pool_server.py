@@ -71,9 +71,8 @@ class BatchOracle(KVOracle):
         )
 
 
-@contextmanager
-def runtime(tmp_path, **kwargs):
-    oracle = BatchOracle()
+def make_server(*, oracle=None, **kwargs):
+    oracle = BatchOracle() if oracle is None else oracle
     state = TokenStateMachine(
         oracle,
         DraftBlockPool(65, 4),
@@ -98,6 +97,12 @@ def runtime(tmp_path, **kwargs):
         limits=RemoteServerLimits(8, 64, 8, 64),
         **kwargs,
     )
+    return state, oracle, server
+
+
+@contextmanager
+def runtime(tmp_path, **kwargs):
+    state, oracle, server = make_server(**kwargs)
     endpoint = server.start(f"unix://{tmp_path}/p.sock")
     clients = []
 
@@ -136,6 +141,65 @@ def proposal(client, key, *, token=2, k=3, batch_id=0):
             deadline=client.deadline(),
         )
     )
+
+
+@pytest.mark.parametrize("previous", ["warmup", "bind", "stop", "fatal"])
+def test_token_server_restarts_only_after_a_recoverable_completed_owner(previous):
+    from vllm.v1.spec_decode.remote.errors import CudaRuntimeError
+    from vllm.v1.spec_decode.remote.transport import TransportError, listen
+
+    class StartupOracle(BatchOracle):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def warmup(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                if previous == "warmup":
+                    raise ValueError("recoverable warmup failure")
+                if previous == "fatal":
+                    raise CudaRuntimeError("fatal warmup", cuda_error_code=226)
+            super().warmup()
+
+    state, oracle, server = make_server(oracle=StartupOracle())
+    session = None
+    try:
+        if previous in {"warmup", "fatal"}:
+            with pytest.raises((ValueError, CudaRuntimeError), match="warmup"):
+                server.start("tcp://127.0.0.1:0")
+        elif previous == "bind":
+            occupied = listen("tcp://127.0.0.1:0")
+            try:
+                with pytest.raises(TransportError, match="cannot listen"):
+                    server.start(occupied.endpoint)
+            finally:
+                occupied.close()
+        else:
+            server.start("tcp://127.0.0.1:0")
+            server.stop()
+        assert server.endpoint is None
+        if previous == "fatal":
+            assert not server.healthy
+            with pytest.raises(RuntimeError, match="unhealthy"):
+                server.start("tcp://127.0.0.1:0")
+            assert oracle.attempts == 1
+            return
+        assert server.healthy
+        endpoint = server.start("tcp://127.0.0.1:0")
+        hello = TokenHello("retry", "target", "draft", "tokenizer", 3, 128, 8, 64, 64)
+        session = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=3000)
+        key = prepared(session)
+        result = proposal(session, key)
+        assert result.valid_lengths == (3,)
+        assert result.token_ids[0][0] == KVOracle.predict([1, 2])
+        session.close_sequences((key,))
+        assert oracle.attempts == 2
+        assert not state.sequences and not len(server.registry)
+    finally:
+        if session is not None:
+            session.close()
+        server.stop()
 
 
 @pytest.mark.parametrize("ka_budget,kb_budget", [(0, 3), (1, 2), (3, 3)])
@@ -251,6 +315,8 @@ def test_queue_shutdown_retains_running_work_and_its_credits():
         with pytest.raises(ServerShutdownTimeout, match="still running"):
             queue.stop(time.monotonic())
         assert queue.depth == 1 and queue.pending_bytes == 8
+        with pytest.raises(RuntimeError, match="already started"):
+            queue.start(lambda: pytest.fail("live GPU owner was replaced"))
         with pytest.raises(ServerShutdownTimeout):
             queue.submit(DraftWork("b", lambda: None))
         release.set()
@@ -335,6 +401,8 @@ def test_server_shutdown_does_not_free_active_gpu_owner_state(tmp_path):
                 assert key in state.sequences
                 assert state.block_pool.num_free_blocks == free
                 assert server.work_queue.depth == 1
+                with pytest.raises(RuntimeError, match="unhealthy"):
+                    server.start("tcp://127.0.0.1:0")
             finally:
                 oracle.release.set()
                 # Join the synthetic CPU owner only after proving the first stop
