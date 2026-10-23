@@ -1769,6 +1769,25 @@ class SpeculativeConfig:
                 raise ValueError("remote token-only draft: " + "; ".join(unsupported))
             return
 
+        if self.use_gemma4_mtp():
+            remote = self.get_remote_draft_config()
+            assert remote is not None
+            if (
+                self.num_speculative_tokens != 1
+                or self.draft_tensor_parallel_size not in (None, 1)
+                or self.draft_sample_method != "greedy"
+                or self.parallel_drafting
+                or self.use_heterogeneous_vocab
+                or remote.transport not in ("auto", "inline")
+            ):
+                raise ValueError(
+                    "remote Gemma4 requires K1, draft TP1, sequential greedy "
+                    "drafting, equal vocabularies and inline transport"
+                )
+            # Target topology, text-only admission and snapshot geometry are
+            # checked by the dedicated target-KV runtime contract.
+            return
+
         if self.method == "mtp" and self.draft_model_config is None:
             # The MTP variant (and thus KV sharing) cannot be determined
             # without the draft model config; fail closed.

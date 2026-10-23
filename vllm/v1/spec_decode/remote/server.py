@@ -397,7 +397,8 @@ class SequenceRegistry:
         return None
 
     def open(self, key: SequenceKey, *, owner: str) -> OpenOutcome:
-        entry = self._entries.get(_registry_key(key))
+        registry_key = _registry_key(key)
+        entry = self._entries.get(registry_key)
         if entry is not None:
             if key.generation < entry.key.generation:
                 return OpenOutcome(
@@ -417,12 +418,17 @@ class SequenceRegistry:
                 entry.last_activity = self._clock()
                 return OpenOutcome(SpeculatorStatusCode.OK, "already open", False, None)
         replaced = entry.key if entry is not None else None
+        new_entry = SequenceEntry(key=key, owner=owner, last_activity=self._clock())
+        outcome = OpenOutcome(SpeculatorStatusCode.OK, "", True, replaced)
+        self._entries[registry_key] = new_entry
         if replaced is None:
-            self._add_count(key.verifier_instance_id, 1)
-        self._entries[_registry_key(key)] = SequenceEntry(
-            key=key, owner=owner, last_activity=self._clock()
-        )
-        return OpenOutcome(SpeculatorStatusCode.OK, "", True, replaced)
+            try:
+                self._add_count(key.verifier_instance_id, 1)
+            except Exception:
+                # Counter allocation must not leave an unreported registration.
+                del self._entries[registry_key]
+                raise
+        return outcome
 
     def prefill(
         self,
@@ -874,38 +880,65 @@ class RemoteDraftServer:
                 ):
                     conn.close()
                     continue
-                self._connections.add(conn)
-                self._handshaking.add(conn)
-                self._workers = [w for w in self._workers if w.is_alive()]
-                worker = threading.Thread(
-                    target=self._serve_connection,
-                    args=(conn,),
-                    name="remote-draft-session",
-                    daemon=True,
-                )
-                self._workers.append(worker)
-                worker.start()
+                worker = None
+                failure: Exception | None = None
+                try:
+                    self._connections.add(conn)
+                    self._handshaking.add(conn)
+                    self._workers = [w for w in self._workers if w.is_alive()]
+                    worker = threading.Thread(
+                        target=self._serve_connection,
+                        args=(conn,),
+                        name="remote-draft-session",
+                        daemon=True,
+                    )
+                    self._workers.append(worker)
+                except (MemoryError, RuntimeError) as error:
+                    failure = error
+                else:
+                    # MemoryError in start() can follow OS thread creation;
+                    # do not assume that ownership can safely be rolled back.
+                    try:
+                        worker.start()
+                    except RuntimeError as error:
+                        failure = error
+                if failure is not None:
+                    conn.close()
+                    # A started worker retains ownership until its own cleanup.
+                    if worker is None or worker.ident is None:
+                        self._connections.discard(conn)
+                        self._handshaking.discard(conn)
+                        if worker is not None and worker in self._workers:
+                            self._workers.remove(worker)
+                    logger.warning("Failed to start remote draft session: %s", failure)
 
     def _serve_connection(self, conn: FramedConnection) -> None:
-        session = _ServerSession(self, conn)
+        session: _ServerSession | None = None
         try:
+            session = _ServerSession(self, conn)
             session.run()
         except AdapterQueueFull:
             logger.warning(
-                "Remote draft session %s: adapter queue full", session.session_id
+                "Remote draft session %s: adapter queue full",
+                getattr(session, "session_id", "<initializing>"),
             )
         except (ConnectionClosed, ServerShutdownTimeout, SequenceCleanupFailed):
             pass
         except Exception:
-            logger.exception("Remote draft session %s crashed", session.session_id)
+            logger.exception(
+                "Remote draft session %s crashed",
+                getattr(session, "session_id", "<initializing>"),
+            )
         finally:
             try:
-                session.cleanup()
+                if session is not None:
+                    session.cleanup()
             except (ServerShutdownTimeout, SequenceCleanupFailed):
                 pass
             except Exception:
                 logger.exception(
-                    "Failed to clean up remote draft session %s", session.session_id
+                    "Failed to clean up remote draft session %s",
+                    getattr(session, "session_id", "<initializing>"),
                 )
             finally:
                 try:

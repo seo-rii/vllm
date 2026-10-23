@@ -8,7 +8,6 @@ import torch
 
 from vllm.config import AttentionConfig
 from vllm.engine.arg_utils import EngineArgs
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.remote.runtime.adapter import TargetConditionedDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.gpu import make_gpu_adapter
 from vllm.v1.spec_decode.remote.runtime.schema import (
@@ -22,13 +21,7 @@ def create_gpu_adapter(
 ) -> tuple[TargetConditionedDraftAdapter, RuntimeContract]:
     if not args.target_model or not args.draft_model:
         raise ValueError("--adapter gpu requires --target-model and --draft-model")
-    attention = AttentionConfig(
-        backend=(
-            AttentionBackendEnum[args.target_attention_backend]
-            if args.target_attention_backend
-            else None
-        )
-    )
+    attention = AttentionConfig(backend=args.target_attention_backend)
     config = EngineArgs(
         model=args.target_model,
         revision=args.target_revision,

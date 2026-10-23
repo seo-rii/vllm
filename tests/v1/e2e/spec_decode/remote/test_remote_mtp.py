@@ -22,10 +22,14 @@ from ..utils import get_spec_decode_metric_value
 
 MODEL = "XiaomiMiMo/MiMo-7B-RL"
 REVISION = "6299b5a2c45daf0c429285c92b8e61a5bd011c0d"
+GEMMA_MODEL = "google/gemma-4-E2B-it"
+GEMMA_REVISION = "3e22461f65e89153144f8adb70e3b8c2cc9845a7"
+GEMMA_DRAFT = "google/gemma-4-E2B-it-assistant"
+GEMMA_DRAFT_REVISION = "2d874ef7d29f9a30599a1e4b3c1cbc9595f005df"
 
 
 @contextmanager
-def draft_server(model: str, log_path: Path):
+def draft_server(model: str, log_path: Path, *, target_kv: bool = False):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
         command = [
@@ -68,6 +72,31 @@ def draft_server(model: str, log_path: Path):
             "FLASH_ATTN",
             "--trust-remote-code",
         ]
+        if target_kv:
+            command = [
+                sys.executable,
+                "-m",
+                "vllm.v1.spec_decode.remote.runtime.target_kv_cli",
+                "--endpoint",
+                f"unix://{path}",
+                "--target-model",
+                model,
+                "--draft-model",
+                maybe_model_redirect(GEMMA_DRAFT),
+                "--target-revision",
+                GEMMA_REVISION,
+                "--draft-revision",
+                GEMMA_DRAFT_REVISION,
+                "--device",
+                "cuda:0",
+                "--max-num-seqs",
+                "4",
+                "--max-model-len",
+                "128",
+                "--max-feature-tokens",
+                "64",
+                "--language-model-only",
+            ]
         with log_path.open("w") as log:
             process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -100,20 +129,24 @@ def draft_server(model: str, log_path: Path):
                 assert process.returncode == 0, f"draft server failed: {log_path}"
 
 
-@pytest.mark.parametrize("transport", ["inline", "cuda_ipc"])
+@pytest.mark.parametrize(
+    "transport,target_kv", [("inline", False), ("cuda_ipc", False), ("inline", True)]
+)
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport
+    vllm_runner, monkeypatch, tmp_path, transport, target_kv
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    model = maybe_model_redirect(MODEL)
+    model = maybe_model_redirect(GEMMA_MODEL if target_kv else MODEL)
+    revision = GEMMA_REVISION if target_kv else REVISION
+    backend = "TRITON_ATTN" if target_kv else "FLASH_ATTN"
     kwargs = dict(
-        revision=REVISION,
-        tokenizer_revision=REVISION,
-        trust_remote_code=True,
+        revision=revision,
+        tokenizer_revision=revision,
+        trust_remote_code=not target_kv,
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
@@ -126,9 +159,11 @@ def test_remote_mtp_matches_target_and_uses_drafts(
         block_size=16,
         kv_cache_memory_bytes=1 << 30,
         gpu_memory_utilization=0.6,
-        attention_config={"backend": "FLASH_ATTN"},
+        attention_config={"backend": backend},
         disable_log_stats=False,
     )
+    if target_kv:
+        kwargs["language_model_only"] = True
     prompts = [
         {"prompt_token_ids": [11 + i % 4 for i in range(length)]}
         for length in (15, 16, 17, 65)
@@ -138,15 +173,15 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     )
     with vllm_runner(model, **kwargs) as baseline:
         expected = baseline.llm.generate(prompts, sampling, use_tqdm=False)
-    with draft_server(model, tmp_path / "draft.log") as endpoint:
+    with draft_server(model, tmp_path / "draft.log", target_kv=target_kv) as endpoint:
         config = dict(
             method="mtp",
-            model=model,
-            revision=REVISION,
+            model=maybe_model_redirect(GEMMA_DRAFT) if target_kv else model,
+            revision=GEMMA_DRAFT_REVISION if target_kv else REVISION,
             num_speculative_tokens=1,
             draft_tensor_parallel_size=1,
             draft_sample_method="greedy",
-            attention_backend="FLASH_ATTN",
+            attention_backend=backend,
             remote_draft=dict(
                 endpoint=endpoint,
                 transport=transport,
