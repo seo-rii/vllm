@@ -327,7 +327,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 try:
                     if handle.error is None and handle.rpc is not None:
                         assert self._session is not None and handle.output is not None
-                        result = self._session.collect(handle.rpc)
+                        if isinstance(handle.rpc, TokenPoolHandle):
+                            assert isinstance(self._session, TokenDraftPool)
+                            result = self._session.collect(handle.rpc)
+                        else:
+                            assert isinstance(self._session, TokenOnlyRemoteSession)
+                            result = self._session.collect(handle.rpc)
                         handle.output.token_ids[list(handle.rows)] = torch.tensor(
                             result.token_ids, dtype=torch.int64
                         )
@@ -376,7 +381,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             if self._session is not None:
                 try:
                     if handle.rpc is not None:
-                        self._session.cancel(handle.rpc)
+                        if isinstance(handle.rpc, TokenPoolHandle):
+                            assert isinstance(self._session, TokenDraftPool)
+                            self._session.cancel(handle.rpc)
+                        else:
+                            assert isinstance(self._session, TokenOnlyRemoteSession)
+                            self._session.cancel(handle.rpc)
                     else:
                         self._session._invalidate()
                 except Exception as exc:

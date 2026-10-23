@@ -75,10 +75,14 @@ def pool_runtime():
             states.append(state)
             oracles.append(oracle)
         hello = TokenHello("v-a", "target", "draft", "tokenizer", 3, 128, 4, 64, 64)
+        endpoints = []
+        for server in servers:
+            assert server.endpoint is not None
+            endpoints.append(server.endpoint)
 
         def client(identity="v-a", policy="error"):
             pool = TokenDraftPool(
-                tuple(server.endpoint for server in servers),
+                tuple(endpoints),
                 replace(hello, verifier_instance_id=identity),
                 failure_policy=policy,
                 request_timeout_ms=5000,
