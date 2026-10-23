@@ -16,9 +16,13 @@ from vllm.v1.spec_decode.remote.runtime.schema import (
 from vllm.v1.spec_decode.remote.target_kv import (
     AttentionSpec,
     SnapshotBudget,
+    _table_width,
     gemma4_source_layers,
 )
-from vllm.v1.spec_decode.remote.target_kv_protocol import snapshot_wire_plan
+from vllm.v1.spec_decode.remote.target_kv_protocol import (
+    MAX_SNAPSHOT_BATCH_SIZE,
+    snapshot_batch_wire_plan,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -35,6 +39,7 @@ class TargetKVRuntimeContract:
     draft_num_attention_heads: int
     snapshot_budget: SnapshotBudget
     receiver_budget: SnapshotBudget
+    max_num_seqs: int = 1
 
 
 def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
@@ -70,11 +75,11 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
     ):
         errors.append("target and draft require TP1/PP1/DP1/DCP1/PCP1")
     if (
-        config.scheduler_config.max_num_seqs != 1
+        not 1 <= config.scheduler_config.max_num_seqs <= MAX_SNAPSHOT_BATCH_SIZE
         or config.scheduler_config.async_scheduling
         or config.scheduler_config.disable_hybrid_kv_cache_manager
     ):
-        errors.append("one sequence, synchronous scheduling and hybrid KV are required")
+        errors.append("1..16 sequences, synchronous scheduling and hybrid KV required")
     backend = config.attention_config.backend
     if getattr(backend, "name", backend) != "TRITON_ATTN":
         errors.append("TRITON_ATTN is required")
@@ -206,7 +211,31 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
     # Native page unification may add physical padding that snapshots cannot
     # represent. Validate that contract, and maximum-context capacity, before
     # either process loads weights or the target allocates its KV cache.
-    snapshot_wire_plan(expected, target.max_model_len, budget, budget)
+    snapshot_batch_wire_plan(
+        expected,
+        (target.max_model_len,) * config.scheduler_config.max_num_seqs,
+        budget,
+        budget,
+    )
+    pages = nbytes = table_bytes = 0
+    for layer in expected.values():
+        count = (target.max_model_len + layer.block_size - 1) // layer.block_size
+        table_bytes += _table_width(layer, count) * 4
+        if layer.sliding_window is not None:
+            count = min(
+                count,
+                (layer.sliding_window + 2 * layer.block_size - 2) // layer.block_size,
+            )
+        pages += count
+        nbytes += count * layer.unpadded_page_size_bytes
+    size = config.scheduler_config.max_num_seqs
+    budget.check(target.max_model_len, size * pages, size * nbytes)
+    budget.check(
+        target.max_model_len,
+        size * pages + len(expected),
+        size * (nbytes + table_bytes)
+        + sum(layer.unpadded_page_size_bytes for layer in expected.values()),
+    )
     identity = {
         "target": _model_identity(target),
         "draft": _model_identity(draft),
@@ -230,4 +259,5 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         draft_num_attention_heads=assistant.num_attention_heads,
         snapshot_budget=budget,
         receiver_budget=budget,
+        max_num_seqs=config.scheduler_config.max_num_seqs,
     )

@@ -34,6 +34,7 @@ from vllm.v1.spec_decode.remote.target_kv import (
 TARGET_KV_PROTOCOL_MAJOR = 4
 CONTROL_BYTES = 16384
 FRAME_METADATA_BYTES = 1024
+MAX_SNAPSHOT_BATCH_SIZE = 16
 
 
 class TargetKVHello(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
@@ -55,6 +56,7 @@ class TargetKVHelloAck(msgspec.Struct):
     contract_fingerprint: str
     max_snapshot_pages: PositiveInt
     max_snapshot_bytes: PositiveInt
+    max_num_seqs: PositiveInt = 1
 
 
 class TargetKVQuery(msgspec.Struct):
@@ -76,6 +78,15 @@ class TargetKVReply(msgspec.Struct):
     detail: str = ""
 
 
+class TargetKVBatchQuery(msgspec.Struct):
+    queries: tuple[TargetKVQuery, ...]
+    budget_ms: PositiveInt
+
+
+class TargetKVBatchReply(msgspec.Struct):
+    replies: tuple[TargetKVReply, ...]
+
+
 _TYPES = {
     "hello": TargetKVHello,
     "hello_ack": TargetKVHelloAck,
@@ -84,6 +95,8 @@ _TYPES = {
     "sequence_ack": SequenceAck,
     "snapshot_query": TargetKVQuery,
     "snapshot_reply": TargetKVReply,
+    "snapshot_batch_query": TargetKVBatchQuery,
+    "snapshot_batch_reply": TargetKVBatchReply,
     "ping": Ping,
     "pong": Pong,
     "error": ErrorReply,
@@ -163,3 +176,27 @@ def snapshot_wire_plan(
             )
         )
     return tuple(plans)
+
+
+def snapshot_batch_wire_plan(
+    specs: Mapping[str, AttentionSpec],
+    lengths: tuple[int, ...],
+    budget: SnapshotBudget,
+    receiver_budget: SnapshotBudget | None = None,
+) -> tuple[tuple[LayerWirePlan, ...], ...]:
+    """Budget all rows and shared receiver caches before reading any payload."""
+    if not 1 <= len(lengths) <= MAX_SNAPSHOT_BATCH_SIZE:
+        raise ValueError("target-KV batch must contain between one and 16 rows")
+    plans = tuple(snapshot_wire_plan(specs, n, budget) for n in lengths)
+    pages = sum(len(p.logical_pages) for row in plans for p in row)
+    nbytes = sum(p.nbytes for row in plans for p in row)
+    budget.check(max(lengths), pages, nbytes)
+    if receiver_budget is not None:
+        receiver_bytes = nbytes
+        for i, spec in enumerate(specs[name] for name in sorted(specs)):
+            width = max(
+                _table_width(spec, row[i].logical_pages[-1] + 1) for row in plans
+            )
+            receiver_bytes += spec.unpadded_page_size_bytes + len(lengths) * width * 4
+        receiver_budget.check(max(lengths), pages + len(specs), receiver_bytes)
+    return plans

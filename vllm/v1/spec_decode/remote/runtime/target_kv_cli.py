@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-feature-tokens", type=int, default=64)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--language-model-only", action="store_true", required=True)
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args(argv)
@@ -35,7 +36,7 @@ def main(argv: list[str] | None = None) -> None:
         dtype="bfloat16",
         tensor_parallel_size=1,
         max_model_len=args.max_model_len,
-        max_num_seqs=1,
+        max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_feature_tokens,
         block_size=16,
         enforce_eager=True,
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
         expected_specs=contract.expected_specs,
         snapshot_budget=contract.snapshot_budget,
         receiver_budget=contract.receiver_budget,
+        max_num_seqs=contract.max_num_seqs,
     )
     try:
         endpoint = server.start(args.endpoint)

@@ -27,7 +27,10 @@ from vllm.v1.spec_decode.remote.target_kv import (
     select_draft_position,
     snapshot_target_kv,
 )
-from vllm.v1.spec_decode.remote.target_kv_protocol import TargetKVHello
+from vllm.v1.spec_decode.remote.target_kv_protocol import (
+    TargetKVHello,
+    snapshot_batch_wire_plan,
+)
 from vllm.v1.spec_decode.remote.target_kv_session import (
     TargetKVProposalHandle,
     TargetKVRemoteSession,
@@ -41,6 +44,7 @@ class _SnapshotHandle(ProposalHandle):
     step: DraftStep
     context: LocalExecutionContext | None
     rpc: TargetKVProposalHandle | None = None
+    rpc_rows: tuple[int, ...] = ()
     error: Exception | None = None
 
 
@@ -75,6 +79,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
                 contract.snapshot_budget.max_model_len,
                 contract.snapshot_budget.max_pages,
                 contract.snapshot_budget.max_bytes,
+                max_num_seqs=contract.max_num_seqs,
             ),
             expected_specs=contract.expected_specs,
             failure_policy=remote.failure_policy,
@@ -93,29 +98,41 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
     def capture(self) -> None:
         pass
 
-    def _profile_snapshot(self) -> None:
+    @staticmethod
+    def _select_hidden(hidden: torch.Tensor, indices: tuple[int, ...]) -> torch.Tensor:
+        return hidden.index_select(
+            0, torch.tensor(indices, dtype=torch.int64, device=hidden.device)
+        )
+
+    def _profile_snapshot(self, context: LocalExecutionContext) -> None:
         # Reserve the export peak alongside the still-live target output. No
         # cache views, request state or RPCs exist during target KV profiling.
-        retained = []
+        shapes = []
         length = self.contract.snapshot_budget.max_model_len
         pages = nbytes = 0
-        for spec in self.contract.expected_specs.values():
-            count = (length + spec.block_size - 1) // spec.block_size
-            if spec.sliding_window is not None:
-                count = min(
-                    count,
-                    (spec.sliding_window + 2 * spec.block_size - 2) // spec.block_size,
+        for _ in range(self.contract.max_num_seqs):
+            for spec in self.contract.expected_specs.values():
+                count = (length + spec.block_size - 1) // spec.block_size
+                if spec.sliding_window is not None:
+                    count = min(
+                        count,
+                        (spec.sliding_window + 2 * spec.block_size - 2)
+                        // spec.block_size,
+                    )
+                pages += count
+                nbytes += count * spec.unpadded_page_size_bytes
+                shapes.append(
+                    (count, spec.num_kv_heads, spec.block_size, 2 * spec.head_size)
                 )
-            pages += count
-            nbytes += count * spec.unpadded_page_size_bytes
-            self.contract.snapshot_budget.check(length, pages, nbytes)
-            retained.append(
-                torch.zeros(
-                    (count, spec.num_kv_heads, spec.block_size, 2 * spec.head_size),
-                    dtype=spec.dtype,
-                    device=self.device,
-                )
-            )
+        self.contract.snapshot_budget.check(length, pages, nbytes)
+        retained = [
+            torch.zeros(shape, dtype=torch.bfloat16, device=self.device)
+            for shape in shapes
+        ]
+        hidden = context.last_hidden_states
+        if hidden is None or hidden.ndim != 2 or not hidden.shape[0]:
+            raise ValueError("target-KV profiling requires target hidden states")
+        retained.append(self._select_hidden(hidden, (0,) * self.contract.max_num_seqs))
         # Inline transfer allocates CPU storage, while every exported GPU page
         # remains live until the synchronous send has consumed the snapshot.
         for tensor in retained:
@@ -129,10 +146,14 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         handle = _SnapshotHandle(self._owner, step, context)
         self._pending = handle
         try:
-            if len(step.request_ids) > 1 or step.num_speculative_tokens not in (0, 1):
-                raise ValueError("target-KV serving requires one request and K0/K1")
+            if (
+                len(step.request_ids) > self.contract.max_num_seqs
+                or len(set(step.request_ids)) != len(step.request_ids)
+                or step.num_speculative_tokens not in (0, 1)
+            ):
+                raise ValueError("target-KV serving exceeds request capacity or K0/K1")
             if context.is_profile:
-                self._profile_snapshot()
+                self._profile_snapshot(context)
             elif not context.dummy_run and step.request_ids:
                 if step != DraftStep.from_batch(
                     context.input_batch, step.num_speculative_tokens
@@ -155,7 +176,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
                     self._session.fail(
                         f"target-KV preparation allocation failed: {error}"
                     )
-                    self.stats["fallback"] += 1
+                    self.stats["fallback"] += len(step.request_ids)
                 except Exception as policy_error:
                     handle.error = policy_error
         return handle
@@ -166,31 +187,46 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         batch = context.input_batch
         if context.mm_inputs is not None:
             raise ValueError("remote Gemma4 requires text-only inputs")
-        req_id = handle.step.request_ids[0]
-        key = self._requests.get(req_id)
-        if key is None:
-            key = session.open_sequence(next(self._sequences), deadline=deadline)
-            self._requests[req_id] = key
-        if not session.active(key):
-            self.stats["fallback"] += 1
+        new_ids = tuple(
+            req_id for req_id in handle.step.request_ids if req_id not in self._requests
+        )
+        if new_ids:
+            keys = session.open_sequences(
+                tuple(next(self._sequences) for _ in new_ids), deadline=deadline
+            )
+            self._requests.update(zip(new_ids, keys, strict=True))
+        active_rows = [
+            row
+            for row, req_id in enumerate(handle.step.request_ids)
+            if session.active(self._requests[req_id])
+        ]
+        self.stats["fallback"] += len(handle.step.request_ids) - len(active_rows)
+        if not active_rows:
             return
         if handle.step.num_speculative_tokens == 0:
             return
         if torch.any(context.temperature[batch.idx_mapping] != 0).item():
             raise ValueError("remote Gemma4 requires greedy sampling")
-        position = select_draft_position(
-            query_start=int(batch.query_start_loc_np[0]),
-            query_length=handle.step.query_lens[0],
-            sequence_length=int(batch.seq_lens[0].item()),
-            num_rejected=int(context.num_rejected[0].item()),
-            num_sampled=int(context.num_sampled[0].item()),
-        )
-        if position is None:
-            return
-        if int(batch.positions[position.hidden_index].item()) != position.position:
-            raise ValueError(
-                "target-KV query position differs from materialized context"
+        positions = {}
+        for row in active_rows:
+            position = select_draft_position(
+                query_start=int(batch.query_start_loc_np[row]),
+                query_length=handle.step.query_lens[row],
+                sequence_length=int(batch.seq_lens[row].item()),
+                num_rejected=int(context.num_rejected[row].item()),
+                num_sampled=int(context.num_sampled[row].item()),
             )
+            if position is not None:
+                if (
+                    int(batch.positions[position.hidden_index].item())
+                    != position.position
+                ):
+                    raise ValueError(
+                        "target-KV query position differs from materialized context"
+                    )
+                positions[row] = position
+        if not positions:
+            return
         hidden = context.last_hidden_states
         if (
             hidden is None
@@ -201,7 +237,12 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
             raise ValueError("target-KV proposal requires the BF16 target hidden row")
         if context.aux_hidden_states:
             raise ValueError("Gemma4 does not consume auxiliary target features")
-        sources = []
+        snapshot_batch_wire_plan(
+            self.contract.expected_specs,
+            tuple(position.materialized_length for position in positions.values()),
+            self.contract.snapshot_budget,
+        )
+        owners = []
         layers = self.config.compilation_config.static_forward_context
         for canonical, index in self.contract.source_indices.items():
             names = [
@@ -227,30 +268,36 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
             )
             if actual != self.contract.expected_specs[canonical]:
                 raise ValueError("live target-KV geometry differs from the contract")
-            sources.append(
-                TargetKVSource(
-                    canonical,
-                    actual,
-                    cache,
-                    metadata.block_table[0],
-                    self.config.cache_config.get_resolved_kv_cache_layout(),
+            owners.append((canonical, actual, cache, metadata.block_table))
+        snapshots = []
+        recovery = []
+        layout = self.config.cache_config.get_resolved_kv_cache_layout()
+        for row, position in positions.items():
+            key = self._requests[handle.step.request_ids[row]]
+            snapshots.append(
+                snapshot_target_kv(
+                    SnapshotIdentity(key, session.epoch, next(self._rounds)),
+                    position.materialized_length,
+                    [
+                        TargetKVSource(name, spec, cache, tables[row], layout)
+                        for name, spec, cache, tables in owners
+                    ],
+                    budget=self.contract.snapshot_budget,
                 )
             )
-        snapshot = snapshot_target_kv(
-            SnapshotIdentity(key, session.epoch, next(self._rounds)),
-            position.materialized_length,
-            sources,
-            budget=self.contract.snapshot_budget,
+            recovery.append(int(context.last_sampled[batch.idx_mapping[row]].item()))
+        selected_hidden = self._select_hidden(
+            hidden, tuple(position.hidden_index for position in positions.values())
         )
-        recovery = int(context.last_sampled[batch.idx_mapping[0]].item())
-        handle.rpc = session.dispatch(
-            snapshot,
-            recovery,
-            hidden[position.hidden_index : position.hidden_index + 1],
+        handle.rpc = session.dispatch_batch(
+            tuple(snapshots),
+            tuple(recovery),
+            selected_hidden,
             k=1,
             deadline=deadline,
         )
-        self.stats["dispatched"] += 1
+        handle.rpc_rows = tuple(positions)
+        self.stats["dispatched"] += len(snapshots)
 
     def _owned(self, handle) -> _SnapshotHandle:
         if (
@@ -265,6 +312,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
     def _discard(self, handle) -> None:
         handle.context = None
         handle.rpc = None
+        handle.rpc_rows = ()
         self._pending = None
 
     def collect(self, handle: ProposalHandle) -> SpeculatorOutput:
@@ -272,19 +320,22 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         try:
             if handle.error is not None:
                 raise handle.error
-            tokens, length = 0, 0
-            if handle.rpc is not None:
-                result = self._session.collect(handle.rpc)
-                length = result.valid_length
-                if length:
-                    tokens = result.token_ids[0]
-                    self.stats["valid"] += 1
-                else:
-                    self.stats["fallback"] += 1
             n = len(handle.step.request_ids)
+            tokens, lengths = [[0] for _ in range(n)], [0] * n
+            if handle.rpc is not None:
+                results = self._session.collect_batch(handle.rpc)
+                for row, result in zip(handle.rpc_rows, results, strict=True):
+                    lengths[row] = result.valid_length
+                    if result.valid_length:
+                        tokens[row][0] = result.token_ids[0]
+                        self.stats["valid"] += 1
+                    else:
+                        self.stats["fallback"] += 1
             return SpeculatorOutput(
-                torch.full((n, 1), tokens, dtype=torch.int64, device=self.device),
-                torch.full((n,), length, dtype=torch.int32, device=self.device),
+                torch.tensor(tokens, dtype=torch.int64, device=self.device).reshape(
+                    n, 1
+                ),
+                torch.tensor(lengths, dtype=torch.int32, device=self.device),
             )
         finally:
             self._discard(handle)

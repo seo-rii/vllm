@@ -25,6 +25,7 @@ def _native_config(
     full_head_dim=256,
     window=1024,
     max_model_len=640,
+    max_num_seqs=1,
 ):
     """Build real offline model/runtime configs; this does not load model weights."""
     from safetensors.torch import save_file
@@ -101,7 +102,7 @@ def _native_config(
         scheduler_config=SchedulerConfig(
             max_model_len=max_model_len,
             is_encoder_decoder=False,
-            max_num_seqs=1,
+            max_num_seqs=max_num_seqs,
             max_num_batched_tokens=64,
             async_scheduling=False,
         ),
@@ -184,6 +185,29 @@ def test_native_configs_derive_gemma_geometry_and_snapshot_import(
             assert destination.cache.untyped_storage().data_ptr() != (
                 source.pages.untyped_storage().data_ptr()
             )
+
+
+def test_native_batch_contract_budgets_all_maximum_length_snapshots(tmp_path):
+    from vllm.v1.spec_decode.remote.target_kv_protocol import snapshot_batch_wire_plan
+
+    config = _native_config(tmp_path, max_num_seqs=4)
+    contract = create_target_kv_contract(config)
+    assert contract.max_num_seqs == 4
+    plans = snapshot_batch_wire_plan(
+        contract.expected_specs,
+        (config.model_config.max_model_len,) * contract.max_num_seqs,
+        contract.snapshot_budget,
+        contract.receiver_budget,
+    )
+    assert len(plans) == 4
+    single = _native_config(tmp_path, max_num_seqs=1)
+    assert create_target_kv_contract(single).fingerprint == contract.fingerprint
+
+
+def test_native_batch_capacity_cannot_multiply_the_fixed_snapshot_budget(tmp_path):
+    config = _native_config(tmp_path, max_model_len=8192, max_num_seqs=2)
+    with pytest.raises(ValueError, match="budget"):
+        create_target_kv_contract(config)
 
 
 @pytest.mark.parametrize(
@@ -404,7 +428,7 @@ def test_local_tokenizer_identity_tracks_contents_not_directory(tmp_path):
         ("parallel_config", "tensor_parallel_size", 2),
         ("parallel_config", "decode_context_parallel_size", 2),
         ("parallel_config", "prefill_context_parallel_size", 2),
-        ("scheduler_config", "max_num_seqs", 2),
+        ("scheduler_config", "max_num_seqs", 17),
         ("scheduler_config", "async_scheduling", True),
         ("scheduler_config", "disable_hybrid_kv_cache_manager", True),
         ("cache_config", "block_size", 32),

@@ -11,7 +11,7 @@ an own-KV draft executor cannot reproduce this contract.
 
 ## Snapshot and receiver ownership
 
-`vllm.v1.spec_decode.remote.target_kv` provides four operations:
+`vllm.v1.spec_decode.remote.target_kv` provides these operations:
 
 - `gemma4_source_layers` resolves native target-to-assistant layer mappings.
 - `select_draft_position` selects the last accepted query row and its materialized
@@ -20,6 +20,9 @@ an own-KV draft executor cannot reproduce this contract.
 - `import_target_kv` validates the caller's expected sequence generation, session,
   round, materialized length and layer specs, then makes independent receiver
   caches and block tables.
+- `import_target_kv_batch` imports multiple requests into one cache per source
+  layer, with disjoint physical page ranges and one block-table row per request.
+  Only the zero null page is shared. The singleton API retains its original shape.
 
 Snapshots retain absolute logical page indices. Receiver pages are compacted
 physically while block tables preserve those logical positions, including null
@@ -83,11 +86,12 @@ Assistant head widths, KV head counts and windows must match their selected
 target owners; query heads must form valid GQA groups. Native page unification
 is preserved. Physical page padding, noncausal attention and incompatible
 assistant architectures are rejected before weights are loaded. Snapshot and
-receiver capacity at the requested maximum context must fit the fixed budgets;
-a larger KV geometry may require a shorter configured context.
+receiver capacity for the configured batch and maximum context must fit the
+fixed budgets, including worst-case sliding-window alignment. Larger batches
+or KV geometry may require a shorter configured context.
 
 Execution requires BF16 weights/KV, target TP1, draft TP1, K1, eager
-`TRITON_ATTN`, scheduler block size 16 and `max_num_seqs=1`. Context is capped at
+`TRITON_ATTN`, scheduler block size 16 and `1 <= max_num_seqs <= 16`. Context is capped at
 8192 tokens. Prefix caching, async scheduling, multimodal inputs, input
 streaming, LoRA, quantization and CUDA IPC are rejected. Ordinary output
 streaming remains supported. The native local factory is unchanged.
@@ -95,9 +99,9 @@ streaming remains supported. The native local factory is unchanged.
 The config-derived contract is not evidence that every Gemma4 checkpoint has
 been evaluated. Real model validation must identify the target and assistant
 revisions; CPU geometry and snapshot tests do not establish model accuracy.
-Other target-state architectures require their own state adapter. Multi-request
-snapshot batching is not implemented: v4 retains one request identity per
-connection, and the GPU executor constructs one Q-only query per call.
+Other target-state architectures require their own state adapter. The server
+constructs one Q-only query per participating request in a single assistant
+forward, preserving differing context lengths and original verifier row order.
 
 Each round exports the last accepted target hidden row, the recovery token and
 private full/SWA KV pages. The selected materialized length excludes rejected
@@ -109,21 +113,31 @@ The server retains no request KV between proposals. K0 and unfinished prefill
 need no assistant forward because the next snapshot contains authoritative
 state. Sequence generation, connection epoch, monotonically increasing round
 and materialized length fence results. There is one active verifier connection
-and one open request; subsequent requests replace the server's bounded identity
-record. Import storage is released only after the assistant consumer completes.
+with bounded open request identities. Unrelated closes wait until a pending
+batch reply has been collected; cancelling a participating request fences that
+connection. Import storage is released only after the assistant consumer completes.
 
 HELLO negotiates a checkpoint/geometry fingerprint and bounded snapshot capacity.
-A control manifest precedes fixed-shape data frames. Each frame's byte cap is
+A control manifest for the entire batch precedes fixed-shape data frames. Each frame's byte cap is
 checked before receiving its body, and both export and receiver budgets are
-checked before tensor allocation. The default limits are 1024 pages and 128 MiB;
-receiver accounting includes null pages and padded tables. The verifier profiles
-the worst-case simultaneous export allocations before allocating target KV.
-The assistant warms up real imports, model forwards and logits before listening.
+checked before tensor allocation. The limits are 1024 pages and 128 MiB for the
+whole batch, not per request; receiver accounting includes one null page per
+source layer and rectangular padded tables. The verifier profiles all retained
+exports and hidden-row compaction before allocating target KV. The assistant
+warms up singleton and configured maximum batches before listening.
+
+The CLI defaults to one sequence. Singleton clients retain the existing v4 wire
+path. A batched client requires the server to acknowledge its requested capacity
+before using batch messages; an older singleton server rejects this handshake.
+Both processes must set compatible sequence limits. This is batching within one
+verifier, not N:M snapshot routing or cross-client scheduling.
 
 Timeout and cancellation close the connection. Affected requests remain
 terminal target-only, or raise under `failure_policy="error"`; a late reply
-cannot reactivate them. A new request can reconnect. Recoverable OOM follows the
-same policy. Unknown CUDA completion and context-fatal errors propagate and
+cannot reactivate them. A new request can reconnect. A recoverable assistant
+forward OOM fences all rows submitted in that forward while preserving unrelated
+open requests. A verifier preparation or transport failure fences its connection.
+Unknown CUDA completion and context-fatal errors propagate and
 require process restart. Closing a socket never serves as a GPU completion fence.
 
 This implementation copies context on every round and synchronizes the host.
@@ -139,7 +153,8 @@ python -m vllm.v1.spec_decode.remote.runtime.target_kv_cli \
   --target-model /models/gemma-4-E2B-it \
   --draft-model /models/gemma-4-E2B-it-assistant \
   --endpoint unix:///tmp/gemma-draft.sock --device cuda:1 \
-  --language-model-only --max-model-len 640 --max-feature-tokens 64
+  --language-model-only --max-model-len 640 --max-feature-tokens 128 \
+  --max-num-seqs 4
 ```
 
 Then start the verifier (device visibility is configured separately per process):
@@ -147,7 +162,7 @@ Then start the verifier (device visibility is configured separately per process)
 ```bash
 vllm serve /models/gemma-4-E2B-it \
   --language-model-only --dtype bfloat16 --enforce-eager \
-  --max-model-len 640 --max-num-seqs 1 --max-num-batched-tokens 64 \
+  --max-model-len 640 --max-num-seqs 4 --max-num-batched-tokens 128 \
   --block-size 16 --no-enable-prefix-caching --no-async-scheduling \
   --attention-config '{"backend":"TRITON_ATTN"}' \
   --speculative-config '{"method":"mtp","model":"/models/gemma-4-E2B-it-assistant","num_speculative_tokens":1,"draft_tensor_parallel_size":1,"remote_draft":{"endpoint":"unix:///tmp/gemma-draft.sock","transport":"inline","failure_policy":"error","request_timeout_ms":1000}}'

@@ -17,7 +17,13 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.session import RemoteDraftError
-from vllm.v1.spec_decode.remote.target_kv import SnapshotBudget, SnapshotCompletionError
+from vllm.v1.spec_decode.remote.target_kv import (
+    SnapshotBudget,
+    SnapshotCompletionError,
+    TargetKVSnapshot,
+)
+from vllm.v1.spec_decode.remote.target_kv_session import TargetKVResult
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import target_kv_remote as remote
 
 
@@ -29,6 +35,8 @@ class Session:
         self.calls = []
         self.generation = 0
         self.pending = None
+        self.batch_calls = []
+        self.open_calls = []
 
     def connect(self):
         pass
@@ -42,6 +50,10 @@ class Session:
         self.records[key] = True
         return key
 
+    def open_sequences(self, sequence_ids, **kwargs):
+        self.open_calls.append((sequence_ids, kwargs))
+        return tuple(self.open_sequence(sequence_id) for sequence_id in sequence_ids)
+
     def active(self, key):
         return self.records.get(key, False)
 
@@ -49,6 +61,24 @@ class Session:
         self.calls.append((snapshot, token, hidden.clone()))
         self.pending = object()
         return self.pending
+
+    def dispatch_batch(self, snapshots, tokens, hidden, **kwargs):
+        self.batch_calls.append((snapshots, tokens, hidden.clone(), kwargs))
+        self.calls.extend(
+            (snapshot, token, hidden[row : row + 1].clone())
+            for row, (snapshot, token) in enumerate(zip(snapshots, tokens, strict=True))
+        )
+        self.pending = object()
+        self.pending_results = tuple(
+            TargetKVResult((23 + snapshot.identity.key.sequence_id,), 1)
+            for snapshot in snapshots
+        )
+        return self.pending
+
+    def collect_batch(self, handle):
+        assert self.pending is handle
+        self.pending = None
+        return self.pending_results
 
     def collect(self, handle):
         assert self.pending is handle
@@ -78,7 +108,7 @@ def verifier(monkeypatch):
     spec = FullAttentionSpec(
         block_size=4, num_kv_heads=1, head_size=2, dtype=torch.bfloat16
     )
-    budget = SnapshotBudget(16, 4096, 32)
+    budget = SnapshotBudget(32, 4096, 32)
     contract = NS(
         expected_specs={"target.layers.0": spec},
         source_indices={"target.layers.0": 0},
@@ -86,6 +116,7 @@ def verifier(monkeypatch):
         vocab_size=100,
         fingerprint="test",
         snapshot_budget=budget,
+        max_num_seqs=4,
     )
     owner = NS(
         kv_cache=torch.arange(9 * 1 * 4 * 4).reshape(9, 1, 4, 4).to(torch.bfloat16),
@@ -105,12 +136,9 @@ def verifier(monkeypatch):
     monkeypatch.setattr(remote, "create_target_kv_contract", lambda cfg: contract)
     monkeypatch.setattr(remote, "TargetKVRemoteSession", Session)
     instance = remote.TargetKVRemoteSpeculator(cfg, torch.device("cpu"))
-    batch = NS(
+    batch = replace(
+        InputBatch.make_dummy(1, 2, InputBuffers(4, 8, torch.device("cpu"))),
         req_ids=["a"],
-        num_reqs=1,
-        query_start_loc_np=np.array([0, 2]),
-        is_prefilling_np=np.array([False]),
-        idx_mapping=torch.tensor([0]),
         positions=torch.tensor([4, 5]),
         seq_lens=torch.tensor([6]),
     )
@@ -168,6 +196,121 @@ def test_snapshot_uses_native_selected_hidden_and_recovery_token(verifier, rejec
     assert output.to_legacy_tokens().tolist() == [[23]]
 
 
+def _mixed_context(context):
+    batch = replace(
+        InputBatch.make_dummy(3, 6, InputBuffers(4, 8, torch.device("cpu"))),
+        req_ids=["decode-b", "prefill", "decode-a"],
+        query_start_loc_np=np.array([0, 2, 5, 6]),
+        query_start_loc=torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+        is_prefilling_np=np.array([False, True, False]),
+        idx_mapping=torch.tensor([2, 0, 1]),
+        idx_mapping_np=np.array([2, 0, 1]),
+        positions=torch.tensor([4, 5, 0, 1, 2, 8]),
+        seq_lens=torch.tensor([6, 3, 9]),
+    )
+    metadata = replace(
+        context.attn_metadata["model.layers.0.self_attn.attn"],
+        block_table=torch.tensor([[1, 2, 3], [3, 4, 5], [6, 7, 8]], dtype=torch.int32),
+    )
+    return replace(
+        context,
+        input_batch=batch,
+        attn_metadata={"model.layers.0.self_attn.attn": metadata},
+        last_hidden_states=torch.arange(18).reshape(6, 3).to(torch.bfloat16),
+        num_rejected=torch.tensor([1, 0, 0]),
+        num_sampled=torch.tensor([1, 0, 1]),
+        last_sampled=torch.tensor([17, 37, 47]),
+        temperature=torch.zeros(3),
+    )
+
+
+def test_mixed_batch_uses_row_owned_kv_and_restores_unsampled_rows(verifier):
+    """Packed queries, request-state indices and physical KV rows are distinct."""
+    instance, context = verifier
+    context = _mixed_context(context)
+    output = instance.collect(
+        instance.dispatch(DraftStep.from_batch(context.input_batch, 1), context)
+    )
+    assert output.to_legacy_tokens().tolist() == [[23], [-1], [25]]
+    snapshots, tokens, hidden, kwargs = instance._session.batch_calls[0]
+    assert [snapshot.materialized_length for snapshot in snapshots] == [5, 9]
+    assert tokens == (47, 37)
+    torch.testing.assert_close(hidden, context.last_hidden_states[[0, 5]])
+    cache = instance.config.compilation_config.static_forward_context[
+        "model.layers.0.self_attn.attn"
+    ].kv_cache
+    torch.testing.assert_close(snapshots[0].layers[0].pages[0], cache[1])
+    torch.testing.assert_close(snapshots[1].layers[0].pages[0], cache[6])
+    assert not snapshots[0].layers[0].pages[-1, :, 1:].count_nonzero()
+    assert not snapshots[1].layers[0].pages[-1, :, 1:].count_nonzero()
+    assert instance._session.open_calls == [((0, 1, 2), {"deadline": 1000})]
+    assert kwargs == {"k": 1, "deadline": 1000}
+
+
+def test_mixed_batch_excludes_terminal_rows_without_changing_other_positions(verifier):
+    instance, context = verifier
+    context = _mixed_context(context)
+    zero = DraftStep.from_batch(context.input_batch, 0)
+    assert instance.collect(
+        instance.dispatch(zero, context)
+    ).valid_lengths.tolist() == [
+        0,
+        0,
+        0,
+    ]
+    assert not instance._session.batch_calls
+    instance._session.records[instance._requests["decode-b"]] = False
+    result = instance.collect(
+        instance.dispatch(DraftStep.from_batch(context.input_batch, 1), context)
+    )
+    assert result.to_legacy_tokens().tolist() == [[-1], [-1], [25]]
+    snapshots, tokens, hidden, _ = instance._session.batch_calls[0]
+    assert len(snapshots) == 1 and snapshots[0].materialized_length == 9
+    assert tokens == (37,)
+    torch.testing.assert_close(hidden, context.last_hidden_states[5:6])
+
+
+def test_batch_snapshot_budget_is_checked_before_any_export(verifier, monkeypatch):
+    instance, context = verifier
+    context = _mixed_context(context)
+    # Both rows fit separately (2 and 3 pages), but cannot coexist in four pages.
+    instance.contract.snapshot_budget = SnapshotBudget(4, 4096, 32)
+    export = Mock(side_effect=AssertionError("export preceded aggregate admission"))
+    monkeypatch.setattr(remote, "snapshot_target_kv", export)
+    handle = instance.dispatch(DraftStep.from_batch(context.input_batch, 1), context)
+    with pytest.raises(ValueError, match="page or byte budget"):
+        instance.collect(handle)
+    assert not export.called and not instance._session.batch_calls
+
+
+def test_partial_batch_export_oom_fences_every_request(verifier, monkeypatch):
+    instance, context = verifier
+    context = _mixed_context(context)
+    original = remote.snapshot_target_kv
+    exports: list[TargetKVSnapshot] = []
+
+    def export(*args, **kwargs):
+        if exports:
+            raise torch.OutOfMemoryError("second snapshot allocation")
+        snapshot = original(*args, **kwargs)
+        exports.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(remote, "snapshot_target_kv", export)
+    step = DraftStep.from_batch(context.input_batch, 1)
+    for _ in range(2):
+        assert instance.collect(
+            instance.dispatch(step, context)
+        ).valid_lengths.tolist() == [
+            0,
+            0,
+            0,
+        ]
+    assert len(exports) == 1 and not instance._session.batch_calls
+    assert not any(instance._session.records.values())
+    assert instance._pending is None and instance._session.pending is None
+
+
 @pytest.mark.parametrize("k,sampled", [(0, 1), (1, 0)])
 def test_no_query_round_keeps_request_reusable_without_snapshot(
     verifier, monkeypatch, k, sampled
@@ -192,19 +335,29 @@ def test_profile_reserves_full_snapshot_peak_without_request_or_rpc(
 ):
     instance, context = verifier
     allocations = []
+    selected = []
     ordinary = torch.zeros
+    select = torch.Tensor.index_select
 
     def allocate(*args, **kwargs):
         result = ordinary(*args, **kwargs)
         allocations.append(result.numel() * result.element_size())
         return result
 
+    def select_rows(tensor, *args, **kwargs):
+        result = select(tensor, *args, **kwargs)
+        selected.append(result)
+        return result
+
     monkeypatch.setattr(torch, "zeros", allocate)
+    monkeypatch.setattr(torch.Tensor, "index_select", select_rows)
     context = replace(context, is_profile=True)
     out = instance.collect(
         instance.dispatch(DraftStep.from_batch(context.input_batch, 1), context)
     )
-    assert allocations == [8 * 1 * 4 * 4 * 2]
+    assert allocations == [8 * 1 * 4 * 4 * 2] * 4
+    assert len(selected) == 1 and selected[0].shape == (4, 3)
+    assert selected[0].data_ptr() != context.last_hidden_states.data_ptr()
     assert not instance._requests and not instance._session.calls
     assert out.valid_lengths.tolist() == [0]
 

@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.remote.target_kv import (
     TargetKVSource,
     gemma4_source_layers,
     import_target_kv,
+    import_target_kv_batch,
     select_draft_position,
     snapshot_target_kv,
 )
@@ -93,6 +94,121 @@ def _import(snapshot, source, **kwargs):
 
 def _token(cache, table, position, block_size):
     return cache[int(table[position // block_size]), :, position % block_size]
+
+
+@pytest.mark.parametrize("lengths", [(17, 3), (9, 17, 3, 12)])
+def test_batch_import_preserves_ragged_rows_and_disjoint_page_ownership(lengths):
+    sources = []
+    snapshots = []
+    for row, length in enumerate(lengths):
+        pair = (_source(name="full"), _source(name="window", window=5))
+        for source in pair:
+            source.cache.add_(100 * row)
+        identity = SnapshotIdentity(SequenceKey("batch", row, 1), 2, 7)
+        snapshots.append(snapshot_target_kv(identity, length, pair, budget=BUDGET))
+        sources.append(pair)
+    imported = import_target_kv_batch(
+        snapshots,
+        expected_identities=tuple(snapshot.identity for snapshot in snapshots),
+        expected_materialized_lengths=lengths,
+        expected_specs={source.layer_name: source.spec for source in sources[0]},
+        budget=BUDGET,
+        device=torch.device("cpu"),
+    )
+    assert imported.materialized_lengths == lengths
+    for layer_index, layer in enumerate(imported.layers):
+        assert layer.block_table.shape[0] == len(lengths)
+        assert not layer.cache[0].count_nonzero()
+        owned: set[int] = set()
+        for row, length in enumerate(lengths):
+            source = sources[row][layer_index]
+            start = max(0, length - source.spec.sliding_window) if layer_index else 0
+            table = layer.block_table[row]
+            live = set(table[table > 0].tolist())
+            assert not owned.intersection(live)
+            owned.update(live)
+            for position in range(length):
+                actual = _token(layer.cache, table, position, source.spec.block_size)
+                if position < start:
+                    assert not actual.count_nonzero()
+                else:
+                    torch.testing.assert_close(
+                        actual,
+                        _token(
+                            source.cache,
+                            source.block_table,
+                            position,
+                            source.spec.block_size,
+                        ),
+                        rtol=0,
+                        atol=0,
+                    )
+            last_page = layer.cache[int(table[(length - 1) // source.spec.block_size])]
+            tail = length % source.spec.block_size
+            if tail:
+                assert not last_page[:, tail:].count_nonzero()
+        assert owned == set(range(1, layer.cache.shape[0]))
+        expected = layer.cache.clone()
+        with torch.inference_mode():
+            for snapshot in snapshots:
+                snapshot.layers[layer_index].pages.fill_(-1)
+        torch.testing.assert_close(layer.cache, expected, rtol=0, atol=0)
+
+
+def test_batch_import_budget_includes_all_rows_and_padded_block_tables():
+    source = _source()
+    identities = tuple(
+        SnapshotIdentity(SequenceKey("batch", row, 1), 2, 7) for row in range(2)
+    )
+    lengths = (1, 17)
+    snapshots = tuple(
+        snapshot_target_kv(identity, length, (source,), budget=BUDGET)
+        for identity, length in zip(identities, lengths)
+    )
+    kwargs = dict(
+        expected_identities=identities,
+        expected_materialized_lengths=lengths,
+        expected_specs={source.layer_name: source.spec},
+        device=torch.device("cpu"),
+    )
+    imported = import_target_kv_batch(snapshots, budget=BUDGET, **kwargs)
+    assert imported.num_pages == 1 + 1 + 5
+    assert imported.nbytes == (
+        imported.num_pages * source.spec.unpadded_page_size_bytes
+        + 2 * get_block_table_width(5, source.spec.block_size) * 4
+    )
+    exact = SnapshotBudget(imported.num_pages, imported.nbytes, 128)
+    assert (
+        import_target_kv_batch(snapshots, budget=exact, **kwargs).nbytes
+        == exact.max_bytes
+    )
+    for budget in (
+        replace(exact, max_pages=exact.max_pages - 1),
+        replace(exact, max_bytes=exact.max_bytes - 1),
+    ):
+        with pytest.raises(ValueError, match="budget"):
+            import_target_kv_batch(snapshots, budget=budget, **kwargs)
+
+
+def test_batch_import_rejects_duplicate_identity_or_stale_sibling():
+    source = _source()
+    identity = SnapshotIdentity(SequenceKey("batch", 1, 1), 2, 7)
+    snapshot = snapshot_target_kv(identity, 7, (source,), budget=BUDGET)
+    kwargs = dict(
+        expected_materialized_lengths=(7, 7),
+        expected_specs={source.layer_name: source.spec},
+        budget=BUDGET,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="distinct"):
+        import_target_kv_batch(
+            (snapshot, snapshot), expected_identities=(identity, identity), **kwargs
+        )
+    sibling = SnapshotIdentity(SequenceKey("batch", 2, 1), 2, 7)
+    with pytest.raises(ValueError, match="identity"):
+        import_target_kv_batch(
+            (snapshot, snapshot), expected_identities=(identity, sibling), **kwargs
+        )
 
 
 def test_gemma_mapping_uses_last_non_shared_owner_of_each_type():

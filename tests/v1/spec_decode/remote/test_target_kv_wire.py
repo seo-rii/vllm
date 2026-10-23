@@ -25,9 +25,12 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotLayer,
     TargetKVSnapshot,
     import_target_kv,
+    import_target_kv_batch,
 )
 from vllm.v1.spec_decode.remote.target_kv_protocol import (
+    TargetKVBatchQuery,
     TargetKVHello,
+    TargetKVQuery,
     decode_target_kv_message,
     encode_target_kv_message,
     snapshot_wire_plan,
@@ -48,6 +51,7 @@ class SnapshotOracle:
     def __init__(self, specs, budget):
         self.specs, self.budget = specs, budget
         self.calls = []
+        self.batch_sizes = []
         self.warmed = False
         self.error = None
         self.entered = threading.Event()
@@ -82,9 +86,39 @@ class SnapshotOracle:
         assert imported.identity == expected_identity
         return (recovery_token + int(hidden_state.sum())) % 128
 
+    def execute_batch(
+        self,
+        snapshots,
+        *,
+        expected_identities,
+        expected_materialized_lengths,
+        recovery_tokens,
+        hidden_states,
+    ):
+        self.entered.set()
+        assert self.release.wait(2)
+        if self.error is not None:
+            raise self.error
+        imported = import_target_kv_batch(
+            snapshots,
+            expected_identities=expected_identities,
+            expected_materialized_lengths=expected_materialized_lengths,
+            expected_specs=self.specs,
+            budget=self.budget,
+            device=torch.device("cpu"),
+        )
+        assert imported.identities == expected_identities
+        self.batch_sizes.append(len(snapshots))
+        self.calls.extend(zip(expected_identities, expected_materialized_lengths))
+        return tuple(
+            (token + int(hidden.sum())) % 128
+            for token, hidden in zip(recovery_tokens, hidden_states)
+        )
+
 
 @pytest.fixture
-def wire_runtime(tmp_path):
+def wire_runtime(tmp_path, request):
+    max_num_seqs = getattr(request, "param", 1)
     specs = {
         "target.layers.1": SlidingWindowSpec(
             block_size=4,
@@ -107,9 +141,19 @@ def wire_runtime(tmp_path):
         expected_specs=specs,
         snapshot_budget=budget,
         receiver_budget=budget,
+        max_num_seqs=max_num_seqs,
     )
     endpoint = server.start(f"unix://{tmp_path}/snapshot.sock")
-    hello = TargetKVHello("verifier", "contract", 8, 128, 64, 128, 1 << 20)
+    hello = TargetKVHello(
+        "verifier",
+        "contract",
+        8,
+        128,
+        64,
+        128,
+        1 << 20,
+        max_num_seqs=max_num_seqs,
+    )
     client = TargetKVRemoteSession(
         endpoint, hello, expected_specs=specs, request_timeout_ms=1000
     )
@@ -625,3 +669,121 @@ def test_local_copy_oom_obeys_policy_and_invalidates_partial_request(
     assert visited == list(range(failure_slot + 1))
     assert not executor.calls
     assert not client.active(key) and client._conn is None and client._pending is None
+
+
+@pytest.mark.parametrize("wire_runtime", [4], indirect=True)
+def test_batch_rounds_preserve_row_order_and_reuse_after_k0(wire_runtime):
+    server, executor, client = wire_runtime
+    keys = client.open_sequences((1, 2, 3), deadline=client.deadline())
+    with pytest.raises(ValueError, match="already open"):
+        client.open_sequence(1, deadline=client.deadline())
+    assert len(server.registry) == 3
+    ordered = (keys[2], keys[0], keys[1])
+    hidden = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
+    for round_id, k in ((0, 0), (1, 1), (2, 1)):
+        snapshots = tuple(
+            snapshot(client, key, round_id, length)
+            for key, length in zip(ordered, (17, 4, 33))
+        )
+        result = client.collect_batch(
+            client.dispatch_batch(
+                snapshots, (10, 20, 30), hidden, k=k, deadline=client.deadline()
+            )
+        )
+        assert [r.valid_length for r in result] == [k] * 3
+        if k:
+            assert [r.token_ids[0] for r in result] == [38, 112, 58]
+        assert all(client.active(key) for key in keys)
+    assert executor.batch_sizes == [3, 3]
+    client.close_sequences(keys)
+    assert len(server.registry) == 0
+
+
+@pytest.mark.parametrize("wire_runtime", [4], indirect=True)
+def test_unrelated_batch_close_waits_for_reply_without_cancelling(wire_runtime):
+    server, executor, client = wire_runtime
+    a, b, c = client.open_sequences((1, 2, 3), deadline=client.deadline())
+    executor.release.clear()
+    handle = client.dispatch_batch(
+        (snapshot(client, a), snapshot(client, b, length=17)),
+        (10, 20),
+        torch.ones((2, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    try:
+        assert executor.entered.wait(1)
+        client.close_sequences(())
+        client.close_sequences((c,))
+        assert len(server.registry) == 3
+    finally:
+        executor.release.set()
+    assert [r.token_ids for r in client.collect_batch(handle)] == [(18,), (28,)]
+    assert len(server.registry) == 2
+    replacement = client.open_sequence(3, deadline=client.deadline())
+    assert replacement.generation > c.generation
+    assert propose(client, snapshot(client, replacement, 1)).token_ids == (18,)
+    assert client.active(a) and client.active(b)
+
+
+@pytest.mark.parametrize("wire_runtime", [4], indirect=True)
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_batch_execution_failure_fences_only_submitted_requests(wire_runtime, policy):
+    server, executor, client = wire_runtime
+    client.failure_policy = policy
+    a, b, healthy = client.open_sequences((1, 2, 3), deadline=client.deadline())
+    executor.error = torch.OutOfMemoryError("batch allocation failure")
+    handle = client.dispatch_batch(
+        (snapshot(client, a), snapshot(client, b)),
+        (10, 20),
+        torch.ones((2, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    if policy == "error":
+        with pytest.raises(RemoteDraftError, match="batch allocation failure"):
+            client.collect_batch(handle)
+    else:
+        assert [r.valid_length for r in client.collect_batch(handle)] == [0, 0]
+    assert not client.active(a) and not client.active(b)
+    assert client.active(healthy) and server.healthy and len(server.registry) == 1
+    executor.error = None
+    assert propose(client, snapshot(client, healthy, 1)).token_ids == (18,)
+
+
+@pytest.mark.parametrize("wire_runtime", [16], indirect=True)
+@pytest.mark.parametrize("diagnostic", ["allocation failure " * 100, "🧠" * 1024])
+def test_large_batch_error_reply_preserves_unsubmitted_sibling(
+    wire_runtime, diagnostic
+):
+    """Repeated per-row diagnostics must fit the bounded control frame."""
+    server, executor, client = wire_runtime
+    client.failure_policy = "target_only"
+    *failed, healthy = client.open_sequences(
+        tuple(range(16)), deadline=client.deadline()
+    )
+    executor.error = torch.OutOfMemoryError(diagnostic)
+    handle = client.dispatch_batch(
+        tuple(snapshot(client, key) for key in failed),
+        (10,) * len(failed),
+        torch.ones((len(failed), 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    assert [r.valid_length for r in client.collect_batch(handle)] == [0] * len(failed)
+    assert not any(client.active(key) for key in failed)
+    assert client.active(healthy) and server.healthy and len(server.registry) == 1
+    executor.error = None
+    assert propose(client, snapshot(client, healthy, 1)).token_ids == (18,)
+
+
+@pytest.mark.parametrize("wire_runtime", [4], indirect=True)
+def test_batch_total_page_limit_rejects_manifest_before_any_data(wire_runtime):
+    server, executor, client = wire_runtime
+    keys = client.open_sequences((1, 2), deadline=client.deadline())
+    # Each row fits; together they exceed the negotiated receive page budget.
+    server.receiver_budget = SnapshotBudget(20, 1 << 20, 64)
+    queries = tuple(TargetKVQuery(key, client.epoch, 0, 64, 1, 1000) for key in keys)
+    client._send(
+        TargetKVBatchQuery(queries, 1000), next(client._ids), client.deadline()
+    )
+    with pytest.raises(TransportError):
+        client._conn.recv(timeout=1)
+    assert not executor.calls

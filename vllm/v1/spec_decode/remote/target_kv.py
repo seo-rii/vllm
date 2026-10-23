@@ -206,6 +206,32 @@ class ImportedTargetKV:
             layer.block_table.record_stream(stream)
 
 
+@dataclass(frozen=True)
+class ImportedTargetKVBatch:
+    """Private caches with disjoint row pages and rectangular block tables."""
+
+    identities: tuple[SnapshotIdentity, ...]
+    materialized_lengths: tuple[int, ...]
+    layers: tuple[ImportedLayer, ...]
+
+    @property
+    def num_pages(self) -> int:
+        return sum(layer.cache.shape[0] for layer in self.layers)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            layer.cache.numel() * layer.cache.element_size()
+            + layer.block_table.numel() * layer.block_table.element_size()
+            for layer in self.layers
+        )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        for layer in self.layers:
+            layer.cache.record_stream(stream)
+            layer.block_table.record_stream(stream)
+
+
 def _validate_spec(spec: AttentionSpec) -> None:
     # Subclasses may represent MLA, sinks, R-SWA, or another state contract.
     if type(spec) not in (FullAttentionSpec, SlidingWindowSpec):
@@ -398,64 +424,137 @@ def import_target_kv(
     snapshot itself.
     Every import allocates independent storage, including sibling imports.
     """
-    if snapshot.identity != expected_identity:
-        raise ValueError("stale or mismatched target-KV snapshot identity")
-    length = snapshot.materialized_length
-    if length != expected_materialized_length:
-        raise ValueError("target-KV snapshot length differs from the expected query")
-    budget.check(length, 0, 0)
-    names = [layer.layer_name for layer in snapshot.layers]
-    if not names or len(set(names)) != len(names) or set(names) != set(expected_specs):
-        raise ValueError("target-KV snapshot layers differ from the expected contract")
+    imported = import_target_kv_batch(
+        (snapshot,),
+        expected_identities=(expected_identity,),
+        expected_materialized_lengths=(expected_materialized_length,),
+        expected_specs=expected_specs,
+        budget=budget,
+        device=device,
+    )
+    by_name = {layer.layer_name: layer for layer in imported.layers}
+    return ImportedTargetKV(
+        expected_identity,
+        expected_materialized_length,
+        tuple(
+            ImportedLayer(
+                source.layer_name,
+                source.spec,
+                by_name[source.layer_name].cache,
+                by_name[source.layer_name].block_table[0],
+            )
+            for source in snapshot.layers
+        ),
+    )
+
+
+@torch.inference_mode()
+def import_target_kv_batch(
+    snapshots: Sequence[TargetKVSnapshot],
+    *,
+    expected_identities: Sequence[SnapshotIdentity],
+    expected_materialized_lengths: Sequence[int],
+    expected_specs: Mapping[str, AttentionSpec],
+    budget: SnapshotBudget,
+    device: torch.device,
+) -> ImportedTargetKVBatch:
+    """Import a bounded batch into one private cache per source layer.
+
+    Logical page indices stay absolute in every row. Physical row ranges are
+    disjoint; only the zero null page is shared. The budget includes the entire
+    batch, its null pages, and padded rectangular block tables.
+    """
+    count = len(snapshots)
+    if (
+        not 1 <= count <= 16
+        or len(expected_identities) != count
+        or len(expected_materialized_lengths) != count
+        or len({identity.key for identity in expected_identities}) != count
+    ):
+        raise ValueError("target-KV batch requires 1..16 distinct expected requests")
     if device.type not in ("cpu", "cuda"):
         raise ValueError("target-KV receiver requires a CPU or CUDA device")
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.accelerator.current_device_index())
-    total_pages = total_bytes = 0
-    for layer in snapshot.layers:
-        spec = layer.spec
-        _validate_spec(spec)
-        start, first, end = _range(spec, length)
-        if spec != expected_specs[layer.layer_name]:
-            raise ValueError("target-KV snapshot attention spec differs from contract")
-        total_pages += end - first + 1
-        total_bytes += (end - first + 1) * spec.unpadded_page_size_bytes + _table_width(
-            spec, end
-        ) * 4
-        budget.check(length, total_pages, total_bytes)
+    source_rows = []
+    for snapshot, identity, length in zip(
+        snapshots, expected_identities, expected_materialized_lengths
+    ):
+        if snapshot.identity != identity:
+            raise ValueError("stale or mismatched target-KV snapshot identity")
+        if snapshot.materialized_length != length:
+            raise ValueError(
+                "target-KV snapshot length differs from the expected query"
+            )
+        budget.check(length, 0, 0)
+        names = [layer.layer_name for layer in snapshot.layers]
         if (
-            layer.logical_pages != tuple(range(first, end))
-            or layer.pages.dtype != spec.dtype
-            or tuple(layer.pages.shape) != (end - first, *_page_shape(spec))
-            or not layer.pages.is_contiguous()
-            or layer.pages.device.type not in ("cpu", "cuda")
+            not names
+            or len(set(names)) != len(names)
+            or set(names) != set(expected_specs)
         ):
-            raise ValueError("invalid target-KV snapshot pages or logical indices")
-        if layer.pages.is_cuda and layer.pages.device != device:
-            raise ValueError("CUDA target-KV imports require the same CUDA device")
+            raise ValueError(
+                "target-KV snapshot layers differ from the expected contract"
+            )
+        row = {layer.layer_name: layer for layer in snapshot.layers}
+        for name, layer in row.items():
+            spec = layer.spec
+            _validate_spec(spec)
+            _, first, end = _range(spec, length)
+            if spec != expected_specs[name]:
+                raise ValueError(
+                    "target-KV snapshot attention spec differs from contract"
+                )
+            if (
+                layer.logical_pages != tuple(range(first, end))
+                or layer.pages.dtype != spec.dtype
+                or tuple(layer.pages.shape) != (end - first, *_page_shape(spec))
+                or not layer.pages.is_contiguous()
+                or layer.pages.device.type not in ("cpu", "cuda")
+            ):
+                raise ValueError("invalid target-KV snapshot pages or logical indices")
+            if layer.pages.is_cuda and layer.pages.device != device:
+                raise ValueError("CUDA target-KV imports require the same CUDA device")
+        source_rows.append(row)
+
+    plans = []
+    total_pages = total_bytes = 0
+    for name, spec in expected_specs.items():
+        ranges = tuple(_range(spec, length) for length in expected_materialized_lengths)
+        pages = 1 + sum(end - first for _, first, end in ranges)
+        width = max(_table_width(spec, end) for _, _, end in ranges)
+        total_pages += pages
+        total_bytes += pages * spec.unpadded_page_size_bytes + count * width * 4
+        budget.check(max(expected_materialized_lengths), total_pages, total_bytes)
+        plans.append((name, spec, ranges, pages, width))
 
     layers = []
-    for layer in snapshot.layers:
-        spec = layer.spec
-        start, first, end = _range(spec, length)
+    for name, spec, _, pages, width in plans:
         cache = torch.zeros(
-            (end - first + 1, *_page_shape(spec)), dtype=spec.dtype, device=device
+            (pages, *_page_shape(spec)), dtype=spec.dtype, device=device
         )
-        block_table = torch.zeros(
-            _table_width(spec, end), dtype=torch.int32, device=device
-        )
-        layers.append(ImportedLayer(layer.layer_name, spec, cache, block_table))
+        block_table = torch.zeros((count, width), dtype=torch.int32, device=device)
+        layers.append(ImportedLayer(name, spec, cache, block_table))
     with _completed_copy_phase(device):
-        for source, receiver in zip(snapshot.layers, layers):
-            start, _, _ = _range(source.spec, length)
-            for i, logical in enumerate(source.logical_pages):
-                receiver.block_table[logical].fill_(i + 1)
-                _copy_live_tokens(
-                    receiver.cache[i + 1],
-                    source.pages[i],
-                    logical_page=logical,
-                    start=start,
-                    length=length,
-                    block_size=source.spec.block_size,
-                )
-    return ImportedTargetKV(snapshot.identity, length, tuple(layers))
+        for receiver, (_, spec, ranges, _, _) in zip(layers, plans):
+            physical = 1
+            for row_index, (source_by_name, (start, _, _), length) in enumerate(
+                zip(source_rows, ranges, expected_materialized_lengths)
+            ):
+                source = source_by_name[receiver.layer_name]
+                if source.pages.is_cuda:
+                    source.pages.record_stream(torch.cuda.current_stream(device))
+                for i, logical in enumerate(source.logical_pages):
+                    receiver.block_table[row_index, logical].fill_(physical)
+                    _copy_live_tokens(
+                        receiver.cache[physical],
+                        source.pages[i],
+                        logical_page=logical,
+                        start=start,
+                        length=length,
+                        block_size=spec.block_size,
+                    )
+                    physical += 1
+    return ImportedTargetKVBatch(
+        tuple(expected_identities), tuple(expected_materialized_lengths), tuple(layers)
+    )
