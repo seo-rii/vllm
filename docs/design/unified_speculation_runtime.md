@@ -124,9 +124,15 @@ accepted prefix, token ranges, and generation before mutating state. Rejected
 tail KV cannot be treated as committed state.
 
 A standalone loader and forward path reuse native model execution without a
-target shell or a second inference engine. The supported mode is greedy, text-only
-Qwen3 full-attention checkpoints, same-host inline, target TP1 and draft TP1,
-with no heterogeneous vocabulary or parallel drafting. Select the built-in
+target shell or a second inference engine. The supported mode is greedy,
+text-only native decoder models with homogeneous causal full attention,
+same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
+parallel drafting. Qwen3, Llama and Mistral configured with `sliding_window=null`
+are examples; the runtime checks model capabilities and the loaded draft's
+actual KV specification rather than requiring a model-type name. Target and
+draft may have different hidden sizes, layer counts and attention geometry.
+Sliding-window, chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
+multimodal and Transformers-backend execution remain unsupported. Select the built-in
 `tokenizer_mode="hf"` explicitly.
 Tokenizer compatibility is checked against the draft checkpoint's own artifacts,
 including token mapping, special tokens, and frontend metadata. This initial
@@ -145,7 +151,7 @@ For the verifier, combine `tokenizer_mode="hf"` with this speculative configurat
 ```json
 {
   "method": "draft_model",
-  "model": "<staged-Qwen3-draft-checkpoint>",
+  "model": "<staged-compatible-draft-checkpoint>",
   "revision": "<immutable-draft-revision>",
   "num_speculative_tokens": 3,
   "execution": {

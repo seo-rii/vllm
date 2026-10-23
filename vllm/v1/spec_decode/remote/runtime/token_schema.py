@@ -77,6 +77,37 @@ def tokenizer_artifact_fingerprint(source: str, revision: str | None) -> str:
     return _fingerprint(artifacts)
 
 
+def _validate_token_model(model, role: str) -> None:
+    """Require the native causal token/KV contract consumed by this executor."""
+    if (
+        model.runner_type not in ("generate", "draft")
+        or model.using_transformers_backend()
+        or model.is_encoder_decoder
+        or model.is_multimodal_model
+        or model.is_diffusion
+        or model.is_attention_free
+        or model.is_hybrid
+        or model.has_inner_state
+        or model.has_noops
+        or model.uses_mrope
+        or model.use_mla
+        or not getattr(model.hf_text_config, "is_causal", True)
+    ):
+        raise ValueError(
+            f"token-only {role} requires a native decoder-only causal attention model"
+        )
+    layers = getattr(model.hf_text_config, "layer_types", None)
+    if (
+        model.get_sliding_window() is not None
+        or model.attention_chunk_size is not None
+        or (
+            layers is not None
+            and any(layer not in ("attention", "full_attention") for layer in layers)
+        )
+    ):
+        raise ValueError(f"token-only {role} requires homogeneous full attention")
+
+
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
@@ -90,10 +121,6 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
             "token-only runtime requires sequential same-tokenizer greedy drafting"
         )
     target, draft = config.model_config, spec.draft_model_config
-    if target.hf_config.model_type != "qwen3" or draft.hf_config.model_type != "qwen3":
-        raise ValueError(
-            "initial token-only runtime supports Qwen3 full-attention model pairs"
-        )
     if (
         target.tokenizer_mode != "hf"
         or getattr(target, "trust_remote_code", False)
@@ -102,6 +129,8 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
         raise ValueError(
             "token-only runtime requires the built-in HF tokenizer implementation"
         )
+    _validate_token_model(target, "target")
+    _validate_token_model(draft, "draft")
     if target.get_vocab_size() != draft.get_vocab_size():
         raise ValueError("token-only runtime requires equal model vocabulary sizes")
     if target.max_model_len > draft.max_model_len:

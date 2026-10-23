@@ -1592,52 +1592,138 @@ def test_actual_socket_timeout_fences_late_completion(
         release.set()
 
 
-def token_config(tmp_path):
-    from types import SimpleNamespace
-
+def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_options):
     import torch
-    from safetensors.torch import save_file
-
-    def model(path):
-        path.mkdir()
-        save_file({"weight": torch.ones(1)}, str(path / "model.safetensors"))
-        (path / "tokenizer.json").write_text('{"vocab":{"a":0}}')
-        (path / "tokenizer_config.json").write_text(
-            '{"tokenizer_class":"Qwen2Tokenizer"}'
-        )
-        hf = SimpleNamespace(
-            model_type="qwen3", bos_token_id=None, eos_token_id=1, pad_token_id=None
-        )
-        hf.to_dict = lambda: {"model_type": "qwen3"}
-        return SimpleNamespace(
-            model=str(path),
-            tokenizer=str(path),
-            revision="a" * 40,
-            tokenizer_revision="a" * 40,
-            tokenizer_mode="hf",
-            hf_config=hf,
-            max_model_len=64,
-            get_vocab_size=lambda: 128,
-            dtype="bfloat16",
-            quantization=None,
-            trust_remote_code=False,
-        )
-
-    target, draft = model(tmp_path / "target"), model(tmp_path / "draft")
-    # Native draft configuration aliases target tokenizer. The contract must
-    # nevertheless inspect what the draft checkpoint was trained to consume.
-    draft.tokenizer = target.tokenizer
-    return SimpleNamespace(
-        model_config=target,
-        speculative_config=SimpleNamespace(
-            method="draft_model",
-            draft_model_config=draft,
-            parallel_drafting=False,
-            draft_sample_method="greedy",
-            use_heterogeneous_vocab=False,
-            num_speculative_tokens=3,
-        ),
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        AutoModelForCausalLM,
+        LlamaConfig,
+        MistralConfig,
+        PreTrainedTokenizerFast,
+        Qwen3Config,
     )
+
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        SpeculativeConfig,
+        VllmConfig,
+    )
+
+    families = {
+        "qwen3": (Qwen3Config, "Qwen3ForCausalLM"),
+        "llama": (LlamaConfig, "LlamaForCausalLM"),
+        "mistral": (MistralConfig, "MistralForCausalLM"),
+    }
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    )
+
+    def model(path, family, *, hidden_size, **options):
+        hf_class, architecture = families[family]
+        hf = hf_class(
+            architectures=[architecture],
+            hidden_size=hidden_size,
+            head_dim=8,
+            intermediate_size=hidden_size * 2,
+            num_hidden_layers=2,
+            num_attention_heads=hidden_size // 8,
+            num_key_value_heads=2,
+            vocab_size=128,
+            max_position_embeddings=64,
+            bos_token_id=0,
+            eos_token_id=1,
+            pad_token_id=2,
+            **(({"sliding_window": None} if family == "mistral" else {}) | options),
+        )
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            AutoModelForCausalLM.from_config(hf).save_pretrained(path)
+        tokenizer.save_pretrained(path)
+        return ModelConfig(
+            model=str(path),
+            tokenizer_mode="hf",
+            dtype="float32",
+            max_model_len=64,
+            skip_tokenizer_init=True,
+        )
+
+    target = model(tmp_path / "target", target_type, hidden_size=32)
+    draft = model(tmp_path / "draft", draft_type, hidden_size=16, **draft_options)
+    parallel = ParallelConfig()
+    spec = SpeculativeConfig(
+        model=draft.model,
+        method="draft_model",
+        num_speculative_tokens=3,
+        target_model_config=target,
+        target_parallel_config=parallel,
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize(
+    "target_type,draft_type",
+    [("qwen3", "llama"), ("llama", "mistral"), ("mistral", "qwen3")],
+)
+def test_token_contract_accepts_native_full_attention_with_different_geometry(
+    tmp_path, target_type, draft_type
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(tmp_path, target_type=target_type, draft_type=draft_type)
+    contract = create_token_runtime_contract(config)
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert (
+        config.model_config.get_hidden_size()
+        != config.speculative_config.draft_model_config.get_hidden_size()
+    )
+
+
+@pytest.mark.parametrize(
+    "options,reason",
+    [
+        ({"sliding_window": 16}, "homogeneous full attention"),
+        (
+            {"layer_types": ["full_attention", "sliding_attention"]},
+            "homogeneous full attention",
+        ),
+        ({"attention_chunk_size": 16}, "homogeneous full attention"),
+        ({"is_causal": False}, "native decoder-only causal"),
+    ],
+)
+def test_token_contract_rejects_models_outside_token_addressed_full_attention(
+    tmp_path, options, reason
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(tmp_path, draft_type="mistral", **options)
+    with pytest.raises(ValueError, match=reason):
+        create_token_runtime_contract(config)
 
 
 def test_contract_uses_draft_checkpoint_assets_not_tokenizer_alias(tmp_path):
