@@ -23,7 +23,8 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenAdvanceRow,
     TokenStateMachine,
 )
-from vllm.v1.spec_decode.remote.token_pool import TokenDraftPool
+from vllm.v1.spec_decode.remote.session import RemoteDraftError
+from vllm.v1.spec_decode.remote.token_pool import TokenDraftPool, TokenPoolRow
 from vllm.v1.spec_decode.remote.token_protocol import TokenHello
 from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
@@ -291,3 +292,67 @@ def test_recovered_worker_rejoins_without_reviving_its_old_sequences(pool_runtim
         pool.close_sequences(tuple(keys))
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_preparation_on_one_worker_cannot_delay_another_workers_proposal(
+    pool_runtime, policy
+):
+    client, _, states, oracles = pool_runtime
+    pool = client(policy=policy)
+    first = pool.reserve_sequence(0, deadline=pool.deadline())
+    second = pool.reserve_sequence(1, deadline=pool.deadline())
+    assert not any(state.sequences for state in states)
+    release = threading.Event()
+    oracles[0].release = release
+    deadline = time.monotonic() + 1
+    rows = tuple(
+        TokenPoolRow(key, True, (1, 2), True, (0, 0, (3,))) for key in (first, second)
+    )
+    handle = pool.dispatch_prepared(0, rows, 2, deadline=deadline)
+    try:
+        assert oracles[0].entered.wait(3)
+        healthy = next(future for index, _, future in handle.jobs if index == 1)
+        ready = healthy.result(timeout=3)
+        assert ready.valid_lengths == (2,)
+        assert ready.token_ids[0][0] == KVOracle.predict([1, 2, 3])
+        assert states[1].sequences[second].committed == 3
+        if policy == "target_only":
+            assert pool.collect(handle).valid_lengths == (0, 2)
+        else:
+            with pytest.raises(RemoteDraftError, match="prefill"):
+                pool.collect(handle)
+        assert pool.active(second)
+        assert not pool.active(first)
+    finally:
+        release.set()
+
+
+def test_prepared_nonfinal_prefill_and_zero_k_keep_state_and_row_order(pool_runtime):
+    client, _, states, _ = pool_runtime
+    pool = client()
+    keys = tuple(pool.reserve_sequence(i, deadline=pool.deadline()) for i in range(2))
+    rows = (
+        TokenPoolRow(keys[1], True, (7,), True, (0, 0, (8,))),
+        TokenPoolRow(keys[0], True, (1,), False, None),
+    )
+    assert pool.collect(
+        pool.dispatch_prepared(0, rows, 0, deadline=pool.deadline())
+    ).valid_lengths == (0, 0)
+    assert pool.records[keys[0]].committed == 1
+    assert pool.records[keys[1]].committed == 2
+    rows = (
+        TokenPoolRow(keys[1], False, None, False, (0, 0, (9,))),
+        TokenPoolRow(keys[0], False, (2,), True, (0, 0, (3,))),
+    )
+    result = pool.collect(pool.dispatch_prepared(1, rows, 1, deadline=pool.deadline()))
+    assert result.valid_lengths == (1, 1)
+    assert tuple(tokens[0] for tokens in result.token_ids) == (
+        KVOracle.predict([7, 8, 9]),
+        KVOracle.predict([1, 2, 3]),
+    )
+    pool.close_sequences(keys)
+    assert all(
+        not state.sequences and state.block_pool.num_free_blocks == 32
+        for state in states
+    )

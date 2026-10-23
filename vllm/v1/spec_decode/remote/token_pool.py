@@ -22,10 +22,19 @@ from vllm.v1.spec_decode.remote.token_session import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TokenPoolRow:
+    key: SequenceKey
+    open_required: bool
+    prefill_tokens: tuple[int, ...] | None
+    final_prefill: bool
+    advance: tuple[int, int, tuple[int, ...]] | None
+
+
 @dataclass(eq=False)
 class TokenPoolHandle(ProposalHandle):
     owner: object
-    rows: tuple[TokenAdvanceRow, ...]
+    rows: tuple[TokenAdvanceRow, ...] | tuple[TokenPoolRow, ...]
     deadline: float
     jobs: tuple[tuple[int, tuple[int, ...], Future], ...]
     active: bool = True
@@ -145,9 +154,7 @@ class TokenDraftPool:
             and self._sessions[index].active(key)
         )
 
-    def open_sequence(self, sequence_id, *, deadline):
-        if self._closed or self._pending is not None:
-            raise RuntimeError("token pool is closed or busy")
+    def _select_worker(self, deadline):
         self._reap_probes()
         candidates = [
             i
@@ -186,9 +193,13 @@ class TokenDraftPool:
             key=lambda i: (self._counts[i], (i - self._next) % len(self._sessions)),
         )
         self._next = (index + 1) % len(self._sessions)
-        key = self._call(
-            index, "open_sequence", sequence_id, deadline=deadline
-        ).result()
+        return index
+
+    def reserve_sequence(self, sequence_id, *, deadline):
+        if self._closed or self._pending is not None:
+            raise RuntimeError("token pool is closed or busy")
+        index = self._select_worker(deadline)
+        key = self._call(index, "reserve_sequence", sequence_id).result()
         try:
             self.records[key] = self._sessions[index].records[key]
             self._routes[key] = index
@@ -201,6 +212,20 @@ class TokenDraftPool:
             raise
         return key
 
+    def open_sequence(self, sequence_id, *, deadline):
+        key = self.reserve_sequence(sequence_id, deadline=deadline)
+        try:
+            self._call(
+                self._routes[key], "open_reserved", key, deadline=deadline
+            ).result()
+        except BaseException:
+            try:
+                self.close_sequences((key,), deadline=deadline)
+            except Exception:
+                logger.exception("Failed to retire an unsuccessful pool open")
+            raise
+        return key
+
     def prefill(self, key, tokens, *, is_final, deadline):
         if self._pending is not None:
             raise RuntimeError("cannot prefill while a pool proposal is pending")
@@ -210,6 +235,52 @@ class TokenDraftPool:
         ).result()
 
     def dispatch(self, batch_id, rows, k, *, deadline):
+        return self._dispatch(batch_id, rows, k, deadline=deadline, prepared=False)
+
+    def dispatch_prepared(self, batch_id, rows, k, *, deadline):
+        return self._dispatch(batch_id, rows, k, deadline=deadline, prepared=True)
+
+    @staticmethod
+    def _prepare_and_collect(session, batch_id, rows, k, deadline):
+        advances, indices = [], []
+        for i, row in enumerate(rows):
+            if not session.active(row.key):
+                continue
+            if row.open_required:
+                session.open_reserved(row.key, deadline=deadline)
+            if row.prefill_tokens is not None:
+                session.prefill(
+                    row.key,
+                    row.prefill_tokens,
+                    is_final=row.final_prefill,
+                    deadline=deadline,
+                )
+            if row.advance is not None and session.active(row.key):
+                state = session.records[row.key]
+                offered, accepted, delta = row.advance
+                advances.append(
+                    TokenAdvanceRow(
+                        row.key,
+                        state.committed,
+                        state.proposal_id,
+                        offered,
+                        accepted,
+                        delta,
+                    )
+                )
+                indices.append(i)
+        tokens = [(0,) * session.hello.num_speculative_tokens for _ in rows]
+        lengths = [0] * len(rows)
+        if advances:
+            result = session.collect(
+                session.dispatch(batch_id, tuple(advances), k, deadline=deadline)
+            )
+            for local, original in enumerate(indices):
+                tokens[original] = result.token_ids[local]
+                lengths[original] = result.valid_lengths[local]
+        return TokenBatchResult(tuple(tokens), tuple(lengths))
+
+    def _dispatch(self, batch_id, rows, k, *, deadline, prepared):
         if self._closed or self._pending is not None:
             raise RuntimeError("token pool is closed or busy")
         if (
@@ -232,6 +303,10 @@ class TokenDraftPool:
 
                 def run(index=index, selected=selected):
                     session = self._sessions[index]
+                    if prepared:
+                        return self._prepare_and_collect(
+                            session, batch_id, selected, k, deadline
+                        )
                     return session.collect(
                         session.dispatch(batch_id, selected, k, deadline=deadline)
                     )

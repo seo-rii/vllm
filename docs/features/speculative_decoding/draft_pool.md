@@ -67,7 +67,9 @@ knowledge of assignments made by other verifiers.
 Proposal rows are partitioned by assignment and their results are restored to
 the original verifier order. Each worker has one socket driver. Drivers progress
 concurrently against the same client deadline, including request preparation;
-splitting a batch never restarts its timeout for each endpoint.
+splitting a batch never restarts its timeout for each endpoint. New opens and
+prefill chunks run on those drivers too, so a stalled preparation on one worker
+does not delay launching a healthy worker's proposal.
 
 Under `target_only`, a failed worker's existing sequences become terminal and
 return zero valid drafts. Healthy worker results remain usable. New requests
