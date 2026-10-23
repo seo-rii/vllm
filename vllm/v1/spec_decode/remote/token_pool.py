@@ -241,10 +241,13 @@ class TokenDraftPool:
             self._finish_all([future for _, _, future in handle.jobs])
             handle.active = False
             self._pending = None
-            if self._deferred_closes:
-                keys = tuple(self._deferred_closes)
-                self._deferred_closes.clear()
-                self.close_sequences(keys, deadline=handle.deadline)
+            self._flush_closes(handle.deadline)
+
+    def _flush_closes(self, deadline):
+        if self._deferred_closes:
+            keys = tuple(self._deferred_closes)
+            self._deferred_closes.clear()
+            self.close_sequences(keys, deadline=deadline)
 
     def cancel(self, handle):
         handle = self._owned(handle)
@@ -256,13 +259,16 @@ class TokenDraftPool:
         finally:
             handle.active = False
             self._pending = None
+            self._flush_closes(handle.deadline)
 
     def _invalidate(self):
-        if self._pending is not None:
-            self.cancel(self._pending)
-        self._finish_all(
-            [self._call(i, "_invalidate") for i in range(len(self._sessions))]
-        )
+        try:
+            if self._pending is not None:
+                self.cancel(self._pending)
+        finally:
+            self._finish_all(
+                [self._call(i, "_invalidate") for i in range(len(self._sessions))]
+            )
 
     def fail(self, detail):
         self._invalidate()
@@ -278,6 +284,7 @@ class TokenDraftPool:
                 self._deferred_closes.update(keys)
                 return
             self.cancel(self._pending)
+            keys = tuple(key for key in keys if key in self._routes)
         deadline = self.deadline() if deadline is None else deadline
         groups: dict[int, list[SequenceKey]] = {}
         for key in keys:
@@ -302,10 +309,12 @@ class TokenDraftPool:
         if self._closed:
             return
         try:
-            self._invalidate()
-            error = self._finish_all(
-                [self._call(i, "close") for i in range(len(self._sessions))]
-            )
+            try:
+                self._invalidate()
+            finally:
+                error = self._finish_all(
+                    [self._call(i, "close") for i in range(len(self._sessions))]
+                )
             if error is not None:
                 raise error
         finally:

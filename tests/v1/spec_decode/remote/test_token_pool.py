@@ -208,6 +208,23 @@ def test_reused_sequence_id_on_another_worker_has_a_new_generation(pool_runtime)
     assert pool.active(second)
 
 
+@pytest.mark.parametrize("finish", ["cancel", "close"])
+def test_cancel_retires_deferred_request_on_an_unaffected_worker(pool_runtime, finish):
+    client, _, states, _ = pool_runtime
+    pool = client()
+    first, other = (open_prompt(pool, i) for i in range(2))
+    row = TokenAdvanceRow(first, 2, None, 0, 0, (3,))
+    handle = pool.dispatch(0, (row,), 1, deadline=pool.deadline())
+    pool.close_sequences((other,))
+    if finish == "cancel":
+        pool.cancel(handle)
+    else:
+        pool.close_sequences((first, other))
+    assert other not in pool.records
+    assert other not in states[1].sequences
+    assert states[1].block_pool.num_free_blocks == 32
+
+
 def test_native_speculative_config_preserves_all_pool_endpoints(tmp_path):
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
     from vllm.config import SpeculativeConfig
