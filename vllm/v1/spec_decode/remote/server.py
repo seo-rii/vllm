@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -170,6 +170,29 @@ class StandaloneProposalResult:
     valid_lengths: DataFrame
     """Integer frame of shape [len(keys)]."""
     row_statuses: tuple[SpeculatorStatusCode, ...]
+
+
+@dataclass(frozen=True)
+class _ProposalInput:
+    message: AdvanceAndPropose
+    accepted: DataFrame
+    recovery: DataFrame
+    accepted_counts: tuple[int, ...]
+    frames: tuple[DataFrame | None, ...]
+    query_lens: tuple[int, ...]
+    num_speculative_tokens: int
+    effective_k: int
+    deadline: float | None
+    copy_deadline: float
+
+
+@dataclass
+class _ProposalExecution:
+    inputs: _ProposalInput
+    begun: list[SpeculatorStatusCode]
+    statuses: list[SpeculatorStatusCode]
+    batch: StandaloneProposalBatch | None = None
+    failure: AdapterError | None = None
 
 
 class StandaloneDraftAdapter(ABC):
@@ -763,6 +786,12 @@ class RemoteDraftServer:
             if entry is not None:
                 self.registry.close(key, owner=entry.owner)
 
+    def _warmup(self) -> None:
+        self.adapter.warmup()
+
+    def _create_session(self, conn: FramedConnection) -> "_ServerSession":
+        return _ServerSession(self, conn)
+
     def start(self, endpoint: str) -> str:
         """Warm up, bind, and serve in the background.
 
@@ -783,7 +812,7 @@ class RemoteDraftServer:
         if not self.healthy:
             raise RuntimeError("unhealthy draft runtime requires a process restart")
         try:
-            self.adapter.warmup()
+            self._warmup()
         except Exception as error:
             self._adapter_failed(error)
             raise
@@ -915,7 +944,7 @@ class RemoteDraftServer:
     def _serve_connection(self, conn: FramedConnection) -> None:
         session: _ServerSession | None = None
         try:
-            session = _ServerSession(self, conn)
+            session = self._create_session(conn)
             session.run()
         except AdapterQueueFull:
             logger.warning(
@@ -1052,7 +1081,19 @@ class _ServerSession:
             partial_frame_timeout=self.server.partial_frame_timeout_s,
         )
 
+    def _run_action(
+        self,
+        action: Callable[[], Any],
+        *,
+        cleanup: bool = False,
+        num_bytes: int = 0,
+    ) -> Any:
+        return action()
+
     def cleanup(self) -> None:
+        self._run_action(self._cleanup, cleanup=True)
+
+    def _cleanup(self) -> None:
         try:
             with self.server.adapter_turn(cleanup=True):
                 receiver, self.ipc_receiver = self.ipc_receiver, None
@@ -1344,30 +1385,38 @@ class _ServerSession:
                 "key belongs to another verifier",
             )
             return
-        server = self.server
-        with server.adapter_turn():
-            registry = server.registry
-            if not server.healthy:
-                status = SpeculatorStatusCode.INTERNAL_ERROR
-                detail = "draft runtime is unhealthy"
-            elif (
-                not registry.has_identity(key)
-                and len(registry) >= server.limits.max_sequences
-            ):
-                status = SpeculatorStatusCode.QUEUE_FULL
-                detail = f"max_sequences={server.limits.max_sequences} reached"
-            else:
-                replaced = registry.replaced_by(key)
-                if replaced is not None:
-                    server._retire_sequences((replaced,))
-                outcome = registry.open(key, owner=self.session_id)
-                status, detail = outcome.status, outcome.detail
-                if outcome.created:
-                    failure = self._call_adapter(server.adapter.open_sequence, key)
-                    if failure is not None:
-                        self._discard_owned_sequences((key,))
-                        status, detail = failure
+
+        def open_sequence():
+            server = self.server
+            with server.adapter_turn():
+                registry = server.registry
+                if not server.healthy:
+                    status = SpeculatorStatusCode.INTERNAL_ERROR
+                    detail = "draft runtime is unhealthy"
+                elif (
+                    not registry.has_identity(key)
+                    and not self._sequence_credit_available()
+                ):
+                    status = SpeculatorStatusCode.QUEUE_FULL
+                    detail = f"max_sequences={server.limits.max_sequences} reached"
+                else:
+                    replaced = registry.replaced_by(key)
+                    if replaced is not None:
+                        server._retire_sequences((replaced,))
+                    outcome = registry.open(key, owner=self.session_id)
+                    status, detail = outcome.status, outcome.detail
+                    if outcome.created:
+                        failure = self._call_adapter(server.adapter.open_sequence, key)
+                        if failure is not None:
+                            self._discard_owned_sequences((key,))
+                            status, detail = failure
+            return status, detail
+
+        status, detail = self._run_action(open_sequence)
         self._ack(key, request_id, status, detail)
+
+    def _sequence_credit_available(self) -> bool:
+        return len(self.server.registry) < self.server.limits.max_sequences
 
     def _prefill(self, message: PrefillChunk, request_id: int) -> None:
         deadline = self._execution_deadline(message)
@@ -1414,43 +1463,59 @@ class _ServerSession:
                 "payload checksum does not match the chunk header",
             )
             return
-        with self.server.adapter_turn():
-            if not self.server.healthy:
-                status = SpeculatorStatusCode.INTERNAL_ERROR
-                detail, apply = "draft runtime is unhealthy", False
-            elif self._expire_owned_sequences(deadline, (key,)):
-                status = SpeculatorStatusCode.TIMEOUT
-                detail, apply = "execution budget expired before prefill", False
-            else:
-                status, detail, apply = self.server.registry.prefill(
-                    key,
-                    owner=self.session_id,
-                    offset=message.offset,
-                    num_tokens=message.num_tokens,
-                    checksum=message.checksum,
-                    is_final=message.is_final,
-                )
-            if apply:
-                try:
-                    resolved = self._resolve_features(frames, deadline=copy_deadline)
-                except (TransportError, RuntimeError) as e:
-                    self.server._adapter_failed(e)
-                    self._discard_owned_sequences((key,))
-                    status, detail = SpeculatorStatusCode.INTERNAL_ERROR, str(e)
+
+        def prefill():
+            with self.server.adapter_turn():
+                if not self.server.healthy:
+                    status = SpeculatorStatusCode.INTERNAL_ERROR
+                    detail, apply = "draft runtime is unhealthy", False
+                elif self._expire_owned_sequences(deadline, (key,)):
+                    status = SpeculatorStatusCode.TIMEOUT
+                    detail, apply = "execution budget expired before prefill", False
                 else:
-                    failure = self._call_adapter(
-                        self.server.adapter.prefill,
+                    status, detail, apply = self.server.registry.prefill(
                         key,
-                        PrefillInputs(
-                            offset=message.offset,
-                            num_tokens=message.num_tokens,
-                            is_final=message.is_final,
-                            features=resolved,
-                        ),
+                        owner=self.session_id,
+                        offset=message.offset,
+                        num_tokens=message.num_tokens,
+                        checksum=message.checksum,
+                        is_final=message.is_final,
                     )
-                    if failure is not None:
+                if apply:
+                    try:
+                        resolved = self._resolve_features(
+                            frames, deadline=copy_deadline
+                        )
+                    except (TransportError, RuntimeError) as e:
+                        self.server._adapter_failed(e)
                         self._discard_owned_sequences((key,))
-                        status, detail = failure
+                        status, detail = SpeculatorStatusCode.INTERNAL_ERROR, str(e)
+                    else:
+                        failure = self._call_adapter(
+                            self.server.adapter.prefill,
+                            key,
+                            PrefillInputs(
+                                offset=message.offset,
+                                num_tokens=message.num_tokens,
+                                is_final=message.is_final,
+                                features=resolved,
+                            ),
+                        )
+                        if failure is not None:
+                            self._discard_owned_sequences((key,))
+                            status, detail = failure
+            return status, detail
+
+        status, detail = self._run_action(
+            prefill,
+            num_bytes=sum(
+                frame.cuda_ipc.nbytes
+                if frame.cuda_ipc is not None
+                else len(frame.payload)
+                for frame in frames
+                if frame is not None
+            ),
+        )
         self._ack(key, request_id, status, detail)
 
     def _call_adapter(
@@ -1579,109 +1644,28 @@ class _ServerSession:
             fail(SpeculatorStatusCode.PROTOCOL_ERROR, problem)
             return
 
-        failure: str | None = None
-        failure_status = SpeculatorStatusCode.INTERNAL_ERROR
-        with self.server.adapter_turn():
-            registry = self.server.registry
-            if not self.server.healthy:
-                failure = "draft runtime is unhealthy"
-                begun = [failure_status] * num_rows
-            elif self._expire_owned_sequences(deadline, message.keys):
-                failure = "execution budget expired before proposal"
-                failure_status = SpeculatorStatusCode.TIMEOUT
-                begun = [failure_status] * num_rows
-            else:
-                begun = [
-                    registry.begin_round(key, message.batch_id, owner=self.session_id)[
-                        0
-                    ]
-                    for key in message.keys
-                ]
-            row_statuses = list(begun)
-            max_model_len = self.server.limits.max_model_len
-            for i, seq_key in enumerate(message.keys):
-                if row_statuses[i] is not SpeculatorStatusCode.OK:
-                    continue
-                entry = registry.get(seq_key)
-                if entry is not None and (
-                    entry.prefix_length + accepted_counts[i] + 1 > max_model_len
-                ):
-                    row_statuses[i] = SpeculatorStatusCode.OUT_OF_MEMORY
-            active = tuple(
-                i
-                for i, status in enumerate(row_statuses)
-                if status is SpeculatorStatusCode.OK
+        outcome = self._run_proposal(
+            _ProposalInput(
+                message,
+                accepted,
+                recovery,
+                tuple(accepted_counts),
+                tuple(frames),
+                tuple(query_lens),
+                num_tokens,
+                effective_k,
+                deadline,
+                copy_deadline,
             )
-            if active:
-                active_keys = tuple(message.keys[i] for i in active)
-                try:
-                    result = self.server.adapter.advance_and_propose(
-                        StandaloneProposalBatch(
-                            batch_id=message.batch_id,
-                            keys=message.keys,
-                            active_rows=active,
-                            num_speculative_tokens=num_tokens,
-                            accepted_counts=accepted,
-                            recovery_tokens=recovery,
-                            features=self._resolve_features(
-                                frames, deadline=copy_deadline
-                            ),
-                            query_lens=tuple(query_lens),
-                            effective_num_speculative_tokens=effective_k,
-                        )
-                    )
-                except Exception as e:
-                    self.server._adapter_failed(e)
-                    logger.exception(
-                        "Session %s: adapter failed on batch %d",
-                        self.session_id,
-                        message.batch_id,
-                    )
-                    failure = "adapter raised"
-                else:
-                    if not _result_well_formed(result, num_rows, num_tokens):
-                        failure = "adapter returned a malformed result"
-                    else:
-                        valid_lengths = frame_to_ints(result.valid_lengths)
-                        if any(length > effective_k for length in valid_lengths):
-                            failure = "adapter exceeded the round draft budget"
-                        else:
-                            for i in active:
-                                row_statuses[i] = result.row_statuses[i]
-                                if row_statuses[i] is SpeculatorStatusCode.OK:
-                                    registry.advance(
-                                        message.keys[i],
-                                        accepted_counts[i],
-                                        owner=self.session_id,
-                                    )
-                            for i, status in enumerate(row_statuses):
-                                if status is not SpeculatorStatusCode.OK:
-                                    valid_lengths[i] = 0
-                            tokens = result.token_ids
-                            valid = ints_to_frame(
-                                0, valid_lengths, dtype=result.valid_lengths.dtype
-                            )
-                if failure is not None:
-                    self._discard_owned_sequences(active_keys)
-            else:
-                tokens = ints_to_frame(
-                    0,
-                    [0] * (num_rows * num_tokens),
-                    dtype="int64",
-                    shape=(num_rows, num_tokens),
-                )
-                valid = ints_to_frame(0, [0] * num_rows)
-            self._discard_owned_sequences(
-                tuple(
-                    seq_key
-                    for seq_key, began, status in zip(message.keys, begun, row_statuses)
-                    if began is SpeculatorStatusCode.OK and status is not began
-                )
-            )
-
-        if failure is not None:
-            fail(failure_status, failure)
+        )
+        if isinstance(outcome, AdapterError):
+            fail(outcome.status, outcome.detail)
             return
+        tokens, valid, row_statuses = (
+            outcome.token_ids,
+            outcome.valid_lengths,
+            outcome.row_statuses,
+        )
         base = self.next_result_slot
         self.next_result_slot += _RESULT_FRAMES
         self._send(
@@ -1698,11 +1682,166 @@ class _ServerSession:
             ],
         )
 
-    def _close(self, message: CloseSequence, request_id: int) -> None:
+    def _run_proposal(
+        self, inputs: _ProposalInput
+    ) -> StandaloneProposalResult | AdapterError:
         with self.server.adapter_turn():
-            self._discard_owned_sequences(
-                tuple(key for key in message.keys if self._owns(key))
+            execution = self._begin_proposal(inputs)
+            result: StandaloneProposalResult | Exception | None = None
+            if execution.batch is not None:
+                try:
+                    result = self.server.adapter.advance_and_propose(execution.batch)
+                except Exception as error:
+                    result = error
+            return self._finish_proposal(execution, result)
+
+    def _begin_proposal(self, inputs: _ProposalInput) -> _ProposalExecution:
+        """Validate mutable request state on the adapter owner, before GPU work."""
+        message = inputs.message
+        registry = self.server.registry
+        failure = None
+        if not self.server.healthy:
+            failure = AdapterError(
+                SpeculatorStatusCode.INTERNAL_ERROR, "draft runtime is unhealthy"
             )
+        elif self._expire_owned_sequences(inputs.deadline, message.keys):
+            failure = AdapterError(
+                SpeculatorStatusCode.TIMEOUT, "execution budget expired before proposal"
+            )
+        begun = (
+            [failure.status] * len(message.keys)
+            if failure is not None
+            else [
+                registry.begin_round(key, message.batch_id, owner=self.session_id)[0]
+                for key in message.keys
+            ]
+        )
+        execution = _ProposalExecution(inputs, begun, list(begun), failure=failure)
+        for i, key in enumerate(message.keys):
+            if execution.statuses[i] is not SpeculatorStatusCode.OK:
+                continue
+            entry = registry.get(key)
+            if entry is not None and (
+                entry.prefix_length + inputs.accepted_counts[i] + 1
+                > self.server.limits.max_model_len
+            ):
+                execution.statuses[i] = SpeculatorStatusCode.OUT_OF_MEMORY
+        active = tuple(
+            i
+            for i, status in enumerate(execution.statuses)
+            if status is SpeculatorStatusCode.OK
+        )
+        if active:
+            try:
+                features = self._resolve_features(
+                    list(inputs.frames), deadline=inputs.copy_deadline
+                )
+                execution.batch = StandaloneProposalBatch(
+                    batch_id=message.batch_id,
+                    keys=message.keys,
+                    active_rows=active,
+                    num_speculative_tokens=inputs.num_speculative_tokens,
+                    accepted_counts=inputs.accepted,
+                    recovery_tokens=inputs.recovery,
+                    features=features,
+                    query_lens=inputs.query_lens,
+                    effective_num_speculative_tokens=inputs.effective_k,
+                )
+            except Exception as error:
+                self.server._adapter_failed(error)
+                logger.exception("Session %s: feature resolve failed", self.session_id)
+                execution.failure = AdapterError(
+                    SpeculatorStatusCode.INTERNAL_ERROR, "feature resolve failed"
+                )
+        return execution
+
+    def _finish_proposal(
+        self,
+        execution: _ProposalExecution,
+        result: StandaloneProposalResult | Exception | None,
+    ) -> StandaloneProposalResult | AdapterError:
+        """Commit valid results and retire failed rows before releasing ownership."""
+        inputs = execution.inputs
+        message = inputs.message
+        num_rows, width = len(message.keys), inputs.num_speculative_tokens
+        statuses = execution.statuses
+        active = tuple(
+            i for i, status in enumerate(statuses) if status is SpeculatorStatusCode.OK
+        )
+        if isinstance(result, Exception):
+            self.server._adapter_failed(result)
+            logger.error(
+                "Session %s: adapter failed on batch %d: %s",
+                self.session_id,
+                message.batch_id,
+                result,
+            )
+            execution.failure = AdapterError(
+                SpeculatorStatusCode.INTERNAL_ERROR, "adapter raised"
+            )
+            result = None
+        elif result is not None:
+            if not _result_well_formed(result, num_rows, width):
+                execution.failure = AdapterError(
+                    SpeculatorStatusCode.INTERNAL_ERROR,
+                    "adapter returned a malformed result",
+                )
+            elif any(
+                length > inputs.effective_k
+                for length in frame_to_ints(result.valid_lengths)
+            ):
+                execution.failure = AdapterError(
+                    SpeculatorStatusCode.INTERNAL_ERROR,
+                    "adapter exceeded the round draft budget",
+                )
+        if execution.failure is not None:
+            self._discard_owned_sequences(tuple(message.keys[i] for i in active))
+        elif result is not None:
+            lengths = frame_to_ints(result.valid_lengths)
+            for i in active:
+                statuses[i] = result.row_statuses[i]
+                if statuses[i] is SpeculatorStatusCode.OK:
+                    self.server.registry.advance(
+                        message.keys[i],
+                        inputs.accepted_counts[i],
+                        owner=self.session_id,
+                    )
+            for i, status in enumerate(statuses):
+                if status is not SpeculatorStatusCode.OK:
+                    lengths[i] = 0
+            result = StandaloneProposalResult(
+                result.token_ids,
+                ints_to_frame(0, lengths, dtype=result.valid_lengths.dtype),
+                tuple(statuses),
+            )
+        else:
+            result = StandaloneProposalResult(
+                ints_to_frame(
+                    0, [0] * (num_rows * width), dtype="int64", shape=(num_rows, width)
+                ),
+                ints_to_frame(0, [0] * num_rows),
+                tuple(statuses),
+            )
+        self._discard_owned_sequences(
+            tuple(
+                key
+                for key, began, status in zip(message.keys, execution.begun, statuses)
+                if began is SpeculatorStatusCode.OK and status is not began
+            )
+        )
+        if execution.failure is not None:
+            return execution.failure
+        assert result is not None
+        return result
+
+    def _close(self, message: CloseSequence, request_id: int) -> None:
+        def close_sequences():
+            with self.server.adapter_turn():
+                self._discard_owned_sequences(
+                    tuple(key for key in message.keys if self._owns(key))
+                )
+
+        self._run_action(close_sequences, cleanup=True)
         deadline = time.monotonic() + self.server.send_timeout_s
         for key in message.keys:
             if self._owns(key):
@@ -1892,6 +2031,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-connections", type=int, default=128)
     parser.add_argument("--max-handshakes", type=int, default=16)
     parser.add_argument("--max-adapter-waiters", type=int, default=64)
+    parser.add_argument("--max-pending-jobs", type=int, default=64)
+    parser.add_argument("--max-queued-feature-bytes", type=int, default=1 << 30)
+    parser.add_argument("--max-jobs-per-verifier", type=int, default=8)
+    parser.add_argument("--max-feature-bytes-per-verifier", type=int, default=1 << 30)
+    parser.add_argument("--max-sequences-per-verifier", type=int)
+    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
     parser.add_argument("--partial-frame-timeout-s", type=float, default=30.0)
     parser.add_argument("--shutdown-timeout-s", type=float, default=5.0)
     parser.add_argument("--target-fingerprint", default="")
@@ -1936,7 +2081,20 @@ def main(argv: list[str] | None = None) -> None:
         max_model_len=args.max_model_len,
     )
     adapter: StandaloneDraftAdapter
+    server_type: type[RemoteDraftServer] = RemoteDraftServer
+    queue_options: dict[str, Any] = {}
     if args.adapter == "gpu":
+        from vllm.v1.spec_decode.remote.conditioned_server import ConditionedDraftServer
+
+        server_type = ConditionedDraftServer
+        queue_options = dict(
+            max_pending_jobs=args.max_pending_jobs,
+            max_queued_feature_bytes=args.max_queued_feature_bytes,
+            max_jobs_per_verifier=args.max_jobs_per_verifier,
+            max_feature_bytes_per_verifier=args.max_feature_bytes_per_verifier,
+            max_sequences_per_verifier=args.max_sequences_per_verifier,
+            batch_wait_ms=args.batch_wait_ms,
+        )
         from vllm.v1.spec_decode.remote.runtime.cli import create_gpu_adapter
 
         adapter, contract = create_gpu_adapter(args)
@@ -1944,8 +2102,9 @@ def main(argv: list[str] | None = None) -> None:
         args.tokenizer_fingerprint = contract.tokenizer_fingerprint
     else:
         adapter = FakeDraftAdapter(vocab_size=args.vocab_size)
-    server = RemoteDraftServer(
+    server = server_type(
         adapter,
+        **queue_options,
         limits=limits,
         target_fingerprint=args.target_fingerprint,
         tokenizer_fingerprint=args.tokenizer_fingerprint,

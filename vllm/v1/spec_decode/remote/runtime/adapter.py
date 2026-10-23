@@ -29,6 +29,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
+from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import (
     SequenceKey,
     SpeculatorStatusCode,
@@ -47,7 +48,12 @@ from vllm.v1.spec_decode.remote.server import (
     StandaloneProposalResult,
 )
 from vllm.v1.spec_decode.remote.session import frame_to_tensor, tensor_to_frame
-from vllm.v1.spec_decode.remote.transport import DataFrame, DeviceFeature, frame_to_ints
+from vllm.v1.spec_decode.remote.transport import (
+    DataFrame,
+    DeviceFeature,
+    frame_to_ints,
+    ints_to_frame,
+)
 
 Features = list[torch.Tensor | None]
 
@@ -276,6 +282,105 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             row_statuses=tuple(statuses),
         )
 
+    def advance_many(
+        self, batches: Sequence[StandaloneProposalBatch]
+    ) -> list[StandaloneProposalResult | Exception]:
+        """Batch compatible verifier rounds without changing any row's K budget."""
+        groups: dict[tuple[int, tuple[bool, ...]], list[int]] = {}
+        for i, batch in enumerate(batches):
+            k = batch.effective_num_speculative_tokens
+            if k is None:
+                k = batch.num_speculative_tokens
+            groups.setdefault(
+                (k, tuple(f is not None for f in batch.features)), []
+            ).append(i)
+        results: list[StandaloneProposalResult | Exception] = [
+            RuntimeError("draft batch was not executed") for _ in batches
+        ]
+        fatal: Exception | None = None
+        for (k, _), indexes in groups.items():
+            if fatal is not None:
+                for i in indexes:
+                    results[i] = fatal
+                continue
+            try:
+                group = [batches[i] for i in indexes]
+                if len(group) == 1:
+                    results[indexes[0]] = self.advance_and_propose(group[0])
+                    continue
+                starts = list(
+                    itertools.accumulate((len(b.keys) for b in group), initial=0)
+                )
+                features: list[DeviceFeature | None] = []
+                for slot in range(len(self._schema.slots)):
+                    frames = [batch.features[slot] for batch in group]
+                    if frames[0] is None:
+                        features.append(None)
+                        continue
+                    present = [frame for frame in frames if frame is not None]
+                    assert len(present) == len(frames)
+                    tensors = [frame_to_tensor(frame) for frame in present]
+                    device = next(
+                        (t.device for t in tensors if t.is_cuda), tensors[0].device
+                    )
+                    tensor = torch.cat([t.to(device) for t in tensors])
+                    features.append(
+                        DeviceFeature(
+                            slot, present[0].dtype, tuple(tensor.shape), tensor
+                        )
+                    )
+                width = max(batch.num_speculative_tokens for batch in group)
+                merged = StandaloneProposalBatch(
+                    batch_id=group[0].batch_id,
+                    keys=tuple(key for batch in group for key in batch.keys),
+                    active_rows=tuple(
+                        start + row
+                        for start, batch in zip(starts, group)
+                        for row in batch.active_rows
+                    ),
+                    num_speculative_tokens=width,
+                    accepted_counts=ints_to_frame(
+                        0,
+                        [
+                            value
+                            for batch in group
+                            for value in frame_to_ints(batch.accepted_counts)
+                        ],
+                    ),
+                    recovery_tokens=ints_to_frame(
+                        0,
+                        [
+                            value
+                            for batch in group
+                            for value in frame_to_ints(batch.recovery_tokens)
+                        ],
+                    ),
+                    features=tuple(features),
+                    query_lens=tuple(
+                        length for batch in group for length in batch.query_lens
+                    ),
+                    effective_num_speculative_tokens=k,
+                )
+                result = self.advance_and_propose(merged)
+                tokens, lengths = (
+                    frame_to_tensor(result.token_ids),
+                    frame_to_tensor(result.valid_lengths),
+                )
+                for index, start, end, batch in zip(indexes, starts, starts[1:], group):
+                    results[index] = StandaloneProposalResult(
+                        tensor_to_frame(
+                            0, tokens[start:end, : batch.num_speculative_tokens]
+                        ),
+                        tensor_to_frame(0, lengths[start:end]),
+                        result.row_statuses[start:end],
+                    )
+            except Exception as error:
+                for index in indexes:
+                    results[index] = error
+                if runtime_unusable(error):
+                    fatal = error
+        return results
+
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
         for key in keys:
             self._last_chunks.pop(key, None)
@@ -307,7 +412,11 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             if any(segment is None for segment in segments):
                 step.append(None)
             else:
-                step.append(torch.cat(segments))  # type: ignore[arg-type]
+                tensors = [segment for segment in segments if segment is not None]
+                device = next(
+                    (t.device for t in tensors if t.is_cuda), tensors[0].device
+                )
+                step.append(torch.cat([t.to(device) for t in tensors]))
         return step
 
 
