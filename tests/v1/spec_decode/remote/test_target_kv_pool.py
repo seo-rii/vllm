@@ -35,7 +35,8 @@ from vllm.v1.spec_decode.remote.transport import FramedConnection
 
 
 @pytest.fixture
-def pool_runtime():
+def pool_runtime(request):
+    quotas = getattr(request, "param", {})
     specs = {
         "full": FullAttentionSpec(
             block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
@@ -63,7 +64,8 @@ def pool_runtime():
                 receiver_budget=budget,
                 max_num_seqs=4,
                 max_connections=4,
-                max_sequences=16,
+                max_sequences=quotas.get("max_sequences", 16),
+                max_sequences_per_verifier=quotas.get("max_sequences_per_verifier", 4),
             )
             server.start("tcp://127.0.0.1:0")
             cleanup.callback(server.stop)
@@ -434,3 +436,35 @@ def test_invalid_batch_and_foreign_handles_leave_current_proposal_usable(pool_ru
     pool.close()
     assert not pool.records and not pool._routes and not pool._epochs
     assert not pool._probes and pool._pending is None
+
+
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+@pytest.mark.parametrize(
+    "pool_runtime",
+    [{"max_sequences_per_verifier": 1}, {"max_sequences": 4}],
+    indirect=True,
+    ids=["verifier-credit", "global-credit"],
+)
+def test_open_credit_rejection_preserves_established_sibling_proposals(
+    pool_runtime, policy
+):
+    client, servers, _ = pool_runtime
+    pool = client(policy=policy)
+    established = pool.open_sequences((0, 1), deadline=pool.deadline())
+    if servers[0].limits.max_sequences == 4:
+        # Fill the shared worker capacity with independent verifier identities.
+        second, third = client("second"), client("third")
+        second.open_sequences((10, 11, 12, 13), deadline=second.deadline())
+        third.open_sequences((20, 21), deadline=third.deadline())
+        assert all(len(server.registry) == 4 for server in servers)
+    if policy == "error":
+        with pytest.raises(RemoteDraftError, match="QUEUE_FULL: sequence credit"):
+            pool.open_sequences((2, 3), deadline=pool.deadline())
+        assert set(pool.records) == set(established)
+    else:
+        denied = pool.open_sequences((2, 3), deadline=pool.deadline())
+        assert not any(pool.active(key) for key in denied)
+    assert all(pool.active(key) for key in established)
+    assert tuple(
+        result.token_ids for result in pool.collect_batch(dispatch(pool, established))
+    ) == ((10,), (19,))

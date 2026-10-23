@@ -955,11 +955,13 @@ def test_snapshot_pool_sequence_credits_preserve_other_verifier_progress(wire_ru
         assert len(server.registry) == 3
         with pytest.raises(RemoteDraftError, match="open"):
             a.open_sequence(2, deadline=a.deadline())
-        assert not any(a.records.values())
+        assert all(a.active(key) for key in keys)
+        rejected = tuple(key for key in a.records if key not in keys)
+        assert len(rejected) == 1 and not a.active(rejected[0])
+        assert propose(a, snapshot(a, keys[0])).token_ids == (18,)
         assert propose(b, snapshot(b, kb)).token_ids == (18,)
-        until(lambda: server.registry.count("verifier") == 0)
-        assert len(server.registry) == 1 and server.healthy
-        assert len(keys) == 2
+        assert server.registry.count("verifier") == 2
+        assert len(server.registry) == 3 and server.healthy
 
 
 @pytest.mark.parametrize(
