@@ -3,6 +3,7 @@
 """Sticky routing and failure isolation through actual v3 sockets and CPU KV."""
 
 import threading
+import time
 from contextlib import ExitStack
 
 import pytest
@@ -241,3 +242,52 @@ def test_native_speculative_config_preserves_all_pool_endpoints(tmp_path):
     )
     assert spec.use_unified_draft_backend() and spec.use_remote_draft()
     assert spec.get_remote_draft_endpoints() == endpoints
+
+
+def test_recovered_worker_rejoins_without_reviving_its_old_sequences(pool_runtime):
+    client, servers, states, _ = pool_runtime
+    pool = client(policy="target_only")
+    keys = [open_prompt(pool, i) for i in range(2)]
+    endpoint = servers[0].endpoint
+    assert endpoint is not None
+    servers[0].stop()
+    result = pool.collect(
+        pool.dispatch(
+            0,
+            tuple(TokenAdvanceRow(key, 2, None, 0, 0, (3,)) for key in keys),
+            1,
+            deadline=pool.deadline(),
+        )
+    )
+    assert result.valid_lengths == (0, 1)
+    recovered = TokenStateMachine(
+        GatedOracle(),
+        DraftBlockPool(33, 4),
+        max_num_reqs=4,
+        max_model_len=64,
+        vocab_size=128,
+        max_k=3,
+    )
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(recovered, servers[0].adapter.contract),
+        limits=servers[0].limits,
+    )
+    try:
+        server.start(endpoint)
+        until = time.monotonic() + 3
+        sequence_id = 2
+        while True:
+            fresh = open_prompt(pool, sequence_id)
+            rejoined = fresh in recovered.sequences
+            pool.close_sequences((fresh,))
+            if rejoined or time.monotonic() >= until:
+                break
+            sequence_id += 1
+            time.sleep(0.01)
+        assert rejoined
+        assert not pool.active(keys[0])
+        assert keys[0] not in recovered.sequences
+        assert keys[1] in states[1].sequences and pool.active(keys[1])
+        pool.close_sequences(tuple(keys))
+    finally:
+        server.stop()

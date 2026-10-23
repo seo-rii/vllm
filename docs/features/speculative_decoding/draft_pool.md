@@ -75,6 +75,10 @@ can use a healthy worker, but existing own-KV sequences are never migrated or
 revived after an uncertain failure. Under `error`, a worker failure is surfaced
 after all submitted endpoint jobs have been drained. Reconnection retains the
 underlying session's backoff and generation fencing.
+New-request admission probes disconnected workers on their own socket drivers
+after backoff while healthy workers continue serving. A worker becomes eligible
+again only after handshake completes. Rejoining enables new sequences; old
+terminal identities remain fenced.
 
 Closing unrelated requests while a proposal is pending defers their close until
 collection. Closing a participating request cancels the pending result and fences

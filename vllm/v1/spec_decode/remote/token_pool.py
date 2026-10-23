@@ -7,6 +7,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
@@ -17,6 +18,8 @@ from vllm.v1.spec_decode.remote.token_session import (
     TokenClientProgress,
     TokenOnlyRemoteSession,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(eq=False)
@@ -78,6 +81,7 @@ class TokenDraftPool:
         self._next = 0
         self._owner = object()
         self._pending: TokenPoolHandle | None = None
+        self._probes: dict[int, Future] = {}
         self._deferred_closes: set[SequenceKey] = set()
         self._closed = False
         self._last_batch = -1
@@ -107,6 +111,7 @@ class TokenDraftPool:
         deadline = (
             deadline if deadline is not None else self.clock() + self.startup_timeout_s
         )
+        self._reap_probes(wait=True)
         jobs = [
             self._call(i, "connect", deadline=deadline)
             for i in range(len(self._sessions))
@@ -119,6 +124,19 @@ class TokenDraftPool:
             self._invalidate()
             raise error
 
+    def _reap_probes(self, *, wait=False):
+        for index, future in tuple(self._probes.items()):
+            if not wait and not future.done():
+                continue
+            try:
+                future.result()
+            except Exception as error:
+                logger.warning(
+                    "Remote draft worker %d reconnect failed: %s", index, error
+                )
+            finally:
+                del self._probes[index]
+
     def active(self, key):
         index = self._routes.get(key)
         return (
@@ -130,9 +148,29 @@ class TokenDraftPool:
     def open_sequence(self, sequence_id, *, deadline):
         if self._closed or self._pending is not None:
             raise RuntimeError("token pool is closed or busy")
+        self._reap_probes()
         candidates = [
-            i for i, session in enumerate(self._sessions) if session._conn is not None
+            i
+            for i, session in enumerate(self._sessions)
+            if i not in self._probes and session._conn is not None
         ]
+        if candidates:
+            # Rejoin workers independently of this request. A probing socket
+            # becomes eligible only after its handshake future has completed.
+            for i, session in enumerate(self._sessions):
+                if (
+                    i not in self._probes
+                    and session._conn is None
+                    and session._reconnect.ready()
+                ):
+                    self._probes[i] = self._call(i, "connect", deadline=deadline)
+        elif self._probes:
+            self._reap_probes(wait=True)
+            candidates = [
+                i
+                for i, session in enumerate(self._sessions)
+                if session._conn is not None
+            ]
         if not candidates:
             candidates = [
                 i
@@ -324,3 +362,4 @@ class TokenDraftPool:
             self.records.clear()
             self._routes.clear()
             self._deferred_closes.clear()
+            self._probes.clear()
