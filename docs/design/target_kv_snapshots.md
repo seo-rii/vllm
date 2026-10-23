@@ -76,12 +76,28 @@ Primitive tests alone do not establish remote model correctness.
 
 A dedicated MRV2 backend and assistant-only GPU process exchange snapshots
 through protocol v4; v2 own-KV and v3
-token-only peers reject its semantics. It supports the Gemma4 E2B text backbone
-and matching assistant, BF16 weights/KV, target TP1, draft TP1, K1, eager
+token-only peers reject its semantics. It derives Gemma4 target/assistant hidden
+sizes, layer counts, attention heads, per-layer KV heads and head widths, sliding
+windows, vocabulary and target KV owners from their native checkpoint configs.
+Assistant head widths, KV head counts and windows must match their selected
+target owners; query heads must form valid GQA groups. Native page unification
+is preserved. Physical page padding, noncausal attention and incompatible
+assistant architectures are rejected before weights are loaded. Snapshot and
+receiver capacity at the requested maximum context must fit the fixed budgets;
+a larger KV geometry may require a shorter configured context.
+
+Execution requires BF16 weights/KV, target TP1, draft TP1, K1, eager
 `TRITON_ATTN`, scheduler block size 16 and `max_num_seqs=1`. Context is capped at
 8192 tokens. Prefix caching, async scheduling, multimodal inputs, input
 streaming, LoRA, quantization and CUDA IPC are rejected. Ordinary output
 streaming remains supported. The native local factory is unchanged.
+
+The config-derived contract is not evidence that every Gemma4 checkpoint has
+been evaluated. Real model validation must identify the target and assistant
+revisions; CPU geometry and snapshot tests do not establish model accuracy.
+Other target-state architectures require their own state adapter. Multi-request
+snapshot batching is not implemented: v4 retains one request identity per
+connection, and the GPU executor constructs one Q-only query per call.
 
 Each round exports the last accepted target hidden row, the recovery token and
 private full/SWA KV pages. The selected materialized length excludes rejected

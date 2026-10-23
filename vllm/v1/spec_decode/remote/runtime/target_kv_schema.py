@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fail-closed Gemma4 E2B contract for the bounded Q-only remote runtime."""
+"""Checkpoint-derived Gemma4 contract for the bounded Q-only remote runtime."""
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotBudget,
     gemma4_source_layers,
 )
+from vllm.v1.spec_decode.remote.target_kv_protocol import snapshot_wire_plan
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -31,6 +32,7 @@ class TargetKVRuntimeContract:
     draft_source_names: tuple[str, ...]
     hidden_size: int
     vocab_size: int
+    draft_num_attention_heads: int
     snapshot_budget: SnapshotBudget
     receiver_budget: SnapshotBudget
 
@@ -117,23 +119,31 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
     text = target.hf_config.get_text_config()
     assistant = draft.hf_config.get_text_config()
     if (
-        text.hidden_size != 1536
-        or text.num_hidden_layers != 35
-        or text.num_kv_shared_layers != 20
-        or text.num_attention_heads != 8
-        or assistant.hidden_size != 256
-        or assistant.num_hidden_layers != 4
-        or assistant.num_attention_heads != 4
+        min(
+            text.hidden_size,
+            assistant.hidden_size,
+            text.vocab_size,
+            text.num_hidden_layers,
+            assistant.num_hidden_layers,
+            text.num_attention_heads,
+            assistant.num_attention_heads,
+        )
+        < 1
         or assistant.num_kv_shared_layers != 0
-        or text.vocab_size != 262144
         or draft.hf_config.backbone_hidden_size != text.hidden_size
         or assistant.vocab_size != text.vocab_size
         or getattr(text, "use_bidirectional_attention", None) == "all"
-        or getattr(text, "enable_moe_block", False)
+        or getattr(assistant, "use_bidirectional_attention", None) == "all"
+        or not getattr(text, "is_causal", True)
+        or not getattr(assistant, "is_causal", True)
         or getattr(assistant, "enable_moe_block", False)
+        or getattr(assistant, "hidden_size_per_layer_input", 0) != 0
+        or getattr(assistant, "vocab_size_per_layer_input", 0) != 0
+        or getattr(assistant, "use_double_wide_mlp", False)
         or getattr(target, "rswa_window", None) is not None
+        or target.max_model_len > assistant.max_position_embeddings
     ):
-        raise ValueError("remote target-KV currently supports Gemma4 E2B text only")
+        raise ValueError("remote target-KV requires compatible causal Gemma4 configs")
     if (
         len(text.layer_types) != text.num_hidden_layers
         or len(assistant.layer_types) != assistant.num_hidden_layers
@@ -144,15 +154,21 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         assistant.layer_types,
         num_kv_shared_layers=text.num_kv_shared_layers,
     )
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
     specs: dict[str, KVCacheSpec] = {}
     layer_spec: AttentionSpec
     for i, kind in enumerate(
         text.layer_types[: text.num_hidden_layers - text.num_kv_shared_layers]
     ):
         layer = text.per_layer_config[i]
-        expected_head = 256 if kind == "sliding_attention" else 512
-        if layer.head_dim != expected_head or layer.num_key_value_heads != 1:
-            raise ValueError("unsupported Gemma4 E2B target attention geometry")
+        if (
+            not TritonAttentionBackend.supports_head_size(layer.head_dim)
+            or layer.head_dim % 2
+            or layer.num_key_value_heads < 1
+            or text.num_attention_heads % layer.num_key_value_heads
+        ):
+            raise ValueError("unsupported Gemma4 target attention geometry")
         kwargs = dict(
             block_size=16,
             num_kv_heads=layer.num_key_value_heads,
@@ -160,9 +176,9 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
             dtype=torch.bfloat16,
         )
         if kind == "sliding_attention":
-            if text.sliding_window != 512:
-                raise ValueError("Gemma4 E2B sliding window must be 512")
-            layer_spec = SlidingWindowSpec(**kwargs, sliding_window=512)
+            if text.sliding_window < 1:
+                raise ValueError("Gemma4 sliding window must be positive")
+            layer_spec = SlidingWindowSpec(**kwargs, sliding_window=text.sliding_window)
         else:
             layer_spec = FullAttentionSpec(**kwargs)
         specs[f"target.layers.{i}"] = layer_spec
@@ -179,6 +195,7 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         if (
             layer.head_dim != owner.head_size
             or layer.num_key_value_heads != owner.num_kv_heads
+            or assistant.num_attention_heads % owner.num_kv_heads
             or (
                 isinstance(owner, SlidingWindowSpec)
                 and assistant.sliding_window != owner.sliding_window
@@ -186,6 +203,10 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         ):
             raise ValueError("assistant attention must match its target KV owner")
     budget = SnapshotBudget(1024, 128 * 1024**2, target.max_model_len)
+    # Native page unification may add physical padding that snapshots cannot
+    # represent. Validate that contract, and maximum-context capacity, before
+    # either process loads weights or the target allocates its KV cache.
+    snapshot_wire_plan(expected, target.max_model_len, budget, budget)
     identity = {
         "target": _model_identity(target),
         "draft": _model_identity(draft),
@@ -197,7 +218,7 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         "sources": source_names,
         "specs": {name: vars(value) for name, value in expected.items()},
         "max_model_len": target.max_model_len,
-        "contract": "gemma4-e2b-q-only-bf16-k1-v1",
+        "contract": "gemma4-q-only-bf16-k1-v2",
     }
     return TargetKVRuntimeContract(
         fingerprint=_fingerprint(identity),
@@ -206,6 +227,7 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         draft_source_names=source_names,
         hidden_size=text.hidden_size,
         vocab_size=text.vocab_size,
+        draft_num_attention_heads=assistant.num_attention_heads,
         snapshot_budget=budget,
         receiver_budget=budget,
     )

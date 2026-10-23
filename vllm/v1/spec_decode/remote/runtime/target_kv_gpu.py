@@ -136,6 +136,7 @@ class Gemma4SnapshotExecutor:
                 if (
                     attn.head_size != spec.head_size
                     or attn.num_kv_heads != spec.num_kv_heads
+                    or attn.num_heads != self.contract.draft_num_attention_heads
                     or attn.attn_backend.get_name() != "TRITON_ATTN"
                     or attn.kv_sharing_target_layer_name is not None
                 ):

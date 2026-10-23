@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run the experimental same-host Gemma4 E2B snapshot assistant."""
+"""Run the experimental same-host Gemma4 snapshot assistant."""
 
 import argparse
 

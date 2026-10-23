@@ -16,6 +16,217 @@ from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
 from vllm.v1.spec_decode.remote.target_kv import import_target_kv
 
 
+def _native_config(
+    tmp_path,
+    *,
+    kv_heads=2,
+    full_kv_heads=None,
+    head_dim=128,
+    full_head_dim=256,
+    window=1024,
+    max_model_len=640,
+):
+    """Build real offline model/runtime configs; this does not load model weights."""
+    from safetensors.torch import save_file
+
+    from vllm.config import (
+        AttentionConfig,
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    text = Gemma4TextConfig(
+        hidden_size=2304,
+        num_hidden_layers=30,
+        num_kv_shared_layers=10,
+        num_key_value_heads=kv_heads,
+        num_global_key_value_heads=full_kv_heads,
+        attention_k_eq_v=full_kv_heads is not None,
+        num_attention_heads=8,
+        head_dim=head_dim,
+        global_head_dim=full_head_dim,
+        sliding_window=window,
+        architectures=["Gemma4ForCausalLM"],
+    )
+    assistant = Gemma4AssistantConfig(
+        text_config=Gemma4TextConfig(
+            hidden_size=384,
+            num_hidden_layers=4,
+            num_kv_shared_layers=4,
+            num_key_value_heads=kv_heads,
+            num_global_key_value_heads=full_kv_heads,
+            attention_k_eq_v=full_kv_heads is not None,
+            num_attention_heads=8,
+            head_dim=head_dim,
+            global_head_dim=full_head_dim,
+            sliding_window=window,
+            layer_types=["sliding_attention"] * 3 + ["full_attention"],
+            hidden_size_per_layer_input=0,
+            vocab_size_per_layer_input=0,
+        ),
+        backbone_hidden_size=text.hidden_size,
+        architectures=["Gemma4AssistantForCausalLM"],
+    )
+    target_path, draft_path = tmp_path / "target", tmp_path / "assistant"
+    for path, hf in ((target_path, text), (draft_path, assistant)):
+        hf.save_pretrained(path)
+        save_file(
+            {"identity_only": torch.zeros(1, dtype=torch.bfloat16)},
+            str(path / "model.safetensors"),
+        )
+        (path / "tokenizer_config.json").write_text("{}")
+    target = ModelConfig(
+        str(target_path),
+        dtype="bfloat16",
+        max_model_len=max_model_len,
+        enforce_eager=True,
+    )
+    parallel = ParallelConfig()
+    speculative = SpeculativeConfig(
+        target_model_config=target,
+        target_parallel_config=parallel,
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=1,
+        draft_tensor_parallel_size=1,
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=speculative,
+        scheduler_config=SchedulerConfig(
+            max_model_len=max_model_len,
+            is_encoder_decoder=False,
+            max_num_seqs=1,
+            max_num_batched_tokens=64,
+            async_scheduling=False,
+        ),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
+        attention_config=AttentionConfig(backend="TRITON_ATTN"),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_heads,full_kv_heads,head_dim,full_head_dim,window",
+    [
+        (1, None, 64, 128, 256),
+        (2, None, 128, 256, 1024),
+        (4, None, 256, 512, 2048),
+        (4, 2, 128, 256, 1024),
+    ],
+)
+def test_native_configs_derive_gemma_geometry_and_snapshot_import(
+    tmp_path, kv_heads, full_kv_heads, head_dim, full_head_dim, window
+):
+    """Compatible Gemma4 sizes retain native owner mapping and independent KV."""
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.target_kv import (
+        SnapshotIdentity,
+        SnapshotLayer,
+        TargetKVSnapshot,
+    )
+    from vllm.v1.spec_decode.remote.target_kv_protocol import snapshot_wire_plan
+
+    config = _native_config(
+        tmp_path,
+        kv_heads=kv_heads,
+        full_kv_heads=full_kv_heads,
+        head_dim=head_dim,
+        full_head_dim=full_head_dim,
+        window=window,
+    )
+    contract = create_target_kv_contract(config)
+    assert contract.hidden_size == 2304
+    assert contract.draft_num_attention_heads == 8
+    assert contract.source_indices == {"target.layers.19": 19, "target.layers.17": 17}
+    assert contract.draft_source_names == ("target.layers.19",) * 3 + (
+        "target.layers.17",
+    )
+    specs = contract.expected_specs
+    assert specs["target.layers.19"].head_size == head_dim
+    assert specs["target.layers.19"].sliding_window == window
+    assert specs["target.layers.17"].head_size == full_head_dim
+    assert specs["target.layers.19"].num_kv_heads == kv_heads
+    assert specs["target.layers.17"].num_kv_heads == (full_kv_heads or kv_heads)
+    assert len({s.page_size_bytes for s in specs.values()}) == 1
+    identity = SnapshotIdentity(SequenceKey("geometry", 0, 0), 1, 0)
+    for length in (1, 31, 32, 33, 640):
+        plans = snapshot_wire_plan(
+            specs, length, contract.snapshot_budget, contract.receiver_budget
+        )
+        layers = tuple(
+            SnapshotLayer(
+                p.name,
+                p.spec,
+                p.logical_pages,
+                torch.ones(p.shape, dtype=torch.bfloat16),
+            )
+            for p in plans
+        )
+        snapshot = TargetKVSnapshot(identity, length, layers)
+        imported = import_target_kv(
+            snapshot,
+            expected_identity=identity,
+            expected_materialized_length=length,
+            expected_specs=specs,
+            budget=contract.receiver_budget,
+            device=torch.device("cpu"),
+        )
+        for source, destination in zip(snapshot.layers, imported.layers):
+            assert destination.cache.shape[1:] == source.pages.shape[1:]
+            assert destination.cache.untyped_storage().data_ptr() != (
+                source.pages.untyped_storage().data_ptr()
+            )
+
+
+@pytest.mark.parametrize(
+    "side,field,value",
+    [
+        ("target", "num_attention_heads", 3),
+        ("target", "sliding_window", 0),
+        ("assistant", "num_attention_heads", 3),
+        ("assistant", "sliding_window", 2048),
+        ("assistant", "num_kv_shared_layers", 1),
+        ("assistant", "vocab_size", 123),
+        ("assistant", "enable_moe_block", True),
+        ("assistant", "max_position_embeddings", 639),
+    ],
+)
+def test_general_gemma_contract_rejects_incompatible_native_configs(
+    tmp_path, side, field, value
+):
+    config = _native_config(tmp_path)
+    model = (
+        config.model_config
+        if side == "target"
+        else config.speculative_config.draft_model_config
+    )
+    setattr(model.hf_config.get_text_config(), field, value)
+    with pytest.raises(ValueError, match="Gemma4|assistant attention"):
+        create_target_kv_contract(config)
+
+
+def test_native_page_padding_is_rejected_before_snapshot_allocation(tmp_path):
+    config = _native_config(tmp_path, head_dim=128, full_head_dim=192)
+    with pytest.raises(ValueError, match="dense causal BF16"):
+        create_target_kv_contract(config)
+
+
+def test_large_gqa_geometry_must_fit_the_negotiated_snapshot_budget(tmp_path):
+    config = _native_config(
+        tmp_path, kv_heads=8, head_dim=256, full_head_dim=512, max_model_len=8192
+    )
+    with pytest.raises(ValueError, match="snapshot exceeds page or byte budget"):
+        create_target_kv_contract(config)
+
+
 def _config():
     text = Gemma4TextConfig(
         hidden_size=1536,
