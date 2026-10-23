@@ -1,16 +1,17 @@
-# Shared own-KV draft workers
+# Shared draft workers
 
-Independent verifier engines can share same-host token-only or target-conditioned
-own-KV draft workers.
+Independent verifier engines can share same-host token-only, target-conditioned
+own-KV, or Gemma4 target-KV snapshot workers.
 Each request stays on the worker selected when its remote sequence opens.
 Workers combine proposals from different verifiers into a ragged GPU batch,
 with one execution thread owning their mutable model and KV state.
 
 Token-only workers use `method="draft_model"`, inline transport, target TP1 and
 draft TP1. Own-KV EAGLE3/MTP workers retain their existing model contracts, target
-TP1/TP2 and draft TP1, and accept inline or explicit CUDA IPC transport. Both
-require sequential greedy drafting. Gemma target-KV snapshots, predictive
-caches, cross-node execution and live sequence migration remain unsupported.
+TP1/TP2 and draft TP1, and accept inline or explicit CUDA IPC transport. Gemma4
+snapshots require inline transport, target TP1, draft TP1 and K=1. All require
+sequential greedy drafting. Predictive caches, cross-node execution and live
+sequence migration remain unsupported.
 
 ## Configuration
 
@@ -54,7 +55,7 @@ Start another worker at a different endpoint and pass both to each verifier:
 
 Between one and sixteen distinct endpoints are accepted. A single endpoint
 retains the original session path and can also be shared by multiple verifiers
-(N:1). Target-KV snapshot methods still require exactly one endpoint. Each
+(N:1). Each
 worker must advertise sufficient per-batch limits for the verifier; the workers
 do not add their individual limits together during handshake.
 
@@ -70,6 +71,52 @@ add together. Feature partitions wait on the producer CUDA event, and each
 driver retains its tensors until the session completes or quarantines the
 transfer. An IPC session whose arena was quarantined cannot reconnect and
 allocate a replacement arena during serving.
+
+## Gemma4 snapshot workers
+
+Start the [snapshot assistant](../../design/target_kv_snapshots.md) with enough
+connection and request credits for the verifier engines sharing it:
+
+```bash
+python -m vllm.v1.spec_decode.remote.runtime.target_kv_cli \
+  --endpoint unix:///run/vllm/gemma0.sock \
+  --target-model google/gemma-4-E2B-it \
+  --draft-model google/gemma-4-E2B-it-assistant \
+  --device cuda:0 --language-model-only \
+  --max-model-len 640 --max-feature-tokens 128 \
+  --max-num-seqs 8 --max-connections 2 \
+  --max-sequences 8 --max-sequences-per-verifier 4
+```
+
+Each verifier can use `max_num_seqs=4`, `method="mtp"`, the assistant checkpoint,
+K=1, and the `execution` object above with one or more Gemma worker endpoints.
+Pin the same target and assistant revisions on both sides. The example capacity
+is for short contexts; startup checks the whole configured batch against the
+snapshot page and byte budgets.
+
+`--max-num-seqs` limits one assistant forward, while `--max-sequences` limits
+open identities across all connections. The latter defaults to the former;
+`--max-sequences-per-verifier` also defaults to `--max-num-seqs`. A verifier
+identity belongs to one live connection on each worker until its cleanup ends.
+
+The shared GPU owner combines snapshots from different verifiers into one
+assistant forward. Aggregate page, receiver-storage and padded-table budgets
+are checked before combining jobs. Individually valid jobs that cannot fit
+one combined batch execute separately. Expired jobs are removed before execution.
+Each reply retains its original identity and row order.
+
+Snapshot job and byte credits are reserved after manifest validation, before
+reading tensor bodies. They remain charged through receive, queueing, execution
+and reply handling. `--max-queued-snapshot-bytes` and
+`--max-snapshot-bytes-per-verifier` both default to 128 MiB. The job-count and
+coalescing options below apply as well. `--max-connections` defaults to one;
+increase it explicitly for N:1 or N:M serving.
+
+For multiple endpoints, the verifier copies private exported pages and selected
+hidden rows to CPU on their producer stream before dispatching socket drivers.
+These host snapshots remain alive until collection or cancellation. The client
+batch still shares the 1024-page/128-MiB snapshot budget across endpoints.
+The pool does not multiply that budget by the number of workers.
 
 ## Routing and failure
 

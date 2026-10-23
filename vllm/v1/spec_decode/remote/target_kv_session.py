@@ -137,6 +137,11 @@ class TargetKVRemoteSession:
     def active(self, key: SequenceKey) -> bool:
         return self.records.get(key, False)
 
+    def epoch_for(self, key: SequenceKey) -> int:
+        if key not in self.records:
+            raise ValueError("unknown target-KV sequence")
+        return self._epoch
+
     def _invalidate(self):
         if self._conn is not None:
             self._conn.close()
@@ -496,7 +501,9 @@ class TargetKVRemoteSession:
         except Exception as error:
             self.fail(f"target-KV close failed: {error}")
 
-    def close_sequences(self, keys: tuple[SequenceKey, ...]):
+    def close_sequences(
+        self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
+    ):
         keys = tuple(key for key in dict.fromkeys(keys) if key in self.records)
         if not keys:
             return
@@ -509,7 +516,11 @@ class TargetKVRemoteSession:
         for key in keys:
             self.records.pop(key, None)
         if self._pending is None:
-            self._flush_closes(self.deadline())
+            deadline = self.deadline() if deadline is None else deadline
+            if self.clock() < deadline:
+                self._flush_closes(deadline)
+            elif not any(self.records.values()):
+                self._invalidate()
 
     def close(self):
         self._invalidate()

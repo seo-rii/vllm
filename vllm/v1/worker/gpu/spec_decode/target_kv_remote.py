@@ -27,6 +27,10 @@ from vllm.v1.spec_decode.remote.target_kv import (
     select_draft_position,
     snapshot_target_kv,
 )
+from vllm.v1.spec_decode.remote.target_kv_pool import (
+    TargetKVDraftPool,
+    TargetKVPoolHandle,
+)
 from vllm.v1.spec_decode.remote.target_kv_protocol import (
     TargetKVHello,
     snapshot_batch_wire_plan,
@@ -43,7 +47,7 @@ class _SnapshotHandle(ProposalHandle):
     owner: object
     step: DraftStep
     context: LocalExecutionContext | None
-    rpc: TargetKVProposalHandle | None = None
+    rpc: TargetKVProposalHandle | TargetKVPoolHandle | None = None
     rpc_rows: tuple[int, ...] = ()
     error: Exception | None = None
 
@@ -69,23 +73,36 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         remote = spec.get_remote_draft_config()
         assert remote is not None
         contract = self.contract
-        self._session = TargetKVRemoteSession(
-            remote.endpoint,
-            TargetKVHello(
-                uuid.uuid4().hex,
-                contract.fingerprint,
-                contract.hidden_size,
-                contract.vocab_size,
-                contract.snapshot_budget.max_model_len,
-                contract.snapshot_budget.max_pages,
-                contract.snapshot_budget.max_bytes,
-                max_num_seqs=contract.max_num_seqs,
-            ),
-            expected_specs=contract.expected_specs,
-            failure_policy=remote.failure_policy,
-            request_timeout_ms=remote.request_timeout_ms,
-            startup_timeout_ms=remote.startup_timeout_ms,
+        endpoints = spec.get_remote_draft_endpoints()
+        hello = TargetKVHello(
+            uuid.uuid4().hex,
+            contract.fingerprint,
+            contract.hidden_size,
+            contract.vocab_size,
+            contract.snapshot_budget.max_model_len,
+            contract.snapshot_budget.max_pages,
+            contract.snapshot_budget.max_bytes,
+            max_num_seqs=contract.max_num_seqs,
         )
+        self._session: TargetKVDraftPool | TargetKVRemoteSession
+        if len(endpoints) > 1:
+            self._session = TargetKVDraftPool(
+                endpoints,
+                hello,
+                expected_specs=contract.expected_specs,
+                failure_policy=remote.failure_policy,
+                request_timeout_ms=remote.request_timeout_ms,
+                startup_timeout_ms=remote.startup_timeout_ms,
+            )
+        else:
+            self._session = TargetKVRemoteSession(
+                remote.endpoint,
+                hello,
+                expected_specs=contract.expected_specs,
+                failure_policy=remote.failure_policy,
+                request_timeout_ms=remote.request_timeout_ms,
+                startup_timeout_ms=remote.startup_timeout_ms,
+            )
         try:
             self._session.connect()
         except Exception:
@@ -276,7 +293,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
             key = self._requests[handle.step.request_ids[row]]
             snapshots.append(
                 snapshot_target_kv(
-                    SnapshotIdentity(key, session.epoch, next(self._rounds)),
+                    SnapshotIdentity(key, session.epoch_for(key), next(self._rounds)),
                     position.materialized_length,
                     [
                         TargetKVSource(name, spec, cache, tables[row], layout)
@@ -289,6 +306,20 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         selected_hidden = self._select_hidden(
             hidden, tuple(position.hidden_index for position in positions.values())
         )
+        if isinstance(session, TargetKVDraftPool):
+            # Finish producer-stream reads before handing CPU storage to the
+            # endpoint drivers, which must not read CUDA tensors on their streams.
+            snapshots = [
+                replace(
+                    snapshot,
+                    layers=tuple(
+                        replace(layer, pages=layer.pages.cpu())
+                        for layer in snapshot.layers
+                    ),
+                )
+                for snapshot in snapshots
+            ]
+            selected_hidden = selected_hidden.cpu()
         handle.rpc = session.dispatch_batch(
             tuple(snapshots),
             tuple(recovery),
@@ -323,7 +354,11 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
             n = len(handle.step.request_ids)
             tokens, lengths = [[0] for _ in range(n)], [0] * n
             if handle.rpc is not None:
-                results = self._session.collect_batch(handle.rpc)
+                if isinstance(self._session, TargetKVDraftPool):
+                    results = self._session.collect_batch(handle.rpc)
+                else:
+                    assert isinstance(handle.rpc, TargetKVProposalHandle)
+                    results = self._session.collect_batch(handle.rpc)
                 for row, result in zip(handle.rpc_rows, results, strict=True):
                     lengths[row] = result.valid_length
                     if result.valid_length:
@@ -344,7 +379,11 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         handle = self._owned(handle)
         try:
             if handle.rpc is not None:
-                self._session.cancel(handle.rpc)
+                if isinstance(self._session, TargetKVDraftPool):
+                    self._session.cancel(handle.rpc)
+                else:
+                    assert isinstance(handle.rpc, TargetKVProposalHandle)
+                    self._session.cancel(handle.rpc)
         finally:
             self._discard(handle)
 

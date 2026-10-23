@@ -137,6 +137,7 @@ def draft_server(model: str, log_path: Path, *, target_kv: bool = False):
         ("inline", False, 2),
         ("cuda_ipc", False, 2),
         ("inline", True, 1),
+        ("inline", True, 2),
     ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(

@@ -22,7 +22,10 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotCompletionError,
     TargetKVSnapshot,
 )
-from vllm.v1.spec_decode.remote.target_kv_session import TargetKVResult
+from vllm.v1.spec_decode.remote.target_kv_session import (
+    TargetKVProposalHandle,
+    TargetKVResult,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import target_kv_remote as remote
 
@@ -54,6 +57,9 @@ class Session:
         self.open_calls.append((sequence_ids, kwargs))
         return tuple(self.open_sequence(sequence_id) for sequence_id in sequence_ids)
 
+    def epoch_for(self, key):
+        return self.epoch
+
     def active(self, key):
         return self.records.get(key, False)
 
@@ -68,7 +74,15 @@ class Session:
             (snapshot, token, hidden[row : row + 1].clone())
             for row, (snapshot, token) in enumerate(zip(snapshots, tokens, strict=True))
         )
-        self.pending = object()
+        self.pending = TargetKVProposalHandle(
+            self,
+            self.epoch,
+            1,
+            tuple(snapshot.identity for snapshot in snapshots),
+            tuple(snapshot.materialized_length for snapshot in snapshots),
+            kwargs["deadline"],
+            kwargs["k"],
+        )
         self.pending_results = tuple(
             TargetKVResult((23 + snapshot.identity.key.sequence_id,), 1)
             for snapshot in snapshots
@@ -126,7 +140,8 @@ def verifier(monkeypatch):
         speculative_config=NS(
             get_remote_draft_config=lambda: RemoteDraftConfig(
                 endpoint="unix:///unused", failure_policy="target_only"
-            )
+            ),
+            get_remote_draft_endpoints=lambda: ("unix:///unused",),
         ),
         compilation_config=NS(
             static_forward_context={"model.layers.0.self_attn.attn": owner}
