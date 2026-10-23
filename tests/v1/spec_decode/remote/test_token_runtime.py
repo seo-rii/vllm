@@ -1975,12 +1975,20 @@ def test_worker_refuses_accepted_physical_padding_beyond_logical_valid(socket_ru
     worker.close_requests(["a"])
 
 
+def resolved_tokenizer_revision(resolved, initial, *, repo_id, repo_type="model"):
+    from huggingface_hub import ResolvedRevision
+
+    revision = ResolvedRevision(resolved, initial=initial)
+    # Cached-service responses include repository provenance on newer Hub
+    # releases. Populate that external metadata on older supported releases.
+    revision._repo_id, revision._repo_type = repo_id, repo_type
+    return revision
+
+
 @pytest.mark.parametrize("resolved_branch", [False, True])
 def test_cached_tokenizer_assets_prove_immutable_snapshot_revision(
     tmp_path, monkeypatch, resolved_branch
 ):
-    from huggingface_hub import ResolvedRevision
-
     import vllm.transformers_utils.repo_utils as repo_utils
 
     revision = "a" * 40
@@ -1996,7 +2004,7 @@ def test_cached_tokenizer_assets_prove_immutable_snapshot_revision(
 
     monkeypatch.setattr(repo_utils, "try_get_local_file", cached)
     pinned = (
-        ResolvedRevision(revision, initial="main", repo_id="Qwen/Qwen3-8B")
+        resolved_tokenizer_revision(revision, initial="main", repo_id="Qwen/Qwen3-8B")
         if resolved_branch
         else revision
     )
@@ -2016,15 +2024,13 @@ def test_cached_tokenizer_assets_prove_immutable_snapshot_revision(
 def test_tokenizer_revision_must_belong_to_its_model_repository(
     monkeypatch, repo_id, repo_type
 ):
-    from huggingface_hub import ResolvedRevision
-
     import vllm.transformers_utils.repo_utils as repo_utils
 
     lookups = []
     monkeypatch.setattr(
         repo_utils, "try_get_local_file", lambda *args, **kwargs: lookups.append(args)
     )
-    revision = ResolvedRevision(
+    revision = resolved_tokenizer_revision(
         "a" * 40, initial="a" * 40, repo_id=repo_id, repo_type=repo_type
     )
     with pytest.raises(ValueError, match="different repository"):
