@@ -329,20 +329,27 @@ def test_native_hf_override_and_page_unification_match_gemma_e2b():
     assert create_target_kv_contract(changed).fingerprint != contract.fingerprint
 
 
-def test_tokenizer_revision_uses_resolved_commit():
+def _resolved_model_revision(source, resolved):
+    """Represent Hub provenance across ResolvedRevision constructor versions."""
     from huggingface_hub import ResolvedRevision
 
+    revision = ResolvedRevision(resolved, initial="main")
+    revision._repo_id, revision._repo_type = source, "model"
+    return revision
+
+
+def test_tokenizer_revision_uses_resolved_commit():
     config = _config()
     target = config.model_config
     target.tokenizer = "test/separate-tokenizer"
     original = create_target_kv_contract(config).fingerprint
-    target.tokenizer_revision = ResolvedRevision(
-        "a" * 40, initial="main", repo_id=target.tokenizer
-    )
+    target.tokenizer_revision = _resolved_model_revision(target.tokenizer, "a" * 40)
     assert create_target_kv_contract(config).fingerprint == original
-    target.tokenizer_revision = ResolvedRevision(
-        "b" * 40, initial="main", repo_id=target.tokenizer
-    )
+    target.tokenizer = "test/different-tokenizer"
+    with pytest.raises(ValueError, match="different repository"):
+        create_target_kv_contract(config)
+    target.tokenizer = "test/separate-tokenizer"
+    target.tokenizer_revision = _resolved_model_revision(target.tokenizer, "b" * 40)
     assert create_target_kv_contract(config).fingerprint != original
     target.tokenizer_revision = "a" * 40
     target.tokenizer_mode = "slow"
@@ -467,8 +474,6 @@ def test_warmup_uses_real_snapshot_import_at_one_and_max_context(monkeypatch):
 def test_embedding_loader_requests_only_target_embedding_and_keeps_draft_head(
     monkeypatch, resolved
 ):
-    from huggingface_hub import ResolvedRevision
-
     import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
     import vllm.v1.spec_decode.remote.runtime.target_kv_gpu as gpu
 
@@ -476,9 +481,7 @@ def test_embedding_loader_requests_only_target_embedding_and_keeps_draft_head(
     config.hf_config._commit_hash = "c" * 40
     config.hf_config_path = "test/config-only"
     if resolved:
-        config.revision = ResolvedRevision(
-            "a" * 40, initial="main", repo_id=config.model
-        )
+        config.revision = _resolved_model_revision(config.model, "a" * 40)
     config.get_vocab_size, config.get_hidden_size = lambda: 5, lambda: 3
     weight = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3)
     selected = []
