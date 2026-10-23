@@ -169,6 +169,23 @@ target TP1. These explicit restrictions apply to remote execution. A same-GPU
 two-process run is a lifecycle test; normal single-GPU placement remains native
 local execution. Neither `auto` transport nor GPU visibility selects placement.
 
+### Batched token execution
+
+The state machine validates each sequence's proposal identity and reserves its
+KV independently, then packs correction tokens into ragged native forwards.
+Each following draft depth batches the rows that still need tokens, including
+batches with different effective K and client round IDs. Both token and request
+scratch limits bound every forward. Sampled IDs return through one batched CPU
+copy per forward rather than one scalar synchronization per row.
+
+Admission and deadline failures stay local to the affected row. An actual GPU
+forward failure invalidates every row submitted in that forward; it is not
+retried against potentially modified KV. A context-fatal or completion-unknown
+failure prevents further GPU submissions. Deadlines govern admission and
+submission boundaries, not a hard time bound on an already executing kernel.
+This batches on-demand work; it does not precompute outcomes or create target
+and draft overlap.
+
 ## Validation
 
 Record the tested source, immutable model/tokenizer revisions, effective

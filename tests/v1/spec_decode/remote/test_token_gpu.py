@@ -119,17 +119,15 @@ def token_executor(monkeypatch):
     )
 
     def slots(indices, qsl, positions, n):
-        blocks = staged.gpu[int(indices[0])].tolist()
-        block_size = executor.block_size
-        return torch.tensor(
-            [
-                [
-                    blocks[int(p) // block_size] * block_size + int(p) % block_size
-                    for p in positions
-                ]
-            ],
-            dtype=torch.int64,
-        )
+        values = []
+        for row, index in enumerate(indices.tolist()):
+            blocks = staged.gpu[index].tolist()
+            block_size = executor.block_size
+            values.extend(
+                blocks[int(p) // block_size] * block_size + int(p) % block_size
+                for p in positions[int(qsl[row]) : int(qsl[row + 1])]
+            )
+        return torch.tensor([values], dtype=torch.int64)
 
     monkeypatch.setattr(tables, "gather_block_tables", lambda indices, n: ())
     monkeypatch.setattr(tables, "compute_slot_mappings", slots)
@@ -182,6 +180,24 @@ def test_token_executor_calls_native_forward_at_real_positions(token_executor):
     assert calls == [([1, 2], [0, 1]), ([3, 4], [2, 3])]
     assert metadata == [([0, 1], [2], [3]), ([2, 3], [4], [3])]
     assert len(synced) == 1
+
+
+def test_token_executor_packs_ragged_rows_into_one_native_forward(token_executor):
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenForwardRow
+
+    executor, calls, synced, metadata = token_executor
+    keys = tuple(SequenceKey("packed", i, 0) for i in range(3))
+    result = executor.forward_batch(
+        (
+            TokenForwardRow(keys[0], 3, 0, (1, 2), (2,), True),
+            TokenForwardRow(keys[1], 1, 2, (5,), (3,), False),
+            TokenForwardRow(keys[2], 2, 0, (6, 7, 8), (4,), True),
+        )
+    )
+    assert result == (1, None, 1)
+    assert calls == [([1, 2, 5, 6, 7, 8], [0, 1, 2, 0, 1, 2])]
+    assert metadata == [([0, 1, 2, 0, 1, 2], [2, 3, 3], [3, 1, 2])]
+    assert not synced  # The single batched CPU result copy supplies completion.
 
 
 @pytest.mark.parametrize("failure", [None, "stage", "upload"])
@@ -267,7 +283,7 @@ def test_token_warmup_unusable_error_skips_gpu_cleanup(
     from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
 
     executor, _, _, _ = token_executor
-    forward, close = executor.forward, TokenStateMachine.close
+    forward, close = executor.forward_batch, TokenStateMachine.close
     failure = (
         CompletionUnknownError("warmup completion is unknown")
         if completion_unknown
@@ -297,7 +313,7 @@ def test_token_warmup_unusable_error_skips_gpu_cleanup(
         if len(calls) >= failed_forward:
             after_failure.append("sync")
 
-    monkeypatch.setattr(executor, "forward", failing_forward)
+    monkeypatch.setattr(executor, "forward_batch", failing_forward)
     monkeypatch.setattr(TokenStateMachine, "close", record_close)
     monkeypatch.setattr(torch.Tensor, "zero_", record_zero)
     monkeypatch.setattr(torch.accelerator, "synchronize", record_sync)

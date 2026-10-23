@@ -27,6 +27,7 @@ from vllm.v1.spec_decode.remote.runtime.token_schema import (
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenAdvanceRow,
+    TokenForwardRow,
     TokenStateMachine,
     TokenStepExecutor,
 )
@@ -86,42 +87,87 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             )
         return speculator
 
-    @torch.inference_mode()
+    @property
+    def max_num_reqs(self) -> int:
+        return self.input_buffers.max_num_reqs
+
     def forward(self, key, req_index, start, tokens, blocks, *, sample):
+        return self.forward_batch(
+            (
+                TokenForwardRow(
+                    key,
+                    req_index,
+                    start,
+                    tokens,
+                    blocks,
+                    sample,
+                ),
+            )
+        )[0]
+
+    @torch.inference_mode()
+    def forward_batch(
+        self, rows: tuple[TokenForwardRow, ...]
+    ) -> tuple[int | None, ...]:
         from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
-        if not tokens or len(tokens) > self.max_num_tokens:
-            raise ValueError("token forward must fit the configured batch token budget")
-        n = len(tokens)
-        positions = np.arange(start, start + n, dtype=np.int64)
+        if not rows:
+            return ()
+        n = sum(len(row.tokens) for row in rows)
+        if (
+            any(not row.tokens for row in rows)
+            or n > self.max_num_tokens
+            or len(rows) > self.max_num_reqs
+            or len({row.req_index for row in rows}) != len(rows)
+        ):
+            raise ValueError("token forward must fit the configured batch budgets")
+        lengths = np.array([len(row.tokens) for row in rows], dtype=np.int32)
+        starts = np.array([row.start for row in rows], dtype=np.int32)
+        qsl = np.concatenate(
+            (np.zeros(1, dtype=np.int32), np.cumsum(lengths, dtype=np.int32))
+        )
+        positions = np.concatenate(
+            [
+                np.arange(row.start, row.start + len(row.tokens), dtype=np.int64)
+                for row in rows
+            ]
+        )
         plan = DraftStepPlan(
-            rows=(DraftStepRow(key, n, 0),),
-            req_indices=np.array([req_index], dtype=np.int32),
-            num_scheduled_tokens=np.array([n], dtype=np.int32),
-            query_start_loc=np.array([0, n], dtype=np.int32),
-            num_computed_tokens=np.array([start], dtype=np.int32),
-            seq_lens=np.array([start + n], dtype=np.int32),
+            rows=tuple(DraftStepRow(row.key, len(row.tokens), 0) for row in rows),
+            req_indices=np.array([row.req_index for row in rows], dtype=np.int32),
+            num_scheduled_tokens=lengths,
+            query_start_loc=qsl,
+            num_computed_tokens=starts,
+            seq_lens=starts + lengths,
             positions=positions,
             slot_mapping=np.array(
                 [
-                    blocks[p // self.block_size] * self.block_size + p % self.block_size
-                    for p in positions
+                    row.blocks[p // self.block_size] * self.block_size
+                    + p % self.block_size
+                    for row in rows
+                    for p in range(row.start, row.start + len(row.tokens))
                 ],
                 dtype=np.int64,
             ),
-            block_table_updates={req_index: BlockTableUpdate(0, list(blocks))},
-            num_sampled=np.array([0], dtype=np.int32),
-            num_rejected=np.array([0], dtype=np.int32),
-            last_sampled=np.array([0], dtype=np.int64),
-            next_prefill_tokens=np.zeros((1, 1), dtype=np.int32),
+            block_table_updates={
+                row.req_index: BlockTableUpdate(0, list(row.blocks)) for row in rows
+            },
+            num_sampled=np.zeros(len(rows), dtype=np.int32),
+            num_rejected=np.zeros(len(rows), dtype=np.int32),
+            last_sampled=np.zeros(len(rows), dtype=np.int64),
+            next_prefill_tokens=np.zeros((len(rows), 1), dtype=np.int32),
         )
         torch.accelerator.set_device_index(self.device)
         with set_current_vllm_config(self.vllm_config):
             self.prepare_block_tables(plan)
             batch = make_input_batch(
-                plan, torch.tensor(tokens, dtype=torch.int32), self.input_buffers
+                plan,
+                torch.tensor(
+                    [token for row in rows for token in row.tokens], dtype=torch.int32
+                ),
+                self.input_buffers,
             )
-            tables = self.block_tables.gather_block_tables(batch.idx_mapping, 1)
+            tables = self.block_tables.gather_block_tables(batch.idx_mapping, len(rows))
             slots = self.block_tables.compute_slot_mappings(
                 batch.idx_mapping, batch.query_start_loc, batch.positions, n
             )
@@ -140,21 +186,32 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
                 build_slot_mappings_by_layer(slots, self.kv_config),
                 None,
             )
-            if sample:
+            sample_rows = [i for i, row in enumerate(rows) if row.sample]
+            result: list[int | None] = [None] * len(rows)
+            if sample_rows:
+                indices = torch.tensor(
+                    sample_rows, dtype=torch.int64, device=self.device
+                )
+                last = (
+                    batch.query_start_loc[1:].to(torch.int64).index_select(0, indices)
+                    - 1
+                )
                 self.speculator.current_draft_step.zero_()
                 sampled = self.speculator.sample_draft(
-                    hidden[-1:],
-                    batch.positions[-1:],
-                    batch.idx_mapping,
+                    hidden.index_select(0, last),
+                    batch.positions.index_select(0, last),
+                    batch.idx_mapping.index_select(0, indices),
                     self.temperature,
                     self.seeds,
                     self.speculator.current_draft_step,
                     None,
                 )
-                return int(sampled.cpu().item())
-            # Prefill/K0 must complete before ACK and shared buffer reuse, too.
-            torch.accelerator.synchronize(self.device)
-            return None
+                for row, token in zip(sample_rows, sampled.cpu().tolist()):
+                    result[row] = int(token)
+            else:
+                # Prefill/K0 must complete before ACK and shared buffer reuse.
+                torch.accelerator.synchronize(self.device)
+            return tuple(result)
 
     @torch.inference_mode()
     def warmup(self) -> None:

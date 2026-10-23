@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact logical/materialized prefix state for an independent token-only LM."""
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool, DraftKVExhausted
 from vllm.v1.spec_decode.remote.server import AdapterError
@@ -40,6 +42,30 @@ class TokenRowResult:
     proposal_id: int
 
 
+@dataclass(frozen=True)
+class TokenForwardRow:
+    key: SequenceKey
+    req_index: int
+    start: int
+    tokens: tuple[int, ...]
+    blocks: tuple[int, ...]
+    sample: bool
+
+
+@dataclass
+class _TokenUpdate:
+    batch_id: int
+    row: TokenAdvanceRow
+    state: TokenProgress
+    committed: int
+    valid_k: int
+    blocks: tuple[int, ...]
+    written_end: int
+    correction: TokenForwardRow
+    drafts: list[int]
+    started: bool = False
+
+
 class TokenStepExecutor(ABC):
     def warmup(self) -> None:  # noqa: B027
         """Finish device initialization before the listener becomes ready."""
@@ -56,6 +82,38 @@ class TokenStepExecutor(ABC):
         sample: bool,
     ) -> int | None:
         """Complete a real token forward; optionally sample its last position."""
+
+    @property
+    def max_num_tokens(self) -> int | None:
+        return None
+
+    @property
+    def max_num_reqs(self) -> int | None:
+        return None
+
+    def forward_batch(
+        self, rows: tuple[TokenForwardRow, ...]
+    ) -> tuple[int | None | Exception, ...]:
+        """Serial executors can report row errors; GPU forwards fail as a group."""
+        results: list[int | None | Exception] = []
+        for row in rows:
+            try:
+                results.append(
+                    self.forward(
+                        row.key,
+                        row.req_index,
+                        row.start,
+                        row.tokens,
+                        row.blocks,
+                        sample=row.sample,
+                    )
+                )
+            except Exception as error:
+                results.append(error)
+                if runtime_unusable(error):
+                    results.extend([error] * (len(rows) - len(results)))
+                    break
+        return tuple(results)
 
 
 class TokenStateMachine:
@@ -140,7 +198,9 @@ class TokenStateMachine:
         state.materialized = state.speculative_written_end = state.committed
         state.ready = is_final
 
-    def advance(self, batch_id: int, row: TokenAdvanceRow, k: int) -> TokenRowResult:
+    def _prepare_advance(
+        self, batch_id: int, row: TokenAdvanceRow, k: int
+    ) -> _TokenUpdate:
         state = self.sequences[row.key]
         self._tokens(row.delta)
         if (
@@ -181,30 +241,176 @@ class TokenStateMachine:
         blocks = self._reserve(state, committed + max(valid_k - 1, 0))
         keep = min(state.speculative_written_end, state.committed + row.accepted)
         missing = row.delta[keep - state.committed :]
-        token = self.executor.forward(
-            row.key, state.req_index, keep, missing, blocks, sample=valid_k > 0
+        return _TokenUpdate(
+            batch_id,
+            row,
+            state,
+            committed,
+            valid_k,
+            blocks,
+            committed,
+            TokenForwardRow(
+                row.key, state.req_index, keep, missing, blocks, sample=valid_k > 0
+            ),
+            [],
         )
-        state.committed = state.materialized = state.speculative_written_end = committed
-        drafts: list[int] = []
-        for index in range(valid_k):
-            if token is None or not 0 <= token < self.vocab_size:
-                raise AdapterError(
-                    SpeculatorStatusCode.INTERNAL_ERROR, "invalid sampled token"
+
+    def advance_many(
+        self,
+        updates: tuple[tuple[int, TokenAdvanceRow, int], ...],
+        *,
+        deadlines: tuple[float | None, ...] | None = None,
+    ) -> tuple[TokenRowResult | Exception, ...]:
+        """Validate independently, then batch correction and each draft depth.
+
+        A failed shared forward invalidates every participating row. No work
+        with uncertain KV contents is retried. Deadlines bound submission;
+        they cannot interrupt a CUDA kernel that is already executing.
+        """
+        if deadlines is None:
+            deadlines = (None,) * len(updates)
+        if len(deadlines) != len(updates):
+            raise ValueError("token update deadlines do not match the rows")
+        keys = [row.key for _, row, _ in updates]
+        repeated = {key for key in keys if keys.count(key) > 1}
+        results: list[TokenRowResult | Exception | None] = [None] * len(updates)
+        prepared: dict[int, _TokenUpdate] = {}
+
+        def expired(index: int) -> bool:
+            deadline = deadlines[index]
+            if deadline is not None and time.monotonic() >= deadline:
+                results[index] = AdapterError(
+                    SpeculatorStatusCode.TIMEOUT, "token execution deadline expired"
                 )
-            drafts.append(token)
-            if index + 1 < valid_k:
-                token = self.executor.forward(
-                    row.key,
-                    state.req_index,
-                    state.speculative_written_end,
-                    (token,),
-                    blocks,
-                    sample=True,
-                )
-                state.speculative_written_end += 1
-        state.proposal_tokens = tuple(drafts)
-        state.proposal_id = batch_id
-        state.pending_last_token = (
-            (state.speculative_written_end, drafts[-1]) if drafts else None
-        )
-        return TokenRowResult(tuple(drafts), committed, batch_id)
+                return True
+            return False
+
+        for index, (batch_id, row, k) in enumerate(updates):
+            if expired(index):
+                continue
+            try:
+                if row.key in repeated:
+                    raise AdapterError(
+                        SpeculatorStatusCode.SEQUENCE_DESYNC,
+                        "sequence appears more than once in the token batch",
+                    )
+                update = self._prepare_advance(batch_id, row, k)
+                limit = self.executor.max_num_tokens
+                if limit is not None and len(update.correction.tokens) > limit:
+                    raise AdapterError(
+                        SpeculatorStatusCode.OUT_OF_MEMORY,
+                        "token correction exceeds the executor token budget",
+                    )
+                prepared[index] = update
+            except Exception as error:
+                results[index] = error
+
+        def execute(rows: list[tuple[int, TokenForwardRow]]) -> dict[int, int | None]:
+            values: dict[int, int | None] = {}
+            groups: list[list[tuple[int, TokenForwardRow]]] = [[]]
+            count = 0
+            for index, row in rows:
+                if expired(index):
+                    continue
+                limit = self.executor.max_num_tokens
+                row_limit = self.executor.max_num_reqs
+                if (limit is not None and count + len(row.tokens) > limit) or (
+                    row_limit is not None and len(groups[-1]) >= row_limit
+                ):
+                    groups.append([])
+                    count = 0
+                groups[-1].append((index, row))
+                count += len(row.tokens)
+            for group in groups:
+                active = [(index, row) for index, row in group if not expired(index)]
+                if not active:
+                    continue
+                try:
+                    for index, _ in active:
+                        prepared[index].started = True
+                    sampled = self.executor.forward_batch(
+                        tuple(row for _, row in active)
+                    )
+                    if len(sampled) != len(active):
+                        raise RuntimeError(
+                            "token executor returned a different row count"
+                        )
+                    fatal = None
+                    for (index, _), token in zip(active, sampled):
+                        if isinstance(token, Exception):
+                            results[index] = token
+                            if runtime_unusable(token):
+                                fatal = token
+                        else:
+                            values[index] = token
+                    if fatal is not None:
+                        for index in prepared:
+                            if results[index] is None:
+                                results[index] = fatal
+                        break
+
+                except Exception as error:
+                    for index, _ in active:
+                        results[index] = error
+                    # Context-fatal failures prohibit further CUDA calls. Even
+                    # recoverable failures leave this group's KV untrustworthy.
+                    if runtime_unusable(error):
+                        for index in prepared:
+                            if results[index] is None:
+                                results[index] = error
+                        break
+            return values
+
+        values = execute([(i, update.correction) for i, update in prepared.items()])
+        for depth in range(max((u.valid_k for u in prepared.values()), default=0)):
+            following = []
+            for index, update in prepared.items():
+                if results[index] is not None or depth >= update.valid_k:
+                    continue
+                token = values.get(index)
+                if type(token) is not int or not 0 <= token < self.vocab_size:
+                    results[index] = AdapterError(
+                        SpeculatorStatusCode.INTERNAL_ERROR, "invalid sampled token"
+                    )
+                    continue
+                update.drafts.append(token)
+                if depth + 1 < update.valid_k:
+                    following.append(
+                        (
+                            index,
+                            TokenForwardRow(
+                                update.row.key,
+                                update.state.req_index,
+                                update.written_end,
+                                (token,),
+                                update.blocks,
+                                sample=True,
+                            ),
+                        )
+                    )
+                    update.written_end += 1
+            values = execute(following)
+        for index, update in prepared.items():
+            if results[index] is not None:
+                if update.started:
+                    update.state.ready = False
+                continue
+            state = update.state
+            state.committed = state.materialized = update.committed
+            state.speculative_written_end = update.written_end
+            state.proposal_tokens = tuple(update.drafts)
+            state.proposal_id = update.batch_id
+            state.pending_last_token = (
+                (update.written_end, update.drafts[-1]) if update.drafts else None
+            )
+            results[index] = TokenRowResult(
+                tuple(update.drafts), update.committed, update.batch_id
+            )
+        assert all(result is not None for result in results)
+        return tuple(results)  # type: ignore[arg-type]
+
+    def advance(self, batch_id: int, row: TokenAdvanceRow, k: int) -> TokenRowResult:
+        result = self.advance_many(((batch_id, row, k),))[0]
+        if isinstance(result, Exception):
+            raise result
+        return result

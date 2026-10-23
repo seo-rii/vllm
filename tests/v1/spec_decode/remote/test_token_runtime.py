@@ -200,12 +200,148 @@ class KVOracle(TokenStepExecutor):
         return None
 
 
-def machine(*, max_len=64, blocks=33, k=3):
-    oracle = KVOracle()
+def machine(*, max_len=64, blocks=33, k=3, executor=None):
+    oracle = KVOracle() if executor is None else executor
     pool = DraftBlockPool(blocks, 4)
     return TokenStateMachine(
         oracle, pool, max_num_reqs=4, max_model_len=max_len, vocab_size=128, max_k=k
     ), oracle
+
+
+class BatchedKVOracle(KVOracle):
+    def __init__(self, *, token_limit=None, row_limit=None, failure=None):
+        super().__init__()
+        self.batches = []
+        self.token_limit, self.row_limit = token_limit, row_limit
+        self.failure = failure
+
+    @property
+    def max_num_tokens(self):
+        return self.token_limit
+
+    @property
+    def max_num_reqs(self):
+        return self.row_limit
+
+    def forward_batch(self, rows):
+        self.batches.append(rows)
+        if self.failure is not None:
+            raise self.failure
+        return super().forward_batch(rows)
+
+
+def test_batched_token_state_matches_independent_rounds_with_ragged_corrections():
+    oracle = BatchedKVOracle()
+    batched, _ = machine(executor=oracle)
+    reference, _ = machine()
+    keys = tuple(SequenceKey("batch", i, 0) for i in range(3))
+    for state in (batched, reference):
+        for i, key in enumerate(keys):
+            state.open(key)
+            state.prefill(key, 0, tuple(range(1, i + 2)), is_final=True)
+    updates = tuple(
+        (10 + i, TokenAdvanceRow(key, i + 1, None, 0, 0, (7, 8)), k)
+        for i, (key, k) in enumerate(zip(keys, (3, 0, 2)))
+    )
+    expected = tuple(reference.advance(*update) for update in updates)
+    assert batched.advance_many(updates) == expected
+    assert [len(rows) for rows in oracle.batches] == [3, 2, 1]
+    assert [sum(len(row.tokens) for row in rows) for rows in oracle.batches] == [
+        6,
+        2,
+        1,
+    ]
+    # Distinct client batch IDs, reordering and all/partial rejection retain the
+    # same prefix alignment as the established one-sequence execution path.
+    following = []
+    for i in (2, 0, 1):
+        previous = expected[i]
+        accepted = len(previous.token_ids) // 2
+        following.append(
+            (
+                20 + i,
+                TokenAdvanceRow(
+                    keys[i],
+                    previous.committed,
+                    previous.proposal_id,
+                    len(previous.token_ids),
+                    accepted,
+                    previous.token_ids[:accepted] + (5,),
+                ),
+                (0, 3, 1)[i],
+            )
+        )
+    assert batched.advance_many(tuple(following)) == tuple(
+        reference.advance(*update) for update in following
+    )
+    for key in keys:
+        assert batched.sequences[key] == reference.sequences[key]
+        index = batched.sequences[key].req_index
+        assert oracle.kv[index] == reference.executor.kv[index]
+
+
+def test_batched_token_admission_failure_and_expired_row_do_not_delay_sibling():
+    oracle = BatchedKVOracle()
+    state, _ = machine(max_len=8, executor=oracle)
+    keys = tuple(SequenceKey("batch", i, 0) for i in range(3))
+    for key in keys:
+        state.open(key)
+        state.prefill(key, 0, (1,), is_final=True)
+    bad = TokenAdvanceRow(keys[0], 1, None, 0, 0, (2,) * 8)
+    expired = TokenAdvanceRow(keys[1], 1, None, 0, 0, (2,))
+    valid = TokenAdvanceRow(keys[2], 1, None, 0, 0, (3,))
+    failed, timed_out, result = state.advance_many(
+        ((1, bad, 1), (2, expired, 3), (3, valid, 3)),
+        deadlines=(None, 0, None),
+    )
+    assert isinstance(failed, AdapterError)
+    assert failed.status == SpeculatorStatusCode.OUT_OF_MEMORY
+    assert isinstance(timed_out, AdapterError)
+    assert timed_out.status == SpeculatorStatusCode.TIMEOUT
+    assert result.committed == 2 and len(result.token_ids) == 3
+    assert state.sequences[keys[0]].committed == state.sequences[keys[1]].committed == 1
+    assert all(row.key == keys[2] for batch in oracle.batches for row in batch)
+
+
+def test_batched_token_execution_stays_within_both_scratch_budgets():
+    oracle = BatchedKVOracle(token_limit=3, row_limit=2)
+    state, _ = machine(executor=oracle)
+    keys = tuple(SequenceKey("batch", i, 0) for i in range(4))
+    for key in keys:
+        state.open(key)
+        state.prefill(key, 0, (1,), is_final=True)
+    results = state.advance_many(
+        tuple(
+            (i, TokenAdvanceRow(key, 1, None, 0, 0, (2, 3)), 3)
+            for i, key in enumerate(keys)
+        )
+    )
+    assert all(len(result.token_ids) == 3 for result in results)
+    assert all(
+        len(rows) <= 2 and sum(len(row.tokens) for row in rows) <= 3
+        for rows in oracle.batches
+    )
+    assert [len(rows) for rows in oracle.batches] == [1, 1, 1, 1, 2, 2, 2, 2]
+
+
+def test_batched_token_fatal_forward_stops_all_subsequent_gpu_submissions():
+    failure = RuntimeError("CUDA error: device-side assert triggered")
+    oracle = BatchedKVOracle(row_limit=1, failure=failure)
+    state, _ = machine(executor=oracle)
+    keys = tuple(SequenceKey("batch", i, 0) for i in range(2))
+    for key in keys:
+        state.open(key)
+        state.prefill(key, 0, (1,), is_final=True)
+    results = state.advance_many(
+        tuple(
+            (i, TokenAdvanceRow(key, 1, None, 0, 0, (2,)), 3)
+            for i, key in enumerate(keys)
+        )
+    )
+    assert all(result is failure for result in results)
+    assert len(oracle.batches) == 1
+    assert all(state.sequences[key].committed == 1 for key in keys)
+    assert not state.sequences[keys[0]].ready
 
 
 def test_token_close_reuses_all_slots_without_growing_free_storage():
@@ -278,7 +414,7 @@ def test_token_open_metadata_oom_preserves_all_slots(monkeypatch, failure):
 
 @pytest.fixture
 def socket_runtime(tmp_path):
-    state, oracle = machine()
+    state, oracle = machine(executor=BatchedKVOracle())
     contract = RuntimeContract(
         TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
         SpeculatorPlacementCapabilities(
@@ -304,6 +440,37 @@ def socket_runtime(tmp_path):
         server.stop()
         assert not state.sequences
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+
+
+def test_token_socket_batches_rows_at_each_draft_depth(socket_runtime):
+    state, oracle, _, session = socket_runtime
+    keys = tuple(
+        session.open_sequence(i, deadline=session.deadline()) for i in range(3)
+    )
+    prompts = ((1,), (2, 3), (4, 5, 6))
+    for key, prompt in zip(keys, prompts):
+        session.prefill(key, prompt, is_final=True, deadline=session.deadline())
+    rows = tuple(
+        TokenAdvanceRow(key, len(prompt), None, 0, 0, (7, 8))
+        for key, prompt in zip(keys, prompts)
+    )
+    result = session.collect(session.dispatch(7, rows, 3, deadline=session.deadline()))
+    expected = []
+    for prompt in prompts:
+        prefix = list(prompt) + [7, 8]
+        draft = []
+        for _ in range(3):
+            token = KVOracle.predict(prefix)
+            draft.append(token)
+            prefix.append(token)
+        expected.append(tuple(draft))
+    assert result.token_ids == tuple(expected)
+    assert result.valid_lengths == (3, 3, 3)
+    assert [len(batch) for batch in oracle.batches] == [3, 3, 3]
+    assert all(
+        state.sequences[key].committed == len(prompt) + 2
+        for key, prompt in zip(keys, prompts)
+    )
 
 
 def test_protocol_majors_are_explicit_and_v2_unchanged():
@@ -466,12 +633,14 @@ def test_token_row_expiry_preserves_completed_and_unrelated_rows(
 
     from vllm.v1.spec_decode.remote import server as server_module
     from vllm.v1.spec_decode.remote import token_server
+    from vllm.v1.spec_decode.remote.runtime import token_state
 
     state, oracle, server, session = socket_runtime
     session.failure_policy = "target_only"
     keys = [session.open_sequence(i, deadline=session.deadline()) for i in range(3)]
     for key in keys:
         session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+    oracle.row_limit = 1
     before = len(oracle.calls)
     now = [time.monotonic()]
     forward = oracle.forward
@@ -485,6 +654,7 @@ def test_token_row_expiry_preserves_completed_and_unrelated_rows(
         clock = SimpleNamespace(monotonic=lambda: now[0])
         patch.setattr(token_server, "time", clock)
         patch.setattr(server_module, "time", clock)
+        patch.setattr(token_state, "time", clock)
         patch.setattr(oracle, "forward", finish_first_row)
         result = session.collect(
             session.dispatch(
@@ -524,6 +694,7 @@ def test_real_state_rejection_all_acceptance_and_k0(accepted, next_k):
     for token in first.token_ids:
         assert token == oracle.predict(prefix)
         prefix.append(token)
+    oracle.row_limit = 1
     before = len(oracle.calls)
     delta = first.token_ids[:accepted] + (9,)
     second = state.advance(2, TokenAdvanceRow(key, 4, 1, 3, accepted, delta), next_k)

@@ -318,12 +318,15 @@ class _TokenServerSession(_ServerSession):
             value < 0 for array in (base, offered, accepted) for value in array
         ) or any(value < -1 for value in previous):
             raise ProtocolError("negative token state metadata")
-        statuses, valid, committed, identities = [], [], [], []
+        statuses = [SpeculatorStatusCode.INTERNAL_ERROR] * n
+        results = [None] * n
+        valid, committed, identities = [], [], []
         drafts: list[int] = []
-        offset = 0
         with self.server.adapter_turn():
+            updates = []
+            selected = []
+            offset = 0
             for i, key in enumerate(keys):
-                result = None
                 if not self.server.healthy:
                     status = SpeculatorStatusCode.INTERNAL_ERROR
                 elif self._expire_owned_sequences(deadline, (key,)):
@@ -332,9 +335,11 @@ class _TokenServerSession(_ServerSession):
                     status, _ = self.server.registry.begin_round(
                         key, message.batch_id, owner=self.session_id
                     )
+                statuses[i] = status
                 if status is OK:
-                    try:
-                        result = self.server.adapter.state.advance(
+                    selected.append(i)
+                    updates.append(
+                        (
                             message.batch_id,
                             TokenAdvanceRow(
                                 key,
@@ -346,12 +351,23 @@ class _TokenServerSession(_ServerSession):
                             ),
                             message.num_speculative_tokens,
                         )
-                    except AdapterError as error:
-                        self.server._adapter_failed(error)
-                        status = error.status
-                    except Exception as error:
-                        self.server._adapter_failed(error)
-                        status = SpeculatorStatusCode.INTERNAL_ERROR
+                    )
+                offset += lengths[i]
+            if updates:
+                outcomes = self.server.adapter.state.advance_many(
+                    tuple(updates), deadlines=(deadline,) * len(updates)
+                )
+                for i, outcome in zip(selected, outcomes):
+                    if isinstance(outcome, Exception):
+                        self.server._adapter_failed(outcome)
+                        statuses[i] = (
+                            outcome.status
+                            if isinstance(outcome, AdapterError)
+                            else SpeculatorStatusCode.INTERNAL_ERROR
+                        )
+                    else:
+                        results[i] = outcome
+            for key, status, result in zip(keys, statuses, results):
                 if status is not OK:
                     self._discard_owned_sequences((key,))
                 elif result is not None:
@@ -362,11 +378,10 @@ class _TokenServerSession(_ServerSession):
                 drafts.extend(
                     row_tokens + (0,) * (self.num_speculative_tokens - len(row_tokens))
                 )
-                statuses.append(int(status))
                 valid.append(len(row_tokens))
                 committed.append(result.committed if result is not None else -1)
                 identities.append(result.proposal_id if result is not None else -1)
-                offset += lengths[i]
+        statuses = [int(status) for status in statuses]
         slot = self.next_result_slot
         self.next_result_slot += 5
         self._send(
