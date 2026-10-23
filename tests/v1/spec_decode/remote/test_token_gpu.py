@@ -18,6 +18,30 @@ from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
 )
 
 
+@pytest.mark.parametrize("kind", ["features", "custom_state"])
+def test_token_native_input_contract_rejects_unsupported_dependencies(tmp_path, kind):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import validate_token_model_inputs
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    class TokenInput(torch.nn.Module):
+        def forward(self, input_ids, positions):
+            return input_ids
+
+    class FeatureInput(torch.nn.Module):
+        def forward(self, input_ids, positions, hidden_states):
+            return hidden_states
+
+    class StatefulInput(TokenInput):
+        def get_model_state_cls(self):
+            return MambaHybridModelState
+
+    config = token_config(tmp_path)
+    model = FeatureInput() if kind == "features" else StatefulInput()
+    with pytest.raises(ValueError, match="tokens and positions|default decoder"):
+        validate_token_model_inputs(config, model)
+
+
 def test_native_independent_loader_never_needs_target_weights(monkeypatch):
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
 

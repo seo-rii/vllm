@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Token-only native model/attention execution, without a target shell or engine."""
 
+import inspect
 from dataclasses import replace
 
 import numpy as np
@@ -31,6 +32,21 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenStateMachine,
     TokenStepExecutor,
 )
+
+
+def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> None:
+    """Fail closed when a native model needs inputs or state we do not supply."""
+    from vllm.v1.worker.gpu.model_states import resolve_model_state_cls
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    try:
+        inspect.signature(model.forward).bind(input_ids=None, positions=None)
+    except TypeError as error:
+        raise ValueError(
+            "token-only draft must consume tokens and positions alone"
+        ) from error
+    if resolve_model_state_cls(config, model) is not DefaultModelState:
+        raise ValueError("token-only draft requires the default decoder model state")
 
 
 class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
@@ -74,6 +90,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
 
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
+        validate_token_model_inputs(config, speculator.model)
         from vllm.v1.kv_cache_interface import FullAttentionSpec
         from vllm.v1.spec_decode.remote.runtime.kv_layout import (
             select_standalone_kv_spec,

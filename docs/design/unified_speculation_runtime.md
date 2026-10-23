@@ -129,7 +129,9 @@ text-only native decoder models with homogeneous causal full attention,
 same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
 parallel drafting. Qwen3, Llama and Mistral configured with `sliding_window=null`
 are examples; the runtime checks model capabilities and the loaded draft's
-actual KV specification rather than requiring a model-type name. Target and
+actual KV specification rather than requiring a model-type name. Loaded drafts
+must accept token IDs and positions alone and use the default decoder model
+state. Target and
 draft may have different hidden sizes, layer counts and attention geometry.
 Sliding-window, chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
 multimodal and Transformers-backend execution remain unsupported. Select the built-in
