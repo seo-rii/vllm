@@ -138,7 +138,7 @@ class SpeculativeExecutionConfig:
     policy: Literal["on_demand"] = "on_demand"
     """Generate proposals only after authoritative target outcomes."""
     endpoints: tuple[str, ...] = ()
-    """One endpoint, or 2..16 sticky token-only pool workers; none for local."""
+    """One endpoint, or 2..16 sticky own-KV pool workers; none for local."""
     transport: RemoteDraftTransport | None = None
     """Remote transport override. Unset retains the inline default."""
     failure_policy: RemoteDraftFailurePolicy | None = None
@@ -1760,11 +1760,9 @@ class SpeculativeConfig:
         if (
             self.execution is not None
             and len(self.execution.endpoints) > 1
-            and self.method != "draft_model"
+            and self.use_gemma4_mtp()
         ):
-            raise ValueError(
-                "remote draft pools currently require token-only draft_model"
-            )
+            raise ValueError("remote target-KV snapshots require one endpoint")
 
         if self.method == "draft_model" and self.execution is not None:
             remote = self.get_remote_draft_config()

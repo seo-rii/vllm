@@ -1,15 +1,16 @@
-# Shared token-only draft workers
+# Shared own-KV draft workers
 
-Independent verifier engines can share same-host token-only draft workers.
+Independent verifier engines can share same-host token-only or target-conditioned
+own-KV draft workers.
 Each request stays on the worker selected when its remote sequence opens.
 Workers combine proposals from different verifiers into a ragged GPU batch,
 with one execution thread owning their mutable model and KV state.
 
-This opt-in path uses `method="draft_model"`, greedy sampling, inline transport,
-target TP1 and draft TP1. It retains the token-only runtime's model and tokenizer
-contracts. Target-conditioned EAGLE/MTP, Gemma target-KV snapshots, predictive
-caches, cross-node execution and live sequence migration are not supported by
-this pool.
+Token-only workers use `method="draft_model"`, inline transport, target TP1 and
+draft TP1. Own-KV EAGLE3/MTP workers retain their existing model contracts, target
+TP1/TP2 and draft TP1, and accept inline or explicit CUDA IPC transport. Both
+require sequential greedy drafting. Gemma target-KV snapshots, predictive
+caches, cross-node execution and live sequence migration remain unsupported.
 
 ## Configuration
 
@@ -53,9 +54,22 @@ Start another worker at a different endpoint and pass both to each verifier:
 
 Between one and sixteen distinct endpoints are accepted. A single endpoint
 retains the original session path and can also be shared by multiple verifiers
-(N:1). Other remote methods continue to require exactly one endpoint. Each
+(N:1). Target-KV snapshot methods still require exactly one endpoint. Each
 worker must advertise sufficient per-batch limits for the verifier; the workers
 do not add their individual limits together during handshake.
+
+For EAGLE3/MTP, start workers with the existing
+[`--adapter gpu` command](remote_mtp.md) at distinct endpoints and use the same
+`execution` object with the corresponding `method`, model and K. The GPU server
+uses a bounded owner queue for both single-endpoint and pooled clients. All
+workers must provide the same checkpoint and feature contract.
+
+With `transport="cuda_ipc"`, every endpoint must connect at startup. The target
+reserves one export arena per endpoint before KV profiling; their memory costs
+add together. Feature partitions wait on the producer CUDA event, and each
+driver retains its tensors until the session completes or quarantines the
+transfer. An IPC session whose arena was quarantined cannot reconnect and
+allocate a replacement arena during serving.
 
 ## Routing and failure
 
@@ -92,8 +106,11 @@ not a process response-time guarantee.
 
 The worker schedules verifier queues in round-robin order. A short coalescing
 window groups compatible pending proposals; lifecycle operations remain ordered
-with that connection's proposals. Correction tokens are packed first, followed
-by one packed forward per live draft depth. Row validation and KV admission
+with that connection's proposals. Token-only correction tokens are packed first,
+followed by one packed forward per live draft depth. Target-conditioned workers
+combine rounds with equal effective K, preserving per-sequence and packed-token
+feature ordering; K=0 still updates context without a speculative rollout.
+Row validation and KV admission
 failures remain per-row. A shared GPU execution failure invalidates the affected
 rows rather than retrying partially written KV.
 
@@ -105,6 +122,11 @@ rows rather than retrying partially written KV.
 | `--max-token-bytes-per-verifier` | 16 MiB | Foreground payload bytes for one verifier |
 | `--max-sequences-per-verifier` | Worker sequence limit | Live request slots per verifier |
 | `--batch-wait-ms` | 1 ms | Maximum coalescing wait before starting a batch |
+
+The token byte flags above apply to token-only workers. For `--adapter gpu`,
+use `--max-queued-feature-bytes` and `--max-feature-bytes-per-verifier` (both
+default to 1 GiB); accounting includes IPC descriptor payload sizes. The other
+queue options have the same meaning.
 
 These queue limits supplement transport receive limits, connection admission and
 the worker's global sequence/KV limits. They do not reserve every verifier's

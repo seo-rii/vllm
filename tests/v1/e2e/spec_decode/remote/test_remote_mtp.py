@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
@@ -130,10 +130,17 @@ def draft_server(model: str, log_path: Path, *, target_kv: bool = False):
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv", [("inline", False), ("cuda_ipc", False), ("inline", True)]
+    "transport,target_kv,num_workers",
+    [
+        ("inline", False, 1),
+        ("cuda_ipc", False, 1),
+        ("inline", False, 2),
+        ("cuda_ipc", False, 2),
+        ("inline", True, 1),
+    ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport, target_kv
+    vllm_runner, monkeypatch, tmp_path, transport, target_kv, num_workers
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
@@ -173,7 +180,13 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     )
     with vllm_runner(model, **kwargs) as baseline:
         expected = baseline.llm.generate(prompts, sampling, use_tqdm=False)
-    with draft_server(model, tmp_path / "draft.log", target_kv=target_kv) as endpoint:
+    with ExitStack() as servers:
+        endpoints = tuple(
+            servers.enter_context(
+                draft_server(model, tmp_path / f"draft-{i}.log", target_kv=target_kv)
+            )
+            for i in range(num_workers)
+        )
         config = dict(
             method="mtp",
             model=maybe_model_redirect(GEMMA_DRAFT) if target_kv else model,
@@ -182,18 +195,24 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             draft_tensor_parallel_size=1,
             draft_sample_method="greedy",
             attention_backend=backend,
-            remote_draft=dict(
-                endpoint=endpoint,
-                transport=transport,
-                failure_policy="error",
-                request_timeout_ms=5000,
-                startup_timeout_ms=600000,
-            ),
         )
+        remote_options = dict(
+            transport=transport,
+            failure_policy="error",
+            request_timeout_ms=5000,
+            startup_timeout_ms=600000,
+        )
+        if num_workers == 1:
+            config["remote_draft"] = dict(endpoint=endpoints[0], **remote_options)
+        else:
+            config["execution"] = dict(
+                placement="remote", endpoints=endpoints, **remote_options
+            )
         with vllm_runner(model, speculative_config=config, **kwargs) as remote:
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
-            assert actual_config.remote_draft.transport == transport
+            assert actual_config.get_remote_draft_config().transport == transport
+            assert actual_config.get_remote_draft_endpoints() == endpoints
             for inputs, reference in (
                 (prompts, expected),
                 (list(reversed(prompts)), list(reversed(expected))),

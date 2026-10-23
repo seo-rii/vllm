@@ -89,7 +89,7 @@ def test_remote_execution_requires_bounded_distinct_endpoints(endpoints):
         SpeculativeExecutionConfig(placement="remote", endpoints=endpoints)
 
 
-def test_pool_validates_every_endpoint_and_rejects_other_remote_methods():
+def test_pool_validates_every_endpoint_and_rejects_unsupported_methods():
     endpoints = ("unix:///draft0.sock", "tcp://127.0.0.1:5556")
     execution = SpeculativeExecutionConfig(placement="remote", endpoints=endpoints)
     assert execution.endpoints == endpoints
@@ -97,7 +97,7 @@ def test_pool_validates_every_endpoint_and_rejects_other_remote_methods():
         SpeculativeExecutionConfig(
             placement="remote", endpoints=(endpoints[0], "bad-endpoint")
         )
-    with pytest.raises(ValidationError, match="token-only draft_model"):
+    with pytest.raises(ValidationError, match="ngram.*not supported"):
         SpeculativeConfig(
             method="ngram",
             num_speculative_tokens=3,

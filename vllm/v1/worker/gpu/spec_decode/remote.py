@@ -18,6 +18,10 @@ from vllm.utils import random_uuid
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.proposal import ProposalHandle, SpeculatorOutput
 from vllm.v1.spec_decode.remote.capabilities import TargetFeatureKind
+from vllm.v1.spec_decode.remote.conditioned_pool import (
+    ConditionedDraftPool,
+    ConditionedPoolHandle,
+)
 from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
     host_allocation_failure,
@@ -54,7 +58,7 @@ class _RemoteHandle(ProposalHandle):
     step: DraftStep
     context: LocalExecutionContext | None
     started: float
-    session_handle: RemoteProposalHandle | None = None
+    session_handle: RemoteProposalHandle | ConditionedPoolHandle | None = None
     rows: tuple[int, ...] = ()
     output: SpeculatorOutput | None = None
     error: str | None = None
@@ -83,7 +87,7 @@ class RemoteSpeculator(BaseSpeculator):
         self.num_speculative_steps = spec.num_speculative_tokens
         self._contract = create_runtime_contract(vllm_config)
         self._tp = get_tp_group()
-        self._session: RemoteDraftSession | None = None
+        self._session: RemoteDraftSession | ConditionedDraftPool | None = None
         self._requests: dict[str, _Request] = {}
         self._terminal_requests: set[str] = set()
         self._closing_requests: set[str] = set()
@@ -115,7 +119,18 @@ class RemoteSpeculator(BaseSpeculator):
                 max_model_len=vllm_config.model_config.max_model_len,
                 vocab_size=vllm_config.model_config.get_vocab_size(),
             )
-            self._session = RemoteDraftSession.from_config(remote_config, identity)
+            endpoints = spec.get_remote_draft_endpoints()
+            if len(endpoints) > 1:
+                self._session = ConditionedDraftPool(
+                    endpoints,
+                    identity,
+                    transport=remote_config.transport,
+                    failure_policy=remote_config.failure_policy,
+                    request_timeout_ms=remote_config.request_timeout_ms,
+                    startup_timeout_ms=remote_config.startup_timeout_ms,
+                )
+            else:
+                self._session = RemoteDraftSession.from_config(remote_config, identity)
             try:
                 self._session.connect()
                 if self._session.feature_schema != self._contract.schema:
@@ -195,7 +210,7 @@ class RemoteSpeculator(BaseSpeculator):
                 )
                 if cancelled:
                     # A lost completion cannot prove that IPC readers finished.
-                    self._session.close()
+                    self._invalidate_session()
                 if cancelled or pending is None or pending.session_handle is None:
                     self._flush_request_closes()
             except Exception as exc:
@@ -218,6 +233,12 @@ class RemoteSpeculator(BaseSpeculator):
         for req_id in req_ids:
             del self._requests[req_id]
             self._closing_requests.remove(req_id)
+
+    def _invalidate_session(self) -> None:
+        if isinstance(self._session, ConditionedDraftPool):
+            self._session.invalidate()
+        elif self._session is not None:
+            self._session.close()
 
     def close(self) -> None:
         self._closed = True
@@ -345,7 +366,7 @@ class RemoteSpeculator(BaseSpeculator):
             if self._session is not None:
                 try:
                     # Session teardown quarantines IPC exports on uncertain completion.
-                    self._session.close()
+                    self._invalidate_session()
                     self._flush_request_closes()
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
@@ -377,7 +398,13 @@ class RemoteSpeculator(BaseSpeculator):
                     if handle.error is None and handle.session_handle is not None:
                         assert self._session is not None and handle.output is not None
                         started = time.perf_counter()
-                        result = self._session.collect(handle.session_handle).output
+                        if isinstance(self._session, RemoteDraftSession):
+                            assert isinstance(
+                                handle.session_handle, RemoteProposalHandle
+                            )
+                            result = self._session.collect(handle.session_handle).output
+                        else:
+                            result = self._session.collect(handle.session_handle).output
                         self._stats["session_seconds"] += time.perf_counter() - started
                         handle.output.token_ids[list(handle.rows)] = result.token_ids
                         handle.output.valid_lengths[list(handle.rows)] = (
@@ -409,7 +436,7 @@ class RemoteSpeculator(BaseSpeculator):
                             and handle.session_handle is not None
                         ):
                             try:
-                                self._session.close()
+                                self._invalidate_session()
                             except Exception:
                                 logger.exception(
                                     "Failed to close remote proposal session"
@@ -506,7 +533,14 @@ class RemoteSpeculator(BaseSpeculator):
             sequence_rows=rows,
         )
         feature_bytes = self._stats["feature_bytes"]
-        self._select(features, tokens, rows)
+        selected = self._select(features, tokens, rows)
+        if isinstance(self._session, ConditionedDraftPool):
+            # Keep both worker partitions and session admission compaction live
+            # alongside the runner selection. Each is bounded by one full batch.
+            partitions = tuple(
+                None if tensor is None else tensor.clone() for tensor in selected.slots
+            )
+            tuple(None if tensor is None else tensor.clone() for tensor in partitions)
         self._stats["feature_bytes"] = feature_bytes
 
     def _dispatch_step(
@@ -541,7 +575,11 @@ class RemoteSpeculator(BaseSpeculator):
         if new_requests:
             opened_keys: tuple[SequenceKey, ...] = ()
             try:
-                opened_keys = session.open_sequences(
+                opened_keys = (
+                    session.reserve_sequences
+                    if isinstance(session, ConditionedDraftPool)
+                    else session.open_sequences
+                )(
                     tuple(next(self._sequence_ids) for _ in new_requests),
                     deadline=preparation_deadline,
                 )
@@ -551,7 +589,7 @@ class RemoteSpeculator(BaseSpeculator):
                 # Remote opens may already exist without a local request owner.
                 # Fence the stream before dropping their local records; do not
                 # spend a second close-RPC budget after the failed preparation.
-                session.close()
+                self._invalidate_session()
                 session.close_sequences(opened_keys)
                 raise
         active_rows = [
@@ -559,7 +597,7 @@ class RemoteSpeculator(BaseSpeculator):
             for row, req_id in enumerate(batch.req_ids)
             if req_id not in self._terminal_requests
             and session.sequence_state(self._requests[req_id].key)
-            in (SequenceState.PREFILLING, SequenceState.READY)
+            in (SequenceState.OPENING, SequenceState.PREFILLING, SequenceState.READY)
         ]
         handle.output = self._empty_output(batch.num_reqs)
         if not active_rows:
@@ -640,8 +678,10 @@ class RemoteSpeculator(BaseSpeculator):
             query_lens.append(query_len)
             accepted.append(sampled[row] - 1)
             sequence_rows.append(feature_row)
-        session.prefill_many(chunks, deadline=preparation_deadline)
-        if rows:
+        pooled = isinstance(session, ConditionedDraftPool)
+        if isinstance(session, RemoteDraftSession):
+            session.prefill_many(chunks, deadline=preparation_deadline)
+        if rows or pooled:
             proposal = RemoteProposalBatch(
                 batch_id=next(self._batch_ids),
                 keys=tuple(keys),
@@ -651,9 +691,14 @@ class RemoteSpeculator(BaseSpeculator):
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
                 num_speculative_tokens=num_speculative_tokens,
             )
-            handle.session_handle = session.dispatch(
-                proposal, deadline=preparation_deadline
-            )
+            if isinstance(session, ConditionedDraftPool):
+                handle.session_handle = session.dispatch_prepared(
+                    proposal, tuple(chunks), deadline=preparation_deadline
+                )
+            else:
+                handle.session_handle = session.dispatch(
+                    proposal, deadline=preparation_deadline
+                )
             handle.rows = tuple(rows)
             handle.retained = (features, chunks, proposal)
         else:

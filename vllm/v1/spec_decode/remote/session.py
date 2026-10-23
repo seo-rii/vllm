@@ -653,19 +653,54 @@ class RemoteDraftSession:
     def _open_many(
         self, sequence_ids: Sequence[int], *, deadline: float
     ) -> tuple[SequenceKey, ...]:
-        records: list[_SequenceRecord] = []
+        keys = self.reserve_sequences(sequence_ids)
+        return self.open_reserved(keys, deadline=deadline, reconnect=False)
+
+    def reserve_sequences(self, sequence_ids: Sequence[int]) -> tuple[SequenceKey, ...]:
+        """Reserve identities locally for a pool's per-worker preparation job."""
+        self._require_no_inflight("reserve sequences")
+        if len(set(sequence_ids)) != len(sequence_ids):
+            raise ValueError("duplicate sequence ids in reserve_sequences")
         for sequence_id in sequence_ids:
-            generation = self._next_generation
-            self._next_generation += 1
-            key = SequenceKey(
-                verifier_instance_id=self._identity.verifier_instance_id,
-                sequence_id=sequence_id,
-                generation=generation,
-            )
-            record = _SequenceRecord(key, SequenceState.OPENING)
-            self._records[sequence_id] = record
-            records.append(record)
-        keys = tuple(record.key for record in records)
+            record = self._records.get(sequence_id)
+            if record is not None and record.state not in (
+                SequenceState.DESYNCED,
+                SequenceState.INVALID,
+            ):
+                raise RemoteDraftError(f"sequence {sequence_id} is already open")
+        keys = []
+        try:
+            for sequence_id in sequence_ids:
+                key = SequenceKey(
+                    self._identity.verifier_instance_id,
+                    sequence_id,
+                    self._next_generation,
+                )
+                self._next_generation += 1
+                keys.append(key)
+                self._records[sequence_id] = _SequenceRecord(key, SequenceState.OPENING)
+        except BaseException:
+            for key in keys:
+                self._records.pop(key.sequence_id, None)
+            raise
+        return tuple(keys)
+
+    def open_reserved(
+        self,
+        keys: tuple[SequenceKey, ...],
+        *,
+        deadline: float,
+        reconnect: bool = True,
+    ) -> tuple[SequenceKey, ...]:
+        """Open only never-submitted identities; reconnect cannot revive old KV."""
+        self._require_no_inflight("open reserved sequences")
+        records = [self._current_record(key) for key in keys]
+        if len(set(keys)) != len(keys) or any(
+            record.state is not SequenceState.OPENING for record in records
+        ):
+            raise RemoteDraftError("only newly reserved sequences can be opened")
+        if reconnect:
+            self.maybe_reconnect(deadline=deadline)
         if not self._alive:
             for record in records:
                 record.state = SequenceState.INVALID
