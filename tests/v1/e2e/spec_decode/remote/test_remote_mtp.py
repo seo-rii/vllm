@@ -315,6 +315,7 @@ def test_remote_sliding_window_draft_matches_native_and_target(
     target, draft = sliding_window_models
     kwargs = dict(
         tokenizer_mode="hf",
+        trust_remote_code=False,
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
