@@ -23,9 +23,7 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
-    make_standalone_kv_config as _make_standalone_kv_config,
-)
-from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    make_grouped_standalone_kv_config,
     select_standalone_kv_spec,
 )
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
@@ -58,7 +56,6 @@ def initialize_standalone_kv_cache_config(
     from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
 
     specs = get_kv_cache_spec(vllm_config)
-    first = select_standalone_kv_spec(specs)
     layers = get_layers_from_vllm_config(
         vllm_config,
         AttentionLayerBase,  # type: ignore[type-abstract]
@@ -69,7 +66,7 @@ def initialize_standalone_kv_cache_config(
     layout = resolve_kv_cache_layout(
         vllm_config, [[layout.name for layout in layouts]], specs.values()
     )
-    kv_config = _make_standalone_kv_config(first, list(specs), kv_cache_bytes, layout)
+    kv_config = make_grouped_standalone_kv_config(specs, kv_cache_bytes, layout)
     vllm_config.cache_config.num_gpu_blocks = kv_config.num_blocks
     return kv_config
 
@@ -245,15 +242,15 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.kv_config = initialize_standalone_kv_cache_config(
                 vllm_config, kv_cache_bytes
             )
-            first = self.kv_config.kv_cache_groups[0].kv_cache_spec
-            self.block_size = first.block_size
+            group_specs = [g.kv_cache_spec for g in self.kv_config.kv_cache_groups]
+            self.block_size = group_specs[0].block_size
             self.num_blocks = self.kv_config.num_blocks
             scheduler = vllm_config.scheduler_config
             self.input_buffers = InputBuffers(
                 scheduler.max_num_seqs, scheduler.max_num_batched_tokens, device
             )
             self.block_tables = BlockTables(
-                block_sizes=[self.block_size],
+                block_sizes=[spec.block_size for spec in group_specs],
                 max_num_reqs=scheduler.max_num_seqs,
                 max_num_batched_tokens=scheduler.max_num_batched_tokens,
                 max_num_blocks_per_group=[
@@ -262,8 +259,9 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                             vllm_config.model_config.max_model_len / self.block_size
                         ),
                         self.block_size,
-                        token_alignment=first.block_table_token_alignment,
+                        token_alignment=group_spec.block_table_token_alignment,
                     )
+                    for group_spec in group_specs
                 ],
                 device=device,
             )
@@ -305,7 +303,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             draft_bytes,
             embedding_bytes,
             head_bytes,
-            sum(t.size for t in self.kv_config.kv_cache_tensors),
+            self.kv_config.kv_cache_tensors[0].size,
             torch.accelerator.memory_allocated(device),
             vllm_config.model_config.dtype,
             spec.draft_model_config.quantization,
@@ -318,6 +316,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         return create_runtime_contract(config)
 
     def _load_speculator(self, config, device, shared_weights_source):
+        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
@@ -329,6 +328,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
         speculator = speculator_cls(config, device)
         speculator.load_model(target_shell)
+        select_standalone_kv_spec(get_kv_cache_spec(config))
         return speculator
 
     def _init_sampling_buffers(self, max_num_reqs: int) -> None:
@@ -429,7 +429,9 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         try:
             for req_index, update in plan.block_table_updates.items():
                 self.block_tables.append_block_ids(
-                    req_index, (update.block_ids,), overwrite=update.start == 0
+                    req_index,
+                    (update.block_ids,) * self.block_tables.num_kv_cache_groups,
+                    overwrite=update.start == 0,
                 )
             self.block_tables.apply_staged_writes()
         except BaseException as error:
