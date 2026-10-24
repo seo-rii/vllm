@@ -8,6 +8,7 @@ effective K. Native MTP receives compact inputs with zero rejections and
 performs its usual token shift and all configured module forwards.
 """
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -71,6 +72,36 @@ class MultiModuleReplay:
     @property
     def num_sequences(self) -> int:
         return len(self._history)
+
+    def feature_memory_bounds(
+        self, *, max_num_reqs: int, max_num_tokens: int, max_model_len: int
+    ) -> dict[str, int]:
+        """Bound single-verifier floating payloads, excluding allocator overhead."""
+        if min(max_num_reqs, max_num_tokens, max_model_len) <= 0:
+            raise ValueError("MTP feature budgets must be positive")
+        row_bytes = sum(
+            math.prod(slot.trailing_shape)
+            * torch.empty(
+                (), dtype=getattr(torch, slot.dtype), device="cpu"
+            ).element_size()
+            for slot in self._schema.slots
+            if not slot.per_sequence and getattr(torch, slot.dtype).is_floating_point
+        )
+        history_rows = max_num_reqs * self._history_rows
+        bounds = {
+            "history_bytes": history_rows * row_bytes,
+            "staged_history_bytes": min(max_num_reqs, max_num_tokens)
+            * self._history_rows
+            * row_bytes,
+            "final_prefill_bytes": max_num_reqs
+            * min(max_num_tokens, max_model_len)
+            * row_bytes,
+            "incoming_bytes": max_num_tokens * row_bytes,
+            "prepared_bytes": (max_num_tokens + history_rows) * row_bytes,
+            "packed_bytes": max_num_tokens * row_bytes,
+        }
+        bounds["total_bytes"] = sum(bounds.values())
+        return bounds
 
     def prepare_row(
         self, row: DraftStepRow, features: Features
