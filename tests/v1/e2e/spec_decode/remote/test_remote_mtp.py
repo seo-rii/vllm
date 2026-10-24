@@ -440,9 +440,8 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                 assert_speculation(remote, f"remote-{num_workers}")
 
 
-@pytest.fixture
-def tiny_exaone_mtp_model(tmp_path, mtp_window):
-    """Real seeded Exaone weights including the separately stored native MTP head."""
+def _tiny_exaone_mtp_model(tmp_path, mtp_window, num_modules):
+    """Initialize distinct real target layers and save them as native MTP modules."""
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -467,11 +466,12 @@ def tiny_exaone_mtp_model(tmp_path, mtp_window):
         num_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=64,
-        num_nextn_predict_layers=1,
+        num_nextn_predict_layers=num_modules,
         mtp_layer_types=[
             "full_attention" if mtp_window is None else "sliding_attention"
-        ],
-        mtp_sliding_windows=[mtp_window or 32],
+        ]
+        * num_modules,
+        mtp_sliding_windows=[mtp_window or 32] * num_modules,
         rope_parameters={"rope_type": "default", "rope_theta": 1000000.0},
         bos_token_id=0,
         eos_token_id=1,
@@ -493,12 +493,19 @@ def tiny_exaone_mtp_model(tmp_path, mtp_window):
             }
         )
     weights = dict(model.state_dict())
-    weights.update(
-        {
-            f"mtp.layers.0.{name}": tensor.clone()
-            for name, tensor in model.model.layers[0].state_dict().items()
-        }
-    )
+    assert 1 <= num_modules <= len(model.model.layers)
+    for index in range(num_modules):
+        weights.update(
+            {
+                f"mtp.layers.{index}.{name}": tensor.clone()
+                for name, tensor in model.model.layers[index].state_dict().items()
+            }
+        )
+    if num_modules == 2:
+        for name in ("self_attn.q_proj.weight", "mlp.gate_proj.weight"):
+            assert not torch.equal(
+                weights[f"mtp.layers.0.{name}"], weights[f"mtp.layers.1.{name}"]
+            )
     weights["mtp.fc.weight"] = fusion.weight.detach()
     weights.update(
         {f"mtp.{name}": tensor for name, tensor in norms.state_dict().items()}
@@ -513,6 +520,16 @@ def tiny_exaone_mtp_model(tmp_path, mtp_window):
     )
     tokenizer.save_pretrained(path)
     return str(path)
+
+
+@pytest.fixture
+def tiny_exaone_mtp_model(tmp_path, mtp_window):
+    return _tiny_exaone_mtp_model(tmp_path, mtp_window, 1)
+
+
+@pytest.fixture
+def tiny_exaone_two_mtp_model(tmp_path):
+    return _tiny_exaone_mtp_model(tmp_path, None, 2)
 
 
 def _unpack_mtp_experts(state):
@@ -987,7 +1004,10 @@ def tiny_ernie_mtp_model(tmp_path):
             ("glm4_moe_lite", None, "glm4-moe-lite"),
         )
     ]
-    + [pytest.param("ernie", None, 1, id="k1-ernie")],
+    + [
+        pytest.param("ernie", None, 1, id="k1-ernie"),
+        pytest.param("exaone_two", None, 2, id="k2-exaone-two-full"),
+    ],
 )
 def test_remote_native_mtp_matches_native_and_target(
     vllm_runner,
@@ -1029,7 +1049,7 @@ def test_remote_native_mtp_matches_native_and_target(
         attention_config=attention_config,
         disable_log_stats=False,
     )
-    moe_backend = None if mtp_family == "exaone" else "triton"
+    moe_backend = None if mtp_family in ("exaone", "exaone_two") else "triton"
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
     if hybrid_target:
@@ -1257,6 +1277,31 @@ def test_remote_native_mtp_matches_native_and_target(
             for layer in worker.model_runner.get_draft_model().modules()
         )
 
+    def draft_module_identity(worker):
+        import torch
+
+        from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+            MultiModuleMTPSpeculator,
+        )
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, MultiModuleMTPSpeculator)
+        draft = runner.get_draft_model()
+        layers = draft.model.layers
+        assert len(layers) == draft.model.num_mtp_layers == 2
+        assert not torch.equal(
+            layers[0].self_attn.qkv_proj.weight, layers[1].self_attn.qkv_proj.weight
+        )
+        assert not torch.equal(
+            layers[0].mlp.gate_up_proj.weight, layers[1].mlp.gate_up_proj.weight
+        )
+        return {
+            "speculator": type(runner.speculator).__name__,
+            "model": type(draft).__name__,
+            "modules": len(layers),
+            "distinct_attention_and_mlp_weights": True,
+        }
+
     def draft_kv_policy(worker):
         from vllm.model_executor.layers.attention import Attention
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
@@ -1304,14 +1349,18 @@ def test_remote_native_mtp_matches_native_and_target(
         spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
         if dense_mla:
             spec_type = "MLAAttentionSpec"
-        assert policy == [[(mtp_window, spec_type, mtp_window)]]
+        num_modules = 2 if mtp_family == "exaone_two" else 1
+        assert policy == [[(mtp_window, spec_type, mtp_window)] * num_modules]
         record_property("native.kv_policy", policy)
+        if num_modules == 2:
+            identity = native.llm.collective_rpc(draft_module_identity)
+            record_property("native.module_identity", identity)
         if dense_mla:
             layout = native.llm.collective_rpc(draft_mla_layout)
             assert layout == [[expected_mla_layout]]
             record_property("native.mla_layout", layout)
         backends = native.llm.collective_rpc(draft_moe_backends)
-        draft_has_moe = mtp_family not in ("exaone", "ernie")
+        draft_has_moe = mtp_family not in ("exaone", "exaone_two", "ernie")
         assert backends == [["TRITON"] if draft_has_moe else []]
         record_property("native.moe_backends", backends)
         recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
@@ -1367,3 +1416,325 @@ def test_remote_native_mtp_matches_native_and_target(
             for line in server_log.read_text().splitlines()
         )
         record_property("remote.decode_backend_from_server_log", "TRITON_MLA")
+
+
+def _run_two_module_oracle(model_path: str, result_path: str) -> None:
+    """Compare incremental native GPU state with fresh full-prefix executions."""
+    import itertools
+    import json
+
+    import torch
+    from transformers import ExaoneMoeForCausalLM
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
+    from vllm.v1.spec_decode.remote.runtime.gpu import (
+        GPUDraftStepExecutor,
+        make_gpu_adapter,
+    )
+    from vllm.v1.spec_decode.remote.server import PrefillInputs, StandaloneProposalBatch
+    from vllm.v1.spec_decode.remote.session import frame_to_tensor, tensor_to_frame
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+        MultiModuleMTPSpeculator,
+    )
+
+    torch.set_num_threads(1)
+    # Features come from the actual target checkpoint. Controlled verification
+    # outcomes below test state alignment, not acceptance quality of random weights.
+    target = ExaoneMoeForCausalLM.from_pretrained(
+        model_path, dtype=torch.bfloat16, attn_implementation="eager"
+    ).eval()
+    config = EngineArgs(
+        model=model_path,
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=256,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        attention_config={"backend": "TRITON_ATTN"},
+        speculative_config={
+            "method": "mtp",
+            "model": model_path,
+            "num_speculative_tokens": 2,
+            "draft_tensor_parallel_size": 1,
+            "attention_backend": "TRITON_ATTN",
+        },
+    ).create_engine_config()
+    adapter = make_gpu_adapter(
+        config, device=torch.device("cuda:0"), kv_cache_bytes=32 << 20
+    )
+    executor = adapter.executor
+    assert isinstance(executor, GPUDraftStepExecutor)
+    assert isinstance(executor.speculator, MultiModuleMTPSpeculator)
+    layers = [
+        layer
+        for layer in executor.speculator.model.modules()
+        if isinstance(layer, Attention)
+    ]
+    assert len(layers) == 2
+    assert all(layer.sliding_window is None for layer in layers)
+    assert all(layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers)
+    assert all(layer.kv_cache.shape[1:] == (2, 16, 64) for layer in layers)
+    assert not torch.equal(
+        executor.speculator.model.model.layers[0].self_attn.qkv_proj.weight,
+        executor.speculator.model.model.layers[1].self_attn.qkv_proj.weight,
+    )
+    schema = adapter.feature_schema()
+    assert adapter.capabilities().num_prefill_lookahead == 2
+    batch_ids = itertools.count()
+    reference_ids = itertools.count(100)
+    checks = []
+
+    @torch.inference_mode()
+    def target_features(tokens):
+        output = target(
+            torch.tensor([tokens], dtype=torch.int64),
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        hidden = output.hidden_states[-1][0].clone()
+        assert hidden.shape == (len(tokens), 128)
+        assert torch.isfinite(hidden).all()
+        return hidden
+
+    def frames(tokens, positions, hidden, lookahead=None):
+        values = {
+            "token_ids": torch.tensor(tokens, dtype=torch.int32),
+            "positions": torch.tensor(positions, dtype=torch.int64),
+            "last_hidden_states": hidden,
+            "next_prefill_tokens": lookahead,
+        }
+        return tuple(
+            None if values[slot.kind] is None else tensor_to_frame(i, values[slot.kind])
+            for i, slot in enumerate(schema.slots)
+        )
+
+    def prefill(key, tokens, hidden, *, chunked):
+        adapter.open_sequence(key)
+        offset = 0
+        while offset < len(tokens):
+            # A nonfinal chunk must have both real future lookahead tokens.
+            count = min(32, len(tokens) - offset) if chunked else len(tokens)
+            if 0 < len(tokens) - offset - count < 2:
+                count -= 1
+            end = offset + count
+            final = end == len(tokens)
+            lookahead = None if final else torch.tensor([tokens[end : end + 2]])
+            adapter.prefill(
+                key,
+                PrefillInputs(
+                    offset,
+                    count,
+                    final,
+                    frames(
+                        tokens[offset:end],
+                        range(offset, end),
+                        hidden[offset:end],
+                        lookahead,
+                    ),
+                ),
+            )
+            offset = end
+
+    def advance(keys, token_rows, position_rows, hidden_rows, accepted, recovery, k):
+        result = adapter.advance_and_propose(
+            StandaloneProposalBatch(
+                batch_id=next(batch_ids),
+                keys=tuple(keys),
+                active_rows=tuple(range(len(keys))),
+                num_speculative_tokens=2,
+                accepted_counts=tensor_to_frame(
+                    0, torch.tensor(accepted, dtype=torch.int32)
+                ),
+                recovery_tokens=tensor_to_frame(
+                    0, torch.tensor(recovery, dtype=torch.int32)
+                ),
+                features=frames(
+                    list(itertools.chain.from_iterable(token_rows)),
+                    list(itertools.chain.from_iterable(position_rows)),
+                    torch.cat(hidden_rows),
+                ),
+                query_lens=tuple(map(len, token_rows)),
+                effective_num_speculative_tokens=k,
+            )
+        )
+        assert result.row_statuses == (SpeculatorStatusCode.OK,) * len(keys)
+        assert frame_to_tensor(result.valid_lengths).tolist() == [k] * len(keys)
+        return frame_to_tensor(result.token_ids)[:, :k].tolist()
+
+    def kv_prefix(key, length):
+        req_index = adapter.planner.req_index(key)
+        blocks = adapter.planner.block_pool.blocks(req_index)
+        indices = torch.tensor(blocks, dtype=torch.int64, device=executor.device)
+        result = []
+        for module, layer in enumerate(layers):
+            # Module 1's final row still depends on an unverified candidate.
+            # Only compare the authoritative materialized prefix for each module.
+            valid = max(length - module, 0)
+            cache = layer.kv_cache.index_select(0, indices).transpose(1, 2)
+            prefix = cache.flatten(0, 1)[:valid].cpu().clone()
+            assert torch.isfinite(prefix).all()
+            result.append(prefix)
+        return result
+
+    def compare_reference(key, tokens, hidden, recovery, k, actual, label):
+        assert adapter.planner.num_computed(key) == len(tokens)
+        incremental = kv_prefix(key, len(tokens))
+        reference = SequenceKey("oracle", next(reference_ids), 0)
+        prefill(reference, tokens, hidden, chunked=False)
+        expected = advance([reference], [[]], [[]], [hidden[:0]], [0], [recovery], k)[0]
+        assert actual == expected, (label, key, k, actual, expected)
+        for module, (left, right) in enumerate(
+            zip(incremental, kv_prefix(reference, len(tokens)))
+        ):
+            assert torch.equal(left, right), (label, key, module, len(tokens))
+        checks.append(
+            {
+                "case": label,
+                "length": len(tokens),
+                "effective_k": k,
+                "kv_lengths": [len(tensor) for tensor in incremental],
+            }
+        )
+        adapter.close_sequences((reference,))
+
+    keys = [SequenceKey("incremental", i, 0) for i in range(3)]
+    tokens = [
+        [3 + (i * 7 + row) % 125 for i in range(n)]
+        for row, n in enumerate((1, 15, 116))
+    ]
+    hidden = [target_features(row) for row in tokens]
+    for key, ids, features in zip(keys, tokens, hidden):
+        prefill(key, ids, features, chunked=True)
+    recovery = [17, 23, 29]
+    drafts: list[list[int]] = [[], [], []]
+    # Each accepted count refers to the preceding submitted K, including zero.
+    rounds = [
+        (2, (0, 0, 0)),
+        (0, (0, 1, 2)),
+        (1, (0, 0, 0)),
+        (2, (1, 0, 1)),
+        (2, (2, 1, 0)),
+        (0, (0, 2, 1)),
+        (2, (0, 0, 0)),
+        (1, (1, 2, 0)),
+    ]
+    for step, (k, accepted) in enumerate(rounds):
+        token_rows, position_rows, hidden_rows = [], [], []
+        next_recovery = [3 + (step * 11 + row * 13) % 125 for row in range(3)]
+        for row in range(3):
+            if step == 0:
+                query, positions, features = [], [], hidden[row][:0]
+            else:
+                assert accepted[row] <= len(drafts[row])
+                query = [recovery[row], *drafts[row]]
+                start = len(tokens[row])
+                positions = list(range(start, start + len(query)))
+                assert positions[-1] < 128
+                features = target_features(tokens[row] + query)[start:]
+                valid = accepted[row] + 1
+                tokens[row] += query[:valid]
+                hidden[row] = torch.cat((hidden[row], features[:valid]))
+                # Rejected hidden rows must never enter either native module.
+                features[valid:] = torch.nan
+            token_rows.append(query)
+            position_rows.append(positions)
+            hidden_rows.append(features)
+        order = (2, 0, 1) if step % 2 else (1, 2, 0)
+        output = advance(
+            [keys[i] for i in order],
+            [token_rows[i] for i in order],
+            [position_rows[i] for i in order],
+            [hidden_rows[i] for i in order],
+            [accepted[i] for i in order],
+            [next_recovery[i] for i in order],
+            k,
+        )
+        for index, row in enumerate(order):
+            drafts[row] = output[index]
+            compare_reference(
+                keys[row],
+                tokens[row],
+                hidden[row],
+                next_recovery[row],
+                k,
+                drafts[row],
+                f"round-{step}",
+            )
+        recovery = next_recovery
+    adapter.close_sequences(tuple(keys))
+    assert adapter.planner.num_open == 0
+    # Reuse the same external ID and request slot with a fresh generation.
+    key = SequenceKey("incremental", 0, 1)
+    ids = [7]
+    features = target_features(ids)
+    prefill(key, ids, features, chunked=False)
+    output = advance([key], [[]], [[]], [features[:0]], [0], [19], 0)[0]
+    compare_reference(key, ids, features, 19, 0, output, "reused-k0")
+    ids += [19]
+    features = target_features(ids)
+    output = advance([key], [[19]], [[1]], [features[1:]], [0], [31], 2)[0]
+    compare_reference(key, ids, features, 31, 2, output, "reused-k2")
+    adapter.close_sequences((key,))
+    assert adapter.planner.num_open == 0
+    assert adapter.planner.block_pool.num_free_blocks == executor.num_blocks - 1
+    Path(result_path).write_text(
+        json.dumps(
+            {
+                "speculator": type(executor.speculator).__name__,
+                "modules": len(layers),
+                "target_features": "real ExaoneMoeForCausalLM eager CPU forward",
+                "comparison": "exact proposals and authoritative per-module KV",
+                "checks": checks,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def test_remote_two_module_mtp_dynamic_k_matches_full_prefix(
+    tiny_exaone_two_mtp_model, monkeypatch, tmp_path, record_property
+):
+    """Keep K=0/1/2 state updates correct across rejection, reorder and slot reuse."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    result = tmp_path / "two-module-oracle.json"
+    log_path = tmp_path / "two-module-oracle.log"
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _run_two_module_oracle; _run_two_module_oracle(*sys.argv[1:])",
+        tiny_exaone_two_mtp_model,
+        str(result),
+    ]
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            assert process.wait(timeout=300) == 0, (
+                f"native MTP oracle failed: {log_path}"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    receipt = json.loads(result.read_text())
+    assert receipt["modules"] == 2
+    assert len(receipt["checks"]) == 26
+    assert {check["effective_k"] for check in receipt["checks"]} == {0, 1, 2}
+    assert max(check["length"] for check in receipt["checks"]) == 127
+    record_property("native.full_prefix_oracle", receipt)

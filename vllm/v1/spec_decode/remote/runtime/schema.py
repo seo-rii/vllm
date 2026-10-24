@@ -71,8 +71,16 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
         or target.get_vocab_size() != draft.get_vocab_size()
     ):
         raise ValueError("standalone MTP requires matching target hidden/vocab sizes")
-    if getattr(config, "num_nextn_predict_layers", None) != 1:
-        raise ValueError("standalone MTP requires exactly one checkpoint MTP module")
+    num_modules = getattr(config, "num_nextn_predict_layers", None)
+    if architecture == "ExaoneMoeMTP" and num_modules == 2:
+        if spec.num_speculative_tokens != 2:
+            raise ValueError("two Exaone checkpoint MTP modules require configured K=2")
+        if getattr(config, "mtp_layer_types", None) != ["full_attention"] * 2:
+            raise ValueError("two Exaone MTP modules require full attention")
+    elif num_modules != 1:
+        raise ValueError(
+            "standalone MTP requires one checkpoint MTP module, or two Exaone modules"
+        )
     if (
         contract.max_speculative_tokens is not None
         and spec.num_speculative_tokens > contract.max_speculative_tokens
@@ -232,6 +240,15 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         raise ValueError(f"unsupported standalone method: {spec.method}")
     if spec.parallel_drafting or spec.draft_sample_method != "greedy":
         raise ValueError("standalone runtime requires sequential greedy drafting")
+    if spec.use_multi_module_mtp():
+        if vllm_config.parallel_config.tensor_parallel_size != 1:
+            raise ValueError("standalone multi-module MTP requires target TP1")
+        remote = spec.get_remote_draft_config()
+        if remote is not None and (
+            remote.transport not in ("auto", "inline")
+            or len(spec.get_remote_draft_endpoints()) != 1
+        ):
+            raise ValueError("standalone multi-module MTP requires one inline endpoint")
 
     hidden_size = target.get_hidden_size()
     dtype = str(target.dtype).removeprefix("torch.")
@@ -268,11 +285,12 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
                 TargetFeatureKind.LAST_HIDDEN_STATES.value, dtype, (hidden_size,)
             )
         )
+    num_lookahead = vllm_config.num_prefill_lookahead_tokens
     slots.append(
         FeatureSlot(
             TargetFeatureKind.NEXT_PREFILL_TOKENS.value,
             "int64",
-            (1,),
+            (num_lookahead,),
             optional=True,
             per_sequence=True,
         )
@@ -285,7 +303,8 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),
-            num_prefill_lookahead=1,
+            num_prefill_lookahead=num_lookahead,
+            supports_multi_module=spec.use_multi_module_mtp(),
             standalone_weights="materializable",
         ),
         target_fingerprint=_fingerprint({"target": target_identity, "layout": layout}),
