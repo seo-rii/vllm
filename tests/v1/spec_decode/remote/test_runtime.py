@@ -208,6 +208,49 @@ def multi_module_schema(depth=2):
 MULTI_MODULE_SCHEMA = multi_module_schema()
 
 
+@pytest.mark.parametrize(
+    "requests,tokens,length,expected",
+    [
+        (6, 2, 9, (96, 32, 96, 16, 112, 16)),
+        (2, 10, 3, (32, 32, 48, 80, 112, 80)),
+    ],
+)
+def test_multi_module_feature_memory_bounds_include_retained_and_staged_storage(
+    requests, tokens, length, expected
+):
+    schema = multi_module_schema(depth=3)
+    schema = replace(
+        schema,
+        slots=schema.slots
+        + (
+            FeatureSlot(
+                "sequence_summary", "float64", (1024,), optional=True, per_sequence=True
+            ),
+        ),
+    )
+    replay = MultiModuleReplay(schema)
+    # Only the two FP32 values per token row count: integer token/position fields and
+    # floating sequence metadata are outside device token-history accounting.
+    bounds = replay.feature_memory_bounds(
+        max_num_reqs=requests, max_num_tokens=tokens, max_model_len=length
+    )
+    assert bounds == dict(
+        zip(
+            (
+                "history_bytes",
+                "staged_history_bytes",
+                "final_prefill_bytes",
+                "incoming_bytes",
+                "prepared_bytes",
+                "packed_bytes",
+                "total_bytes",
+            ),
+            (*expected, sum(expected)),
+        )
+    )
+    assert replay.num_sequences == 0
+
+
 def multi_module_planner(num_blocks=65, max_num_reqs=4, depth=2):
     return DraftStepPlanner(
         DraftBlockPool(num_blocks, 2),
@@ -668,6 +711,7 @@ def multi_module_runtime():
     )
     try:
         session.connect()
+        assert session.selected_transport == "inline"
         yield session, executor
     finally:
         session.close()

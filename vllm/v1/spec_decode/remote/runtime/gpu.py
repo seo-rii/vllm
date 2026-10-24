@@ -329,6 +329,22 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.num_blocks,
             self.block_size,
         )
+        if self._mtp_replay is not None:
+            logger.info(
+                "Standalone multi-module single-verifier floating payload bounds: %s; "
+                "max_num_seqs=%d max_num_tokens=%d max_model_len=%d modules=%d. "
+                "These bounds exclude weights, KV, native buffers, IPC arenas "
+                "and allocator overhead; draft_kv is a separate budget.",
+                self._mtp_replay.feature_memory_bounds(
+                    max_num_reqs=scheduler.max_num_seqs,
+                    max_num_tokens=self.max_num_tokens,
+                    max_model_len=vllm_config.model_config.max_model_len,
+                ),
+                scheduler.max_num_seqs,
+                self.max_num_tokens,
+                vllm_config.model_config.max_model_len,
+                spec.num_speculative_tokens,
+            )
 
     def _create_contract(self, config):
         return create_runtime_contract(config)
@@ -411,10 +427,24 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         key = SequenceKey("warmup", 0, 0)
         planner.open(key)
         failure: BaseException | None = None
+        replayed_rows = 0
         try:
-            for prefill in (True, False):
+            phases: tuple[bool, ...] = (True, False)
+            if self._mtp_replay is not None and (
+                self.max_num_tokens >= spec.num_speculative_tokens
+            ):
+                # Only the second decode reads speculative history. Use one
+                # new row so its replay suffix fits the configured token budget.
+                phases += (False,)
+            for step, prefill in enumerate(phases):
                 num_tokens = min(
-                    self.block_size + 1 if prefill else spec.num_speculative_tokens + 1,
+                    1
+                    if step == 2
+                    else (
+                        self.block_size + 1
+                        if prefill
+                        else spec.num_speculative_tokens + 1
+                    ),
                     self.max_num_tokens,
                     config.model_config.max_model_len,
                 )
@@ -435,9 +465,15 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                             tensor = torch.arange(start, start + num_tokens)
                         else:
                             count = 1 if slot.per_sequence else num_tokens
+                            dtype = getattr(torch, slot.dtype)
                             tensor = torch.zeros(
                                 (count, *slot.trailing_shape),
-                                dtype=getattr(torch, slot.dtype),
+                                dtype=dtype,
+                                device=self.device
+                                if self._mtp_replay is not None
+                                and dtype.is_floating_point
+                                and not slot.per_sequence
+                                else "cpu",
                             )
                         features.append(tensor)
                     row, features = self.prepare_row(row, features)
@@ -459,6 +495,15 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                         )
                 self.execute(plan, features)
                 planner.commit(plan)
+                replayed_rows += row.num_replayed
+            if self._mtp_replay is not None:
+                logger.info(
+                    "Standalone multi-module warmup: steps=%d replayed_rows=%d "
+                    "floating_feature_device=%s",
+                    len(phases),
+                    replayed_rows,
+                    self.device,
+                )
         except BaseException as exc:
             failure = exc
             raise

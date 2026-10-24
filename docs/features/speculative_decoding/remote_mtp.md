@@ -47,7 +47,9 @@ own-KV adapter. Its native local path is unaffected.
 ### Exaone module chains
 
 A checkpoint with `num_nextn_predict_layers=N`, where N is at least two, can use
-`num_speculative_tokens=N` with target TP1, draft TP1 and one inline endpoint.
+`num_speculative_tokens=N` with target TP1, draft TP1 and one same-host endpoint.
+Choose `transport="inline"` or explicitly choose `transport="cuda_ipc"` on
+NVIDIA CUDA. `transport="auto"` continues to select inline.
 Declare one `full_attention` or `sliding_attention` entry per module in
 `mtp_layer_types`. Sliding modules require positive windows, from
 `mtp_sliding_windows` or the checkpoint's existing window settings. The runtime
@@ -60,13 +62,27 @@ sequence. It replays the affected suffix according to the actual accepted count,
 including after effective K=0 or scheduler truncation of submitted drafts. Short
 prompts retain only their real rows. History is committed only after execution
 completes and is released with its sequence generation. Inline history uses CPU
-memory, separate from the draft GPU's KV and execution buffers; old and staged
-new history can coexist during an update.
+memory; IPC history uses independently owned GPU storage. The receiver completes
+its copy before acknowledging the exporter, so retained final-prefill features
+and replay history survive exporter arena reuse. Old and staged new history can
+coexist during an update.
+
+The startup log reports separate floating-feature payload bounds. For `S` request
+slots, `T` feature tokens, model length `L`, module depth `N` and `R` bytes per
+floating feature row, committed history uses at most `S*(N-1)*R` bytes. Retained
+final-prefill copies can use up to `S*min(T,L)*R` bytes. Including staged history,
+incoming, prepared and packed features, a conservative single-verifier payload
+bound is `R * [S*min(T,L) + 3*T + 3*S*(N-1)]`. This is separate from native model
+buffers, weights, KV backing storage, IPC arenas and allocator overhead. The
+draft KV budget covers KV storage; it does not reserve this additional memory.
+Warmup executes bounded device-feature prefill before listening and exercises
+replay when the token and context budgets permit. It does not validate the peak
+of every admitted batch shape.
 
 Effective K can vary from 0 through N. The native forward still executes all N
 modules; effective K limits returned drafts and does not currently reduce module
-computation. Configured K values different from N, CUDA IPC and pooled placement
-remain unsupported for this path. The single-module path retains its native
+computation. Configured K values different from N and pooled placement remain
+unsupported for this path. The single-module path retains its native
 sequential rollout behavior.
 
 ## Shared weights and execution

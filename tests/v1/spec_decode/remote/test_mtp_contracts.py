@@ -186,33 +186,48 @@ def test_exaone_module_chain_accepts_single_inline_endpoint(transport, depth):
     assert contract.capabilities.num_prefill_lookahead == depth
 
 
-@pytest.mark.parametrize("depth", [2, 3, 4])
-def test_exaone_module_chain_rejects_target_tensor_parallelism(depth):
+@pytest.mark.parametrize("depth", [2, 3])
+def test_exaone_module_chain_accepts_single_ipc_endpoint(depth):
     config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    native = create_runtime_contract(config)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///tmp/unused-multi-module.sock",),
+        transport="cuda_ipc",
+    )
+    contract = create_runtime_contract(config)
+    assert contract == native
+    assert contract.capabilities.supports_multi_module
+    assert contract.capabilities.num_prefill_lookahead == depth
+
+
+@pytest.mark.parametrize("transport", ["inline", "cuda_ipc"])
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_rejects_target_tensor_parallelism(transport, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///tmp/unused-multi-module.sock",),
+        transport=transport,
+    )
     config.parallel_config = ParallelConfig(tensor_parallel_size=2)
     with pytest.raises(ValueError, match="target TP1"):
         create_runtime_contract(config)
 
 
-@pytest.mark.parametrize(
-    "transport,endpoints",
-    [
-        ("cuda_ipc", ("unix:///tmp/unused-multi-module.sock",)),
-        (
-            "inline",
-            ("unix:///tmp/unused-worker-a.sock", "unix:///tmp/unused-worker-b.sock"),
-        ),
-    ],
-)
+@pytest.mark.parametrize("transport", ["inline", "cuda_ipc"])
 @pytest.mark.parametrize("depth", [2, 3, 4])
-def test_exaone_module_chain_rejects_ipc_and_pooling(transport, endpoints, depth):
+def test_exaone_module_chain_rejects_pooling(transport, depth):
     config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
     config.speculative_config.execution = SpeculativeExecutionConfig(
         placement="remote",
-        endpoints=endpoints,
+        endpoints=(
+            "unix:///tmp/unused-worker-a.sock",
+            "unix:///tmp/unused-worker-b.sock",
+        ),
         transport=transport,
     )
-    with pytest.raises(ValueError, match="one inline endpoint"):
+    with pytest.raises(ValueError, match="one (?:inline )?endpoint"):
         create_runtime_contract(config)
 
 

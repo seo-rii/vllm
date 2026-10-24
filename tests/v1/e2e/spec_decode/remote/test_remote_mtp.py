@@ -2011,10 +2011,8 @@ def _compare_native_and_remote_draft(
             record_property(f"{mode}.{label}", value)
         assert counts[0] > 0 and counts[1] > 0
         assert 0 <= counts[2] <= counts[1]
-        if detailed:
-            assert counts[2] > 0, (
-                "the controlled draft fixture must exercise acceptance"
-            )
+        if detailed or num_modules == 3:
+            assert counts[2] > 0, "this draft fixture must exercise actual acceptance"
         return counts
 
     def target_windows(model):
@@ -2511,63 +2509,87 @@ def _compare_native_and_remote_draft(
         trust_remote_code=False,
         moe_backend=moe_backend,
     ) as endpoint:
-        remote_options = dict(
-            transport="inline",
-            failure_policy="error",
-            request_timeout_ms=5000,
-            startup_timeout_ms=600000,
-        )
-        remote_config = dict(config)
-        if independent:
-            remote_config["execution"] = dict(
-                placement="remote",
-                policy="on_demand",
-                endpoints=[endpoint],
-                **remote_options,
+        transports = ("inline", "cuda_ipc") if num_modules > 1 else ("inline",)
+        for transport in transports:
+            mode = "remote" if transport == "inline" else "remote_ipc"
+            remote_options = dict(
+                transport=transport,
+                failure_policy="error",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
             )
-        else:
-            remote_config["remote_draft"] = dict(endpoint=endpoint, **remote_options)
-        with vllm_runner(
-            model,
-            speculative_config=remote_config,
-            per_request_spec_decode_metrics="detailed" if detailed else "none",
-            **kwargs,
-        ) as remote:
-            actual_config = remote.llm.llm_engine.vllm_config.speculative_config
-            assert actual_config.use_remote_draft()
-            assert actual_config.get_remote_draft_endpoints() == (endpoint,)
-            remote_recurrence = check_recurrence(remote, "remote")
-            if native_control:
-                assert remote_recurrence == native_recurrence
+            remote_config = dict(config)
             if independent:
-                record_property(
-                    "remote.backend", remote.llm.collective_rpc(token_remote_identity)
+                remote_config["execution"] = dict(
+                    placement="remote",
+                    policy="on_demand",
+                    endpoints=[endpoint],
+                    **remote_options,
                 )
-            if eagle3:
-                record_property(
-                    "remote.eagle3", remote.llm.collective_rpc(eagle_identity)
+            else:
+                remote_config["remote_draft"] = dict(
+                    endpoint=endpoint, **remote_options
                 )
-            remote_outputs = generate(remote, "remote")
-            compare_outputs(remote_outputs, expected, "remote")
-            if native_control:
-                for actual_batch, native_batch in zip(remote_outputs, native_outputs):
-                    assert [output[0] for output in actual_batch] == [
-                        output[0] for output in native_batch
-                    ]
-                    if dense_mla or detailed:
-                        assert [output[2] for output in actual_batch] == [
-                            output[2] for output in native_batch
-                        ]
-                if dense_mla or detailed:
-                    record_property("placement.logprobs", "exact_returned_top5")
-            remote_counts = speculation_counts(remote, "remote")
-            if native_control:
-                if detailed:
+            with vllm_runner(
+                model,
+                speculative_config=remote_config,
+                per_request_spec_decode_metrics="detailed" if detailed else "none",
+                **kwargs,
+            ) as remote:
+                actual_config = remote.llm.llm_engine.vllm_config.speculative_config
+                assert actual_config.use_remote_draft()
+                assert actual_config.get_remote_draft_endpoints() == (endpoint,)
+                remote_recurrence = check_recurrence(remote, mode)
+                if native_control:
+                    assert remote_recurrence == native_recurrence
+                if independent:
                     record_property(
-                        "placement.speculation_counts_equal",
-                        remote_counts == native_counts,
+                        "remote.backend",
+                        remote.llm.collective_rpc(token_remote_identity),
                     )
-                assert remote_counts == native_counts
+                if eagle3:
+                    record_property(
+                        "remote.eagle3", remote.llm.collective_rpc(eagle_identity)
+                    )
+                remote_outputs = generate(remote, mode)
+                compare_outputs(remote_outputs, expected, mode)
+                if native_control:
+                    for actual_batch, native_batch in zip(
+                        remote_outputs, native_outputs
+                    ):
+                        assert [output[0] for output in actual_batch] == [
+                            output[0] for output in native_batch
+                        ]
+                        if dense_mla or detailed:
+                            assert [output[2] for output in actual_batch] == [
+                                output[2] for output in native_batch
+                            ]
+                    if dense_mla or detailed:
+                        record_property("placement.logprobs", "exact_returned_top5")
+                remote_counts = speculation_counts(remote, mode)
+                if native_control:
+                    if detailed:
+                        record_property(
+                            "placement.speculation_counts_equal",
+                            remote_counts == native_counts,
+                        )
+                    assert remote_counts == native_counts
+    if num_modules > 1:
+        server_lines = server_log.read_text().splitlines()
+        negotiated = [
+            line.rsplit(" over ", 1)[1].strip()
+            for line in server_lines
+            if "opened for verifier" in line and " over " in line
+        ]
+        assert negotiated == ["inline", "cuda_ipc"]
+        record_property("remote.negotiated_transports", negotiated)
+        warmup = (
+            "Standalone multi-module warmup: steps=3 "
+            f"replayed_rows={num_modules - 1} floating_feature_device=cuda:0"
+        )
+        assert sum(warmup in line for line in server_lines) == 1
+        record_property("remote.device_replay_warmup", warmup)
+
     if eagle3:
         identity = (
             "Standalone EAGLE3 features: model=Eagle3LlamaForCausalLM "
@@ -3207,7 +3229,178 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
             assert all(math.isfinite(value.logprob) for value in values.values())
 
 
-def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
+def _multi_module_ipc_client(pipe, endpoint, identity) -> None:
+    """Own the verifier's CUDA exports; all feature consumption uses the socket."""
+    import torch
+
+    from vllm.v1.spec_decode.remote.protocol import SpeculatorStatusCode
+    from vllm.v1.spec_decode.remote.session import RemoteDraftSession, frame_to_tensor
+    from vllm.v1.spec_decode.remote.state import FeatureBatch, RemoteProposalBatch
+
+    torch.set_num_threads(1)
+    device = torch.device("cuda:0")
+    torch.accelerator.set_device_index(device)
+    session = RemoteDraftSession(
+        endpoint,
+        identity,
+        transport="cuda_ipc",
+        failure_policy="error",
+        request_timeout_ms=5000,
+        startup_timeout_ms=60000,
+    )
+
+    def features(frames):
+        slots = []
+        for frame, spec in zip(frames, session.feature_schema.slots):
+            tensor = None if frame is None else frame_to_tensor(frame)
+            if (
+                tensor is not None
+                and tensor.is_floating_point()
+                and not spec.per_sequence
+            ):
+                tensor = tensor.to(device)
+            slots.append(tensor)
+        return FeatureBatch(session.feature_schema.schema_id, tuple(slots))
+
+    try:
+        session.connect()
+        assert session.selected_transport == "cuda_ipc"
+        session.prepare_cuda_ipc(device)
+        pipe.send(session.selected_transport)
+        while True:
+            operation, payload = pipe.recv()
+            if operation == "stop":
+                break
+            if operation == "open":
+                result = session.open_sequence(payload)
+            elif operation == "prefill":
+                key, chunk = payload
+                session.prefill(key, features(chunk.features), is_final=chunk.is_final)
+                result = None
+            elif operation == "advance":
+                batch = payload
+                handle = session.dispatch(
+                    RemoteProposalBatch(
+                        batch_id=batch.batch_id,
+                        keys=batch.keys,
+                        accepted_counts=frame_to_tensor(batch.accepted_counts),
+                        recovery_tokens=frame_to_tensor(batch.recovery_tokens),
+                        features=features(batch.features),
+                        query_lens=torch.tensor(batch.query_lens, dtype=torch.int32),
+                        num_speculative_tokens=batch.effective_num_speculative_tokens,
+                    )
+                )
+                proposal = session.collect(handle)
+                assert proposal.row_statuses == (SpeculatorStatusCode.OK,) * len(
+                    batch.keys
+                )
+                assert proposal.output.valid_lengths.tolist() == [
+                    batch.effective_num_speculative_tokens
+                ] * len(batch.keys)
+                result = proposal.output.token_ids[
+                    :, : batch.effective_num_speculative_tokens
+                ].tolist()
+            else:
+                assert operation == "close"
+                session.close_sequences(payload)
+                result = None
+            pipe.send(result)
+    finally:
+        try:
+            session.close()
+        finally:
+            pipe.close()
+
+
+@contextmanager
+def _multi_module_ipc_oracle(adapter, config):
+    """Serialize the real reference and IPC execution through one GPU owner."""
+    import multiprocessing
+
+    from vllm.v1.spec_decode.remote.conditioned_server import ConditionedDraftServer
+    from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits
+    from vllm.v1.spec_decode.remote.session import VerifierIdentity
+
+    contract = adapter.executor.contract
+    limits = RemoteServerLimits(5, 256, 5, 128)
+    server = ConditionedDraftServer(
+        adapter,
+        limits=limits,
+        target_fingerprint=contract.target_fingerprint,
+        tokenizer_fingerprint=contract.tokenizer_fingerprint,
+    )
+    identity = VerifierIdentity(
+        verifier_instance_id="ipc-oracle",
+        target_fingerprint=contract.target_fingerprint,
+        tokenizer_fingerprint=contract.tokenizer_fingerprint,
+        method="mtp",
+        num_speculative_tokens=config.speculative_config.num_speculative_tokens,
+        parallel_drafting=False,
+        provided_features=tuple(slot.kind for slot in contract.schema.slots),
+        max_num_seqs=4,
+        max_num_batched_tokens=256,
+        max_model_len=128,
+        vocab_size=config.model_config.get_vocab_size(),
+        draft_checkpoint_fingerprint=contract.draft_fingerprint,
+        uses_multi_module=True,
+    )
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = None
+    with tempfile.TemporaryDirectory(prefix="vllm-mtp-ipc-") as directory:
+        try:
+            endpoint = server.start(f"unix://{directory}/draft.sock")
+            process = context.Process(
+                target=_multi_module_ipc_client, args=(child, endpoint, identity)
+            )
+            process.start()
+            child.close()
+
+            def receive():
+                assert parent.poll(60), (
+                    "IPC oracle client did not complete its operation"
+                )
+                return parent.recv()
+
+            assert receive() == "cuda_ipc"
+
+            def call(operation, payload):
+                assert process is not None and process.is_alive()
+                parent.send((operation, payload))
+                return receive()
+
+            yield call, server
+            parent.send(("stop", None))
+            process.join(timeout=10)
+            assert process.exitcode == 0
+            assert server.healthy
+        finally:
+            try:
+                if process is not None and process.pid is not None:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=10)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=10)
+                    assert not process.is_alive()
+                    process.close()
+            finally:
+                try:
+                    parent.close()
+                    child.close()
+                finally:
+                    server.stop()
+
+
+def _run_multi_module_oracle(
+    model_path: str, result_path: str, transport: str = "direct"
+) -> None:
+    with ExitStack() as resources:
+        _multi_module_oracle(model_path, result_path, transport, resources)
+
+
+def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
     """Compare incremental native GPU state with fresh full-prefix executions."""
     import itertools
     import json
@@ -3331,6 +3524,31 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
     reference_ids = itertools.count(100)
     checks = []
     prefill_chunks = []
+    assert transport in ("direct", "cuda_ipc")
+    client = server = None
+    wire_keys: dict[SequenceKey, SequenceKey] = {}
+    if transport == "cuda_ipc":
+        client, server = resources.enter_context(
+            _multi_module_ipc_oracle(adapter, config)
+        )
+
+    def on_owner(action):
+        return action() if server is None else server.work_queue.call("oracle", action)
+
+    def allocation():
+        torch.accelerator.synchronize(executor.device)
+        return {
+            "allocated": torch.accelerator.memory_allocated(executor.device),
+            "reserved": torch.accelerator.memory_reserved(executor.device),
+        }
+
+    initial_allocation = on_owner(allocation)
+
+    def close_sequences(keys):
+        if client is not None:
+            client("close", tuple(wire_keys[key] for key in keys))
+        else:
+            adapter.close_sequences(tuple(keys))
 
     @torch.inference_mode()
     def target_features(tokens):
@@ -3357,7 +3575,20 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
         )
 
     def prefill(key, tokens, hidden, *, chunk_size=None):
-        adapter.open_sequence(key)
+        remote = client is not None and key.verifier_instance_id != "oracle"
+        if remote:
+            assert client is not None
+            actual = client("open", key.sequence_id)
+            assert actual.sequence_id == key.sequence_id
+            previous = [
+                value.generation
+                for old, value in wire_keys.items()
+                if old.sequence_id == key.sequence_id
+            ]
+            assert not previous or actual.generation > max(previous)
+            wire_keys[key] = actual
+        else:
+            adapter.open_sequence(key)
         offset = 0
         while offset < len(tokens):
             # Nonfinal chunks need D real future prompt tokens. If a tiny
@@ -3373,20 +3604,22 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
             lookahead = None if final else torch.tensor([tokens[end : end + depth]])
             assert count > 0
             assert final or (lookahead is not None and lookahead.shape == (1, depth))
-            adapter.prefill(
-                key,
-                PrefillInputs(
-                    offset,
-                    count,
-                    final,
-                    frames(
-                        tokens[offset:end],
-                        range(offset, end),
-                        hidden[offset:end],
-                        lookahead,
-                    ),
+            chunk = PrefillInputs(
+                offset,
+                count,
+                final,
+                frames(
+                    tokens[offset:end],
+                    range(offset, end),
+                    hidden[offset:end],
+                    lookahead,
                 ),
             )
+            if remote:
+                assert client is not None
+                client("prefill", (wire_keys[key], chunk))
+            else:
+                adapter.prefill(key, chunk)
             prefill_chunks.append(
                 {
                     "prompt_length": len(tokens),
@@ -3399,32 +3632,36 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
             offset = end
 
     def advance(keys, token_rows, position_rows, hidden_rows, accepted, recovery, k):
-        result = adapter.advance_and_propose(
-            StandaloneProposalBatch(
-                batch_id=next(batch_ids),
-                keys=tuple(keys),
-                active_rows=tuple(range(len(keys))),
-                num_speculative_tokens=depth,
-                accepted_counts=tensor_to_frame(
-                    0, torch.tensor(accepted, dtype=torch.int32)
-                ),
-                recovery_tokens=tensor_to_frame(
-                    0, torch.tensor(recovery, dtype=torch.int32)
-                ),
-                features=frames(
-                    list(itertools.chain.from_iterable(token_rows)),
-                    list(itertools.chain.from_iterable(position_rows)),
-                    torch.cat(hidden_rows),
-                ),
-                query_lens=tuple(map(len, token_rows)),
-                effective_num_speculative_tokens=k,
-            )
+        remote = client is not None and keys[0].verifier_instance_id != "oracle"
+        batch = StandaloneProposalBatch(
+            batch_id=next(batch_ids),
+            keys=tuple(wire_keys[key] for key in keys) if remote else tuple(keys),
+            active_rows=tuple(range(len(keys))),
+            num_speculative_tokens=depth,
+            accepted_counts=tensor_to_frame(
+                0, torch.tensor(accepted, dtype=torch.int32)
+            ),
+            recovery_tokens=tensor_to_frame(
+                0, torch.tensor(recovery, dtype=torch.int32)
+            ),
+            features=frames(
+                list(itertools.chain.from_iterable(token_rows)),
+                list(itertools.chain.from_iterable(position_rows)),
+                torch.cat(hidden_rows),
+            ),
+            query_lens=tuple(map(len, token_rows)),
+            effective_num_speculative_tokens=k,
         )
+        if remote:
+            assert client is not None
+            return client("advance", batch)
+        result = adapter.advance_and_propose(batch)
         assert result.row_statuses == (SpeculatorStatusCode.OK,) * len(keys)
         assert frame_to_tensor(result.valid_lengths).tolist() == [k] * len(keys)
         return frame_to_tensor(result.token_ids)[:, :k].tolist()
 
     def kv_prefix(key, length):
+        key = wire_keys.get(key, key)
         req_index = adapter.planner.req_index(key)
         blocks = adapter.planner.block_pool.blocks(req_index)
         indices = torch.tensor(blocks, dtype=torch.int64, device=executor.device)
@@ -3440,7 +3677,14 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
         return result
 
     def compare_reference(key, tokens, hidden, recovery, k, actual, label):
-        assert adapter.planner.num_computed(key) == len(tokens)
+        on_owner(
+            lambda: compare_reference_on_owner(
+                key, tokens, hidden, recovery, k, actual, label
+            )
+        )
+
+    def compare_reference_on_owner(key, tokens, hidden, recovery, k, actual, label):
+        assert adapter.planner.num_computed(wire_keys.get(key, key)) == len(tokens)
         incremental = kv_prefix(key, len(tokens))
         reference = SequenceKey("oracle", next(reference_ids), 0)
         prefill(reference, tokens, hidden)
@@ -3477,7 +3721,7 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
     active = set(range(len(keys)))
     for step, k in enumerate(rounds):
         finished = {row for row in active if len(tokens[row]) >= max_model_len - 1}
-        adapter.close_sequences(tuple(keys[row] for row in finished))
+        close_sequences(tuple(keys[row] for row in finished))
         active -= finished
         token_rows, position_rows, hidden_rows, accepted = {}, {}, {}, {}
         next_recovery = [3 + (step * 11 + row * 13) % 125 for row in range(4)]
@@ -3559,8 +3803,8 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
         {"round": 1, "row": 3, "start": 126, "returned_k": depth, "submitted_k": 0},
     ]
     assert {outcome["accepted"] for outcome in outcomes} == set(range(depth + 1))
-    adapter.close_sequences(tuple(keys))
-    assert adapter.planner.num_open == 0
+    close_sequences(tuple(keys))
+    assert on_owner(lambda: adapter.planner.num_open) == 0
     # Tiny nonfinal chunks and both block/window edges use real prompt lookahead.
     for length in (15, 16, 17, 31, 32, 33):
         key = SequenceKey("boundary", length, 0)
@@ -3569,7 +3813,7 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
         prefill(key, ids, features, chunk_size=1 if length == 15 else 32)
         output = advance([key], [[]], [[]], [features[:0]], [0], [19], depth)[0]
         compare_reference(key, ids, features, 19, depth, output, f"prompt-{length}")
-        adapter.close_sequences((key,))
+        close_sequences((key,))
     # Reuse the same external ID and request slot with a fresh generation.
     key = SequenceKey("incremental", 0, 1)
     ids = [7]
@@ -3581,9 +3825,53 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
     features = target_features(ids)
     output = advance([key], [[19]], [[1]], [features[1:]], [0], [31], depth)[0]
     compare_reference(key, ids, features, 31, depth, output, "reused-max-k")
-    adapter.close_sequences((key,))
-    assert adapter.planner.num_open == 0
-    assert adapter.planner.block_pool.num_free_blocks == executor.num_blocks - 1
+    close_sequences((key,))
+    assert on_owner(lambda: adapter.planner.num_open) == 0
+    assert on_owner(lambda: adapter.planner.block_pool.num_free_blocks) == (
+        executor.num_blocks - 1
+    )
+    final_allocation = on_owner(allocation)
+    close_reopen_allocations = []
+    if client is not None:
+        previous_output = None
+        # The first identical cycle settles persistent native buffers. The next
+        # two must release history/received features without growing live storage.
+        for generation in (2, 3, 4):
+            key = SequenceKey("incremental", 0, generation)
+            ids = [7]
+            features = target_features(ids)
+            prefill(key, ids, features)
+            output = advance([key], [[]], [[]], [features[:0]], [0], [19], depth)[0]
+            cycle_output = [output]
+            for correction, recovery_token in ((19, 31), (31, 43)):
+                start = len(ids)
+                query = [correction, *output]
+                features = target_features(ids + query)[start:].clone()
+                features[1:] = torch.nan
+                output = advance(
+                    [key],
+                    [query],
+                    [list(range(start, start + len(query)))],
+                    [features],
+                    [0],
+                    [recovery_token],
+                    depth,
+                )[0]
+                ids.append(correction)
+                cycle_output.append(output)
+            if previous_output is not None:
+                assert cycle_output == previous_output
+            previous_output = cycle_output
+            close_sequences((key,))
+            assert on_owner(lambda: adapter.planner.num_open) == 0
+            assert on_owner(lambda: adapter.planner.block_pool.num_free_blocks) == (
+                executor.num_blocks - 1
+            )
+            close_reopen_allocations.append(on_owner(allocation))
+        assert (
+            close_reopen_allocations[-1]["allocated"]
+            == (close_reopen_allocations[-2]["allocated"])
+        )
     Path(result_path).write_text(
         json.dumps(
             {
@@ -3597,6 +3885,17 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
                 "max_length_truncations": max_length_truncations,
                 "outcomes": outcomes,
                 "prefill_chunks": prefill_chunks,
+                "transport": transport,
+                "wire_generations": [
+                    {"sequence_id": key.sequence_id, "generation": key.generation}
+                    for key in wire_keys.values()
+                ],
+                "allocation": {
+                    "scope": "draft process; client export arena is separate",
+                    "before_scenarios": initial_allocation,
+                    "after_close": final_allocation,
+                    "close_reopen_cycles": close_reopen_allocations,
+                },
             },
             indent=2,
         )
@@ -3609,8 +3908,9 @@ def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
     [("exaone_two", 2), ("exaone_three", 3)],
     ids=["two-full", "three-mixed"],
 )
+@pytest.mark.parametrize("transport", ["direct", "cuda_ipc"])
 def test_remote_multi_module_mtp_dynamic_k_matches_full_prefix(
-    mtp_family, depth, request, monkeypatch, tmp_path, record_property
+    mtp_family, depth, transport, request, monkeypatch, tmp_path, record_property
 ):
     """Keep K=0..D correct across rejection, reorder, short prompts and slot reuse."""
     import json
@@ -3629,6 +3929,7 @@ def test_remote_multi_module_mtp_dynamic_k_matches_full_prefix(
         "import _run_multi_module_oracle; _run_multi_module_oracle(*sys.argv[1:])",
         model,
         str(result),
+        transport,
     ]
     with log_path.open("w") as log:
         process = subprocess.Popen(
@@ -3643,6 +3944,17 @@ def test_remote_multi_module_mtp_dynamic_k_matches_full_prefix(
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
     receipt = json.loads(result.read_text())
+    assert receipt["transport"] == transport
+    if transport == "cuda_ipc":
+        generations = receipt["wire_generations"]
+        assert len(generations) == 14
+        reused = [key["generation"] for key in generations if key["sequence_id"] == 0]
+        assert len(reused) == 5 and all(
+            left < right for left, right in zip(reused, reused[1:])
+        )
+        cycles = receipt["allocation"]["close_reopen_cycles"]
+        assert len(cycles) == 3
+        assert cycles[-1]["allocated"] == cycles[-2]["allocated"]
     assert receipt["modules"] == depth
     assert receipt["speculator"] == "MultiModuleMTPSpeculator"
     assert [layer["window"] for layer in receipt["layout"]] == (
