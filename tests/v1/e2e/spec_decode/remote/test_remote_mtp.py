@@ -35,6 +35,12 @@ def draft_server(
     *,
     target_kv: bool = False,
     token_only_draft: str | None = None,
+    revision: str | None = REVISION,
+    num_speculative_tokens: int = 1,
+    attention_backend: str = "FLASH_ATTN",
+    draft_kv_cache_gib: float = 0.25,
+    max_feature_tokens: int = 64,
+    trust_remote_code: bool = True,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
@@ -50,14 +56,10 @@ def draft_server(
             model,
             "--draft-model",
             model,
-            "--target-revision",
-            REVISION,
-            "--draft-revision",
-            REVISION,
             "--method",
             "mtp",
             "--num-speculative-tokens",
-            "1",
+            str(num_speculative_tokens),
             "--device",
             "cuda:0",
             "--dtype",
@@ -67,17 +69,22 @@ def draft_server(
             "--max-model-len",
             "128",
             "--max-feature-tokens",
-            "64",
+            str(max_feature_tokens),
             "--draft-kv-cache-gib",
-            "0.25",
+            str(draft_kv_cache_gib),
             "--block-size",
             "16",
             "--attention-backend",
-            "FLASH_ATTN",
+            attention_backend,
             "--target-attention-backend",
-            "FLASH_ATTN",
-            "--trust-remote-code",
+            attention_backend,
         ]
+        if trust_remote_code:
+            command.append("--trust-remote-code")
+        if revision is not None:
+            command.extend(
+                ["--target-revision", revision, "--draft-revision", revision]
+            )
         if target_kv:
             command = [
                 sys.executable,
@@ -428,3 +435,218 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                 assert actual_config.get_remote_draft_endpoints() == endpoints
                 assert generate(remote) == expected
                 assert_speculation(remote, f"remote-{num_workers}")
+
+
+@pytest.fixture
+def tiny_exaone_mtp_model(tmp_path, mtp_window):
+    """Real seeded Exaone weights including the separately stored native MTP head."""
+    import torch
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        ExaoneMoeConfig,
+        ExaoneMoeForCausalLM,
+        TokenizersBackend,
+    )
+    from transformers.models.exaone_moe.modeling_exaone_moe import ExaoneMoeRMSNorm
+
+    config = ExaoneMoeConfig(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        layer_types=["full_attention", "full_attention"],
+        mlp_layer_types=["dense", "dense"],
+        sliding_window=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        num_nextn_predict_layers=1,
+        mtp_layer_types=[
+            "full_attention" if mtp_window is None else "sliding_attention"
+        ],
+        mtp_sliding_windows=[mtp_window or 32],
+        rope_parameters={"rope_type": "default", "rope_theta": 1000000.0},
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+        tie_word_embeddings=False,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = ExaoneMoeForCausalLM(config)
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        norms = torch.nn.ModuleDict(
+            {
+                name: ExaoneMoeRMSNorm(128, eps=config.rms_norm_eps)
+                for name in (
+                    "norm",
+                    "pre_fc_norm_hidden",
+                    "pre_fc_norm_embedding",
+                )
+            }
+        )
+    weights = dict(model.state_dict())
+    weights.update(
+        {
+            f"mtp.layers.0.{name}": tensor.clone()
+            for name, tensor in model.model.layers[0].state_dict().items()
+        }
+    )
+    weights["mtp.fc.weight"] = fusion.weight.detach()
+    weights.update(
+        {f"mtp.{name}": tensor for name, tensor in norms.state_dict().items()}
+    )
+    path = tmp_path / "exaone"
+    model.save_pretrained(path, state_dict=weights)
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    )
+    tokenizer.save_pretrained(path)
+    return str(path)
+
+
+@pytest.mark.parametrize("mtp_window", [None, 16], ids=["full", "swa"])
+@pytest.mark.parametrize("k", [1, 3], ids=["k1", "k3"])
+def test_remote_exaone_mtp_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    tiny_exaone_mtp_model,
+    mtp_window,
+    k,
+    record_property,
+):
+    """Compare native and standalone MTP across chunk/window boundaries and reuse."""
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    model = tiny_exaone_mtp_model
+    kwargs = dict(
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
+        for length in (15, 16, 17, 31, 32, 33, 65)
+    ]
+    batches = (
+        prompts[:1],
+        [prompts[i] for i in (4, 1, 6, 2)],
+        [prompts[i] for i in (5, 3, 2, 0)],
+    )
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+
+    def generate(runner):
+        return [
+            [
+                list(output.outputs[0].token_ids)
+                for output in runner.llm.generate(batch, sampling, use_tqdm=False)
+            ]
+            for batch in batches
+        ]
+
+    def speculation_counts(runner, mode):
+        runner.llm.llm_engine.do_log_stats()
+        metrics = runner.llm.get_metrics()
+        counts = tuple(
+            get_spec_decode_metric_value(metrics, name)
+            for name in (
+                "vllm:spec_decode_num_drafts",
+                "vllm:spec_decode_num_draft_tokens",
+                "vllm:spec_decode_num_accepted_tokens",
+            )
+        )
+        for label, value in zip(("proposals", "drafted", "accepted"), counts):
+            record_property(f"{mode}.{label}", value)
+        assert counts[0] > 0 and counts[1] > 0
+        assert 0 <= counts[2] <= counts[1]
+        return counts
+
+    def target_windows(model):
+        return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+
+    def draft_kv_policy(worker):
+        draft = worker.model_runner.get_draft_model()
+        policies = []
+        for layer in draft.model.layers:
+            attention = layer.self_attn.attn
+            spec = attention.get_kv_cache_spec(worker.vllm_config)
+            policies.append(
+                (
+                    attention.sliding_window,
+                    type(spec).__name__,
+                    getattr(spec, "sliding_window", None),
+                )
+            )
+        return policies
+
+    config = dict(
+        method="mtp",
+        model=model,
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        attention_backend="TRITON_ATTN",
+    )
+    with vllm_runner(model, **kwargs) as baseline:
+        windows = baseline.llm.apply_model(target_windows)
+        assert windows == [[None, None]]
+        record_property("target.attention_windows", windows)
+        expected = generate(baseline)
+    assert all(len(tokens) == 8 for batch in expected for tokens in batch)
+    with vllm_runner(model, speculative_config=config, **kwargs) as native:
+        policy = native.llm.collective_rpc(draft_kv_policy)
+        spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
+        assert policy == [[(mtp_window, spec_type, mtp_window)]]
+        record_property("native.kv_policy", policy)
+        assert generate(native) == expected
+        native_counts = speculation_counts(native, "native")
+    with draft_server(
+        model,
+        tmp_path / "exaone-draft.log",
+        revision=None,
+        num_speculative_tokens=k,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+        trust_remote_code=False,
+    ) as endpoint:
+        remote_config = dict(
+            config,
+            remote_draft=dict(
+                endpoint=endpoint,
+                transport="inline",
+                failure_policy="error",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
+            ),
+        )
+        with vllm_runner(model, speculative_config=remote_config, **kwargs) as remote:
+            actual_config = remote.llm.llm_engine.vllm_config.speculative_config
+            assert actual_config.use_remote_draft()
+            assert actual_config.get_remote_draft_endpoints() == (endpoint,)
+            assert generate(remote) == expected
+            assert speculation_counts(remote, "remote") == native_counts
