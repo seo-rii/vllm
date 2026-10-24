@@ -103,7 +103,6 @@ def make_recurrent_kv_config(
                 spec.mamba_type != MambaAttentionBackendEnum.MAMBA2
                 or spec.mamba_cache_mode != "none"
                 or spec.num_speculative_blocks != 0
-                or spec.num_prefill_checkpoint_blocks != 0
                 or spec.tp_replicated
                 or spec.block_size != config.cache_config.mamba_block_size
                 or spec.num_heads != 1

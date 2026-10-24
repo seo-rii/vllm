@@ -2998,6 +2998,8 @@ def _run_independent_recurrent_oracle(
         shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(ordinary),
         dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(ordinary),
         page_size_padded=ordinary.cache_config.mamba_page_size_padded,
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
     )
     attention_spec = FullAttentionSpec(
         block_size=16, num_kv_heads=2, head_size=32, dtype=torch.bfloat16
@@ -3017,6 +3019,13 @@ def _run_independent_recurrent_oracle(
     assert identity["state_slots"] == live_slots + 1
     assert executor.kv_config.kv_cache_tensors[0].size == budget
     assert executor.max_num_reqs == 1
+    assert [
+        group.kv_cache_spec
+        for group in executor.kv_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ] == [state_spec]
+    assert state_spec.max_memory_usage_bytes(ordinary) == state_spec.page_size_bytes
+    assert state_spec.max_num_blocks_per_req(ordinary, 128) == 1
     mamba = next(
         layer for layer in executor.model.modules() if isinstance(layer, MambaMixer2)
     )

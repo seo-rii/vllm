@@ -122,6 +122,120 @@ def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
     }
 
 
+def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(
+    tmp_path, monkeypatch
+):
+    """Native checkpoint export metadata does not reserve align-mode states."""
+    from safetensors import safe_open
+
+    import vllm.ir
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    from vllm.model_executor.model_loader import get_model
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MambaSpec
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        create_recurrent_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = create_recurrent_executor_config(
+        token_config(
+            tmp_path,
+            draft_type="nemotron_h",
+            dtype="bfloat16",
+            num_nextn_predict_layers=0,
+            cache_options={"mamba_ssm_cache_dtype": "float32"},
+            scheduler_options={"max_num_seqs": 2},
+            spec_options={"attention_backend": "TRITON_ATTN"},
+        )
+    )
+    with safe_open(tmp_path / "draft/model.safetensors", framework="pt") as weights:
+        assert len(weights.keys()) == 17
+    assert not torch.cuda.is_initialized()
+    assert not torch.distributed.is_initialized()
+    initialized = False
+    try:
+        with (
+            set_current_vllm_config(config),
+            vllm.ir.enable_torch_wrap(config.compilation_config.ir_enable_torch_wrap),
+        ):
+            config.kernel_config.ir_op_priority.set_default()
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=(tmp_path / "gloo").as_uri(),
+                backend="gloo",
+            )
+            initialized = True
+            initialize_model_parallel(backend="gloo")
+            model = get_model(vllm_config=config)
+            specs: dict[str, KVCacheSpec] = {}
+            for name, layer in model.named_modules():
+                if isinstance(layer, (Attention, MambaMixer2)):
+                    spec = layer.get_kv_cache_spec(config)
+                    assert spec is not None
+                    specs[name] = spec
+            assert len(specs) == 2
+            state_name, state_spec = next(
+                (name, spec)
+                for name, spec in specs.items()
+                if isinstance(spec, MambaSpec)
+            )
+            attention_name, attention_spec = next(
+                (name, spec)
+                for name, spec in specs.items()
+                if isinstance(spec, FullAttentionSpec)
+            )
+            assert state_spec.num_prefill_checkpoint_blocks == 1
+            assert state_spec.prefill_checkpoint_alignment == 1
+            assert state_spec.mamba_cache_mode == "none"
+            assert state_spec.num_speculative_blocks == 0
+            assert (
+                state_spec.max_memory_usage_bytes(config) == state_spec.page_size_bytes
+            )
+            assert state_spec.max_num_blocks_per_req(config, 64) == 1
+            budget = 3 * state_spec.page_size_bytes + 9 * attention_spec.page_size_bytes
+            cache = make_recurrent_kv_config(
+                config, specs, budget, 2, KVCacheLayout.LBNHC
+            )
+            assert cache.num_blocks == 9 and cache.recurrent_num_blocks == 3
+            allocated = allocate_kv_cache(
+                cache, torch.device("cpu"), KVCacheLayout.LBNHC
+            )
+            assert allocated[attention_name].shape[0] == 9
+            assert allocated[state_name].shape == (3, 1, 1, state_spec.page_size_bytes)
+            assert all(
+                tensor.untyped_storage().nbytes() == budget
+                for tensor in allocated.values()
+            )
+            preserved = next(
+                group.kv_cache_spec
+                for group in cache.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            )
+            assert preserved == state_spec
+    finally:
+        if initialized:
+            try:
+                destroy_model_parallel()
+            finally:
+                destroy_distributed_environment()
+    assert not torch.distributed.is_initialized()
+    assert not torch.cuda.is_initialized()
+
+
 @pytest.mark.parametrize("attention_blocks,recurrent_blocks", [(9, 3), (2, 5)])
 def test_recurrent_native_allocation_separates_token_pages_and_live_state_slots(
     tmp_path, monkeypatch, attention_blocks, recurrent_blocks
