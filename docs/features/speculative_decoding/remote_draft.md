@@ -90,10 +90,34 @@ llm = LLM(
 Set `VLLM_USE_V2_MODEL_RUNNER=1` for the target too. Both processes must agree on
 target/draft device assignments and checkpoint/schema identities. The example's
 5000 ms budget is explicit; it does not establish that the 100 ms default is
-suitable for long prefills. EAGLE3 currently accepts GPT-OSS and Qwen3 targets;
+suitable for long prefills. EAGLE3 accepts GPT-OSS, Qwen3 and Llama targets;
 see [own-KV MTP contracts](remote_mtp.md) for the experimental MTP families.
 Prefix caching, input streaming, async scheduling, multimodal input, LoRA and
 `draft_lm_head_quantization` are rejected for this backend. Native local speculation retains its own support.
+
+### Llama EAGLE3 feature contract
+
+Llama remote placement requires native `LlamaForCausalLM` and an
+`Eagle3LlamaForCausalLM` draft (including its `LlamaForCausalLMEagle3` alias),
+matching hidden widths and vocabularies, unquantized weights, target TP1 and
+draft TP1. Use one inline endpoint; `auto` selects inline. CUDA IPC and pooled
+Llama EAGLE3 execution are not enabled by this contract.
+
+The runtime follows native auxiliary-layer selection and capture order. Layer
+position `0` is the target embedding input; positions `1..N` capture the residual
+stream after a target layer, before the final model normalization. Explicit
+checkpoint selections are sorted and deduplicated as in the native target.
+Without a selection, the native defaults are `(2, N // 2, N - 3)`. The resolved
+positions must exist and their count and hidden width must match the draft's
+auxiliary projection. In particular, small test models may need explicit layer
+positions because their defaults can repeat or fall outside the model.
+
+For a Llama EAGLE3 draft, `num_aux_hidden_states` determines the projection count;
+`num_aux_layers` belongs to the Qwen3 EAGLE3 draft contract. With
+`eagle_config.use_aux_hidden_state=False`, the draft instead consumes the target's
+final normalized hidden state without an auxiliary projection. Both peers
+fingerprint the resolved feature contract, and the server checks its actual
+loaded projection before allocating draft KV and warming the model.
 
 ## CUDA IPC feature transport
 
