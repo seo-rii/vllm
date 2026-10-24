@@ -20,6 +20,7 @@ below. All supported paths use scalar token positions.
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeLiteMTPModel` | `Glm4MoeLiteForCausalLM` | Dense MLA | Native sequential rollout |
+| `DeepSeekMTPModel` | `DeepseekV3ForCausalLM` | Dense MLA | One checkpoint head, native sequential rollout |
 | `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Full attention or sliding window, including mixed module groups | One module: native sequential rollout; multiple modules: configured K equals checkpoint module count |
 | `NemotronHMTPModel` | `NemotronHForCausalLM` / `NemotronHPuzzleForCausalLM` | Attention/MoE-only MTP block | Native sequential rollout |
 | `HYV3MTPModel` | `HYV3ForCausalLM` | Full attention | Native sequential rollout |
@@ -43,6 +44,24 @@ features, mRoPE and mHC are rejected. Nemotron MTP must contain only attention
 and MoE layers.
 Gemma4's Q-only assistant reads target-owned KV and is not supported by this
 own-KV adapter. Its native local path is unaffected.
+
+### DeepSeek-V3
+
+The DeepSeek-V3 path requires native, unquantized BF16 target and draft weights,
+BF16 KV, target TP1, draft TP1 and one inline endpoint. `transport="auto"`
+continues to select inline. Both dense feed-forward and routed-expert blocks use
+the existing native DeepSeek MTP implementation; "dense MLA" describes its KV
+layout, not the absence of MoE layers. The native configuration override resolves
+`DeepseekV3ForCausalLM` to `DeepSeekMTPModel` with one checkpoint head. K controls
+sequential rollout of that head rather than the number of checkpoint heads.
+
+Any `index_topk` attribute, including a zero value, is rejected on either model.
+Sparse/indexed DeepSeek variants, mHC, multiple MTP heads, FP8 checkpoint
+metadata, CUDA IPC and pooled placement are outside this contract. Published
+FP8 checkpoints require a separately validated loading and execution contract;
+passing a synthetic BF16 configuration does not establish their support.
+Select an MLA attention backend supported by the device for both native and
+remote comparison, and keep the MLA prefill backend consistent.
 
 ### Exaone module chains
 

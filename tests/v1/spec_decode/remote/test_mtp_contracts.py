@@ -3,6 +3,7 @@
 """CPU admission and shared-weight checks for standalone MTP model families."""
 
 import copy
+import json
 from functools import cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,13 +11,30 @@ from tempfile import TemporaryDirectory
 import pytest
 import torch
 from safetensors.torch import save_file
-from transformers import AutoConfig, PreTrainedConfig, Qwen3Config
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    DeepseekV3Config,
+    PreTrainedConfig,
+    Qwen3Config,
+    TokenizersBackend,
+)
 
 from tests.v1.spec_decode.remote.runtime_fixtures import (
     cpu_parallel_state as cpu_parallel_state,
 )
 from tests.v1.spec_decode.remote.runtime_fixtures import make_config
-from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 from vllm.config.speculative import RemoteDraftConfig, SpeculativeExecutionConfig
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.weights import materialize_target_shell
@@ -134,6 +152,262 @@ def _config(
             target_windows,
         )[1]
     )
+
+
+def _deepseek_public_config(
+    tmp_path,
+    *,
+    k=3,
+    routed=False,
+    target_options=None,
+    draft_options=None,
+    wrong_target=False,
+    dtype="bfloat16",
+    target_tp=1,
+    draft_tp=1,
+    transport="inline",
+    endpoints=None,
+    cache_dtype="auto",
+    spec_options=None,
+    model_impl="auto",
+):
+    options = dict(
+        architectures=["DeepseekV3ForCausalLM"],
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        max_position_embeddings=64,
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+        n_routed_experts=4 if routed else 0,
+        n_shared_experts=1 if routed else 0,
+        first_k_dense_replace=1 if routed else 3,
+        num_experts_per_tok=2 if routed else 1,
+        n_group=1,
+        topk_group=1,
+        num_nextn_predict_layers=1,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    )
+
+    def checkpoint(path, hf):
+        hf.save_pretrained(path)
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(32)})),
+            bos_token="token0",
+            eos_token="token1",
+            pad_token="token2",
+        ).save_pretrained(path)
+        if getattr(hf, "quantization_config", None) is None:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                model = AutoModelForCausalLM.from_config(hf, dtype=torch.bfloat16)
+            embedding = model.get_input_embeddings().weight.detach()
+            save_file(
+                {"model.embed_tokens.weight": embedding},
+                path / "model.safetensors",
+            )
+
+    target_path = draft_path = tmp_path
+    if target_options or draft_options or wrong_target:
+        target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target_hf = (
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+        if wrong_target
+        else DeepseekV3Config(**(options | (target_options or {})))
+    )
+    checkpoint(target_path, target_hf)
+    if draft_path != target_path:
+        checkpoint(draft_path, DeepseekV3Config(**(options | (draft_options or {}))))
+    target = ModelConfig(
+        model=str(target_path),
+        dtype=dtype,
+        max_model_len=64,
+        skip_tokenizer_init=True,
+        model_impl=model_impl,
+    )
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
+    placement = (
+        dict(
+            execution=SpeculativeExecutionConfig(
+                placement="remote", endpoints=endpoints, transport=transport
+            )
+        )
+        if endpoints
+        else dict(
+            remote_draft=RemoteDraftConfig(
+                endpoint="unix:///tmp/deepseek-contract.sock", transport=transport
+            )
+        )
+    )
+    spec = SpeculativeConfig(
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=draft_tp,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        **placement,
+        **(spec_options or {}),
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False, cache_dtype=cache_dtype),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("routed", [False, True], ids=["dense", "moe"])
+def test_deepseek_v3_public_override_resolves_single_native_mtp_head(
+    tmp_path, k, routed
+):
+    config = _deepseek_public_config(tmp_path, k=k, routed=routed)
+    target = config.model_config
+    spec = config.speculative_config
+    assert spec is not None and spec.method == "mtp"
+    draft = spec.draft_model_config
+    assert draft is not None
+    assert target.hf_config.architectures == ["DeepseekV3ForCausalLM"]
+    assert draft.hf_config.architectures == ["DeepSeekMTPModel"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.dtype == draft.dtype == torch.bfloat16
+    assert target.quantization is None and draft.quantization is None
+    assert all(not hasattr(model.hf_config, "index_topk") for model in (target, draft))
+    assert all(
+        model.hf_config.first_k_dense_replace == (1 if routed else 3)
+        and model.hf_config.n_routed_experts == (4 if routed else 0)
+        and model.hf_config.n_shared_experts == (1 if routed else 0)
+        for model in (target, draft)
+    )
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[1].trailing_shape == ()
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (16,)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("index_topk", [0, 4])
+def test_deepseek_public_config_rejects_any_indexer_attribute(
+    tmp_path, role, index_topk
+):
+    config = _deepseek_public_config(
+        tmp_path, **{f"{role}_options": {"index_topk": index_topk}}
+    )
+    with pytest.raises(ValueError, match="sparse indexer"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_requires_one_checkpoint_head(tmp_path):
+    config = _deepseek_public_config(
+        tmp_path, k=2, draft_options={"num_nextn_predict_layers": 2}
+    )
+    with pytest.raises(ValueError, match="one checkpoint"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_deepseek_public_config_rejects_multi_channel_features(tmp_path, role):
+    config = _deepseek_public_config(tmp_path, **{f"{role}_options": {"hc_mult": 2}})
+    with pytest.raises(ValueError, match="scalar positions"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_requires_its_actual_target_family(tmp_path):
+    config = _deepseek_public_config(tmp_path, wrong_target=True)
+    with pytest.raises(ValueError, match="matching target architecture"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_float32_execution(tmp_path):
+    config = _deepseek_public_config(tmp_path, dtype="float32")
+    with pytest.raises(ValueError, match="unquantized bfloat16"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_deepseek_public_config_preserves_rejected_fp8_metadata(tmp_path, role):
+    quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    with pytest.raises(ValueError, match="quant|fp8|bfloat16"):
+        config = _deepseek_public_config(
+            tmp_path, **{f"{role}_options": {"quantization_config": quantization}}
+        )
+        create_runtime_contract(config)
+    saved = json.loads((tmp_path / role / "config.json").read_text())
+    assert saved["quantization_config"] == quantization
+
+
+@pytest.mark.parametrize("target_tp,draft_tp", [(2, 1), (1, 2), (2, 2)])
+def test_deepseek_public_config_rejects_tensor_parallel_drafting(
+    tmp_path, target_tp, draft_tp
+):
+    with pytest.raises(ValueError, match="TP1|draft_tensor_parallel_size"):
+        config = _deepseek_public_config(
+            tmp_path, target_tp=target_tp, draft_tp=draft_tp
+        )
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_ipc(tmp_path):
+    config = _deepseek_public_config(tmp_path, transport="cuda_ipc")
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_multiple_endpoints(tmp_path):
+    config = _deepseek_public_config(
+        tmp_path,
+        endpoints=("unix:///tmp/deepseek-a.sock", "unix:///tmp/deepseek-b.sock"),
+    )
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("draft_dtype", [None, "auto", "fp8"])
+def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_dtype):
+    options = {} if draft_dtype is None else {"kv_cache_dtype": draft_dtype}
+    config = _deepseek_public_config(
+        tmp_path,
+        cache_dtype="auto" if draft_dtype == "fp8" else "fp8",
+        spec_options=options,
+    )
+    with pytest.raises(ValueError, match="bfloat16 KV"):
+        create_runtime_contract(config)
 
 
 @pytest.mark.parametrize("model_type,target_arch,draft_arch,k", MODELS)

@@ -646,6 +646,244 @@ def _save_mtp_checkpoint(path, config, weights):
     return str(path)
 
 
+def _check_deepseek_mtp_weights(target, draft, model_path):
+    """Account for every checkpoint tensor and native packed parameter."""
+    import torch
+    from safetensors.torch import load_file
+
+    weights = load_file(Path(model_path) / "model.safetensors")
+    checked = set()
+    parameter_counts = {}
+    assert type(target).__name__ == "DeepseekV3ForCausalLM"
+    assert type(draft).__name__ == "DeepSeekMTP"
+
+    def equal(actual, names):
+        expected = torch.cat([weights[name] for name in names]).to(actual.dtype)
+        assert torch.equal(actual.detach().cpu(), expected), names
+        checked.update(names)
+
+    for role, model in (("target", target), ("draft", draft)):
+        parameters = dict(model.named_parameters())
+        for name, parameter in parameters.items():
+            source = name.replace(".mtp_block.", ".")
+            if source in weights:
+                equal(parameter, [source])
+            elif source.endswith(".fused_qkv_a_proj.weight"):
+                equal(
+                    parameter,
+                    [
+                        source.replace("fused_qkv_a_proj", projection)
+                        for projection in ("q_a_proj", "kv_a_proj_with_mqa")
+                    ],
+                )
+            elif source.endswith(".gate_up_proj.weight"):
+                equal(
+                    parameter,
+                    [
+                        source.replace("gate_up_proj", projection)
+                        for projection in ("gate_proj", "up_proj")
+                    ],
+                )
+            elif source.endswith((".w13_weight", ".w2_weight")):
+                prefix, projection = source.rsplit(".", 1)
+                for expert, value in enumerate(parameter):
+                    names = (
+                        ("gate_proj", "up_proj")
+                        if projection == "w13_weight"
+                        else ("down_proj",)
+                    )
+                    equal(
+                        value,
+                        [f"{prefix}.{expert}.{name}.weight" for name in names],
+                    )
+            elif source.endswith((".W_UV", ".W_UK_T")):
+                prefix = source.rsplit(".self_attn.", 1)[0]
+                checkpoint_name = f"{prefix}.self_attn.kv_b_proj.weight"
+                config = model.config
+                original = (
+                    weights[checkpoint_name]
+                    .to(parameter.dtype)
+                    .T.reshape(
+                        config.kv_lora_rank,
+                        config.num_attention_heads,
+                        config.qk_nope_head_dim + config.v_head_dim,
+                    )
+                )
+                key, value = original.split(
+                    [config.qk_nope_head_dim, config.v_head_dim], dim=-1
+                )
+                expected = (
+                    value.transpose(0, 1)
+                    if source.endswith(".W_UV")
+                    else key.permute(1, 2, 0)
+                )
+                assert torch.equal(parameter.detach().cpu(), expected), name
+                checked.add(checkpoint_name)
+            else:
+                raise AssertionError(f"unchecked native {role} parameter: {name}")
+        parameter_counts[role] = len(parameters)
+
+    assert draft.model.embed_tokens is target.model.embed_tokens
+    assert draft.lm_head is target.lm_head
+    assert tuple(draft.model.layers) == ("2",)
+    layer = draft.model.layers["2"]
+    assert layer.shared_head.head is target.lm_head
+    equal(target.model.embed_tokens.weight, ["model.layers.2.embed_tokens.weight"])
+    equal(target.lm_head.weight, ["model.layers.2.shared_head.head.weight"])
+    assert checked == weights.keys(), weights.keys() - checked
+    return dict(
+        target=type(target).__name__,
+        draft=type(draft).__name__,
+        parameters=parameter_counts,
+        checkpoint_tensors=len(checked),
+        exact_parameter_roundtrip=True,
+        shared_embedding_and_head=True,
+        mtp_absolute_layer=2,
+    )
+
+
+def _save_deepseek_mtp_model(directory, ffn_layout):
+    """Save a complete initialized HF V3 target and independent native MTP block."""
+    import json
+
+    import torch
+    from transformers import DeepseekV3Config, DeepseekV3ForCausalLM
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3DecoderLayer,
+        DeepseekV3RMSNorm,
+    )
+
+    assert current_platform.is_cpu() and not torch.cuda.is_initialized()
+    assert ffn_layout in ("dense", "moe")
+    torch.set_num_threads(1)
+    root = Path(directory)
+    dense = ffn_layout == "dense"
+    config = DeepseekV3Config(
+        architectures=["DeepseekV3ForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        n_routed_experts=0 if dense else 4,
+        n_shared_experts=0 if dense else 1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        first_k_dense_replace=3 if dense else 1,
+        n_group=1,
+        topk_group=1,
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        num_nextn_predict_layers=1,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        attention_bias=False,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+        topk_method="noaux_tc",
+        scoring_func="sigmoid",
+    )
+    assert not hasattr(config, "index_topk")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261026)
+        target = DeepseekV3ForCausalLM(config)
+        _two_candidate_head(target.lm_head.weight)
+        # HF initializes expert tensors in the owning model's post_init().
+        # Use its independently initialized absolute-N layer, not raw empty
+        # expert Parameters from a standalone decoder constructor.
+        mtp_config = DeepseekV3Config.from_dict(config.to_dict(), num_hidden_layers=3)
+        mtp = DeepseekV3ForCausalLM(mtp_config).model.layers[2]
+        assert isinstance(mtp, DeepseekV3DecoderLayer)
+        state = dict(target.state_dict())
+        state.update(
+            {
+                f"model.layers.2.{name}": value
+                for name, value in mtp.state_dict().items()
+            }
+        )
+        for name in ("enorm", "hnorm", "shared_head.norm"):
+            norm = DeepseekV3RMSNorm(128, config.rms_norm_eps)
+            state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
+        state["model.layers.2.embed_tokens.weight"] = state[
+            "model.embed_tokens.weight"
+        ].clone()
+        state["model.layers.2.shared_head.head.weight"] = state[
+            "lm_head.weight"
+        ].clone()
+    weights = _unpack_mtp_experts(state)
+    _save_mtp_checkpoint(root / "model", config, weights)
+    assert not torch.cuda.is_initialized()
+    receipt = dict(
+        target_architecture=config.architectures[0],
+        draft_architecture="DeepSeekMTPModel",
+        target_hf_class=type(target).__name__,
+        mtp_hf_class=type(mtp).__name__,
+        mtp_source="independently_initialized_hf_layer_2_of_3",
+        checkpoint_tensors=len(weights),
+        exact_checkpoint_roundtrip=True,
+        mtp_absolute_layer=2,
+        ffn_layout=ffn_layout,
+        routed_experts=config.n_routed_experts,
+        first_k_dense_replace=config.first_k_dense_replace,
+        latent_width=576,
+        seed=20261026,
+        head_candidate_ids=[3, 4],
+        head_scale=32,
+        cuda_initialized=False,
+    )
+    (root / "fixture.json").write_text(json.dumps(receipt) + "\n")
+
+
+@pytest.fixture
+def tiny_deepseek_mtp_model(tmp_path, ffn_layout):
+    """Build real initialized weights without changing the serving CUDA platform."""
+    root = (tmp_path / f"deepseek-v3-{ffn_layout}").resolve()
+    root.mkdir()
+    source = Path(__file__).resolve().parents[5]
+    command = [
+        sys.executable,
+        "-c",
+        "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_deepseek_mtp_model; "
+        "import sys; _save_deepseek_mtp_model(*sys.argv[1:])",
+        str(root),
+        ffn_layout,
+    ]
+    log_path = root / "fixture.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(source),
+                CUDA_VISIBLE_DEVICES="",
+                VLLM_TARGET_DEVICE="cpu",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            assert process.wait(timeout=210) == 0, (
+                f"DeepSeek fixture failed: {log_path}"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    return str(root / "model")
+
+
 @pytest.fixture
 def tiny_glm4_moe_mtp_model(tmp_path):
     """Keep a real routed target layer and its initialized native MTP counterpart."""
@@ -1878,6 +2116,38 @@ def test_remote_native_mtp_matches_native_and_target(
     )
 
 
+@pytest.mark.parametrize("ffn_layout", ["dense", "moe"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_deepseek_mtp_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    ffn_layout,
+    k,
+    tiny_deepseek_mtp_model,
+    record_property,
+):
+    """Preserve dense MLA KV, initialized MTP weights and repeated-head feedback."""
+    import json
+
+    model = tiny_deepseek_mtp_model
+    record_property(
+        "fixture", json.loads((Path(model).parent / "fixture.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        f"deepseek_v3_{ffn_layout}",
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
 @pytest.mark.parametrize("mtp_family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
 @pytest.mark.parametrize("k", [1, 3])
 def test_remote_independent_draft_with_hybrid_or_mla_target(
@@ -2042,7 +2312,8 @@ def _compare_native_and_remote_draft(
             assert draft_config["architectures"] == ["NemotronHForCausalLM"]
             assert draft_config["num_nextn_predict_layers"] == 0
     eagle3 = eagle3_draft is not None
-    detailed = independent or eagle3
+    deepseek_mtp = mtp_family in ("deepseek_v3_dense", "deepseek_v3_moe")
+    detailed = independent or eagle3 or deepseek_mtp
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
@@ -2054,7 +2325,7 @@ def _compare_native_and_remote_draft(
         "exaone_three": (None, 16, 32),
     }.get(mtp_family, (mtp_window,))
     num_modules = len(mtp_windows)
-    dense_mla = mtp_family == "glm4_moe_lite"
+    dense_mla = mtp_family == "glm4_moe_lite" or deepseek_mtp
     attention_backend = "TRITON_MLA" if dense_mla else "TRITON_ATTN"
     attention_config: dict[str, Any] = {"backend": attention_backend}
     if dense_mla or mla_draft:
@@ -2090,7 +2361,11 @@ def _compare_native_and_remote_draft(
         kwargs["tokenizer_mode"] = "hf"
     moe_backend = (
         None
-        if mtp_family.startswith("exaone") or eagle3 or mla_draft or recurrent_draft
+        if mtp_family.startswith("exaone")
+        or eagle3
+        or mla_draft
+        or recurrent_draft
+        or mtp_family == "deepseek_v3_dense"
         else "triton"
     )
     if moe_backend is not None:
@@ -2414,6 +2689,9 @@ def _compare_native_and_remote_draft(
             assert policy["attention_backends"] == [attention_backend] * (
                 1 if hybrid_target else 2
             )
+        if deepseek_mtp:
+            assert policy["model"] == "DeepseekV3ForCausalLM"
+            assert policy["attention_backends"] == ["TRITON_MLA"] * 2
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
@@ -2488,6 +2766,28 @@ def _compare_native_and_remote_draft(
                 )
             )
         return policies
+
+    def deepseek_identity(worker):
+        from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
+        from vllm.model_executor.models.deepseek_v2 import (
+            DeepseekV2MLP,
+            DeepseekV2MoE,
+        )
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, MTPSpeculator)
+        draft = runner.get_draft_model()
+        assert isinstance(draft, DeepSeekMTP)
+        assert draft.model.num_mtp_layers == 1
+        assert draft.model.mtp_start_layer_idx == 2
+        assert not hasattr(draft.config, "index_topk")
+        dense = mtp_family == "deepseek_v3_dense"
+        assert draft.config.n_routed_experts == (0 if dense else 4)
+        assert draft.config.first_k_dense_replace == (3 if dense else 1)
+        block = draft.model.layers["2"].mtp_block
+        assert isinstance(block.mlp, DeepseekV2MLP if dense else DeepseekV2MoE)
+        return _check_deepseek_mtp_weights(runner.get_model(), draft, model)
 
     def independent_draft_identity(worker):
         from vllm.model_executor.layers.attention import Attention
@@ -2727,6 +3027,11 @@ def _compare_native_and_remote_draft(
                 record_property(
                     "native.eagle3", native.llm.collective_rpc(eagle_identity)
                 )
+            if deepseek_mtp:
+                record_property(
+                    "native.deepseek_weights",
+                    native.llm.collective_rpc(deepseek_identity),
+                )
             if dense_mla and not independent:
                 layout = native.llm.collective_rpc(draft_mla_layout)
                 assert layout == [[expected_mla_layout]]
@@ -2737,6 +3042,7 @@ def _compare_native_and_remote_draft(
                 and not eagle3
                 and not mtp_family.startswith("exaone")
                 and mtp_family != "ernie"
+                and mtp_family != "deepseek_v3_dense"
             )
             assert backends == [["TRITON"] if draft_has_moe else []]
             record_property("native.moe_backends", backends)

@@ -73,6 +73,7 @@ _MTP_MODELS = {
     "Qwen3NextMTP": _MTPModelContract(("Qwen3NextForCausalLM",)),
     "Glm4MoeMTPModel": _MTPModelContract(("Glm4MoeForCausalLM",)),
     "Glm4MoeLiteMTPModel": _MTPModelContract(("Glm4MoeLiteForCausalLM",)),
+    "DeepSeekMTPModel": _MTPModelContract(("DeepseekV3ForCausalLM",)),
     "ExaoneMoeMTP": _MTPModelContract(("ExaoneMoeForCausalLM", "ExaoneMoEForCausalLM")),
     "NemotronHMTPModel": _MTPModelContract(
         ("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
@@ -174,6 +175,21 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
             raise ValueError("standalone Nemotron MTP requires attention/MoE layers")
     if architecture == "Glm4MoeLiteMTPModel" and hasattr(config, "index_topk"):
         raise ValueError("standalone GLM MLA does not support a sparse indexer")
+    if architecture == "DeepSeekMTPModel":
+        for model in (target, draft):
+            if hasattr(model.hf_config, "index_topk"):
+                raise ValueError(
+                    "standalone DeepSeek MTP does not support a sparse indexer"
+                )
+            if (
+                model.using_transformers_backend()
+                or model.quantization is not None
+                or getattr(model.hf_config, "quantization_config", None) is not None
+                or str(model.dtype) != "torch.bfloat16"
+            ):
+                raise ValueError(
+                    "standalone DeepSeek MTP requires native unquantized bfloat16"
+                )
 
 
 def _fingerprint(value: Any) -> str:
@@ -438,6 +454,25 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         eagle3_features = _resolve_eagle3_features(vllm_config)
     elif spec.method == "mtp":
         _validate_mtp_contract(target, spec)
+        if draft.hf_config.architectures == ["DeepSeekMTPModel"]:
+            if (
+                vllm_config.parallel_config.tensor_parallel_size != 1
+                or spec.draft_parallel_config.tensor_parallel_size != 1
+            ):
+                raise ValueError(
+                    "standalone DeepSeek MTP requires target TP1 and draft TP1"
+                )
+            remote = spec.get_remote_draft_config()
+            if remote is not None and (
+                remote.transport not in ("auto", "inline")
+                or len(spec.get_remote_draft_endpoints()) != 1
+            ):
+                raise ValueError("standalone DeepSeek MTP requires one inline endpoint")
+            if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16") or (
+                spec.kv_cache_dtype is not None
+                and spec.kv_cache_dtype not in ("auto", "bfloat16")
+            ):
+                raise ValueError("standalone DeepSeek MTP requires bfloat16 KV")
     else:
         raise ValueError(f"unsupported standalone method: {spec.method}")
     if spec.parallel_drafting or spec.draft_sample_method != "greedy":
