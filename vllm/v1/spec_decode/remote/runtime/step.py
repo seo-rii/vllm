@@ -25,9 +25,9 @@ from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool, DraftKVExhaust
 class DraftStepRow:
     """One sequence's share of a draft step.
 
-    ``num_tokens`` target tokens starting at the sequence's committed length
-    are covered; the last ``num_rejected`` of them were rejected by the
-    target. ``num_sampled == 0`` marks a prompt chunk that is not the last:
+    ``num_tokens`` target tokens start ``num_replayed`` positions before the
+    sequence's committed length; the last ``num_rejected`` of them were rejected
+    by the target. ``num_sampled == 0`` marks a prompt chunk that is not the last:
     its final position is completed by ``next_prefill_tokens`` instead of a
     sampled token.
     """
@@ -38,6 +38,8 @@ class DraftStepRow:
     num_rejected: int = 0
     last_sampled: int = 0
     next_prefill_tokens: tuple[int, ...] = ()
+    num_replayed: int = 0
+    """Previously committed rows prepended to repair later MTP modules."""
 
 
 @dataclass(frozen=True)
@@ -64,9 +66,9 @@ class DraftStepPlan:
     query_start_loc: np.ndarray
     """[num_reqs + 1] prefix sums of num_scheduled_tokens."""
     num_computed_tokens: np.ndarray
-    """[num_reqs] committed positions before this step."""
+    """[num_reqs] execution starts, including any previously committed replay."""
     seq_lens: np.ndarray
-    """[num_reqs] committed positions plus this step's tokens."""
+    """[num_reqs] execution starts plus this step's tokens."""
     positions: np.ndarray
     """[num_tokens] target position of every token."""
     slot_mapping: np.ndarray
@@ -110,12 +112,14 @@ class DraftStepPlanner:
         max_model_len: int,
         num_speculative_tokens: int,
         num_prefill_lookahead: int = 1,
+        multi_module: bool = False,
     ) -> None:
         self.block_pool = block_pool
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.num_speculative_tokens = num_speculative_tokens
         self.num_prefill_lookahead = num_prefill_lookahead
+        self.multi_module = multi_module
         self._free_slots = list(range(max_num_reqs - 1, -1, -1))
         self._num_free_slots = max_num_reqs
         self._sequences: dict[SequenceKey, _DraftSequence] = {}
@@ -181,7 +185,9 @@ class DraftStepPlanner:
             if sequence is None:
                 failures[i] = (SpeculatorStatusCode.SEQUENCE_DESYNC, "not open")
                 continue
-            seq_len = sequence.num_computed + row.num_tokens
+            if row.num_replayed > sequence.num_computed:
+                raise ValueError(f"row for {row.key} replays before position zero")
+            seq_len = sequence.num_computed - row.num_replayed + row.num_tokens
             if seq_len > self.max_model_len:
                 failures[i] = (
                     SpeculatorStatusCode.OUT_OF_MEMORY,
@@ -192,7 +198,9 @@ class DraftStepPlanner:
             start = len(self.block_pool.blocks(sequence.req_index))
             draft_extent = min(
                 self.max_model_len,
-                seq_len - row.num_rejected + max(num_speculative_tokens - 1, 0),
+                seq_len
+                - row.num_rejected
+                + (0 if self.multi_module else max(num_speculative_tokens - 1, 0)),
             )
             try:
                 blocks = self.block_pool.ensure(
@@ -209,7 +217,9 @@ class DraftStepPlanner:
     def commit(self, plan: DraftStepPlan) -> None:
         """Advance every planned row by its accepted tokens."""
         for row in plan.rows:
-            self._sequences[row.key].num_computed += row.num_tokens - row.num_rejected
+            self._sequences[row.key].num_computed += (
+                row.num_tokens - row.num_rejected - row.num_replayed
+            )
 
     def _validate(self, row: DraftStepRow) -> None:
         if row.num_tokens <= 0:
@@ -221,6 +231,10 @@ class DraftStepPlanner:
             )
         if row.num_sampled < 0:
             raise ValueError(f"row for {row.key} samples {row.num_sampled} tokens")
+        if not 0 <= row.num_replayed < row.num_tokens - row.num_rejected:
+            raise ValueError(f"row for {row.key} has invalid replay length")
+        if row.num_replayed and not self.multi_module:
+            raise ValueError("replay rows require a multi-module planner")
         if row.num_sampled == 0:
             if row.num_rejected:
                 raise ValueError(f"prompt chunk for {row.key} rejects tokens")
@@ -238,7 +252,8 @@ class DraftStepPlanner:
             [self._sequences[row.key].req_index for row in rows], dtype=np.int32
         )
         num_computed = np.array(
-            [self._sequences[row.key].num_computed for row in rows], dtype=np.int32
+            [self._sequences[row.key].num_computed - row.num_replayed for row in rows],
+            dtype=np.int32,
         )
         num_scheduled = np.array([row.num_tokens for row in rows], dtype=np.int32)
         query_start_loc = np.zeros(len(rows) + 1, dtype=np.int32)

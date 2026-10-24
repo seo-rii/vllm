@@ -10,7 +10,8 @@ between target and draft computation.
 
 The runtime checks the resolved draft architecture and its matching target,
 including hidden width, vocabulary size and the number of checkpoint MTP modules.
-It currently requires exactly one MTP module and scalar token positions.
+It accepts one MTP module, or the Exaone module chain described
+below. All supported paths use scalar token positions.
 
 | Resolved draft architecture | Matching target | Draft cache | K restriction |
 | --- | --- | --- | --- |
@@ -19,7 +20,7 @@ It currently requires exactly one MTP module and scalar token positions.
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeLiteMTPModel` | `Glm4MoeLiteForCausalLM` | Dense MLA | Native sequential rollout |
-| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Uniform full attention or sliding window | Native sequential rollout |
+| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Full attention or sliding window, including mixed module groups | One module: native sequential rollout; multiple modules: configured K equals checkpoint module count |
 | `NemotronHMTPModel` | `NemotronHForCausalLM` / `NemotronHPuzzleForCausalLM` | Attention/MoE-only MTP block | Native sequential rollout |
 | `HYV3MTPModel` | `HYV3ForCausalLM` | Full attention | Native sequential rollout |
 
@@ -28,17 +29,45 @@ or topology in each family. A target with hybrid attention or recurrent layers
 can have a conventional attention-only MTP head. The target's architecture name
 alone does not determine the draft's cache layout.
 
-The standalone allocator accepts one homogeneous, unquantized full-attention,
-dense MLA, or sliding-window group. It uses the shared vLLM KV allocator and
-retains a null block. Sliding-window attention conservatively reserves the full
+The standalone allocator accepts unquantized full-attention, dense MLA, or
+sliding-window KV. Exaone module chains can mix full and sliding-window groups
+with a common block size and dtype; other own-KV models require one homogeneous
+group. The runtime uses the shared vLLM KV allocator and retains a null block.
+Sliding-window attention conservatively reserves the full
 context; the attention backend applies the window, and this runtime does not
 recycle evicted window pages. Budget the draft KV accordingly.
 
 Sparse/indexer MLA (including any `index_topk` configuration), compressed or
-packed KV, mixed KV groups, multiple MTP modules, multimodal features, mRoPE and
-mHC are rejected. Nemotron MTP must contain only attention and MoE layers.
+packed KV, mixed MLA/dense groups, other multi-module model families, multimodal
+features, mRoPE and mHC are rejected. Nemotron MTP must contain only attention
+and MoE layers.
 Gemma4's Q-only assistant reads target-owned KV and is not supported by this
 own-KV adapter. Its native local path is unaffected.
+
+### Exaone module chains
+
+A checkpoint with `num_nextn_predict_layers=N`, where N is at least two, can use
+`num_speculative_tokens=N` with target TP1, draft TP1 and one inline endpoint.
+Declare one `full_attention` or `sliding_attention` entry per module in
+`mtp_layer_types`. Sliding modules require positive windows, from
+`mtp_sliding_windows` or the checkpoint's existing window settings. The runtime
+loads all N checkpoint modules and calls the existing native multi-module
+speculator. Every nonfinal prefill chunk sends N known lookahead tokens.
+
+Later modules' trailing KV rows can depend on rejected proposals. The runtime
+retains at most N−1 independently owned target input/hidden-state rows per live
+sequence. It replays the affected suffix according to the actual accepted count,
+including after effective K=0 or scheduler truncation of submitted drafts. Short
+prompts retain only their real rows. History is committed only after execution
+completes and is released with its sequence generation. Inline history uses CPU
+memory, separate from the draft GPU's KV and execution buffers; old and staged
+new history can coexist during an update.
+
+Effective K can vary from 0 through N. The native forward still executes all N
+modules; effective K limits returned drafts and does not currently reduce module
+computation. Configured K values different from N, CUDA IPC and pooled placement
+remain unsupported for this path. The single-module path retains its native
+sequential rollout behavior.
 
 ## Shared weights and execution
 

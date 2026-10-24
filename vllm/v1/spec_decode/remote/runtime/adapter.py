@@ -69,6 +69,15 @@ class DraftStepExecutor(ABC):
         """Maximum tokens per execution, or None for an unbounded executor."""
         return None
 
+    def prepare_row(
+        self, row: DraftStepRow, features: Features
+    ) -> tuple[DraftStepRow, Features]:
+        """Adapt execution inputs before the planner reserves their KV."""
+        return row, features
+
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:  # noqa: B027
+        """Release executor-owned request history after work has completed."""
+
     @abstractmethod
     def execute(
         self,
@@ -170,6 +179,12 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_sampled=0,
             next_prefill_tokens=tuple(int(t) for t in lookahead[0].tolist()),
         )
+        try:
+            row, features = self.executor.prepare_row(row, features)
+        except torch.OutOfMemoryError as error:
+            raise AdapterError(
+                SpeculatorStatusCode.OUT_OF_MEMORY, str(error)
+            ) from error
         plan, failures = self.planner.plan([row], num_speculative_tokens=0)
         if failures:
             raise AdapterError(*failures[0])
@@ -224,6 +239,14 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
                     num_rejected=query_len - 1 - accepted[i],
                     last_sampled=recovery[i],
                 )
+            try:
+                row, source = self.executor.prepare_row(row, source)
+            except torch.OutOfMemoryError:
+                statuses[i] = SpeculatorStatusCode.OUT_OF_MEMORY
+                continue
+            except AdapterError as error:
+                statuses[i] = error.status
+                continue
             rows.append(row)
             batch_rows.append(i)
             sources.append(source)
@@ -382,6 +405,7 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         return results
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        self.executor.close_sequences(keys)
         for key in keys:
             self._last_chunks.pop(key, None)
             self.planner.close(key)
