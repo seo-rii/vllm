@@ -515,13 +515,100 @@ def tiny_exaone_mtp_model(tmp_path, mtp_window):
     return str(path)
 
 
+def _unpack_mtp_experts(state):
+    """Preserve packed HF expert values under native per-expert checkpoint names."""
+    import torch
+
+    weights = {}
+    for name, tensor in state.items():
+        if name.endswith(".experts.gate_up_proj"):
+            prefix = name.removesuffix(".gate_up_proj")
+            gates, ups = tensor.chunk(2, dim=1)
+            for expert in range(tensor.shape[0]):
+                weights[f"{prefix}.{expert}.gate_proj.weight"] = gates[expert].clone()
+                weights[f"{prefix}.{expert}.up_proj.weight"] = ups[expert].clone()
+            reconstructed = torch.stack(
+                [
+                    torch.cat(
+                        (
+                            weights[f"{prefix}.{e}.gate_proj.weight"],
+                            weights[f"{prefix}.{e}.up_proj.weight"],
+                        )
+                    )
+                    for e in range(tensor.shape[0])
+                ]
+            )
+            assert torch.equal(reconstructed, tensor)
+        elif name.endswith((".experts.up_proj", ".experts.down_proj")):
+            prefix, projection = name.rsplit(".", 1)
+            for expert in range(tensor.shape[0]):
+                weights[f"{prefix}.{expert}.{projection}.weight"] = tensor[
+                    expert
+                ].clone()
+            assert torch.equal(
+                torch.stack(
+                    [
+                        weights[f"{prefix}.{e}.{projection}.weight"]
+                        for e in range(tensor.shape[0])
+                    ]
+                ),
+                tensor,
+            )
+        else:
+            weights[name] = tensor.clone()
+    return weights
+
+
+def _save_mtp_checkpoint(path, config, weights):
+    import torch
+    from safetensors.torch import load_file, save_file
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import TokenizersBackend
+
+    for name, tensor in weights.items():
+        dtype = (
+            torch.float32
+            if name.endswith(
+                (
+                    ".gate.weight",
+                    ".e_score_correction_bias",
+                    ".expert_bias",
+                    ".A_log",
+                    ".dt_bias",
+                    ".D",
+                )
+            )
+            else torch.bfloat16
+        )
+        weights[name] = tensor.to(dtype).contiguous()
+        assert torch.isfinite(weights[name]).all()
+    path.mkdir()
+    save_file(weights, path / "model.safetensors", metadata={"format": "pt"})
+    reloaded = load_file(path / "model.safetensors")
+    assert weights.keys() == reloaded.keys()
+    assert all(torch.equal(tensor, reloaded[name]) for name, tensor in weights.items())
+    config.save_pretrained(path)
+    vocabulary = {token: i for i, token in enumerate(("<pad>", "<s>", "</s>", "<unk>"))}
+    vocabulary.update({f"t{i}": i for i in range(4, 128)})
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = TokenizersBackend(
+        tokenizer_object=backend,
+        pad_token="<pad>",
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        model_max_length=128,
+    )
+    tokenizer.save_pretrained(path)
+    return str(path)
+
+
 @pytest.fixture
 def tiny_glm4_moe_mtp_model(tmp_path):
     """Keep a real routed target layer and its initialized native MTP counterpart."""
     import torch
-    from safetensors.torch import load_file, save_file
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import Glm4MoeConfig, Glm4MoeForCausalLM, TokenizersBackend
+    from transformers import Glm4MoeConfig, Glm4MoeForCausalLM
     from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeRMSNorm
 
     config = Glm4MoeConfig(
@@ -566,76 +653,204 @@ def tiny_glm4_moe_mtp_model(tmp_path):
         fusion = torch.nn.Linear(256, 128, bias=False)
         state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
 
-    weights = {}
-    for name, tensor in state.items():
-        if name.endswith(".experts.gate_up_proj"):
-            prefix = name.removesuffix(".gate_up_proj")
-            gates, ups = tensor.chunk(2, dim=1)
-            for expert in range(tensor.shape[0]):
-                weights[f"{prefix}.{expert}.gate_proj.weight"] = gates[expert].clone()
-                weights[f"{prefix}.{expert}.up_proj.weight"] = ups[expert].clone()
-            reconstructed = torch.stack(
-                [
-                    torch.cat(
-                        (
-                            weights[f"{prefix}.{e}.gate_proj.weight"],
-                            weights[f"{prefix}.{e}.up_proj.weight"],
-                        )
-                    )
-                    for e in range(tensor.shape[0])
-                ]
-            )
-            assert torch.equal(reconstructed, tensor)
-        elif name.endswith(".experts.down_proj"):
-            prefix = name.removesuffix(".down_proj")
-            for expert in range(tensor.shape[0]):
-                weights[f"{prefix}.{expert}.down_proj.weight"] = tensor[expert].clone()
-            assert torch.equal(
-                torch.stack(
-                    [
-                        weights[f"{prefix}.{e}.down_proj.weight"]
-                        for e in range(tensor.shape[0])
-                    ]
-                ),
-                tensor,
-            )
-        else:
-            weights[name] = tensor.clone()
-    for name, tensor in weights.items():
-        dtype = (
-            torch.float32
-            if name.endswith((".mlp.gate.weight", ".e_score_correction_bias"))
-            else torch.bfloat16
-        )
-        weights[name] = tensor.to(dtype).contiguous()
-        assert torch.isfinite(weights[name]).all()
-    path = tmp_path / "glm4-moe"
-    path.mkdir()
-    save_file(weights, path / "model.safetensors", metadata={"format": "pt"})
-    reloaded = load_file(path / "model.safetensors")
-    assert weights.keys() == reloaded.keys()
-    assert all(torch.equal(tensor, reloaded[name]) for name, tensor in weights.items())
-    config.save_pretrained(path)
-    vocabulary = {token: i for i, token in enumerate(("<pad>", "<s>", "</s>", "<unk>"))}
-    vocabulary.update({f"t{i}": i for i in range(4, 128)})
-    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
-    backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer = TokenizersBackend(
-        tokenizer_object=backend,
-        pad_token="<pad>",
-        bos_token="<s>",
-        eos_token="</s>",
-        unk_token="<unk>",
-        model_max_length=128,
+    return _save_mtp_checkpoint(
+        tmp_path / "glm4-moe", config, _unpack_mtp_experts(state)
     )
-    tokenizer.save_pretrained(path)
-    return str(path)
+
+
+@pytest.fixture
+def tiny_qwen3_next_mtp_model(tmp_path):
+    """Retain real GDN target state while cloning its attention layer for MTP."""
+    import torch
+    from transformers import Qwen3NextConfig, Qwen3NextForCausalLM
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
+
+    config = Qwen3NextConfig(
+        architectures=["Qwen3NextForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        layer_types=["linear_attention", "full_attention"],
+        linear_conv_kernel_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        decoder_sparse_step=1,
+        num_nextn_predict_layers=1,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+        },
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = Qwen3NextForCausalLM(config)
+        state = dict(model.state_dict())
+        state.update(
+            {
+                f"mtp.layers.0.{name}": tensor.clone()
+                for name, tensor in model.model.layers[1].state_dict().items()
+            }
+        )
+        for name in ("norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding"):
+            norm = Qwen3NextRMSNorm(128, config.rms_norm_eps)
+            assert torch.equal(norm.weight, model.model.norm.weight)
+            state[f"mtp.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["mtp.fc.weight"] = fusion.weight.detach().clone()
+    return _save_mtp_checkpoint(
+        tmp_path / "qwen3-next", config, _unpack_mtp_experts(state)
+    )
+
+
+@pytest.fixture
+def tiny_nemotron_h_mtp_model(tmp_path):
+    """Exercise the real Mamba/attention/MoE target and attention/MoE MTP."""
+    import torch
+    from transformers import NemotronHConfig, NemotronHForCausalLM
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHRMSNorm
+
+    config = NemotronHConfig(
+        architectures=["NemotronHForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        layers_block_type=["linear_attention", "full_attention", "moe"],
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        ssm_state_size=64,
+        n_groups=1,
+        conv_kernel=4,
+        chunk_size=128,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        moe_intermediate_size=128,
+        moe_shared_expert_intermediate_size=128,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["full_attention", "moe"],
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = NemotronHForCausalLM(config)
+        state = dict(model.state_dict())
+        for source, destination in ((1, 0), (2, 1)):
+            state.update(
+                {
+                    f"mtp.layers.{destination}.{name}": tensor.clone()
+                    for name, tensor in model.model.layers[source].state_dict().items()
+                }
+            )
+        for name in ("layers.0.enorm", "layers.0.hnorm", "layers.1.final_layernorm"):
+            norm = NemotronHRMSNorm(128, config.layer_norm_epsilon)
+            assert torch.equal(norm.weight, model.model.norm_f.weight)
+            state[f"mtp.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["mtp.layers.0.eh_proj.weight"] = fusion.weight.detach().clone()
+    return _save_mtp_checkpoint(
+        tmp_path / "nemotron-h", config, _unpack_mtp_experts(state)
+    )
+
+
+@pytest.fixture
+def tiny_hyv3_mtp_model(tmp_path):
+    """Preserve HYV3's routed layer and distinct post-block MTP normalization."""
+    import torch
+    from transformers import HYV3Config, HYV3ForCausalLM
+    from transformers.models.hy_v3.modeling_hy_v3 import HYV3RMSNorm
+
+    config = HYV3Config(
+        architectures=["HYV3ForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        num_experts=4,
+        num_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        mlp_layer_types=["dense", "sparse"],
+        tie_word_embeddings=False,
+        attention_bias=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+    )
+    config.update(
+        {
+            "first_k_dense_replace": 1,
+            "expert_hidden_dim": 128,
+            "route_norm": True,
+            "qk_norm": True,
+            "use_cla": False,
+            "num_nextn_predict_layers": 1,
+        }
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = HYV3ForCausalLM(config)
+        state = dict(model.state_dict())
+        state.update(
+            {
+                f"model.layers.2.{name}": tensor.clone()
+                for name, tensor in model.model.layers[1].state_dict().items()
+            }
+        )
+        for name in ("enorm", "hnorm", "final_layernorm"):
+            norm = HYV3RMSNorm(128, eps=config.rms_norm_eps)
+            state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
+    weights = {}
+    for name, tensor in _unpack_mtp_experts(state).items():
+        name = name.replace(".mlp.shared_experts.", ".mlp.shared_mlp.")
+        name = name.replace(".mlp.e_score_correction_bias", ".mlp.expert_bias")
+        assert name not in weights
+        weights[name] = tensor
+    return _save_mtp_checkpoint(tmp_path / "hyv3", config, weights)
 
 
 @pytest.mark.parametrize(
     "mtp_family,mtp_window",
-    [("exaone", None), ("exaone", 16), ("glm4_moe", None)],
-    ids=["exaone-full", "exaone-swa", "glm4-moe"],
+    [
+        ("exaone", None),
+        ("exaone", 16),
+        ("glm4_moe", None),
+        ("qwen3_next", None),
+        ("nemotron_h", None),
+        ("hyv3", None),
+    ],
+    ids=["exaone-full", "exaone-swa", "glm4-moe", "qwen3-next", "nemotron-h", "hyv3"],
 )
 @pytest.mark.parametrize("k", [1, 3], ids=["k1", "k3"])
 def test_remote_native_mtp_matches_native_and_target(
@@ -671,9 +886,15 @@ def test_remote_native_mtp_matches_native_and_target(
         attention_config={"backend": "TRITON_ATTN"},
         disable_log_stats=False,
     )
-    moe_backend = "triton" if mtp_family == "glm4_moe" else None
+    moe_backend = None if mtp_family == "exaone" else "triton"
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
+    hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
+    if hybrid_target:
+        kwargs.update(mamba_backend="triton", use_replayssm=False)
+    if mtp_family == "qwen3_next":
+        kwargs["gdn_prefill_backend"] = "triton"
+        monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
     prompts = [
         {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
         for length in (15, 16, 17, 31, 32, 33, 65)
@@ -739,6 +960,74 @@ def test_remote_native_mtp_matches_native_and_target(
     def draft_moe_backends(worker):
         return moe_backends(worker.model_runner.get_draft_model())
 
+    def recurrent_policy(worker):
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        runner = worker.model_runner
+        layers = []
+        for layer in runner.get_model().modules():
+            if not isinstance(layer, MambaBase):
+                continue
+            spec = layer.get_kv_cache_spec(worker.vllm_config)
+            assert isinstance(spec, MambaSpec)
+            shapes = tuple(layer.get_state_shape())
+            assert spec.shapes == shapes
+            assert tuple(tuple(t.shape[1:]) for t in layer.kv_cache) == shapes
+            kernels = {}
+            if isinstance(layer, QwenGatedDeltaNetAttention):
+                kernels = {
+                    "prefill": layer.gdn_prefill_backend,
+                    "decode": layer.gdn_decode_kernel,
+                }
+            elif isinstance(layer, MambaMixer2):
+                kernels = {"ssu": layer.mamba_config.backend.name}
+            layers.append(
+                {"type": layer.mamba_type.name, "shapes": shapes, "kernels": kernels}
+            )
+        return {
+            "state": type(runner.model_state).__name__,
+            "k": worker.vllm_config.num_speculative_tokens,
+            "layers": layers,
+        }
+
+    def check_recurrence(runner, mode):
+        policies = runner.llm.collective_rpc(recurrent_policy)
+        record_property(f"{mode}.recurrent_policy", policies)
+        assert len(policies) == 1
+        policy = policies[0]
+        assert policy["k"] == (0 if mode == "target" else k)
+        if hybrid_target:
+            assert policy["state"] == "MambaHybridModelState"
+            assert len(policy["layers"]) == 1
+            layer = policy["layers"][0]
+            is_gdn = mtp_family == "qwen3_next"
+            assert layer["type"] == ("GDN_ATTN" if is_gdn else "MAMBA2")
+            conv_shape, state_shape = layer["shapes"]
+            assert sorted(conv_shape) == [3 + policy["k"], 512 if is_gdn else 384]
+            assert state_shape == ((2, 128, 128) if is_gdn else (4, 64, 64))
+            assert layer["kernels"] == (
+                {"prefill": "triton", "decode": "triton"}
+                if is_gdn
+                else {"ssu": "TRITON"}
+            )
+        else:
+            assert policy["state"] == "DefaultModelState"
+            assert policy["layers"] == []
+        return policies
+
+    def draft_recurrent_layers(worker):
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+
+        return sum(
+            isinstance(layer, MambaBase)
+            for layer in worker.model_runner.get_draft_model().modules()
+        )
+
     def draft_kv_policy(worker):
         from vllm.model_executor.layers.attention import Attention
 
@@ -767,11 +1056,13 @@ def test_remote_native_mtp_matches_native_and_target(
     )
     with vllm_runner(model, **kwargs) as baseline:
         windows = baseline.llm.apply_model(target_windows)
-        assert windows == [[None, None]]
+        assert windows == [[None] if hybrid_target else [None, None]]
         record_property("target.attention_windows", windows)
         backends = baseline.llm.apply_model(moe_backends)
-        assert backends == [["TRITON"] if moe_backend else []]
+        expected_moe_count = 2 if mtp_family == "qwen3_next" else int(bool(moe_backend))
+        assert backends == [["TRITON"] * expected_moe_count]
         record_property("target.moe_backends", backends)
+        check_recurrence(baseline, "target")
         expected = generate(baseline)
     assert all(len(tokens) == 8 for batch in expected for tokens in batch)
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
@@ -782,6 +1073,10 @@ def test_remote_native_mtp_matches_native_and_target(
         backends = native.llm.collective_rpc(draft_moe_backends)
         assert backends == [["TRITON"] if moe_backend else []]
         record_property("native.moe_backends", backends)
+        recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
+        assert recurrent_layers == [0]
+        record_property("native.recurrent_layers", recurrent_layers)
+        native_recurrence = check_recurrence(native, "native")
         assert generate(native) == expected
         native_counts = speculation_counts(native, "native")
     with draft_server(
@@ -809,5 +1104,6 @@ def test_remote_native_mtp_matches_native_and_target(
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
+            assert check_recurrence(remote, "remote") == native_recurrence
             assert generate(remote) == expected
             assert speculation_counts(remote, "remote") == native_counts
