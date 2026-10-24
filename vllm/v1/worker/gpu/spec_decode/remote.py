@@ -113,6 +113,7 @@ class RemoteSpeculator(BaseSpeculator):
                 method=spec.method,
                 num_speculative_tokens=self.num_speculative_steps,
                 parallel_drafting=False,
+                uses_multi_module=spec.use_multi_module_mtp(),
                 provided_features=tuple(s.kind for s in self._contract.schema.slots),
                 max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
                 max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
@@ -743,7 +744,8 @@ class RemoteSpeculator(BaseSpeculator):
                 mapping = batch.idx_mapping
                 if sequence_rows is not None:
                     mapping = mapping[sequence_rows]
-                tensor = next_prefill_tokens[:1, mapping].T
+                lookahead = self._contract.capabilities.num_prefill_lookahead
+                tensor = next_prefill_tokens[:lookahead, mapping].T
             else:
                 tensor = source[slot.kind]
                 if tensor is None:

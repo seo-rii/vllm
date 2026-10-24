@@ -10,7 +10,8 @@ between target and draft computation.
 
 The runtime checks the resolved draft architecture and its matching target,
 including hidden width, vocabulary size and the number of checkpoint MTP modules.
-It currently requires exactly one MTP module and scalar token positions.
+It accepts one MTP module, or the two-module Exaone configuration described
+below. All supported paths use scalar token positions.
 
 | Resolved draft architecture | Matching target | Draft cache | K restriction |
 | --- | --- | --- | --- |
@@ -19,7 +20,7 @@ It currently requires exactly one MTP module and scalar token positions.
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeLiteMTPModel` | `Glm4MoeLiteForCausalLM` | Dense MLA | Native sequential rollout |
-| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Uniform full attention or sliding window | Native sequential rollout |
+| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | One module: uniform full attention or sliding window; two modules: full attention | One module: native sequential rollout; two modules: configured K=2 |
 | `NemotronHMTPModel` | `NemotronHForCausalLM` / `NemotronHPuzzleForCausalLM` | Attention/MoE-only MTP block | Native sequential rollout |
 | `HYV3MTPModel` | `HYV3ForCausalLM` | Full attention | Native sequential rollout |
 
@@ -35,10 +36,28 @@ context; the attention backend applies the window, and this runtime does not
 recycle evicted window pages. Budget the draft KV accordingly.
 
 Sparse/indexer MLA (including any `index_topk` configuration), compressed or
-packed KV, mixed KV groups, multiple MTP modules, multimodal features, mRoPE and
+packed KV, mixed KV groups, other multi-module layouts, multimodal features, mRoPE and
 mHC are rejected. Nemotron MTP must contain only attention and MoE layers.
 Gemma4's Q-only assistant reads target-owned KV and is not supported by this
 own-KV adapter. Its native local path is unaffected.
+
+### Two-module Exaone
+
+A checkpoint with `num_nextn_predict_layers=2` and two full-attention MTP layers
+can use `num_speculative_tokens=2` with target TP1, draft TP1 and one inline
+endpoint. The runtime loads both checkpoint modules and calls the existing
+native multi-module speculator. Prefill sends two known lookahead tokens.
+
+The second module's last KV row can depend on a rejected proposal. The remote
+runtime retains one independently owned target input/hidden-state row per live
+sequence and replays it when no draft from the previous round was accepted.
+This also repairs state after a round with effective K=0 or K=1. The configured
+native two-module forward still runs both modules; effective K limits returned
+drafts and does not currently reduce module computation. History is committed
+only after execution completes and is released with its sequence generation.
+
+Sliding-window or mixed module layouts, more than two modules, other configured
+K values, CUDA IPC and pooled placement remain unsupported for this path.
 
 ## Shared weights and execution
 
