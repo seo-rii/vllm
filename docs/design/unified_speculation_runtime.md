@@ -211,12 +211,16 @@ target layers. Native and remote comparisons must retain the same target kernel
 settings and inspect the loaded draft backend, rather than assuming a requested
 backend string was used.
 
-The native dense-target/MoE-draft combination currently lacks the expert group
-required to load the draft. The standalone server initializes groups from its
-own draft configuration. DeepSeek-V2 validation therefore uses a dense-FFN
-checkpoint for native/remote parity, and separately checks the routed-expert
-checkpoint against target-only output and an authoritative latent-KV replay.
-The routed-expert case does not establish native local placement parity.
+Native Qwen3-target/MLA-draft execution currently builds draft metadata with
+the target's head dimension, even with explicit draft KV dtype. A routed draft
+also requires an expert group that a dense native target does not initialize.
+The standalone server owns its draft configuration and distributed groups.
+DeepSeek-V2 validation compares both dense-FFN and routed-expert remote serving
+against target-only output, with actual accepted drafts. A separate standalone
+native DeepSeek-V2 LLM checks proposal tokens from authoritative committed
+prefixes after the remote executor exits. Exact latent-KV replay retains the
+same attention paths; the standalone token check uses full-prefix execution.
+These controls do not establish native mixed local placement parity.
 
 For the verifier, combine `tokenizer_mode="hf"` with this speculative configuration:
 
