@@ -888,6 +888,498 @@ def tiny_deepseek_mtp_model(tmp_path, ffn_layout):
     return str(root / "model")
 
 
+def _save_step3p5_mtp_model(directory, profile="one_full"):
+    import json
+
+    import torch
+    from transformers import Step3p7TextConfig, Step3p7TextModel
+    from transformers.models.step3p7.modeling_step3p7 import Step3p7RMSNorm
+
+    assert not torch.cuda.is_initialized()
+    torch.set_num_threads(1)
+    root = Path(directory)
+    assert profile in ("one_full", "three_swa")
+    heads = 3 if profile == "three_swa" else 1
+    target_types = (
+        ["full_attention", "sliding_attention"]
+        if heads == 3
+        else ["full_attention"] * 2
+    )
+    head_types = ["sliding_attention" if heads == 3 else "full_attention"] * heads
+    max_length = 256 if heads == 3 else 128
+    config = Step3p7TextConfig(
+        architectures=["Step3p5ForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=max_length,
+        num_nextn_predict_layers=heads,
+        layer_types=target_types + head_types,
+        per_layer_config={} if heads == 3 else None,
+        mlp_layer_types=["dense", "sparse"] + ["dense"] * heads,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        share_expert_dim=128,
+        use_moe_router_bias=True,
+        need_fp32_gate=True,
+        norm_expert_weight=True,
+        moe_router_activation="sigmoid",
+        use_head_wise_attn_gate=True,
+        gating=True,
+        swiglu_limits=[0] * (2 + heads),
+        swiglu_limits_shared=[0] * (2 + heads),
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+        **(
+            {"num_sliding_attention_heads": 4, "sliding_window": 128}
+            if heads == 3
+            else {}
+        ),
+    )
+    assert config.model_type == "step3p5"
+    assert config.layer_types == target_types
+    assert config.mtp_layer_types == head_types
+    assert config.mlp_layer_types == ["dense", "sparse"]
+    assert config.mtp_mlp_layer_types == ["dense"] * heads
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261027)
+        target = Step3p7TextModel(config)
+        head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        _two_candidate_head(head.weight)
+        expanded = Step3p7TextConfig.from_dict(
+            config.to_dict(),
+            num_hidden_layers=2 + heads,
+            num_nextn_predict_layers=0,
+            layer_types=target_types + head_types,
+            mlp_layer_types=["dense", "sparse"] + ["dense"] * heads,
+            swiglu_limits=[0] * (2 + heads),
+            swiglu_limits_shared=[0] * (2 + heads),
+        )
+        mtp_owner = Step3p7TextModel(expanded)
+        state = {f"model.{name}": value for name, value in target.state_dict().items()}
+        state["lm_head.weight"] = (
+            head.weight.detach().to(torch.bfloat16).clone()
+            if heads == 3
+            else head.weight.detach().clone()
+        )
+        for index in range(2, 2 + heads):
+            mtp = mtp_owner.layers[index]
+            state.update(
+                {
+                    f"model.layers.{index}.{name}": value
+                    for name, value in mtp.state_dict().items()
+                }
+            )
+            for name in ("enorm", "hnorm", "shared_head.norm"):
+                norm = Step3p7RMSNorm(config.hidden_size, config.rms_norm_eps)
+                assert torch.count_nonzero(norm.weight) == 0
+                prefix = "transformer." if name == "shared_head.norm" else ""
+                state[f"model.layers.{index}.{prefix}{name}.weight"] = (
+                    norm.weight.detach().clone()
+                )
+            fusion = torch.nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
+            _conditioned_mtp_fusion(fusion.weight)
+            state[f"model.layers.{index}.eh_proj.weight"] = (
+                fusion.weight.detach().clone()
+            )
+            state[f"model.layers.{index}.transformer.shared_head.output.weight"] = (
+                state["lm_head.weight"] * index
+            )
+
+    weights = {}
+    for name, value in state.items():
+        if ".mlp.experts.gate_up_proj" in name:
+            assert name == "model.layers.1.mlp.experts.gate_up_proj"
+            gate, up = value.chunk(2, dim=1)
+            weights["model.layers.1.moe.gate_proj.weight"] = gate
+            weights["model.layers.1.moe.up_proj.weight"] = up
+        elif name == "model.layers.1.mlp.experts.down_proj":
+            weights["model.layers.1.moe.down_proj.weight"] = value
+        elif name == "model.layers.1.mlp.gate.weight":
+            weights["model.layers.1.moe.gate.weight"] = value
+        elif name == "model.layers.1.mlp.gate.e_score_correction_bias":
+            weights["model.layers.1.moe.router_bias"] = value
+        elif name.startswith("model.layers.1.mlp.shared_experts."):
+            weights[name.replace(".mlp.shared_experts.", ".share_expert.")] = value
+        else:
+            weights[name] = value
+    model_path = Path(_save_mtp_checkpoint(root / "model", config, weights))
+    saved_config = json.loads((model_path / "config.json").read_text())
+    if heads == 1:
+        saved_config["per_layer_config"] = None
+    (model_path / "config.json").write_text(json.dumps(saved_config, indent=2) + "\n")
+    for index in range(2, 2 + heads):
+        head_value = weights[
+            f"model.layers.{index}.transformer.shared_head.output.weight"
+        ]
+        assert not torch.equal(head_value, weights["lm_head.weight"])
+        assert torch.equal(head_value, weights["lm_head.weight"] * index)
+    receipt = dict(
+        synthetic_profile=True,
+        target_architecture="Step3p5ForCausalLM",
+        draft_architecture="Step3p5MTP",
+        target_hf_class=type(target).__name__,
+        mtp_hf_class=type(mtp).__name__,
+        mtp_source=f"independently_initialized_hf_tail_{heads}_of_{heads + 2}",
+        fusion="embedding_1_4_target_hidden_3_4",
+        owned_head_scales=list(range(2, 2 + heads)),
+        head_paths=[
+            f"model.layers.{index}.shared_head.head" for index in range(2, 2 + heads)
+        ],
+        checkpoint_heads=[
+            f"model.layers.{index}.transformer.shared_head.output.weight"
+            for index in range(2, 2 + heads)
+        ],
+        head_candidate_ids=[3, 4],
+        head_scale=32,
+        checkpoint_tensors=len(weights),
+        exact_checkpoint_roundtrip=True,
+        mtp_absolute_layer=2,
+        target_mlp=["dense", "sparse"],
+        mtp_mlp=["dense"] * heads,
+        attention_layers=target_types + head_types,
+        profile=profile,
+        mtp_heads=heads,
+        max_model_len=max_length,
+        mtp_windows=[128 if heads == 3 else None] * heads,
+        target_num_attention_heads=4,
+        num_attention_groups=2,
+        head_dim=32,
+        rms_norm_semantics="(1 + weight), checkpoint zero weights",
+        homogeneous_config="public per_layer_config:null"
+        if heads == 1
+        else "canonical per_layer_config:{}; SWA head count resolves directly",
+        seed=20261027,
+        cuda_initialized=torch.cuda.is_initialized(),
+    )
+    assert not receipt["cuda_initialized"]
+    (root / "fixture.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    return model_path, receipt
+
+
+def _check_step3p5_model_weights(model, model_path, *, mtp):
+    """Account for every native parameter and each packed checkpoint tensor."""
+    import torch
+    from safetensors.torch import load_file
+
+    weights = load_file(Path(model_path) / "model.safetensors")
+    checked = set()
+    parameters = dict(model.named_parameters())
+    for name, parameter in parameters.items():
+        source = name.replace(".mtp_block.", ".")
+        if mtp and ".shared_head." in source:
+            source = source.replace(".shared_head.", ".transformer.shared_head.")
+            source = source.replace(".shared_head.head.", ".shared_head.output.")
+        source = source.replace(".moe.share_expert.", ".share_expert.")
+        if source in weights:
+            inputs = [source]
+        elif source.endswith(".qkv_proj.weight"):
+            inputs = [
+                source.replace("qkv_proj", proj)
+                for proj in ("q_proj", "k_proj", "v_proj")
+            ]
+        elif source.endswith(".gate_up_proj.weight"):
+            inputs = [
+                source.replace("gate_up_proj", proj)
+                for proj in ("gate_proj", "up_proj")
+            ]
+        else:
+            assert source.endswith((".w13_weight", ".w2_weight")), name
+            prefix, projection = source.rsplit(".", 1)
+            assert prefix.endswith(".moe.experts.routed_experts")
+            prefix = prefix.removesuffix(".experts.routed_experts")
+            projections = (
+                ("gate_proj", "up_proj")
+                if projection == "w13_weight"
+                else ("down_proj",)
+            )
+            inputs = [f"{prefix}.{proj}.weight" for proj in projections]
+        values = [weights[key] for key in inputs]
+        expected = values[0] if len(values) == 1 else torch.cat(values, dim=-2)
+        assert torch.equal(parameter.detach().cpu(), expected.to(parameter.dtype)), name
+        checked.update(inputs)
+    config = model.config if mtp else model.model.config
+    tail = tuple(
+        f"model.layers.{i}." for i in range(2, 2 + config.num_nextn_predict_layers)
+    )
+    required = (
+        {key for key in weights if key.startswith(tail)}
+        if mtp
+        else {key for key in weights if not key.startswith(tail)}
+    )
+    if mtp:
+        required.add("model.embed_tokens.weight")
+    assert checked == required, (required - checked, checked - required)
+    return dict(parameters=len(parameters), checkpoint_keys=sorted(checked))
+
+
+def _check_step3p5_mtp_weights(target, draft, model_path, *, shared=True):
+    """Verify complete native values and checkpoint-owned heads after loading."""
+    import torch
+
+    from vllm.model_executor.models.step3p5 import Step3p5ForCausalLM
+    from vllm.model_executor.models.step3p5_mtp import Step3p5MTP
+
+    assert type(target) is Step3p5ForCausalLM and type(draft) is Step3p5MTP
+    proofs = {
+        role: _check_step3p5_model_weights(model, model_path, mtp=role == "draft")
+        for role, model in (("target", target), ("draft", draft))
+    }
+    heads = draft.config.num_nextn_predict_layers
+    assert heads in (1, 3)
+    keys = set().union(*(proof["checkpoint_keys"] for proof in proofs.values()))
+    assert len(keys) == 32 + 17 * heads
+    assert {role: proof["parameters"] for role, proof in proofs.items()} == {
+        "target": 25,
+        "draft": 1 + 14 * heads,
+    }
+    assert draft.has_own_lm_head and not hasattr(draft, "lm_head")
+    assert (draft.model.embed_tokens is target.model.embed_tokens) is shared
+    assert torch.equal(
+        draft.model.embed_tokens.weight, target.model.embed_tokens.weight
+    )
+    owned: list[torch.nn.Module] = []
+    for index in range(2, 2 + heads):
+        layer = draft.model.layers[str(index)]
+        head = layer.shared_head.head
+        assert head is not target.lm_head
+        assert head.weight.data_ptr() != target.lm_head.weight.data_ptr()
+        assert torch.equal(head.weight, target.lm_head.weight * index)
+        assert not torch.equal(head.weight, target.lm_head.weight)
+        assert all(head is not previous for previous in owned)
+        assert all(not torch.equal(head.weight, previous.weight) for previous in owned)
+        owned.append(head)
+        assert all(
+            torch.count_nonzero(norm.weight) == 0
+            for norm in (
+                layer.enorm,
+                layer.hnorm,
+                layer.shared_head.norm,
+            )
+        )
+    return dict(
+        target=type(target).__name__,
+        draft=type(draft).__name__,
+        parameters={role: proof["parameters"] for role, proof in proofs.items()},
+        checkpoint_keys=len(keys),
+        exact_parameter_roundtrip=True,
+        shared_embedding=shared,
+        checkpoint_owned_heads=heads,
+        owned_head_scales=list(range(2, 2 + heads)),
+        owned_head_bytes=sum(
+            head.weight.numel() * head.weight.element_size() for head in owned
+        ),
+        distinct_owned_head_objects_and_bytes=True,
+        top_level_draft_head=False,
+        gemma_rms_checkpoint_weights_zero=True,
+    )
+
+
+def _step3p5_attention_geometry(model):
+    from vllm.model_executor.layers.attention import Attention
+
+    return [
+        dict(
+            window=layer.sliding_window,
+            query_heads=layer.num_heads,
+            kv_heads=layer.num_kv_heads,
+            head_dim=layer.head_size,
+            backend=layer.get_attn_backend().get_name(),
+            cache_shape=tuple(layer.kv_cache.shape),
+            cache_dtype=str(layer.kv_cache.dtype),
+        )
+        for layer in model.modules()
+        if isinstance(layer, Attention)
+    ]
+
+
+def _step3p5_standalone_ownership(model_path, k, profile, output):
+    """Check the actual standalone loader before running its production server."""
+    import json
+
+    import torch
+    from safetensors.torch import load_file
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.spec_decode.remote.runtime.gpu import GPUDraftStepExecutor
+    from vllm.v1.spec_decode.remote.runtime.weights import model_weight_bytes
+
+    heads = 3 if profile == "three_swa" else 1
+    config = EngineArgs(
+        model=model_path,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=256 if heads == 3 else 128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        speculative_config=dict(
+            method="mtp",
+            model=model_path,
+            num_speculative_tokens=k,
+            draft_tensor_parallel_size=1,
+            draft_sample_method="greedy",
+            remote_draft=dict(
+                endpoint="unix:///tmp/step3p5-ownership.sock", transport="inline"
+            ),
+        ),
+    ).create_engine_config()
+    executor = GPUDraftStepExecutor(
+        config, device=torch.device("cuda:0"), kv_cache_bytes=32 << 20
+    )
+    assert executor.contract.requires_target_lm_head is False
+    draft = executor.speculator.model
+    assert type(draft).__name__ == "Step3p5MTP"
+    assert not hasattr(draft, "lm_head")
+    assert draft.model.num_mtp_layers == heads
+    proof = _check_step3p5_model_weights(draft, model_path, mtp=True)
+    assert proof["parameters"] == 1 + 14 * heads
+    weights = load_file(Path(model_path) / "model.safetensors")
+    assert torch.equal(
+        draft.model.embed_tokens.weight.cpu(), weights["model.embed_tokens.weight"]
+    )
+    owned: list[torch.nn.Module] = []
+    for index in range(2, 2 + heads):
+        head = draft.model.layers[str(index)].shared_head.head
+        assert torch.equal(head.weight.cpu(), weights["lm_head.weight"] * index)
+        assert all(head is not previous for previous in owned)
+        assert all(not torch.equal(head.weight, previous.weight) for previous in owned)
+        owned.append(head)
+    draft_bytes, embedding_bytes, head_bytes = model_weight_bytes(draft)
+    assert embedding_bytes == 128 * 128 * 2
+    assert head_bytes == heads * embedding_bytes
+    assert draft_bytes + embedding_bytes + head_bytes == sum(
+        parameter.numel() * parameter.element_size() for parameter in draft.parameters()
+    )
+    geometry = _step3p5_attention_geometry(draft)
+    assert [row["window"] for row in geometry] == ([128] * 3 if heads == 3 else [None])
+    assert all(
+        row["query_heads"] == 4
+        and row["kv_heads"] == 2
+        and row["head_dim"] == 32
+        and row["backend"] == "TRITON_ATTN"
+        and row["cache_dtype"] == "torch.bfloat16"
+        for row in geometry
+    )
+    executor.warmup()
+    assert config.speculative_config is not None
+    result = dict(
+        model=type(draft).__name__,
+        parameters=proof["parameters"],
+        checkpoint_keys=proof["checkpoint_keys"],
+        exact_parameter_roundtrip=True,
+        requires_target_lm_head=False,
+        top_level_draft_head=False,
+        checkpoint_owned_heads=heads,
+        owned_head_scales=list(range(2, 2 + heads)),
+        owned_head_bytes=head_bytes,
+        embedding_bytes=embedding_bytes,
+        draft_specific_bytes=draft_bytes,
+        distinct_owned_head_objects_and_bytes=True,
+        embedding_checkpoint_values=True,
+        geometry=geometry,
+        actual_warmup=True,
+        num_prefill_lookahead_tokens=config.num_prefill_lookahead_tokens,
+        use_multi_module_mtp=config.speculative_config.use_multi_module_mtp(),
+    )
+    assert (
+        result["num_prefill_lookahead_tokens"] == 1
+        and not result["use_multi_module_mtp"]
+    )
+    Path(output).write_text(json.dumps(result, indent=2) + "\n")
+
+
+@pytest.mark.parametrize(
+    "profile,k",
+    [("one_full", 1), ("one_full", 3), ("three_swa", 1)],
+    ids=["one_full-1", "one_full-3", "three_swa-1"],
+)
+def test_remote_step3p5_mtp_matches_native_and_target(
+    profile,
+    k,
+    vllm_runner,
+    request,
+    monkeypatch,
+    tmp_path,
+    record_property,
+):
+    """Keep checkpoint-owned MTP output heads through native and remote loading."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    directory = tmp_path / "step3p5"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_step3p5_mtp_model; "
+            "from pathlib import Path; p=Path(sys.argv[1]); p.mkdir(); "
+            "_save_step3p5_mtp_model(p, sys.argv[2])"
+        ),
+        str(directory),
+        profile,
+    ]
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        VLLM_TARGET_DEVICE="cpu",
+        VLLM_BATCH_INVARIANT="0",
+    )
+    subprocess.run(command, env=environment, check=True, timeout=180)
+    model = str(directory / "model")
+    record_property("fixture", json.loads((directory / "fixture.json").read_text()))
+    ownership = tmp_path / "step3p5-standalone.json"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _step3p5_standalone_ownership; "
+            "_step3p5_standalone_ownership("
+            "sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4])"
+        ),
+        model,
+        str(k),
+        profile,
+        str(ownership),
+    ]
+    with (tmp_path / "step3p5-standalone.log").open("w") as log:
+        subprocess.run(
+            command, check=True, timeout=180, stdout=log, stderr=subprocess.STDOUT
+        )
+    record_property("remote.step3p5_identity", json.loads(ownership.read_text()))
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        "step3p5_" + profile,
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
 def _mimo_v2_flash_fixture_data():
     import torch
     from transformers import AutoConfig
@@ -2658,7 +3150,9 @@ def _compare_native_and_remote_draft(
     eagle3 = eagle3_draft is not None
     deepseek_mtp = mtp_family in ("deepseek_v3_dense", "deepseek_v3_moe")
     mimo_v2_flash = mtp_family == "mimo_v2_flash"
-    detailed = independent or eagle3 or deepseek_mtp or mimo_v2_flash
+    step3p5 = mtp_family in ("step3p5_one_full", "step3p5_three_swa")
+    step3p5_swa = mtp_family == "step3p5_three_swa"
+    detailed = independent or eagle3 or deepseek_mtp or mimo_v2_flash or step3p5
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
@@ -2668,8 +3162,11 @@ def _compare_native_and_remote_draft(
     mtp_windows = {
         "exaone_two": (None, None),
         "exaone_three": (None, 16, 32),
+        "step3p5_one_full": (None,),
+        "step3p5_three_swa": (128, 128, 128),
     }.get(mtp_family, (128 if mimo_v2_flash else mtp_window,))
     num_modules = len(mtp_windows)
+    multi_module = num_modules > 1 and not step3p5
     dense_mla = mtp_family == "glm4_moe_lite" or deepseek_mtp
     attention_backend = (
         "TRITON_ATTN_DIFFKV"
@@ -2695,7 +3192,7 @@ def _compare_native_and_remote_draft(
         trust_remote_code=False,
         skip_tokenizer_init=True,
         dtype="bfloat16",
-        max_model_len=256 if mimo_v2_flash else 128,
+        max_model_len=256 if mimo_v2_flash or step3p5_swa else 128,
         max_num_seqs=4,
         max_num_batched_tokens=32,
         enable_chunked_prefill=True,
@@ -2730,7 +3227,7 @@ def _compare_native_and_remote_draft(
         {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
         for length in (
             (31, 32, 33, 127, 128, 129, 193)
-            if mimo_v2_flash
+            if mimo_v2_flash or step3p5_swa
             else (15, 16, 17, 31, 32, 33, 65)
         )
     ]
@@ -3050,6 +3547,9 @@ def _compare_native_and_remote_draft(
         if mimo_v2_flash:
             assert policy["model"] == "MiMoV2FlashForCausalLM"
             assert policy["attention_backends"] == ["TRITON_ATTN_DIFFKV"] * 2
+        if step3p5:
+            assert policy["model"] == "Step3p5ForCausalLM"
+            assert policy["attention_backends"] == ["TRITON_ATTN"] * 2
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
@@ -3170,6 +3670,44 @@ def _compare_native_and_remote_draft(
             ),
             metadata_builders=[type(builder).__name__ for builder in builders],
             geometry=_mimo_v2_flash_gpu_geometry(runner.get_draft_model(), mtp=True),
+        )
+
+    def step3p5_identity(worker):
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        runner = worker.model_runner
+        spec = worker.vllm_config.speculative_config
+        assert isinstance(runner.speculator, MTPSpeculator)
+        assert type(runner.model_state).__name__ == "DefaultModelState"
+        assert not spec.use_multi_module_mtp() and not spec.use_remote_draft()
+        assert worker.vllm_config.num_speculative_tokens == k
+        assert worker.vllm_config.num_prefill_lookahead_tokens == 1
+        target, draft = runner.get_model(), runner.get_draft_model()
+        geometry = {
+            "target": _step3p5_attention_geometry(target),
+            "draft": _step3p5_attention_geometry(draft),
+        }
+        assert [row["window"] for row in geometry["target"]] == (
+            [None, 128] if step3p5_swa else [None, None]
+        )
+        assert [row["window"] for row in geometry["draft"]] == list(mtp_windows)
+        assert all(
+            row["query_heads"] == 4
+            and row["kv_heads"] == 2
+            and row["head_dim"] == 32
+            and row["backend"] == "TRITON_ATTN"
+            and row["cache_dtype"] == "torch.bfloat16"
+            for rows in geometry.values()
+            for row in rows
+        )
+        return dict(
+            weights=_check_step3p5_mtp_weights(target, draft, model),
+            geometry=geometry,
+            speculator=type(runner.speculator).__name__,
+            model_state=type(runner.model_state).__name__,
+            use_multi_module_mtp=False,
+            num_prefill_lookahead_tokens=1,
+            num_speculative_tokens=k,
         )
 
     def independent_draft_identity(worker):
@@ -3360,7 +3898,9 @@ def _compare_native_and_remote_draft(
         windows = baseline.llm.apply_model(target_windows)
         assert windows == [
             [None, 128]
-            if mimo_v2_flash
+            if mimo_v2_flash or step3p5_swa
+            else [None, None]
+            if step3p5
             else [None] * (4 if eagle3 else 1 if hybrid_target else max(2, num_modules))
         ]
         record_property("target.attention_windows", windows)
@@ -3407,7 +3947,7 @@ def _compare_native_and_remote_draft(
                 ]
             ]
             record_property("native.kv_policy", policy)
-            if num_modules > 1:
+            if multi_module:
                 identity = native.llm.collective_rpc(draft_module_identity)
                 record_property("native.module_identity", identity)
             if independent:
@@ -3426,6 +3966,11 @@ def _compare_native_and_remote_draft(
                 record_property(
                     "native.mimo_identity", native.llm.collective_rpc(mimo_identity)
                 )
+            if step3p5:
+                record_property(
+                    "native.step3p5_identity",
+                    native.llm.collective_rpc(step3p5_identity),
+                )
             if dense_mla and not independent:
                 layout = native.llm.collective_rpc(draft_mla_layout)
                 assert layout == [[expected_mla_layout]]
@@ -3438,6 +3983,7 @@ def _compare_native_and_remote_draft(
                 and mtp_family != "ernie"
                 and mtp_family != "deepseek_v3_dense"
                 and not mimo_v2_flash
+                and not step3p5
             )
             assert backends == [["TRITON"] if draft_has_moe else []]
             record_property("native.moe_backends", backends)
@@ -3466,12 +4012,12 @@ def _compare_native_and_remote_draft(
         target_attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=128 if recurrent_draft else 32,
-        max_model_len=256 if mimo_v2_flash else 128,
+        max_model_len=256 if mimo_v2_flash or step3p5_swa else 128,
         trust_remote_code=False,
         moe_backend=moe_backend,
         batch_invariant=False if recurrent_draft else None,
     ) as endpoint:
-        transports = ("inline", "cuda_ipc") if num_modules > 1 else ("inline",)
+        transports = ("inline", "cuda_ipc") if multi_module else ("inline",)
         for transport in transports:
             mode = "remote" if transport == "inline" else "remote_ipc"
             remote_options = dict(
@@ -3541,7 +4087,7 @@ def _compare_native_and_remote_draft(
                             remote_counts == native_counts,
                         )
                     assert remote_counts == native_counts
-    if num_modules > 1:
+    if multi_module:
         server_lines = server_log.read_text().splitlines()
         negotiated = [
             line.rsplit(" over ", 1)[1].strip()
