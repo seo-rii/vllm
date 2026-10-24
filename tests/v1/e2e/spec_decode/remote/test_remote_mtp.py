@@ -659,6 +659,80 @@ def tiny_glm4_moe_mtp_model(tmp_path):
 
 
 @pytest.fixture
+def tiny_glm4_moe_lite_mtp_model(tmp_path):
+    """Keep dense MLA dimensions and a routed MTP block in the real checkpoint."""
+    import torch
+    from transformers import Glm4MoeLiteConfig, Glm4MoeLiteForCausalLM
+    from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+        Glm4MoeLiteRMSNorm,
+    )
+
+    config = Glm4MoeLiteConfig(
+        architectures=["Glm4MoeLiteForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        n_group=1,
+        topk_group=1,
+        mlp_layer_types=["dense", "sparse"],
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=192,
+        v_head_dim=256,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        attention_bias=False,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+    )
+    config.update(
+        {
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "num_nextn_predict_layers": 1,
+        }
+    )
+    assert not hasattr(config, "index_topk")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = Glm4MoeLiteForCausalLM(config)
+        state = dict(model.state_dict())
+        # The native predictor indexes from the target config's layer count,
+        # even though the derived draft config reports zero target layers.
+        state.update(
+            {
+                f"model.layers.2.{name}": tensor.clone()
+                for name, tensor in model.model.layers[1].state_dict().items()
+            }
+        )
+        for name in ("enorm", "hnorm", "shared_head.norm"):
+            norm = Glm4MoeLiteRMSNorm(128, eps=config.rms_norm_eps)
+            state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
+        state["model.layers.2.embed_tokens.weight"] = state[
+            "model.embed_tokens.weight"
+        ].clone()
+        state["model.layers.2.shared_head.head.weight"] = state[
+            "lm_head.weight"
+        ].clone()
+    return _save_mtp_checkpoint(
+        tmp_path / "glm4-moe-lite", config, _unpack_mtp_experts(state)
+    )
+
+
+@pytest.fixture
 def tiny_qwen3_next_mtp_model(tmp_path):
     """Retain real GDN target state while cloning its attention layer for MTP."""
     import torch
@@ -840,19 +914,81 @@ def tiny_hyv3_mtp_model(tmp_path):
     return _save_mtp_checkpoint(tmp_path / "hyv3", config, weights)
 
 
+@pytest.fixture
+def tiny_ernie_mtp_model(tmp_path):
+    """Use a routed ERNIE target and its native dense, single-token MTP block."""
+    import torch
+    from transformers import Ernie4_5_MoeConfig, Ernie4_5_MoeForCausalLM
+    from transformers.models.ernie4_5_moe.modeling_ernie4_5_moe import (
+        Ernie4_5_MoeRMSNorm,
+    )
+
+    config = Ernie4_5_MoeConfig(
+        architectures=["Ernie4_5_MoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        moe_intermediate_size=128,
+        moe_k=2,
+        moe_num_experts=4,
+        moe_num_shared_experts=1,
+        moe_layer_start_index=1,
+        moe_layer_end_index=1,
+        moe_layer_interval=1,
+        num_nextn_predict_layers=1,
+        tie_word_embeddings=False,
+        use_bias=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = Ernie4_5_MoeForCausalLM(config)
+        state = dict(model.state_dict())
+        state.update(
+            {
+                f"model.mtp_block.0.{name}": tensor.clone()
+                for name, tensor in model.model.layers[0].state_dict().items()
+            }
+        )
+        for name in ("mtp_emb_norm", "mtp_hidden_norm"):
+            norm = Ernie4_5_MoeRMSNorm(128, config.rms_norm_eps)
+            assert torch.equal(norm.weight, model.model.norm.weight)
+            state[f"model.{name}.0.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["model.mtp_linear_proj.0.weight"] = fusion.weight.detach().clone()
+    weights = {}
+    for name, tensor in _unpack_mtp_experts(state).items():
+        name = name.replace(".mlp.gate.moe_statics.", ".mlp.moe_statics.")
+        assert name not in weights
+        weights[name] = tensor
+    return _save_mtp_checkpoint(tmp_path / "ernie", config, weights)
+
+
 @pytest.mark.parametrize(
-    "mtp_family,mtp_window",
+    "mtp_family,mtp_window,k",
     [
-        ("exaone", None),
-        ("exaone", 16),
-        ("glm4_moe", None),
-        ("qwen3_next", None),
-        ("nemotron_h", None),
-        ("hyv3", None),
-    ],
-    ids=["exaone-full", "exaone-swa", "glm4-moe", "qwen3-next", "nemotron-h", "hyv3"],
+        pytest.param(family, window, k, id=f"k{k}-{label}")
+        for k in (1, 3)
+        for family, window, label in (
+            ("exaone", None, "exaone-full"),
+            ("exaone", 16, "exaone-swa"),
+            ("glm4_moe", None, "glm4-moe"),
+            ("qwen3_next", None, "qwen3-next"),
+            ("nemotron_h", None, "nemotron-h"),
+            ("hyv3", None, "hyv3"),
+            ("glm4_moe_lite", None, "glm4-moe-lite"),
+        )
+    ]
+    + [pytest.param("ernie", None, 1, id="k1-ernie")],
 )
-@pytest.mark.parametrize("k", [1, 3], ids=["k1", "k3"])
 def test_remote_native_mtp_matches_native_and_target(
     vllm_runner,
     monkeypatch,
@@ -869,6 +1005,11 @@ def test_remote_native_mtp_matches_native_and_target(
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     model = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    dense_mla = mtp_family == "glm4_moe_lite"
+    attention_backend = "TRITON_MLA" if dense_mla else "TRITON_ATTN"
+    attention_config = {"backend": attention_backend}
+    if dense_mla:
+        attention_config["mla_prefill_backend"] = "FLASH_ATTN"
     kwargs = dict(
         trust_remote_code=False,
         skip_tokenizer_init=True,
@@ -883,7 +1024,7 @@ def test_remote_native_mtp_matches_native_and_target(
         block_size=16,
         kv_cache_memory_bytes=32 << 20,
         gpu_memory_utilization=0.2,
-        attention_config={"backend": "TRITON_ATTN"},
+        attention_config=attention_config,
         disable_log_stats=False,
     )
     moe_backend = None if mtp_family == "exaone" else "triton"
@@ -936,12 +1077,53 @@ def test_remote_native_mtp_matches_native_and_target(
 
     def target_windows(model):
         from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
         return [
             layer.sliding_window
             for layer in model.modules()
-            if isinstance(layer, Attention)
+            if isinstance(layer, (Attention, MLAAttention))
         ]
+
+    def mla_layout(model):
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+        layouts = []
+        for layer in model.modules():
+            if not isinstance(layer, MLAAttention):
+                continue
+            assert layer.prefill_backend is not None
+            layouts.append(
+                {
+                    "kv_lora_rank": layer.kv_lora_rank,
+                    "qk_nope_head_dim": layer.qk_nope_head_dim,
+                    "qk_rope_head_dim": layer.qk_rope_head_dim,
+                    "v_head_dim": layer.v_head_dim,
+                    "num_heads": layer.num_heads,
+                    "head_size": layer.head_size,
+                    "cache_shape": tuple(layer.kv_cache.shape[1:]),
+                    "decode": layer.get_attn_backend().get_name(),
+                    "prefill": layer.prefill_backend.get_name(),
+                    "sparse": layer.impl.is_sparse,
+                }
+            )
+        return layouts
+
+    def draft_mla_layout(worker):
+        return mla_layout(worker.model_runner.get_draft_model())
+
+    expected_mla_layout = {
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "num_heads": 2,
+        "head_size": 576,
+        "cache_shape": (16, 576),
+        "decode": "TRITON_MLA",
+        "prefill": "FLASH_ATTN",
+        "sparse": False,
+    }
 
     def moe_backends(model):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -1030,11 +1212,12 @@ def test_remote_native_mtp_matches_native_and_target(
 
     def draft_kv_policy(worker):
         from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
         draft = worker.model_runner.get_draft_model()
         policies = []
         for attention in draft.modules():
-            if not isinstance(attention, Attention):
+            if not isinstance(attention, (Attention, MLAAttention)):
                 continue
             spec = attention.get_kv_cache_spec(worker.vllm_config)
             policies.append(
@@ -1052,12 +1235,16 @@ def test_remote_native_mtp_matches_native_and_target(
         num_speculative_tokens=k,
         draft_tensor_parallel_size=1,
         draft_sample_method="greedy",
-        attention_backend="TRITON_ATTN",
+        attention_backend=attention_backend,
     )
     with vllm_runner(model, **kwargs) as baseline:
         windows = baseline.llm.apply_model(target_windows)
         assert windows == [[None] if hybrid_target else [None, None]]
         record_property("target.attention_windows", windows)
+        if dense_mla:
+            layout = baseline.llm.apply_model(mla_layout)
+            assert layout == [[expected_mla_layout] * 2]
+            record_property("target.mla_layout", layout)
         backends = baseline.llm.apply_model(moe_backends)
         expected_moe_count = 2 if mtp_family == "qwen3_next" else int(bool(moe_backend))
         assert backends == [["TRITON"] * expected_moe_count]
@@ -1068,10 +1255,17 @@ def test_remote_native_mtp_matches_native_and_target(
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
         policy = native.llm.collective_rpc(draft_kv_policy)
         spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
+        if dense_mla:
+            spec_type = "MLAAttentionSpec"
         assert policy == [[(mtp_window, spec_type, mtp_window)]]
         record_property("native.kv_policy", policy)
+        if dense_mla:
+            layout = native.llm.collective_rpc(draft_mla_layout)
+            assert layout == [[expected_mla_layout]]
+            record_property("native.mla_layout", layout)
         backends = native.llm.collective_rpc(draft_moe_backends)
-        assert backends == [["TRITON"] if moe_backend else []]
+        draft_has_moe = mtp_family not in ("exaone", "ernie")
+        assert backends == [["TRITON"] if draft_has_moe else []]
         record_property("native.moe_backends", backends)
         recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
         assert recurrent_layers == [0]
@@ -1079,12 +1273,13 @@ def test_remote_native_mtp_matches_native_and_target(
         native_recurrence = check_recurrence(native, "native")
         assert generate(native) == expected
         native_counts = speculation_counts(native, "native")
+    server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
         model,
-        tmp_path / f"{mtp_family}-draft.log",
+        server_log,
         revision=None,
         num_speculative_tokens=k,
-        attention_backend="TRITON_ATTN",
+        attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=32,
         trust_remote_code=False,
@@ -1107,3 +1302,9 @@ def test_remote_native_mtp_matches_native_and_target(
             assert check_recurrence(remote, "remote") == native_recurrence
             assert generate(remote) == expected
             assert speculation_counts(remote, "remote") == native_counts
+    if dense_mla:
+        assert any(
+            "Using " in line and "TRITON_MLA" in line and "backend." in line
+            for line in server_log.read_text().splitlines()
+        )
+        record_property("remote.decode_backend_from_server_log", "TRITON_MLA")
