@@ -1004,9 +1004,84 @@ def tiny_ernie_mtp_model(tmp_path):
 
 
 @pytest.fixture
-def tiny_independent_qwen3_draft(tmp_path, request, mtp_family):
+def tiny_independent_qwen3_models(tmp_path, request, mtp_family):
     target_path = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
-    return _tiny_independent_qwen3_draft(tmp_path, target_path)
+    return _tiny_independent_qwen3_models(tmp_path, target_path)
+
+
+def _two_candidate_head(weight):
+    import torch
+
+    with torch.no_grad():
+        weight[3].mul_(32)
+        weight[4].copy_(-weight[3])
+
+
+def _tiny_independent_qwen3_models(tmp_path, target_path):
+    """Exercise accepted states with real models and two amplified output rows.
+
+    Keep every target attention/recurrent weight and the original fixture intact.
+    The independent draft has its own head geometry; this is not a quality test.
+    """
+    import hashlib
+    import json
+    import shutil
+
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoConfig
+
+    def digests(path):
+        return {
+            str(file.relative_to(path)): hashlib.sha256(file.read_bytes()).hexdigest()
+            for file in sorted(path.rglob("*"))
+            if file.is_file()
+        }
+
+    source = Path(target_path)
+    original = digests(source)
+    config = AutoConfig.from_pretrained(source)
+    assert not config.tie_word_embeddings
+    target = tmp_path / "controlled-target"
+    shutil.copytree(source, target)
+    checkpoint = target / "model.safetensors"
+    with safe_open(checkpoint, framework="pt", device="cpu") as reader:
+        metadata = reader.metadata()
+    weights = load_file(checkpoint)
+    original_head = weights["lm_head.weight"].clone()
+    _two_candidate_head(weights["lm_head.weight"])
+    assert torch.equal(weights["lm_head.weight"][:3], original_head[:3])
+    assert torch.equal(weights["lm_head.weight"][5:], original_head[5:])
+    replacement = target / "controlled.safetensors"
+    save_file(weights, replacement, metadata=metadata)
+    replacement.replace(checkpoint)
+    assert digests(source) == original
+    target_identity = digests(target)
+    assert all(
+        target_identity[name] == digest
+        for name, digest in original.items()
+        if name != "model.safetensors"
+    )
+    draft = _tiny_independent_qwen3_draft(tmp_path, target)
+    (tmp_path / "independent-control.json").write_text(
+        json.dumps(
+            dict(
+                original_target=original,
+                controlled_target=target_identity,
+                draft=digests(Path(draft)),
+                target_architecture=config.architectures,
+                target_hidden_size=config.hidden_size,
+                draft_hidden_size=64,
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+                original_target_unchanged=True,
+                changed_target_rows=[3, 4],
+            )
+        )
+        + "\n"
+    )
+    return str(target), draft
 
 
 def _tiny_independent_qwen3_draft(tmp_path, target_path):
@@ -1043,6 +1118,7 @@ def _tiny_independent_qwen3_draft(tmp_path, target_path):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(20261025)
         draft = Qwen3ForCausalLM(config)
+    _two_candidate_head(draft.lm_head.weight)
     path = tmp_path / "independent-qwen3"
     draft.save_pretrained(path)
     for name in (
@@ -1117,10 +1193,16 @@ def test_remote_independent_draft_with_hybrid_or_mla_target(
     request,
     mtp_family,
     k,
-    tiny_independent_qwen3_draft,
+    tiny_independent_qwen3_models,
     record_property,
 ):
     """Keep target state local while a distinct dense AR model drafts token deltas."""
+    import json
+
+    target, draft = tiny_independent_qwen3_models
+    record_property(
+        "fixture", json.loads((tmp_path / "independent-control.json").read_text())
+    )
     _compare_native_and_remote_draft(
         vllm_runner,
         monkeypatch,
@@ -1130,7 +1212,8 @@ def test_remote_independent_draft_with_hybrid_or_mla_target(
         None,
         k,
         record_property,
-        independent_draft=tiny_independent_qwen3_draft,
+        target_model=target,
+        independent_draft=draft,
     )
 
 
@@ -1145,6 +1228,7 @@ def _compare_native_and_remote_draft(
     record_property,
     *,
     independent_draft=None,
+    target_model=None,
 ):
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     independent = independent_draft is not None
@@ -1153,7 +1237,7 @@ def _compare_native_and_remote_draft(
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    model = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    model = target_model or request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
     mtp_windows = {
         "exaone_two": (None, None),
         "exaone_three": (None, 16, 32),
@@ -1357,6 +1441,10 @@ def _compare_native_and_remote_draft(
             record_property(f"{mode}.{label}", value)
         assert counts[0] > 0 and counts[1] > 0
         assert 0 <= counts[2] <= counts[1]
+        if independent:
+            assert counts[2] > 0, (
+                "the controlled draft fixture must exercise acceptance"
+            )
         return counts
 
     def target_windows(model):
