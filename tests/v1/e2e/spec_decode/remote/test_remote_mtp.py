@@ -1051,9 +1051,15 @@ def test_remote_native_mtp_matches_native_and_target(
         max_tokens=8,
         ignore_eos=True,
         detokenize=False,
-        logprobs=5 if hybrid_target else None,
+        logprobs=5 if hybrid_target or dense_mla else None,
     )
-    record_property("comparison", "top5_logprobs" if hybrid_target else "exact_tokens")
+    # MLA prefill and absorbed decode use different floating-point operations.
+    compare_target_logprobs = hybrid_target or dense_mla
+    record_property(
+        "target_comparison",
+        "top5_logprobs" if compare_target_logprobs else "exact_tokens",
+    )
+    record_property("placement_comparison", "exact_tokens")
     record_property("batch_invariant", not hybrid_target)
 
     def generate(runner):
@@ -1082,7 +1088,7 @@ def test_remote_native_mtp_matches_native_and_target(
                 for output, expected_output in zip(outputs, expected_outputs)
                 for token, expected_token in zip(output[0], expected_output[0])
             )
-            if hybrid_target:
+            if compare_target_logprobs:
                 assert all(
                     output[2] is not None and len(output[2]) == 8
                     for output in (*outputs, *expected_outputs)
@@ -1312,7 +1318,8 @@ def test_remote_native_mtp_matches_native_and_target(
         assert recurrent_layers == [0]
         record_property("native.recurrent_layers", recurrent_layers)
         native_recurrence = check_recurrence(native, "native")
-        compare_outputs(generate(native), expected, "native")
+        native_outputs = generate(native)
+        compare_outputs(native_outputs, expected, "native")
         native_counts = speculation_counts(native, "native")
     server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
@@ -1341,7 +1348,18 @@ def test_remote_native_mtp_matches_native_and_target(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
             assert check_recurrence(remote, "remote") == native_recurrence
-            compare_outputs(generate(remote), expected, "remote")
+            remote_outputs = generate(remote)
+            compare_outputs(remote_outputs, expected, "remote")
+            for actual_batch, native_batch in zip(remote_outputs, native_outputs):
+                assert [output[0] for output in actual_batch] == [
+                    output[0] for output in native_batch
+                ]
+                if dense_mla:
+                    assert [output[2] for output in actual_batch] == [
+                        output[2] for output in native_batch
+                    ]
+            if dense_mla:
+                record_property("placement.logprobs", "exact_returned_top5")
             assert speculation_counts(remote, "remote") == native_counts
     if dense_mla:
         assert any(
