@@ -72,14 +72,50 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
     ):
         raise ValueError("standalone MTP requires matching target hidden/vocab sizes")
     num_modules = getattr(config, "num_nextn_predict_layers", None)
-    if architecture == "ExaoneMoeMTP" and num_modules == 2:
-        if spec.num_speculative_tokens != 2:
-            raise ValueError("two Exaone checkpoint MTP modules require configured K=2")
-        if getattr(config, "mtp_layer_types", None) != ["full_attention"] * 2:
-            raise ValueError("two Exaone MTP modules require full attention")
+    if type(num_modules) is not int or num_modules < 1:
+        raise ValueError(
+            "standalone MTP requires a positive checkpoint MTP module count"
+        )
+    if architecture == "ExaoneMoeMTP" and num_modules > 1:
+        if spec.num_speculative_tokens != num_modules:
+            raise ValueError(
+                "Exaone checkpoint MTP modules require configured K "
+                f"to equal the module count ({num_modules})"
+            )
+        layers = getattr(config, "mtp_layer_types", None)
+        if (
+            not isinstance(layers, (list, tuple))
+            or len(layers) != num_modules
+            or any(
+                layer not in ("full_attention", "sliding_attention") for layer in layers
+            )
+        ):
+            raise ValueError("Exaone MTP layers require one full/SWA type per module")
+        module_windows = getattr(config, "mtp_sliding_windows", None)
+        windows = module_windows or getattr(config, "sliding_windows", None)
+        if module_windows and (
+            not isinstance(module_windows, (list, tuple))
+            or len(module_windows) != num_modules
+        ):
+            raise ValueError("Exaone MTP windows require one entry per module")
+        if windows is not None and not isinstance(windows, (list, tuple)):
+            raise ValueError("Exaone MTP windows require an array of per-layer values")
+        for index, layer in enumerate(layers):
+            if layer != "sliding_attention":
+                continue
+            if windows is not None and index >= len(windows):
+                raise ValueError("Exaone MTP windows do not cover every sliding layer")
+            window = (
+                windows[index]
+                if windows is not None
+                else getattr(config, "sliding_window", None)
+            )
+            if type(window) is not int or window <= 0:
+                raise ValueError("Exaone MTP sliding layers require positive windows")
     elif num_modules != 1:
         raise ValueError(
-            "standalone MTP requires one checkpoint MTP module, or two Exaone modules"
+            "standalone MTP requires one checkpoint MTP module, "
+            "or an Exaone module chain"
         )
     if (
         contract.max_speculative_tokens is not None

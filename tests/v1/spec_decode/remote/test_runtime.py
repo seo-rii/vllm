@@ -187,26 +187,34 @@ def test_malformed_rows_are_caller_bugs(row):
         planner.plan([row])
 
 
-MULTI_MODULE_SCHEMA = TargetFeatureSchema(
-    schema_id=1,
-    slots=(
-        FeatureSlot("token_ids", "int32", ()),
-        FeatureSlot("positions", "int64", ()),
-        FeatureSlot("last_hidden_states", "float32", (2,)),
-        FeatureSlot(
-            "next_prefill_tokens", "int64", (2,), optional=True, per_sequence=True
+def multi_module_schema(depth=2):
+    return TargetFeatureSchema(
+        schema_id=1,
+        slots=(
+            FeatureSlot("token_ids", "int32", ()),
+            FeatureSlot("positions", "int64", ()),
+            FeatureSlot("last_hidden_states", "float32", (2,)),
+            FeatureSlot(
+                "next_prefill_tokens",
+                "int64",
+                (depth,),
+                optional=True,
+                per_sequence=True,
+            ),
         ),
-    ),
-)
+    )
 
 
-def multi_module_planner(num_blocks=65, max_num_reqs=4):
+MULTI_MODULE_SCHEMA = multi_module_schema()
+
+
+def multi_module_planner(num_blocks=65, max_num_reqs=4, depth=2):
     return DraftStepPlanner(
         DraftBlockPool(num_blocks, 2),
         max_num_reqs=max_num_reqs,
         max_model_len=128,
-        num_speculative_tokens=2,
-        num_prefill_lookahead=2,
+        num_speculative_tokens=depth,
+        num_prefill_lookahead=depth,
         multi_module=True,
     )
 
@@ -233,11 +241,14 @@ def complete_multi_module_step(planner, replay, row, features, effective_k=2):
 
 
 @pytest.mark.parametrize(
-    "effective_k,accepted", [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]
+    "depth,effective_k,accepted",
+    [(d, k, a) for d in (2, 3, 4) for k in range(d + 1) for a in range(k + 1)],
 )
-def test_multi_module_replay_preserves_only_authoritative_prefix(effective_k, accepted):
-    planner = multi_module_planner()
-    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+def test_multi_module_replay_preserves_only_authoritative_prefix(
+    depth, effective_k, accepted
+):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
     a = key(1)
     assert planner.open(a)
     complete_multi_module_step(
@@ -254,16 +265,16 @@ def test_multi_module_replay_preserves_only_authoritative_prefix(effective_k, ac
         num_rejected=effective_k - accepted,
         last_sampled=31,
     )
-    prepared, features = replay.prepare_row(
-        row, multi_module_features(4, [30, 80, 81][: 1 + effective_k])
-    )
-    repair = int(accepted == 0)
+    query = [30, *range(80, 80 + effective_k)]
+    source = multi_module_features(4, query)
+    source[2][accepted + 1 :] = torch.nan
+    prepared, features = replay.prepare_row(row, source)
+    repair = max(0, depth - 1 - accepted)
     assert prepared.num_replayed == repair
     assert prepared.num_rejected == 0
     assert features[0] is not None
-    assert (
-        features[0].tolist() == ([14] if repair else []) + [30, 80, 81][: accepted + 1]
-    )
+    assert features[0].tolist() == list(range(15 - repair, 15)) + query[: accepted + 1]
+    assert features[2] is not None and torch.isfinite(features[2]).all()
     plan, failures = planner.plan([prepared], num_speculative_tokens=effective_k)
     assert not failures
     assert plan.positions.tolist() == list(range(4 - repair, 5 + accepted))
@@ -280,36 +291,83 @@ def test_multi_module_replay_preserves_only_authoritative_prefix(effective_k, ac
     assert planner.num_computed(a) == 5 + accepted
     assert updates[0].history.position == 4 + accepted
     assert updates[0].history.features[0] is not None
-    assert updates[0].history.features[0].tolist() == [[30, 80, 81][accepted]]
+    committed = [11, 12, 13, 14, *query[: accepted + 1]]
+    assert updates[0].history.features[0].tolist() == committed[-(depth - 1) :]
 
 
-def test_multi_module_known_prefill_lookahead_does_not_need_replay():
-    planner = multi_module_planner()
-    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_known_prefill_lookahead_does_not_need_replay(depth):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
     a = key(1)
     planner.open(a)
+    lookahead = tuple(range(12, 12 + depth))
     first = complete_multi_module_step(
         planner,
         replay,
-        DraftStepRow(a, 3, num_sampled=0, next_prefill_tokens=(14, 15)),
-        multi_module_features(0, [11, 12, 13], (14, 15)),
+        DraftStepRow(a, 1, num_sampled=0, next_prefill_tokens=lookahead),
+        multi_module_features(0, [11], lookahead),
         effective_k=0,
     )
-    assert first.next_prefill_tokens.tolist() == [[14, 15]]
+    assert first.next_prefill_tokens.tolist() == [list(lookahead)]
     second = complete_multi_module_step(
         planner,
         replay,
-        DraftStepRow(a, 2, num_sampled=1, last_sampled=16),
-        multi_module_features(3, [14, 15]),
+        DraftStepRow(a, depth, num_sampled=1, last_sampled=20),
+        multi_module_features(1, lookahead),
+        effective_k=depth,
     )
     assert second.rows[0].num_replayed == 0
-    assert second.positions.tolist() == [3, 4]
-    assert planner.num_computed(a) == 5
+    assert second.positions.tolist() == list(range(1, depth + 1))
+    assert planner.num_computed(a) == depth + 1
 
 
-def test_multi_module_history_owns_one_row_and_fences_closed_generations():
-    planner = multi_module_planner(max_num_reqs=1)
-    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_short_prefix_keeps_history_across_single_token_steps(depth):
+    """K=0 still needs the real suffix from more than the last input chunk."""
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a = key(1)
+    planner.open(a)
+    transcript = [11]
+    complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 1, num_sampled=1),
+        multi_module_features(0, transcript),
+        effective_k=0,
+    )
+    for k in (depth, 0, 1, 0, depth):
+        start = len(transcript)
+        row, features = replay.prepare_row(
+            DraftStepRow(a, 1, num_sampled=1),
+            multi_module_features(start, [20 + start]),
+        )
+        assert features[0] is not None and features[1] is not None
+        tail = transcript[-(depth - 1) :]
+        assert row.num_replayed == len(tail)
+        assert features[0].tolist() == tail + [20 + start]
+        assert features[1].tolist() == list(range(start - len(tail), start + 1))
+        plan, failures = planner.plan([row], num_speculative_tokens=k)
+        assert not failures
+        staged = replay.stage_history(plan, features)
+        planner.commit(plan)
+        replay.commit_history(staged)
+        transcript.append(20 + start)
+        owned = staged[0].history.features[0]
+        assert owned is not None and owned.tolist() == transcript[-(depth - 1) :]
+        assert owned.untyped_storage().nbytes() == owned.numel() * owned.element_size()
+        assert planner.num_computed(a) == len(transcript)
+    replay.close_sequences((a,))
+    planner.close(a)
+    assert replay.num_sequences == 0
+    assert planner.block_pool.num_free_blocks == planner.block_pool.num_blocks - 1
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_history_owns_bounded_rows_and_fences_closed_generations(depth):
+    planner = multi_module_planner(max_num_reqs=1, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
     a = key(1)
     planner.open(a)
     source = multi_module_features(0, list(range(64)))
@@ -322,6 +380,7 @@ def test_multi_module_history_owns_one_row_and_fences_closed_generations():
             assert retained is None
         else:
             assert retained is not None
+            assert retained.shape[0] == depth - 1
             assert (
                 retained.untyped_storage().data_ptr()
                 != tensor.untyped_storage().data_ptr()
@@ -337,8 +396,11 @@ def test_multi_module_history_owns_one_row_and_fences_closed_generations():
         DraftStepRow(a, 1, num_sampled=1), multi_module_features(64, [70])
     )
     assert repaired[0] is not None and repaired[2] is not None
-    assert repaired[0].tolist() == [63, 70]
-    assert repaired[2].tolist() == [[63.0, 63.0], [64.0, 70.0]]
+    assert repaired[0].tolist() == [*range(65 - depth, 64), 70]
+    assert repaired[2].tolist() == [
+        *[[float(p), float(p)] for p in range(65 - depth, 64)],
+        [64.0, 70.0],
+    ]
     with pytest.raises(ValueError, match="stale"):
         replay.commit_history(staged)
     replay.close_sequences((a,))
@@ -383,9 +445,10 @@ def test_multi_module_close_fences_history_staged_before_first_completion():
     assert features[0].tolist() == [12, 13]
 
 
-def test_multi_module_failed_admission_preserves_history_and_pool():
-    planner = multi_module_planner(num_blocks=4)
-    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_failed_admission_preserves_history_and_pool(depth):
+    planner = multi_module_planner(num_blocks=4, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
     a, b = key(1), key(2)
     for sequence, tokens in ((a, [11, 12, 13, 14]), (b, [21, 22])):
         planner.open(sequence)
@@ -407,7 +470,7 @@ def test_multi_module_failed_admission_preserves_history_and_pool():
     assert replay.num_sequences == 2
     _, repeated = replay.prepare_row(row, multi_module_features(4, [30, 80, 81]))
     assert repeated[0] is not None
-    assert repeated[0].tolist() == [14, 30]
+    assert repeated[0].tolist() == [*range(16 - depth, 15), 30]
     planner.close(b)
     replay.close_sequences((b,))
     plan, failures = planner.plan([prepared])
@@ -417,6 +480,86 @@ def test_multi_module_failed_admission_preserves_history_and_pool():
     replay.commit_history(updates)
     assert planner.num_computed(a) == 5
     assert replay.num_sequences == 1
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_stale_history_rejects_the_whole_staged_batch(depth):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a, b = key(1), key(2)
+    for sequence in (a, b):
+        planner.open(sequence)
+        complete_multi_module_step(
+            planner,
+            replay,
+            DraftStepRow(sequence, 1, num_sampled=1),
+            multi_module_features(0, [11]),
+        )
+    prepared = [
+        replay.prepare_row(
+            DraftStepRow(sequence, 1, num_sampled=1), multi_module_features(1, [12])
+        )
+        for sequence in (a, b)
+    ]
+    plan, failures = planner.plan([row for row, _ in prepared])
+    assert not failures
+    features = [
+        torch.cat([source[slot] for _, source in prepared]) for slot in range(3)
+    ] + [None]
+    staged = replay.stage_history(plan, features)
+    # The valid update comes first; discovering the closed second key must not
+    # install the first update before rejecting the batch.
+    replay.close_sequences((b,))
+    with pytest.raises(ValueError, match="stale"):
+        replay.commit_history(staged)
+    assert planner.num_computed(a) == 1
+    row, repeated = replay.prepare_row(
+        DraftStepRow(a, 1, num_sampled=1), multi_module_features(1, [13])
+    )
+    assert row.num_replayed == 1
+    assert repeated[0] is not None and repeated[0].tolist() == [11, 13]
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_replay_uses_submitted_budget_at_model_length_boundary(depth):
+    planner = multi_module_planner(num_blocks=193, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    rows, sources = [], []
+    for sequence_id, start in enumerate((126, 125, 120)):
+        sequence = key(sequence_id)
+        planner.open(sequence)
+        complete_multi_module_step(
+            planner,
+            replay,
+            DraftStepRow(sequence, start, num_sampled=1),
+            multi_module_features(0, list(range(start))),
+            effective_k=depth,
+        )
+        # The target reserves one bonus slot, regardless of returned K=depth.
+        submitted = min(depth, 128 - start - 2)
+        accepted = 1 if sequence_id == 2 else 0
+        row, source = replay.prepare_row(
+            DraftStepRow(
+                sequence,
+                submitted + 1,
+                num_sampled=accepted + 1,
+                num_rejected=submitted - accepted,
+            ),
+            multi_module_features(start, list(range(start, start + submitted + 1))),
+        )
+        assert source[1] is not None and int(source[1][-1]) < 127
+        rows.append(row)
+        sources.append(source)
+    assert [row.num_replayed for row in rows] == [depth - 1, depth - 1, depth - 2]
+    plan, failures = planner.plan(rows, num_speculative_tokens=0)
+    assert not failures
+    features = [
+        torch.cat([source[slot] for source in sources]) for slot in range(3)
+    ] + [None]
+    staged = replay.stage_history(plan, features)
+    planner.commit(plan)
+    replay.commit_history(staged)
+    assert [planner.num_computed(row.key) for row in rows] == [127, 126, 122]
 
 
 def test_multi_module_reserved_range_stops_at_real_model_boundary():

@@ -42,12 +42,21 @@ pytestmark = pytest.mark.usefixtures("cpu_parallel_state")
 
 
 @cache
-def _template(model_type, architecture, k, num_modules=1, module_layers=None):
+def _template(
+    model_type,
+    architecture,
+    k,
+    num_modules=1,
+    module_layers=None,
+    module_windows=None,
+    num_target_layers=2,
+    target_windows=None,
+):
     kwargs = dict(
         architectures=[architecture],
         hidden_size=16,
         vocab_size=32,
-        num_hidden_layers=2,
+        num_hidden_layers=num_target_layers,
         num_attention_heads=2,
         num_key_value_heads=2,
         num_nextn_predict_layers=num_modules,
@@ -57,11 +66,13 @@ def _template(model_type, architecture, k, num_modules=1, module_layers=None):
         kwargs["mtp_hybrid_override_pattern"] = "*E"
     if model_type == "exaone_moe":
         kwargs.update(
-            layer_types=["full_attention"] * 2,
+            layer_types=["full_attention"] * num_target_layers,
             mtp_layer_types=list(module_layers)
             if module_layers is not None
             else ["full_attention"] * num_modules,
             sliding_window=16,
+            mtp_sliding_windows=module_windows,
+            sliding_windows=target_windows,
         )
     hf_config = (
         PreTrainedConfig(model_type=model_type, **kwargs)
@@ -107,9 +118,21 @@ def _config(
     k=1,
     num_modules=1,
     module_layers=None,
+    module_windows=None,
+    num_target_layers=2,
+    target_windows=None,
 ):
     return copy.deepcopy(
-        _template(model_type, architecture, k, num_modules, module_layers)[1]
+        _template(
+            model_type,
+            architecture,
+            k,
+            num_modules,
+            module_layers,
+            module_windows,
+            num_target_layers,
+            target_windows,
+        )[1]
     )
 
 
@@ -130,27 +153,29 @@ def test_native_mtp_config_override_resolves_own_kv_contract(
     assert contract.schema.slots[2].trailing_shape == (16,)
 
 
-def test_exaone_two_checkpoint_modules_have_two_token_lookahead():
-    config = _config("exaone_moe", "ExaoneMoeForCausalLM", 2, num_modules=2)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_checkpoint_depth_determines_prefill_lookahead(depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
     contract = create_runtime_contract(config)
-    assert contract.capabilities.num_prefill_lookahead == 2
+    assert contract.capabilities.num_prefill_lookahead == depth
     assert contract.capabilities.supports_multi_module
     lookahead = next(
         slot for slot in contract.schema.slots if slot.kind == "next_prefill_tokens"
     )
-    assert lookahead.per_sequence and lookahead.trailing_shape == (2,)
+    assert lookahead.per_sequence and lookahead.trailing_shape == (depth,)
     assert contract.schema.slots[2].trailing_shape == (16,)
     config.speculative_config.remote_draft = RemoteDraftConfig(
         endpoint="unix:///tmp/unused-multi-module.sock"
     )
     assert config.speculative_config.use_remote_draft()
     assert config.speculative_config.use_multi_module_mtp()
-    assert config.num_prefill_lookahead_tokens == 2
+    assert config.num_prefill_lookahead_tokens == depth
 
 
 @pytest.mark.parametrize("transport", ["auto", "inline"])
-def test_two_exaone_modules_accept_single_inline_endpoint(transport):
-    config = _config("exaone_moe", "ExaoneMoeForCausalLM", 2, num_modules=2)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_accepts_single_inline_endpoint(transport, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
     config.speculative_config.execution = SpeculativeExecutionConfig(
         placement="remote",
         endpoints=("unix:///tmp/unused-multi-module.sock",),
@@ -158,11 +183,12 @@ def test_two_exaone_modules_accept_single_inline_endpoint(transport):
     )
     contract = create_runtime_contract(config)
     assert contract.capabilities.supports_multi_module
-    assert contract.capabilities.num_prefill_lookahead == 2
+    assert contract.capabilities.num_prefill_lookahead == depth
 
 
-def test_two_exaone_modules_reject_target_tensor_parallelism():
-    config = _config("exaone_moe", "ExaoneMoeForCausalLM", 2, num_modules=2)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_rejects_target_tensor_parallelism(depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
     config.parallel_config = ParallelConfig(tensor_parallel_size=2)
     with pytest.raises(ValueError, match="target TP1"):
         create_runtime_contract(config)
@@ -178,8 +204,9 @@ def test_two_exaone_modules_reject_target_tensor_parallelism():
         ),
     ],
 )
-def test_two_exaone_modules_reject_ipc_and_pooling(transport, endpoints):
-    config = _config("exaone_moe", "ExaoneMoeForCausalLM", 2, num_modules=2)
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_rejects_ipc_and_pooling(transport, endpoints, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
     config.speculative_config.execution = SpeculativeExecutionConfig(
         placement="remote",
         endpoints=endpoints,
@@ -199,30 +226,101 @@ def test_exaone_module_count_changes_state_and_feature_contract_identity():
     assert single.tokenizer_fingerprint == multi.tokenizer_fingerprint
 
 
-@pytest.mark.parametrize("k", [1, 3])
-def test_two_exaone_modules_require_configured_k_two(k):
-    config = _config("exaone_moe", "ExaoneMoeForCausalLM", k, num_modules=2)
-    with pytest.raises(ValueError, match="two|2"):
+@pytest.mark.parametrize("depth", [2, 3, 4])
+@pytest.mark.parametrize("difference", [-1, 1])
+def test_exaone_module_chain_requires_configured_depth(depth, difference):
+    config = _config(
+        "exaone_moe", "ExaoneMoeForCausalLM", depth + difference, num_modules=depth
+    )
+    with pytest.raises(ValueError, match="configured K"):
         create_runtime_contract(config)
 
 
 @pytest.mark.parametrize(
-    "module_layers",
+    "module_layers,module_windows",
     [
-        ("sliding_attention", "sliding_attention"),
-        ("full_attention", "sliding_attention"),
-        ("sliding_attention", "full_attention"),
+        (("sliding_attention", "sliding_attention"), None),
+        (("full_attention", "sliding_attention"), None),
+        (("sliding_attention", "full_attention"), None),
+        (("full_attention", "sliding_attention", "sliding_attention"), (0, 16, 32)),
+        (("full_attention", "sliding_attention") * 2, (0, 16, 0, 32)),
     ],
 )
-def test_two_exaone_modules_require_full_attention(module_layers):
+def test_exaone_module_chain_accepts_dense_full_and_sliding_groups(
+    module_layers, module_windows
+):
+    depth = len(module_layers)
     config = _config(
         "exaone_moe",
         "ExaoneMoeForCausalLM",
-        2,
-        num_modules=2,
+        depth,
+        num_modules=depth,
         module_layers=module_layers,
+        module_windows=module_windows,
     )
-    with pytest.raises(ValueError, match="full.attention"):
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == depth
+    assert contract.capabilities.supports_multi_module
+
+
+@pytest.mark.parametrize("module_windows", [None, ()])
+@pytest.mark.parametrize(
+    "module_layers,target_windows",
+    [
+        (
+            ("full_attention", "sliding_attention", "sliding_attention"),
+            (0, 16, 32, 64, 128),
+        ),
+        (("sliding_attention", "full_attention", "full_attention"), (16,)),
+        (("full_attention",) * 3, ()),
+    ],
+)
+def test_exaone_module_windows_inherit_only_used_target_indexes(
+    module_windows, module_layers, target_windows
+):
+    config = _config(
+        "exaone_moe",
+        "ExaoneMoeForCausalLM",
+        3,
+        num_modules=3,
+        module_layers=module_layers,
+        module_windows=module_windows,
+        num_target_layers=5,
+        target_windows=target_windows,
+    )
+    assert config.model_config.hf_config.num_hidden_layers == 5
+    draft = config.speculative_config.draft_model_config.hf_config
+    resolved = draft.mtp_sliding_windows or draft.sliding_windows
+    assert resolved == target_windows
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("mtp_layer_types", ["full_attention"]),
+        (
+            "mtp_layer_types",
+            ["full_attention", "compressed_attention", "full_attention"],
+        ),
+        ("mtp_sliding_windows", [0, 16]),
+        ("mtp_sliding_windows", [0, 0, 32]),
+        ("mtp_sliding_windows", [0, -1, 32]),
+        ("mtp_sliding_windows", [0, True, 32]),
+    ],
+)
+def test_exaone_module_chain_rejects_incomplete_or_invalid_layout(field, value):
+    config = _config(
+        "exaone_moe",
+        "ExaoneMoeForCausalLM",
+        3,
+        num_modules=3,
+        module_layers=("full_attention", "sliding_attention", "sliding_attention"),
+        module_windows=(0, 16, 32),
+    )
+    setattr(config.speculative_config.draft_model_config.hf_config, field, value)
+    with pytest.raises(ValueError, match="MTP.*(layer|window)"):
         create_runtime_contract(config)
 
 
@@ -237,7 +335,7 @@ def test_non_recurrent_mtp_models_keep_k_one(model_type, target_arch, draft_arch
 def test_mtp_contract_rejects_missing_or_multiple_checkpoint_modules(
     model_type, target_arch, draft_arch, k
 ):
-    for count in (0, 3) if model_type == "exaone_moe" else (0, 2):
+    for count in (0,) if model_type == "exaone_moe" else (0, 2):
         config = _config(model_type, target_arch, k, num_modules=count)
         if model_type == "nemotron_h" and count == 0:
             # The native override does not select an MTP architecture without
