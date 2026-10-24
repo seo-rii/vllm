@@ -6,6 +6,10 @@ from copy import deepcopy
 from dataclasses import replace
 
 import pytest
+from huggingface_hub.errors import (
+    StrictDataclassClassValidationError,
+    StrictDataclassFieldValidationError,
+)
 
 from vllm.v1.spec_decode.remote.capabilities import SpeculatorPlacementCapabilities
 from vllm.v1.spec_decode.remote.protocol import (
@@ -1830,7 +1834,14 @@ def test_actual_socket_timeout_fences_late_completion(
         release.set()
 
 
-def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_options):
+def token_config(
+    tmp_path,
+    *,
+    target_type="qwen3",
+    draft_type="qwen3",
+    target_options=None,
+    **draft_options,
+):
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -1838,8 +1849,8 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         AutoModelForCausalLM,
         LlamaConfig,
         MistralConfig,
-        PreTrainedTokenizerFast,
         Qwen3Config,
+        TokenizersBackend,
     )
 
     from vllm.config import (
@@ -1857,7 +1868,7 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         "llama": (LlamaConfig, "LlamaForCausalLM"),
         "mistral": (MistralConfig, "MistralForCausalLM"),
     }
-    tokenizer = PreTrainedTokenizerFast(
+    tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
         bos_token="token0",
         eos_token="token1",
@@ -1893,7 +1904,9 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
             skip_tokenizer_init=True,
         )
 
-    target = model(tmp_path / "target", target_type, hidden_size=32)
+    target = model(
+        tmp_path / "target", target_type, hidden_size=32, **(target_options or {})
+    )
     draft = model(tmp_path / "draft", draft_type, hidden_size=16, **draft_options)
     parallel = ParallelConfig()
     spec = SpeculativeConfig(
@@ -1914,7 +1927,18 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
             async_scheduling=False,
             is_encoder_decoder=False,
         ),
-        cache_config=CacheConfig(enable_prefix_caching=False),
+        cache_config=CacheConfig(
+            enable_prefix_caching=False,
+            sliding_window=(
+                target.get_sliding_window()
+                if getattr(target.hf_text_config, "layer_types", None) is None
+                or all(
+                    layer == "sliding_attention"
+                    for layer in target.hf_text_config.layer_types
+                )
+                else None
+            ),
+        ),
         device_config=DeviceConfig("cpu"),
     )
 
@@ -1941,26 +1965,106 @@ def test_token_contract_accepts_native_full_attention_with_different_geometry(
 
 
 @pytest.mark.parametrize(
-    "options,reason",
+    "family,target_options,draft_options",
     [
-        ({"sliding_window": 16}, "homogeneous full attention"),
+        ("mistral", {}, {"sliding_window": 16}),
+        ("mistral", {"sliding_window": 16}, {}),
+        ("mistral", {"sliding_window": 16}, {"sliding_window": 32}),
         (
-            {"layer_types": ["full_attention", "sliding_attention"]},
-            "homogeneous full attention",
+            "qwen3",
+            {"use_sliding_window": True, "max_window_layers": 0, "sliding_window": 16},
+            {"use_sliding_window": True, "max_window_layers": 0, "sliding_window": 32},
         ),
-        ({"attention_chunk_size": 16}, "homogeneous full attention"),
-        ({"is_causal": False}, "native decoder-only causal"),
     ],
 )
-def test_token_contract_rejects_models_outside_token_addressed_full_attention(
-    tmp_path, options, reason
+def test_token_contract_accepts_independent_uniform_attention_windows(
+    tmp_path, family, target_options, draft_options
+):
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type=family,
+        draft_type=family,
+        target_options=target_options,
+        **draft_options,
+    )
+    contract = create_token_runtime_contract(config)
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.state_dependency == "own_kv"
+    resource = create_token_executor_config(config)
+    assert resource.cache_config.sliding_window == draft_options.get("sliding_window")
+    assert config.cache_config.sliding_window == target_options.get("sliding_window")
+    assert resource.cache_config is not config.cache_config
+    assert resource.model_config is config.speculative_config.draft_model_config
+
+
+def test_full_attention_layer_declarations_ignore_unused_window(tmp_path):
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        draft_type="llama",
+        sliding_window=16,
+        layer_types=["full_attention", "full_attention"],
+    )
+    assert (
+        create_token_runtime_contract(config).capabilities.state_dependency == "own_kv"
+    )
+    assert create_token_executor_config(config).cache_config.sliding_window is None
+
+
+@pytest.mark.parametrize(
+    "options,error_type,reason",
+    [
+        (
+            {"layer_types": ["full_attention", "sliding_attention"]},
+            ValueError,
+            "homogeneous full or sliding-window attention",
+        ),
+        (
+            {"layer_types": ["sliding_attention", "sliding_attention"]},
+            ValueError,
+            "homogeneous full or sliding-window attention",
+        ),
+        ({"sliding_window": -1}, ValueError, "positive integer sliding window"),
+        (
+            {"sliding_window": True},
+            StrictDataclassFieldValidationError,
+            "expected int, got bool",
+        ),
+        (
+            {"layer_types": ["full_attention"]},
+            StrictDataclassClassValidationError,
+            "must be equal to the number of `layer_types`",
+        ),
+        (
+            {"attention_chunk_size": 16},
+            ValueError,
+            "does not support chunked attention",
+        ),
+        ({"is_causal": False}, ValueError, "native decoder-only causal"),
+    ],
+)
+def test_token_contract_rejects_nonuniform_or_invalid_attention(
+    tmp_path, options, error_type, reason
 ):
     from vllm.v1.spec_decode.remote.runtime.token_schema import (
         create_token_runtime_contract,
     )
 
-    config = token_config(tmp_path, draft_type="mistral", **options)
-    with pytest.raises(ValueError, match=reason):
+    with pytest.raises(error_type, match=reason):
+        config = token_config(tmp_path, draft_type="mistral", **options)
         create_token_runtime_contract(config)
 
 

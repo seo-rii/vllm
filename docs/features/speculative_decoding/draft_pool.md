@@ -7,7 +7,13 @@ Workers combine proposals from different verifiers into a ragged GPU batch,
 with one execution thread owning their mutable model and KV state.
 
 Token-only workers use `method="draft_model"`, inline transport, target TP1 and
-draft TP1. Own-KV EAGLE3/MTP workers retain their existing model contracts, target
+draft TP1. Each token-only model may use homogeneous full or sliding-window
+attention, with independently configured target and draft windows. Draft workers
+retain full-context KV rather than evicting old window positions; size their KV
+budget for the context limit. See the
+[token-only contract](../../design/unified_speculation_runtime.md#token-only-state-contract)
+for model and tokenizer requirements.
+Own-KV EAGLE3/MTP workers retain their existing model contracts, target
 TP1/TP2 and draft TP1, and accept inline or explicit CUDA IPC transport. Gemma4
 snapshots require inline transport, target TP1, draft TP1 and K=1. All require
 sequential greedy drafting. Predictive caches, cross-node execution and live
