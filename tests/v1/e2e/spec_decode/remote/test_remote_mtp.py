@@ -1708,7 +1708,7 @@ def _run_two_module_oracle(model_path: str, result_path: str) -> None:
                 query = [recovery[row], *submitted_drafts]
                 positions = list(range(start, start + len(query)))
                 assert positions[-1] < max_model_len - 1
-                features = target_features(tokens[row] + query)[start:]
+                features = target_features(tokens[row] + query)[start:].clone()
                 valid = accepted[row] + 1
                 tokens[row] += query[:valid]
                 hidden[row] = torch.cat((hidden[row], features[:valid]))
