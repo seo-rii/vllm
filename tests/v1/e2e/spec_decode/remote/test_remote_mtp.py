@@ -1705,7 +1705,7 @@ def test_remote_independent_mla_draft_preserves_target(
     tiny_independent_mla_models,
     record_property,
 ):
-    """Check native parity for dense FFNs and original MoE remote correctness."""
+    """Check exact target output and accepted drafts for dense and routed MLA."""
     import json
 
     target, draft = tiny_independent_mla_models
@@ -1723,7 +1723,7 @@ def test_remote_independent_mla_draft_preserves_target(
         target_model=target,
         independent_draft=draft,
         independent_draft_kind="deepseek_v2",
-        native_control=fixture["ffn_layout"] == "dense",
+        native_control=False,
     )
 
 
@@ -1783,12 +1783,10 @@ def _compare_native_and_remote_draft(
         import json
 
         assert mla_draft
-        assert (
-            json.loads((Path(independent_draft) / "config.json").read_text())[
-                "n_routed_experts"
-            ]
-            == 4
-        )
+        assert mtp_family == "qwen3"
+        assert json.loads((Path(independent_draft) / "config.json").read_text())[
+            "n_routed_experts"
+        ] in (0, 4)
     eagle3 = eagle3_draft is not None
     detailed = independent or eagle3
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
@@ -1875,8 +1873,10 @@ def _compare_native_and_remote_draft(
     if not native_control:
         record_property(
             "native.unavailable",
-            "Dense target does not initialize the expert group required by the "
-            "native MoE draft; this case makes no native placement parity claim.",
+            "Native mixed Qwen3/MLA execution builds draft metadata with the "
+            "target head dimension; routed drafts also require an expert group "
+            "that the dense target does not initialize. No native placement "
+            "parity is claimed; standalone native proposal replay is separate.",
         )
     record_property("batch_invariant", not hybrid_target)
 
@@ -2744,7 +2744,7 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
     ]
     proposals: list[list[int]] = [[], [], []]
     previous_ids: list[int | None] = [None, None, None]
-    checks, outcomes, orders, partitions = [], [], [], []
+    checks, outcomes, orders, partitions, proposal_references = [], [], [], [], []
 
     def blocks(key):
         return pool.blocks(state.sequences[key].req_index)
@@ -2943,6 +2943,15 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
                     )
                 proposals[row] = list(result.token_ids)
                 previous_ids[row] = result.proposal_id
+                if result.token_ids:
+                    proposal_references.append(
+                        dict(
+                            step=step,
+                            row=row,
+                            committed_token_ids=list(transcripts[row]),
+                            token_ids=list(result.token_ids),
+                        )
+                    )
                 checks.append(
                     dict(
                         step=step, row=row, committed=committed, k=k, poisoned_tail=True
@@ -3006,6 +3015,7 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
                     orders=orders,
                     metadata=metadata,
                     same_path_partitions=partitions,
+                    proposal_references=proposal_references,
                     decode_threshold=decode_threshold,
                     truncations=truncations,
                     generation_reuse=True,
@@ -3021,14 +3031,16 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
 
 
 def test_remote_independent_mla_state_matches_authoritative_replay(
-    monkeypatch, tmp_path, tiny_independent_mla_models, record_property
+    vllm_runner, monkeypatch, tmp_path, tiny_independent_mla_models, record_property
 ):
-    """Actual MLA rollback, ragged corrections, K0 and capacity recovery."""
+    """Check exact MLA state and standalone native proposals after corrections."""
     import json
+    import math
 
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     target, draft = tiny_independent_mla_models
     result, log_path = tmp_path / "mla-oracle.json", tmp_path / "mla-oracle.log"
     command = [
@@ -3071,6 +3083,128 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
         )
     )
     record_property("native.mla_state_oracle", receipt)
+    cases = receipt["proposal_references"]
+    assert len(cases) == 18 and sum(len(case["token_ids"]) for case in cases) == 48
+
+    def native_identity(worker):
+        import torch
+
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.attention.backends.mla.triton_mla import (
+            TritonMLAMetadataBuilder,
+        )
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        config, runner = worker.vllm_config, worker.model_runner
+        model = runner.model
+        assert config.speculative_config is None
+        assert config.model_config.model == draft
+        assert config.model_config.use_mla and not model.use_mha
+        assert config.model_config.get_hidden_size() == 128
+        assert config.model_config.get_head_size() == 576
+        assert config.cache_config.cache_dtype == "auto"
+        assert type(model).__name__ == "DeepseekV2ForCausalLM"
+        assert type(runner.model_state).__name__ == "DefaultModelState"
+        layers = [m for m in model.modules() if isinstance(m, MLAAttention)]
+        assert len(layers) == 2
+        for layer in layers:
+            spec = layer.get_kv_cache_spec(config)
+            assert isinstance(spec, MLAAttentionSpec)
+            assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
+            assert spec.dtype == torch.bfloat16 and spec.block_size == 16
+            assert layer.get_attn_backend().get_name() == "TRITON_MLA"
+            assert layer.prefill_backend is not None
+            assert layer.prefill_backend.get_name() == "FLASH_ATTN"
+        builders = [
+            g.get_metadata_builder() for groups in runner.attn_groups for g in groups
+        ]
+        assert builders and all(
+            isinstance(b, TritonMLAMetadataBuilder) for b in builders
+        )
+        assert all(b.model_config is config.model_config for b in builders)
+        return dict(
+            model=type(model).__name__,
+            model_path=config.model_config.model,
+            head_size=config.model_config.get_head_size(),
+            backend="TRITON_MLA",
+            prefill_backend="FLASH_ATTN",
+            checkpoint_weights=_check_independent_mla_weights(model, draft),
+        )
+
+    # The executor child has exited. A real standalone LLM now owns the draft
+    # checkpoint and distributed state, without the mixed native runner's target
+    # metadata ownership. Cross-path token equality supplements same-path KV.
+    with vllm_runner(
+        draft,
+        tokenizer_mode="hf",
+        skip_tokenizer_init=True,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=6,
+        max_num_batched_tokens=128,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        kernel_config={"moe_backend": "triton", "enable_jit_warmup": False},
+        attention_config={"backend": "TRITON_MLA", "mla_prefill_backend": "FLASH_ATTN"},
+    ) as native:
+        identity = native.llm.collective_rpc(native_identity)
+        assert identity[0]["checkpoint_weights"] == receipt["checkpoint_weights"]
+        outputs = native.llm.generate(
+            [{"prompt_token_ids": case["committed_token_ids"]} for case in cases],
+            [
+                SamplingParams(
+                    temperature=0,
+                    max_tokens=len(case["token_ids"]),
+                    ignore_eos=True,
+                    detokenize=False,
+                    logprobs=5,
+                )
+                for case in cases
+            ],
+            use_tqdm=False,
+        )
+    observations = [
+        dict(
+            **case,
+            native_prompt_token_ids=output.prompt_token_ids,
+            native_token_ids=list(output.outputs[0].token_ids),
+            native_logprobs=[
+                {
+                    token: dict(logprob=value.logprob, rank=value.rank)
+                    for token, value in values.items()
+                }
+                for values in output.outputs[0].logprobs or []
+            ],
+        )
+        for case, output in zip(cases, outputs)
+    ]
+    record_property(
+        "native.mla_proposal_replay",
+        dict(
+            identity=identity,
+            comparison="exact_proposal_tokens_from_committed_prefix",
+            requests=len(observations),
+            tokens=sum(len(case["token_ids"]) for case in cases),
+            observations=observations,
+        ),
+    )
+    assert len(outputs) == len(cases)
+    for case, output in zip(cases, outputs):
+        assert output.prompt_token_ids == case["committed_token_ids"]
+        generated = output.outputs[0]
+        assert list(generated.token_ids) == case["token_ids"], case
+        assert generated.finish_reason == "length"
+        assert generated.logprobs is not None
+        assert len(generated.logprobs) == len(generated.token_ids)
+        for token, values in zip(generated.token_ids, generated.logprobs):
+            assert token in values and len(values) >= 5
+            assert all(math.isfinite(value.logprob) for value in values.values())
 
 
 def _run_multi_module_oracle(model_path: str, result_path: str) -> None:
