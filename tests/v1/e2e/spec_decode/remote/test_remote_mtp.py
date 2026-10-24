@@ -814,6 +814,7 @@ def _save_deepseek_mtp_model(directory, ffn_layout):
             norm = DeepseekV3RMSNorm(128, config.rms_norm_eps)
             state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
         fusion = torch.nn.Linear(256, 128, bias=False)
+        _conditioned_mtp_fusion(fusion.weight)
         state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
         state["model.layers.2.embed_tokens.weight"] = state[
             "model.embed_tokens.weight"
@@ -830,6 +831,7 @@ def _save_deepseek_mtp_model(directory, ffn_layout):
         target_hf_class=type(target).__name__,
         mtp_hf_class=type(mtp).__name__,
         mtp_source="independently_initialized_hf_layer_2_of_3",
+        fusion="embedding_1_4_target_hidden_3_4",
         checkpoint_tensors=len(weights),
         exact_checkpoint_roundtrip=True,
         mtp_absolute_layer=2,
@@ -984,6 +986,7 @@ def _mimo_v2_flash_fixture_data():
                 mlp(prefix + f".mlp.experts.{expert}")
     mtp = "model.mtp.layers.0"
     weight(mtp + ".eh_proj.weight", (64, 128))
+    _conditioned_mtp_fusion(weights[mtp + ".eh_proj.weight"])
     for name in [
         "enorm",
         "hnorm",
@@ -1022,6 +1025,7 @@ def tiny_mimo_v2_flash_mtp_model(tmp_path):
                 head_scale=32,
                 architecture="MiMoV2FlashForCausalLM",
                 synthetic_bf16=True,
+                fusion="embedding_1_4_target_hidden_3_4",
                 checkpoint_tensors=47,
                 exact_checkpoint_roundtrip=True,
                 native_used_heads=1,
@@ -1882,6 +1886,17 @@ def tiny_eagle3_models(tmp_path, eagle_target):
 def tiny_independent_qwen3_models(tmp_path, request, mtp_family):
     target_path = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
     return _tiny_independent_qwen3_models(tmp_path, target_path)
+
+
+def _conditioned_mtp_fusion(weight):
+    """Preserve target feature direction while retaining token conditioning."""
+    import torch
+
+    width = weight.shape[0]
+    assert weight.shape == (width, 2 * width)
+    identity = torch.eye(width, dtype=weight.dtype, device=weight.device)
+    with torch.no_grad():
+        weight.copy_(torch.cat((identity / 4, 3 * identity / 4), dim=1))
 
 
 def _two_candidate_head(weight):
