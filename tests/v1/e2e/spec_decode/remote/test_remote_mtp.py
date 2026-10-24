@@ -686,6 +686,7 @@ def _check_deepseek_mtp_weights(target, draft, model_path):
                 )
             elif source.endswith((".w13_weight", ".w2_weight")):
                 prefix, projection = source.rsplit(".", 1)
+                prefix = prefix.removesuffix(".routed_experts")
                 for expert, value in enumerate(parameter):
                     names = (
                         ("gate_proj", "up_proj")
