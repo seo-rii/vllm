@@ -42,6 +42,7 @@ def draft_server(
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
     trust_remote_code: bool = True,
+    moe_backend: str | None = None,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
@@ -82,6 +83,8 @@ def draft_server(
         ]
         if trust_remote_code:
             command.append("--trust-remote-code")
+        if moe_backend is not None:
+            command.extend(["--moe-backend", moe_backend])
         if revision is not None:
             command.extend(
                 ["--target-revision", revision, "--draft-revision", revision]
@@ -566,13 +569,135 @@ def tiny_exaone_mtp_model(tmp_path, mtp_window):
     return str(path)
 
 
-@pytest.mark.parametrize("mtp_window", [None, 16], ids=["full", "swa"])
+@pytest.fixture
+def tiny_glm4_moe_mtp_model(tmp_path):
+    """Keep a real routed target layer and its initialized native MTP counterpart."""
+    import torch
+    from safetensors.torch import load_file, save_file
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import Glm4MoeConfig, Glm4MoeForCausalLM, TokenizersBackend
+    from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeRMSNorm
+
+    config = Glm4MoeConfig(
+        architectures=["Glm4MoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        n_group=1,
+        topk_group=1,
+        first_k_dense_replace=1,
+        use_qk_norm=True,
+        num_mtp_layers=1,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        model = Glm4MoeForCausalLM(config)
+        state = dict(model.state_dict())
+        state.update(
+            {
+                f"model.layers.2.{name}": tensor.clone()
+                for name, tensor in model.model.layers[1].state_dict().items()
+            }
+        )
+        for name in ("enorm", "hnorm", "shared_head.norm"):
+            norm = Glm4MoeRMSNorm(128, eps=config.rms_norm_eps)
+            state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
+
+    weights = {}
+    for name, tensor in state.items():
+        if name.endswith(".experts.gate_up_proj"):
+            prefix = name.removesuffix(".gate_up_proj")
+            gates, ups = tensor.chunk(2, dim=1)
+            for expert in range(tensor.shape[0]):
+                weights[f"{prefix}.{expert}.gate_proj.weight"] = gates[expert].clone()
+                weights[f"{prefix}.{expert}.up_proj.weight"] = ups[expert].clone()
+            reconstructed = torch.stack(
+                [
+                    torch.cat(
+                        (
+                            weights[f"{prefix}.{e}.gate_proj.weight"],
+                            weights[f"{prefix}.{e}.up_proj.weight"],
+                        )
+                    )
+                    for e in range(tensor.shape[0])
+                ]
+            )
+            assert torch.equal(reconstructed, tensor)
+        elif name.endswith(".experts.down_proj"):
+            prefix = name.removesuffix(".down_proj")
+            for expert in range(tensor.shape[0]):
+                weights[f"{prefix}.{expert}.down_proj.weight"] = tensor[expert].clone()
+            assert torch.equal(
+                torch.stack(
+                    [
+                        weights[f"{prefix}.{e}.down_proj.weight"]
+                        for e in range(tensor.shape[0])
+                    ]
+                ),
+                tensor,
+            )
+        else:
+            weights[name] = tensor.clone()
+    for name, tensor in weights.items():
+        dtype = (
+            torch.float32
+            if name.endswith((".mlp.gate.weight", ".e_score_correction_bias"))
+            else torch.bfloat16
+        )
+        weights[name] = tensor.to(dtype).contiguous()
+        assert torch.isfinite(weights[name]).all()
+    path = tmp_path / "glm4-moe"
+    path.mkdir()
+    save_file(weights, path / "model.safetensors", metadata={"format": "pt"})
+    reloaded = load_file(path / "model.safetensors")
+    assert weights.keys() == reloaded.keys()
+    assert all(torch.equal(tensor, reloaded[name]) for name, tensor in weights.items())
+    config.save_pretrained(path)
+    vocabulary = {token: i for i, token in enumerate(("<pad>", "<s>", "</s>", "<unk>"))}
+    vocabulary.update({f"t{i}": i for i in range(4, 128)})
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = TokenizersBackend(
+        tokenizer_object=backend,
+        pad_token="<pad>",
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        model_max_length=128,
+    )
+    tokenizer.save_pretrained(path)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "mtp_family,mtp_window",
+    [("exaone", None), ("exaone", 16), ("glm4_moe", None)],
+    ids=["exaone-full", "exaone-swa", "glm4-moe"],
+)
 @pytest.mark.parametrize("k", [1, 3], ids=["k1", "k3"])
-def test_remote_exaone_mtp_matches_native_and_target(
+def test_remote_native_mtp_matches_native_and_target(
     vllm_runner,
     monkeypatch,
     tmp_path,
-    tiny_exaone_mtp_model,
+    request,
+    mtp_family,
     mtp_window,
     k,
     record_property,
@@ -582,7 +707,7 @@ def test_remote_exaone_mtp_matches_native_and_target(
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    model = tiny_exaone_mtp_model
+    model = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
     kwargs = dict(
         trust_remote_code=False,
         skip_tokenizer_init=True,
@@ -600,6 +725,9 @@ def test_remote_exaone_mtp_matches_native_and_target(
         attention_config={"backend": "TRITON_ATTN"},
         disable_log_stats=False,
     )
+    moe_backend = "triton" if mtp_family == "glm4_moe" else None
+    if moe_backend is not None:
+        kwargs["moe_backend"] = moe_backend
     prompts = [
         {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
         for length in (15, 16, 17, 31, 32, 33, 65)
@@ -640,13 +768,39 @@ def test_remote_exaone_mtp_matches_native_and_target(
         return counts
 
     def target_windows(model):
-        return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+        from vllm.model_executor.layers.attention import Attention
+
+        return [
+            layer.sliding_window
+            for layer in model.modules()
+            if isinstance(layer, Attention)
+        ]
+
+    def moe_backends(model):
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        backends = []
+        for layer in model.modules():
+            if isinstance(layer, RoutedExperts):
+                method = layer.quant_method
+                assert isinstance(method, UnquantizedFusedMoEMethod)
+                backends.append(method.unquantized_backend.name)
+        return backends
+
+    def draft_moe_backends(worker):
+        return moe_backends(worker.model_runner.get_draft_model())
 
     def draft_kv_policy(worker):
+        from vllm.model_executor.layers.attention import Attention
+
         draft = worker.model_runner.get_draft_model()
         policies = []
-        for layer in draft.model.layers:
-            attention = layer.self_attn.attn
+        for attention in draft.modules():
+            if not isinstance(attention, Attention):
+                continue
             spec = attention.get_kv_cache_spec(worker.vllm_config)
             policies.append(
                 (
@@ -669,6 +823,9 @@ def test_remote_exaone_mtp_matches_native_and_target(
         windows = baseline.llm.apply_model(target_windows)
         assert windows == [[None, None]]
         record_property("target.attention_windows", windows)
+        backends = baseline.llm.apply_model(moe_backends)
+        assert backends == [["TRITON"] if moe_backend else []]
+        record_property("target.moe_backends", backends)
         expected = generate(baseline)
     assert all(len(tokens) == 8 for batch in expected for tokens in batch)
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
@@ -676,17 +833,21 @@ def test_remote_exaone_mtp_matches_native_and_target(
         spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
         assert policy == [[(mtp_window, spec_type, mtp_window)]]
         record_property("native.kv_policy", policy)
+        backends = native.llm.collective_rpc(draft_moe_backends)
+        assert backends == [["TRITON"] if moe_backend else []]
+        record_property("native.moe_backends", backends)
         assert generate(native) == expected
         native_counts = speculation_counts(native, "native")
     with draft_server(
         model,
-        tmp_path / "exaone-draft.log",
+        tmp_path / f"{mtp_family}-draft.log",
         revision=None,
         num_speculative_tokens=k,
         attention_backend="TRITON_ATTN",
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=32,
         trust_remote_code=False,
+        moe_backend=moe_backend,
     ) as endpoint:
         remote_config = dict(
             config,
