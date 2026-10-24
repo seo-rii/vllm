@@ -3531,7 +3531,7 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
             prefix = list(case["committed_token_ids"])
             for position, expected in enumerate(case["token_ids"]):
                 output = native.llm.generate(
-                    [{"prompt_token_ids": prefix}],
+                    [{"prompt_token_ids": list(prefix)}],
                     SamplingParams(
                         temperature=0,
                         max_tokens=1,
@@ -3542,11 +3542,12 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
                     use_tqdm=False,
                 )[0]
                 generated = output.outputs[0]
+                assert output.prompt_token_ids is not None
                 observed = dict(
                     case=case["case"],
                     position=position,
                     prefix=list(prefix),
-                    native_prompt_token_ids=output.prompt_token_ids,
+                    native_prompt_token_ids=list(output.prompt_token_ids),
                     expected_token=expected,
                     token_ids=list(generated.token_ids),
                     finish_reason=generated.finish_reason,
