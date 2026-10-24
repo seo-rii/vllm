@@ -320,7 +320,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
 
 
 @pytest.fixture
-def sliding_window_models(tmp_path):
+def sliding_window_models(tmp_path, mixed_attention):
     """Equal real weights with different target/draft attention windows."""
     import torch
     from tokenizers import Tokenizer
@@ -351,15 +351,26 @@ def sliding_window_models(tmp_path):
         torch.manual_seed(0)
         model = MistralForCausalLM(config)
     paths = (tmp_path / "target", tmp_path / "draft")
-    for path, window in zip(paths, (32, 16)):
+    for index, (path, window) in enumerate(zip(paths, (32, 16))):
         model.config.sliding_window = window
+        if mixed_attention:
+            layers = ["sliding_attention", "full_attention"]
+            model.config.layer_types = layers if index == 0 else list(reversed(layers))
+        else:
+            model.config.layer_types = ["sliding_attention"] * 2
         model.save_pretrained(path)
         tokenizer.save_pretrained(path)
     return tuple(str(path) for path in paths)
 
 
+@pytest.mark.parametrize("mixed_attention", [False, True], ids=["uniform", "mixed"])
 def test_remote_sliding_window_draft_matches_native_and_target(
-    vllm_runner, monkeypatch, tmp_path, sliding_window_models, record_property
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    sliding_window_models,
+    mixed_attention,
+    record_property,
 ):
     """Retain old KV positions while native attention applies the draft window."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
@@ -414,6 +425,12 @@ def test_remote_sliding_window_draft_matches_native_and_target(
             record_property(f"{mode}.{name}", value)
             assert value > 0
 
+    def attention_windows(model):
+        return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+
+    def draft_attention_windows(worker):
+        return attention_windows(worker.model_runner.get_draft_model())
+
     config = dict(
         method="draft_model",
         model=draft,
@@ -423,9 +440,15 @@ def test_remote_sliding_window_draft_matches_native_and_target(
         attention_backend="TRITON_ATTN",
     )
     with vllm_runner(target, **kwargs) as baseline:
+        assert baseline.llm.apply_model(attention_windows) == [
+            [32, None] if mixed_attention else [32, 32]
+        ]
         expected = generate(baseline)
     assert all(len(tokens) == 8 for batch in expected for tokens in batch)
     with vllm_runner(target, speculative_config=config, **kwargs) as native:
+        assert native.llm.collective_rpc(draft_attention_windows) == [
+            [None, 16] if mixed_attention else [16, 16]
+        ]
         assert generate(native) == expected
         assert_speculation(native, "native")
     for num_workers in (1, 2):
