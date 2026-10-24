@@ -129,9 +129,10 @@ tail KV cannot be treated as committed state.
 
 A standalone loader and forward path reuse native model execution without a
 target shell or a second inference engine. The supported mode is greedy,
-text-only native decoder models with causal full or sliding-window attention,
-same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
-parallel drafting. Qwen3, Llama and Mistral support homogeneous attention.
+text-only, same-host inline, target TP1 and draft TP1, with no heterogeneous
+vocabulary or parallel drafting. Independent drafts require native decoder
+models with causal full or sliding-window attention. Qwen3, Llama and Mistral
+support homogeneous attention.
 Llama and Mistral also support a mixture of full and sliding-window layers via
 their checkpoint's `layer_types`. The runtime checks model capabilities and the
 loaded draft's actual per-layer KV specification. Loaded drafts
@@ -146,9 +147,18 @@ standalone draft retains full-context KV
 blocks, including positions outside the current window, so rejection and replay
 never depend on evicted pages. Sliding-window support therefore does not reduce
 the draft KV reservation to the window size.
-Chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
-multimodal and Transformers-backend execution remain unsupported. Select the built-in
-`tokenizer_mode="hf"` explicitly.
+Targets additionally support native `Qwen3NextForCausalLM`,
+`NemotronHForCausalLM` and dense `Glm4MoeLiteForCausalLM` with a single remote
+endpoint. Their recurrent state or MLA KV remains entirely on the target;
+only committed token IDs reach the independent draft. This uses
+`method="draft_model"` and does not load a target's MTP head as the drafter.
+Their target-state recovery must use the native verifier, not draft KV replay.
+These combinations require the same tokenizer contract as dense targets.
+
+Sparse MLA targets and recurrent, hybrid or MLA drafts remain unsupported.
+Chunked attention, encoder-decoder, multimodal and Transformers-backend models
+remain unsupported in either role. Select the built-in `tokenizer_mode="hf"`
+explicitly.
 Tokenizer compatibility is checked against the draft checkpoint's own artifacts,
 including token mapping, special tokens, and frontend metadata. This initial
 contract requires identical tokenizer artifact sets; a chat-template difference
@@ -160,6 +170,34 @@ Start the v3 server through
 checkpoints and tokenizer assets at immutable revisions before launch. The server
 requires the same target, draft, context limit, K, dtype and tokenizer contract
 as the verifier. It completes model warmup before exposing its socket.
+The draft uses its own model geometry, attention window and requested
+`attention_backend`, `moe_backend` and `kv_cache_dtype` overrides. The server's
+`--target-attention-backend` and `--attention-backend` select target and draft
+backends separately. Startup logs identify the actual loaded draft model,
+model state, attention backends and KV geometry.
+
+For a native local comparison using different target/draft head geometry,
+set the public speculative option `kv_cache_dtype="auto"` when the target KV
+cache also uses `auto`; this selects native draft metadata without changing
+cache precision. For a dense MLA target with a dense draft, select native
+attention by KV kind:
+
+```python
+attention_config = {
+    "backend": "TRITON_ATTN",
+    "backend_per_kind": {
+        "mla_attention": "TRITON_MLA",
+        "full_attention": "TRITON_ATTN",
+    },
+    "mla_prefill_backend": "FLASH_ATTN",
+}
+```
+
+Per-kind settings take precedence over the global backend. Recurrent targets
+use their native GDN or Mamba kernels; the token server never executes those
+target layers. Native and remote comparisons must retain the same target kernel
+settings and inspect the loaded draft backend, rather than assuming a requested
+backend string was used.
 
 For the verifier, combine `tokenizer_mode="hf"` with this speculative configuration:
 

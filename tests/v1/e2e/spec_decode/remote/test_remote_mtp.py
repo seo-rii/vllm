@@ -11,6 +11,7 @@ import tempfile
 import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,6 +39,7 @@ def draft_server(
     revision: str | None = REVISION,
     num_speculative_tokens: int = 1,
     attention_backend: str = "FLASH_ATTN",
+    target_attention_backend: str | None = None,
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
     trust_remote_code: bool = True,
@@ -78,7 +80,7 @@ def draft_server(
             "--attention-backend",
             attention_backend,
             "--target-attention-backend",
-            attention_backend,
+            target_attention_backend or attention_backend,
         ]
         if trust_remote_code:
             command.append("--trust-remote-code")
@@ -125,19 +127,19 @@ def draft_server(
                 "--draft-model",
                 token_only_draft,
                 "--num-speculative-tokens",
-                "3",
+                str(num_speculative_tokens),
                 "--max-batch-size",
                 "4",
                 "--max-model-len",
                 "128",
                 "--max-feature-tokens",
-                "64",
+                str(max_feature_tokens),
                 "--draft-kv-cache-gib",
-                "0.03125",
+                str(draft_kv_cache_gib),
                 "--attention-backend",
-                "TRITON_ATTN",
+                attention_backend,
                 "--target-attention-backend",
-                "TRITON_ATTN",
+                target_attention_backend or attention_backend,
             ]
         with log_path.open("w") as log:
             process = subprocess.Popen(
@@ -415,6 +417,9 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                         target,
                         tmp_path / f"token-{num_workers}-{i}.log",
                         token_only_draft=draft,
+                        num_speculative_tokens=3,
+                        attention_backend="TRITON_ATTN",
+                        draft_kv_cache_gib=0.03125,
                     )
                 )
                 for i in range(num_workers)
@@ -998,6 +1003,67 @@ def tiny_ernie_mtp_model(tmp_path):
     return _save_mtp_checkpoint(tmp_path / "ernie", config, weights)
 
 
+@pytest.fixture
+def tiny_independent_qwen3_draft(tmp_path, request, mtp_family):
+    target_path = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    return _tiny_independent_qwen3_draft(tmp_path, target_path)
+
+
+def _tiny_independent_qwen3_draft(tmp_path, target_path):
+    """Load a separate dense LM with the target's exact tokenizer artifacts."""
+    import shutil
+
+    import torch
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    target_path = Path(target_path)
+    target = AutoConfig.from_pretrained(target_path)
+    assert (
+        target.vocab_size,
+        target.bos_token_id,
+        target.eos_token_id,
+        target.pad_token_id,
+    ) == (128, 1, 2, 0)
+    config = Qwen3Config(
+        vocab_size=target.vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=128,
+        layer_types=["full_attention"] * 2,
+        bos_token_id=target.bos_token_id,
+        eos_token_id=target.eos_token_id,
+        pad_token_id=target.pad_token_id,
+        tie_word_embeddings=False,
+    )
+    assert config.hidden_size != target.hidden_size
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261025)
+        draft = Qwen3ForCausalLM(config)
+    path = tmp_path / "independent-qwen3"
+    draft.save_pretrained(path)
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "vocab.txt",
+        "merges.txt",
+        "tokenizer.model",
+    ):
+        if (target_path / name).is_file():
+            shutil.copyfile(target_path / name, path / name)
+            assert (path / name).read_bytes() == (target_path / name).read_bytes()
+    assert all(
+        (path / name).is_file() for name in ("tokenizer.json", "tokenizer_config.json")
+    )
+    return str(path)
+
+
 @pytest.mark.parametrize(
     "mtp_family,mtp_window,k",
     [
@@ -1030,7 +1096,58 @@ def test_remote_native_mtp_matches_native_and_target(
     record_property,
 ):
     """Compare native and standalone MTP across chunk/window boundaries and reuse."""
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        mtp_family,
+        mtp_window,
+        k,
+        record_property,
+    )
+
+
+@pytest.mark.parametrize("mtp_family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_independent_draft_with_hybrid_or_mla_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    mtp_family,
+    k,
+    tiny_independent_qwen3_draft,
+    record_property,
+):
+    """Keep target state local while a distinct dense AR model drafts token deltas."""
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        mtp_family,
+        None,
+        k,
+        record_property,
+        independent_draft=tiny_independent_qwen3_draft,
+    )
+
+
+def _compare_native_and_remote_draft(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    mtp_family,
+    mtp_window,
+    k,
+    record_property,
+    *,
+    independent_draft=None,
+):
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    independent = independent_draft is not None
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
@@ -1044,9 +1161,19 @@ def test_remote_native_mtp_matches_native_and_target(
     num_modules = len(mtp_windows)
     dense_mla = mtp_family == "glm4_moe_lite"
     attention_backend = "TRITON_MLA" if dense_mla else "TRITON_ATTN"
-    attention_config = {"backend": attention_backend}
+    attention_config: dict[str, Any] = {"backend": attention_backend}
     if dense_mla:
         attention_config["mla_prefill_backend"] = "FLASH_ATTN"
+        if independent:
+            # Native AR uses the public per-kind map to give the MLA target and
+            # independent dense draft their actual attention implementations.
+            attention_config.update(
+                backend="TRITON_ATTN",
+                backend_per_kind={
+                    "mla_attention": "TRITON_MLA",
+                    "full_attention": "TRITON_ATTN",
+                },
+            )
     kwargs = dict(
         trust_remote_code=False,
         skip_tokenizer_init=True,
@@ -1064,6 +1191,8 @@ def test_remote_native_mtp_matches_native_and_target(
         attention_config=attention_config,
         disable_log_stats=False,
     )
+    if independent:
+        kwargs.update(tokenizer_mode="hf", per_request_spec_decode_metrics="detailed")
     moe_backend = None if mtp_family.startswith("exaone") else "triton"
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
@@ -1097,7 +1226,57 @@ def test_remote_native_mtp_matches_native_and_target(
     record_property("placement_comparison", "exact_tokens")
     record_property("batch_invariant", not hybrid_target)
 
-    def generate(runner):
+    def generate(runner, mode):
+        outputs = [
+            runner.llm.generate(batch, sampling, use_tqdm=False) for batch in batches
+        ]
+        if independent:
+            record_property(
+                f"{mode}.outputs",
+                [
+                    [
+                        {
+                            "prompt_token_ids": prompt["prompt_token_ids"],
+                            "token_ids": list(output.outputs[0].token_ids),
+                            "text": output.outputs[0].text,
+                            "logprobs": [
+                                {
+                                    token: {
+                                        "logprob": value.logprob,
+                                        "rank": value.rank,
+                                        "decoded_token": value.decoded_token,
+                                    }
+                                    for token, value in step.items()
+                                }
+                                for step in output.outputs[0].logprobs
+                            ],
+                        }
+                        for prompt, output in zip(prompts, batch)
+                    ]
+                    for prompts, batch in zip(batches, outputs)
+                ],
+            )
+        if independent and mode != "target":
+            observations = []
+            for batch in outputs:
+                for output in batch:
+                    metrics = output.outputs[0].spec_decode_metrics
+                    assert metrics is not None
+                    observation = metrics.to_dict()
+                    assert observation["num_spec_tokens"] == k
+                    assert len(metrics.histogram) == k + 1
+                    assert metrics.per_step_accepted
+                    assert len(metrics.per_step_accepted) == len(
+                        metrics.per_step_drafted
+                    )
+                    assert all(
+                        0 <= a <= d <= k
+                        for a, d in zip(
+                            metrics.per_step_accepted, metrics.per_step_drafted
+                        )
+                    )
+                    observations.append(observation)
+            record_property(f"{mode}.request_speculation", observations)
         return [
             [
                 (
@@ -1105,9 +1284,9 @@ def test_remote_native_mtp_matches_native_and_target(
                     output.outputs[0].text,
                     output.outputs[0].logprobs,
                 )
-                for output in runner.llm.generate(batch, sampling, use_tqdm=False)
+                for output in batch
             ]
-            for batch in batches
+            for batch in outputs
         ]
 
     def compare_outputs(actual, reference, mode):
@@ -1115,7 +1294,10 @@ def test_remote_native_mtp_matches_native_and_target(
 
         assert len(actual) == len(reference) == len(batches)
         mismatches = 0
-        for outputs, expected_outputs, prompts in zip(actual, reference, batches):
+        first_mismatch = None
+        for batch_index, (outputs, expected_outputs, prompts) in enumerate(
+            zip(actual, reference, batches)
+        ):
             assert len(outputs) == len(expected_outputs) == len(prompts)
             assert all(len(output[0]) == 8 for output in outputs)
             mismatches += sum(
@@ -1123,6 +1305,24 @@ def test_remote_native_mtp_matches_native_and_target(
                 for output, expected_output in zip(outputs, expected_outputs)
                 for token, expected_token in zip(output[0], expected_output[0])
             )
+            if independent and first_mismatch is None:
+                for row, (output, expected_output) in enumerate(
+                    zip(outputs, expected_outputs)
+                ):
+                    for position, (token, expected_token) in enumerate(
+                        zip(output[0], expected_output[0])
+                    ):
+                        if token != expected_token:
+                            first_mismatch = {
+                                "batch": batch_index,
+                                "row": row,
+                                "position": position,
+                                "actual_prefix": output[0][: position + 1],
+                                "target_prefix": expected_output[0][: position + 1],
+                            }
+                            break
+                    if first_mismatch is not None:
+                        break
             if compare_target_logprobs:
                 assert all(
                     output[2] is not None and len(output[2]) == 8
@@ -1139,6 +1339,8 @@ def test_remote_native_mtp_matches_native_and_target(
                     output[0] for output in expected_outputs
                 ]
         record_property(f"{mode}.token_mismatches", mismatches)
+        if independent:
+            record_property(f"{mode}.first_target_token_mismatch", first_mismatch)
 
     def speculation_counts(runner, mode):
         runner.llm.llm_engine.do_log_stats()
@@ -1225,6 +1427,8 @@ def test_remote_native_mtp_matches_native_and_target(
         return moe_backends(worker.model_runner.get_draft_model())
 
     def recurrent_policy(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
         from vllm.model_executor.layers.mamba.abstract import MambaBase
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             QwenGatedDeltaNetAttention,
@@ -1254,9 +1458,15 @@ def test_remote_native_mtp_matches_native_and_target(
                 {"type": layer.mamba_type.name, "shapes": shapes, "kernels": kernels}
             )
         return {
+            "model": type(runner.get_model()).__name__,
             "state": type(runner.model_state).__name__,
             "k": worker.vllm_config.num_speculative_tokens,
             "layers": layers,
+            "attention_backends": [
+                layer.get_attn_backend().get_name()
+                for layer in runner.get_model().modules()
+                if isinstance(layer, (Attention, MLAAttention))
+            ],
         }
 
     def check_recurrence(runner, mode):
@@ -1265,6 +1475,18 @@ def test_remote_native_mtp_matches_native_and_target(
         assert len(policies) == 1
         policy = policies[0]
         assert policy["k"] == (0 if mode == "target" else k)
+        if independent:
+            assert (
+                policy["model"]
+                == {
+                    "qwen3_next": "Qwen3NextForCausalLM",
+                    "nemotron_h": "NemotronHForCausalLM",
+                    "glm4_moe_lite": "Glm4MoeLiteForCausalLM",
+                }[mtp_family]
+            )
+            assert policy["attention_backends"] == [attention_backend] * (
+                1 if hybrid_target else 2
+            )
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
@@ -1340,14 +1562,89 @@ def test_remote_native_mtp_matches_native_and_target(
             )
         return policies
 
+    def independent_draft_identity(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionMetadataBuilder,
+        )
+        from vllm.v1.worker.gpu.model_states import resolve_model_state_cls
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+        from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
+            StandaloneARSpeculator,
+        )
+
+        runner = worker.model_runner
+        speculator = runner.speculator
+        assert isinstance(speculator, StandaloneARSpeculator)
+        draft = runner.get_draft_model()
+        assert type(draft).__name__ == "Qwen3ForCausalLM"
+        config = speculator.attn_vllm_config
+        assert config.model_config.model == independent_draft
+        assert config.model_config.get_hidden_size() == 64
+        assert config.model_config.get_num_kv_heads(config.parallel_config) == 1
+        assert config.model_config.get_head_size() == 32
+        assert config.cache_config.cache_dtype == "auto"
+        assert worker.vllm_config.speculative_config.kv_cache_dtype == "auto"
+        assert resolve_model_state_cls(config, draft) is DefaultModelState
+        layers = [layer for layer in draft.modules() if isinstance(layer, Attention)]
+        assert len(layers) == 2
+        assert all(
+            layer.num_kv_heads == 1 and layer.head_size == 32 for layer in layers
+        )
+        assert all(layer.sliding_window is None for layer in layers)
+        assert all(
+            layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers
+        )
+        builders = []
+        for groups in speculator.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                assert isinstance(builder, TritonAttentionMetadataBuilder)
+                assert (builder.num_heads_q, builder.num_heads_kv, builder.headdim) == (
+                    2,
+                    1,
+                    32,
+                )
+                builders.append(type(builder).__name__)
+        assert builders
+        return {
+            "speculator": type(speculator).__name__,
+            "model": type(draft).__name__,
+            "resolved_model_state": "DefaultModelState",
+            "hidden_size": 64,
+            "kv_heads": 1,
+            "head_size": 32,
+            "backend": "TRITON_ATTN",
+            "metadata_builders": builders,
+            "kv_cache_dtype": config.cache_config.cache_dtype,
+        }
+
+    def token_remote_identity(worker):
+        from vllm.v1.worker.gpu.spec_decode.token_remote import (
+            TokenOnlyRemoteSpeculator,
+        )
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, TokenOnlyRemoteSpeculator)
+        assert runner.draft_backend is runner.speculator
+        assert runner.get_draft_model() is None
+        spec = worker.vllm_config.speculative_config
+        assert spec.method == "draft_model"
+        assert spec.draft_model_config.model == independent_draft
+        return type(runner.speculator).__name__
+
     config = dict(
-        method="mtp",
-        model=model,
+        method="draft_model" if independent else "mtp",
+        model=independent_draft if independent else model,
         num_speculative_tokens=k,
         draft_tensor_parallel_size=1,
         draft_sample_method="greedy",
-        attention_backend=attention_backend,
+        attention_backend="TRITON_ATTN" if independent else attention_backend,
     )
+    if independent:
+        # Public native control: select draft-owned metadata geometry while
+        # preserving the target's automatic BF16 cache precision.
+        config["kv_cache_dtype"] = "auto"
     with vllm_runner(model, **kwargs) as baseline:
         windows = baseline.llm.apply_model(target_windows)
         assert windows == [[None] * (1 if hybrid_target else max(2, num_modules))]
@@ -1361,7 +1658,7 @@ def test_remote_native_mtp_matches_native_and_target(
         assert backends == [["TRITON"] * expected_moe_count]
         record_property("target.moe_backends", backends)
         check_recurrence(baseline, "target")
-        expected = generate(baseline)
+        expected = generate(baseline, "target")
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
         policy = native.llm.collective_rpc(draft_kv_policy)
@@ -1370,41 +1667,50 @@ def test_remote_native_mtp_matches_native_and_target(
                 (
                     window,
                     "MLAAttentionSpec"
-                    if dense_mla
+                    if dense_mla and not independent
                     else "FullAttentionSpec"
                     if window is None
                     else "SlidingWindowSpec",
                     window,
                 )
-                for window in mtp_windows
+                for window in ((None, None) if independent else mtp_windows)
             ]
         ]
         record_property("native.kv_policy", policy)
         if num_modules > 1:
             identity = native.llm.collective_rpc(draft_module_identity)
             record_property("native.module_identity", identity)
-        if dense_mla:
+        if independent:
+            identity = native.llm.collective_rpc(independent_draft_identity)
+            record_property("native.independent_draft", identity)
+        if dense_mla and not independent:
             layout = native.llm.collective_rpc(draft_mla_layout)
             assert layout == [[expected_mla_layout]]
             record_property("native.mla_layout", layout)
         backends = native.llm.collective_rpc(draft_moe_backends)
-        draft_has_moe = not mtp_family.startswith("exaone") and mtp_family != "ernie"
+        draft_has_moe = (
+            not independent
+            and not mtp_family.startswith("exaone")
+            and mtp_family != "ernie"
+        )
         assert backends == [["TRITON"] if draft_has_moe else []]
         record_property("native.moe_backends", backends)
         recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
         assert recurrent_layers == [0]
         record_property("native.recurrent_layers", recurrent_layers)
         native_recurrence = check_recurrence(native, "native")
-        native_outputs = generate(native)
+        native_outputs = generate(native, "native")
         compare_outputs(native_outputs, expected, "native")
         native_counts = speculation_counts(native, "native")
     server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
         model,
         server_log,
+        token_only_draft=independent_draft,
         revision=None,
         num_speculative_tokens=k,
-        attention_backend=attention_backend,
+        attention_backend="TRITON_ATTN" if independent else attention_backend,
+        target_attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=32,
         trust_remote_code=False,
@@ -1425,20 +1731,57 @@ def test_remote_native_mtp_matches_native_and_target(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
             assert check_recurrence(remote, "remote") == native_recurrence
-            remote_outputs = generate(remote)
+            if independent:
+                record_property(
+                    "remote.backend", remote.llm.collective_rpc(token_remote_identity)
+                )
+            remote_outputs = generate(remote, "remote")
             compare_outputs(remote_outputs, expected, "remote")
             for actual_batch, native_batch in zip(remote_outputs, native_outputs):
                 assert [output[0] for output in actual_batch] == [
                     output[0] for output in native_batch
                 ]
-                if dense_mla:
+                if dense_mla or independent:
                     assert [output[2] for output in actual_batch] == [
                         output[2] for output in native_batch
                     ]
-            if dense_mla:
+            if dense_mla or independent:
                 record_property("placement.logprobs", "exact_returned_top5")
-            assert speculation_counts(remote, "remote") == native_counts
-    if dense_mla:
+            remote_counts = speculation_counts(remote, "remote")
+            if independent:
+                record_property(
+                    "placement.speculation_counts_equal", remote_counts == native_counts
+                )
+            assert remote_counts == native_counts
+    if independent:
+        import ast
+
+        identity_prefix = "Token-only draft loaded: "
+        identities = [
+            line.split(identity_prefix, 1)[1]
+            for line in server_log.read_text().splitlines()
+            if identity_prefix in line
+        ]
+        assert len(identities) == 1
+        identity, layout_text = identities[0].split(" kv_layouts=", 1)
+        assert identity == (
+            "speculator=StandaloneARSpeculator model=Qwen3ForCausalLM "
+            "state=DefaultModelState attention_backends=['TRITON_ATTN']"
+        )
+        layouts = ast.literal_eval(layout_text)
+        assert layouts and sum(layout["layers"] for layout in layouts) == 2
+        assert all(
+            layout["kind"] == "FullAttentionSpec"
+            and layout["kv_heads"] == 1
+            and layout["head_size"] == 32
+            and layout["window"] is None
+            and layout["dtype"] == "torch.bfloat16"
+            for layout in layouts
+        )
+        record_property(
+            "remote.loaded_draft", {"identity": identity, "kv_layouts": layouts}
+        )
+    if dense_mla and not independent:
         assert any(
             "Using " in line and "TRITON_MLA" in line and "backend." in line
             for line in server_log.read_text().splitlines()
