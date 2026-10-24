@@ -2087,7 +2087,9 @@ def _compare_native_and_remote_draft(
     if independent:
         kwargs["tokenizer_mode"] = "hf"
     moe_backend = (
-        None if mtp_family.startswith("exaone") or eagle3 or mla_draft else "triton"
+        None
+        if mtp_family.startswith("exaone") or eagle3 or mla_draft or recurrent_draft
+        else "triton"
     )
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
