@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.errors import (
     host_allocation_failure,
@@ -53,6 +54,8 @@ from vllm.v1.spec_decode.remote.transport import (
     connect,
     is_local_endpoint,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -136,6 +139,11 @@ class TargetKVRemoteSession:
 
     def active(self, key: SequenceKey) -> bool:
         return self.records.get(key, False)
+
+    def epoch_for(self, key: SequenceKey) -> int:
+        if key not in self.records:
+            raise ValueError("unknown target-KV sequence")
+        return self._epoch
 
     def _invalidate(self):
         if self._conn is not None:
@@ -226,20 +234,24 @@ class TargetKVRemoteSession:
             self.hello.verifier_instance_id, sequence_id, next(self._generations)
         )
         self.records[key] = True
+        row_error = None
         try:
             self.connect(deadline=deadline)
             self._flush_closes(deadline)
             request_id = next(self._ids)
             self._send(OpenSequence(key), request_id, deadline)
             ack = self._recv(request_id, deadline)
-            if (
-                not isinstance(ack, SequenceAck)
-                or ack.key != key
-                or ack.status is not SpeculatorStatusCode.OK
-            ):
+            if not isinstance(ack, SequenceAck) or ack.key != key:
                 raise ProtocolError("invalid target-KV open acknowledgment")
+            if ack.status is not SpeculatorStatusCode.OK:
+                self.records[key] = False
+                row_error = f"{ack.status.name}: {ack.detail}"
         except Exception as error:
             self.fail(f"target-KV open failed: {error}")
+        if row_error is not None:
+            logger.warning("Target-KV open rejected for %s: %s", key, row_error)
+            if self.failure_policy == "error":
+                raise RemoteDraftError(f"target-KV open rejected: {row_error}")
         return key
 
     def open_sequences(
@@ -496,7 +508,9 @@ class TargetKVRemoteSession:
         except Exception as error:
             self.fail(f"target-KV close failed: {error}")
 
-    def close_sequences(self, keys: tuple[SequenceKey, ...]):
+    def close_sequences(
+        self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
+    ):
         keys = tuple(key for key in dict.fromkeys(keys) if key in self.records)
         if not keys:
             return
@@ -509,7 +523,11 @@ class TargetKVRemoteSession:
         for key in keys:
             self.records.pop(key, None)
         if self._pending is None:
-            self._flush_closes(self.deadline())
+            deadline = self.deadline() if deadline is None else deadline
+            if self.clock() < deadline:
+                self._flush_closes(deadline)
+            elif not any(self.records.values()):
+                self._invalidate()
 
     def close(self):
         self._invalidate()

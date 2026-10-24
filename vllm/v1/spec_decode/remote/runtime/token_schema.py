@@ -77,8 +77,8 @@ def tokenizer_artifact_fingerprint(source: str, revision: str | None) -> str:
     return _fingerprint(artifacts)
 
 
-def _validate_token_model(model, role: str) -> None:
-    """Require the native causal token/KV contract consumed by this executor."""
+def _validate_token_model(model, role: str) -> int | None:
+    """Validate the token/KV contract and return its uniform attention window."""
     if (
         model.runner_type not in ("generate", "draft")
         or model.using_transformers_backend()
@@ -96,16 +96,29 @@ def _validate_token_model(model, role: str) -> None:
         raise ValueError(
             f"token-only {role} requires a native decoder-only causal attention model"
         )
-    layers = getattr(model.hf_text_config, "layer_types", None)
-    if (
-        model.get_sliding_window() is not None
-        or model.attention_chunk_size is not None
-        or (
-            layers is not None
-            and any(layer not in ("attention", "full_attention") for layer in layers)
+    if model.attention_chunk_size is not None:
+        raise ValueError(f"token-only {role} does not support chunked attention")
+    window = model.get_sliding_window()
+    if window is not None and (type(window) is not int or window <= 0):
+        raise ValueError(
+            f"token-only {role} requires a positive integer sliding window"
         )
+    layers = getattr(model.hf_text_config, "layer_types", None)
+    if layers is None:
+        return window
+    if (
+        not isinstance(layers, (list, tuple))
+        or len(layers) != model.get_total_num_hidden_layers()
     ):
-        raise ValueError(f"token-only {role} requires homogeneous full attention")
+        raise ValueError(f"token-only {role} requires one attention type per layer")
+    if all(layer in ("attention", "full_attention") for layer in layers):
+        # Match EngineArgs: an unused window must not override full layers.
+        return None
+    if all(layer == "sliding_attention" for layer in layers) and window is not None:
+        return window
+    raise ValueError(
+        f"token-only {role} requires homogeneous full or sliding-window attention"
+    )
 
 
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:

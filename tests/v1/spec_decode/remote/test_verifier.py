@@ -1150,3 +1150,95 @@ def test_resumable_input_admission_uses_real_input_processor(remote_enabled, res
         )
         assert request.resumable is resumable
         assert request.prompt_token_ids == [1, 2]
+
+
+@pytest.mark.parametrize("stall", ["open", "prefill"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_pooled_worker_preparation_timeout_preserves_healthy_endpoint(
+    tmp_path, stall, reverse
+):
+    from contextlib import ExitStack
+
+    from tests.v1.spec_decode.remote.test_token_runtime import (
+        KVOracle,
+        machine,
+        token_config,
+    )
+    from vllm.config import SpeculativeConfig
+    from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.spec_decode.remote.server import RemoteServerLimits
+    from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    class DelayedAdapter(TokenOnlyDraftAdapter):
+        gate = None
+
+        def open_sequence(self, key):
+            if self.gate is not None and stall == "open":
+                assert self.gate.wait(5), "test must release the delayed worker"
+            return super().open_sequence(key)
+
+        def prefill(self, key, values):
+            if self.gate is not None and stall == "prefill":
+                assert self.gate.wait(5), "test must release the delayed worker"
+            return super().prefill(key, values)
+
+    config = token_config(tmp_path)
+    contract = create_token_runtime_contract(config)
+    with ExitStack() as cleanup:
+        endpoints, adapters = [], []
+        for _ in range(2):
+            state, _ = machine()
+            adapter = DelayedAdapter(state, contract)
+            server = TokenDraftServer(adapter, limits=RemoteServerLimits(4, 64, 4, 64))
+            endpoints.append(server.start("tcp://127.0.0.1:0"))
+            cleanup.callback(server.stop)
+            adapters.append(adapter)
+        config.speculative_config = SpeculativeConfig(
+            model=config.speculative_config.model,
+            method="draft_model",
+            num_speculative_tokens=3,
+            target_model_config=config.model_config,
+            target_parallel_config=config.parallel_config,
+            execution={
+                "placement": "remote",
+                "endpoints": endpoints,
+                "failure_policy": "target_only",
+                "request_timeout_ms": 1000,
+            },
+        )
+        worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        cleanup.callback(worker.close)
+        initial = inputs(["old", "healthy"], [[1, 2], [3, 4]], [[0, 1]] * 2, [2, 2])
+        draft_step, context = split_step(initial, [5, 6], k=1)
+        assert worker.collect(
+            worker.dispatch(draft_step, context)
+        ).valid_lengths.tolist() == [1, 1]
+        worker.close_requests(("old",))
+        adapters[0].gate = threading.Event()
+        # Release before closing sessions or joining the blocked server owner.
+        cleanup.callback(adapters[0].gate.set)
+        rows = [("new", [7, 8], [0, 1], 2, 9), ("healthy", [6], [2], 0, 10)]
+        if reverse:
+            rows.reverse()
+        batch = inputs(
+            [r[0] for r in rows],
+            [r[1] for r in rows],
+            [r[2] for r in rows],
+            [r[3] for r in rows],
+        )
+        draft_step, context = split_step(batch, [r[4] for r in rows], k=1)
+        result = worker.collect(worker.dispatch(draft_step, context))
+        healthy = int(not reverse)
+        assert result.valid_lengths.tolist() == ([1, 0] if reverse else [0, 1])
+        assert result.token_ids[healthy, 0].item() == KVOracle.predict([3, 4, 6, 10])
+        adapters[0].gate.set()
+        # A terminal new request must not revive; the healthy request continues.
+        later = inputs(["new", "healthy"], [[9], [10]], [[2], [3]], [0, 0])
+        draft_step, context = split_step(later, [11, 12], k=1)
+        result = worker.collect(worker.dispatch(draft_step, context))
+        assert result.valid_lengths.tolist() == [0, 1]
+        assert result.token_ids[1, 0].item() == KVOracle.predict([3, 4, 6, 10, 12])

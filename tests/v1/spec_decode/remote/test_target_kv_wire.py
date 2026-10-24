@@ -6,8 +6,12 @@ import errno
 import socket
 import struct
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 
+import msgspec
 import pytest
 import torch
 
@@ -17,6 +21,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     ProtocolVersionError,
     encode_message,
 )
+from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
 from vllm.v1.spec_decode.remote.session import RemoteDraftError
 from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotBudget,
@@ -47,11 +52,21 @@ from vllm.v1.spec_decode.remote.transport import (
 )
 
 
+def until(predicate):
+    deadline = time.monotonic() + 3
+    while not predicate():
+        assert time.monotonic() < deadline
+        threading.Event().wait(0.001)
+
+
 class SnapshotOracle:
     def __init__(self, specs, budget):
         self.specs, self.budget = specs, budget
         self.calls = []
+        self.threads = set()
+        self.batches = []
         self.batch_sizes = []
+        self.attempts = []
         self.warmed = False
         self.error = None
         self.entered = threading.Event()
@@ -59,6 +74,7 @@ class SnapshotOracle:
         self.release.set()
 
     def warmup(self):
+        self.threads.add(threading.get_ident())
         self.warmed = True
 
     def execute(
@@ -70,6 +86,8 @@ class SnapshotOracle:
         recovery_token,
         hidden_state,
     ):
+        self.attempts.append((expected_identity,))
+        self.threads.add(threading.get_ident())
         self.entered.set()
         assert self.release.wait(2)
         if self.error is not None:
@@ -95,6 +113,8 @@ class SnapshotOracle:
         recovery_tokens,
         hidden_states,
     ):
+        self.attempts.append(expected_identities)
+        self.threads.add(threading.get_ident())
         self.entered.set()
         assert self.release.wait(2)
         if self.error is not None:
@@ -108,6 +128,7 @@ class SnapshotOracle:
             device=torch.device("cpu"),
         )
         assert imported.identities == expected_identities
+        self.batches.append(expected_identities)
         self.batch_sizes.append(len(snapshots))
         self.calls.extend(zip(expected_identities, expected_materialized_lengths))
         return tuple(
@@ -118,7 +139,9 @@ class SnapshotOracle:
 
 @pytest.fixture
 def wire_runtime(tmp_path, request):
-    max_num_seqs = getattr(request, "param", 1)
+    options = getattr(request, "param", 1)
+    options = dict(options) if isinstance(options, dict) else {"max_num_seqs": options}
+    max_num_seqs = options.pop("max_num_seqs", 1)
     specs = {
         "target.layers.1": SlidingWindowSpec(
             block_size=4,
@@ -132,7 +155,8 @@ def wire_runtime(tmp_path, request):
         ),
     }
     budget = SnapshotBudget(128, 1 << 20, 64)
-    executor = SnapshotOracle(specs, budget)
+    receiver_budget = options.pop("receiver_budget", budget)
+    executor = SnapshotOracle(specs, receiver_budget)
     server = TargetKVDraftServer(
         executor,
         contract_fingerprint="contract",
@@ -140,8 +164,9 @@ def wire_runtime(tmp_path, request):
         vocab_size=128,
         expected_specs=specs,
         snapshot_budget=budget,
-        receiver_budget=budget,
+        receiver_budget=receiver_budget,
         max_num_seqs=max_num_seqs,
+        **options,
     )
     endpoint = server.start(f"unix://{tmp_path}/snapshot.sock")
     hello = TargetKVHello(
@@ -164,7 +189,8 @@ def wire_runtime(tmp_path, request):
         executor.release.set()
         client.close()
         server.stop()
-        assert len(server.registry) == 0
+        if not server._shutdown_failed:
+            assert len(server.registry) == 0
         assert not server._connections
         assert not server._handshaking
 
@@ -353,15 +379,14 @@ def test_second_connection_is_refused_without_running_adapter(wire_runtime):
         second.close()
 
 
-def test_session_construction_failure_releases_exclusive_connection(
+def test_session_construction_failure_releases_connection_admission(
     wire_runtime, monkeypatch
 ):
     from vllm.v1.spec_decode.remote import target_kv_server
 
     server, executor, client = wire_runtime
     client.close()
-    assert server._connection_turn.acquire(timeout=2)
-    server._connection_turn.release()
+    until(lambda: not server._connections)
     construct = target_kv_server._TargetKVServerSession
     injected = threading.Event()
     workers: list[threading.Thread] = []
@@ -386,7 +411,6 @@ def test_session_construction_failure_releases_exclusive_connection(
             assert not thread_errors, [error.exc_value for error in thread_errors]
             with pytest.raises(ConnectionClosed):
                 rejected.recv(timeout=1)
-            assert not server._connection_turn.locked()
             assert not server._connections and not server._handshaking
             assert not len(server.registry)
             assert server.healthy and server._acceptor.is_alive()
@@ -420,8 +444,7 @@ def test_connection_backoff_bounds_new_target_kv_requests(
 
     server, _, client = wire_runtime
     client.close()
-    assert server._connection_turn.acquire(timeout=2)
-    server._connection_turn.release()
+    until(lambda: not server._connections)
     now = [time.monotonic()]
     session = TargetKVRemoteSession(
         client.endpoint,
@@ -787,3 +810,261 @@ def test_batch_total_page_limit_rejects_manifest_before_any_data(wire_runtime):
     with pytest.raises(TransportError):
         client._conn.recv(timeout=1)
     assert not executor.calls
+
+
+@contextmanager
+def peer(client, identity):
+    other = TargetKVRemoteSession(
+        client.endpoint,
+        msgspec.structs.replace(client.hello, verifier_instance_id=identity),
+        expected_specs=client.expected_specs,
+        request_timeout_ms=2000,
+    )
+    try:
+        other.connect()
+        yield other
+    finally:
+        other.close()
+
+
+_POOL_LIMITS = {
+    "max_num_seqs": 4,
+    "max_connections": 4,
+    "max_sequences": 12,
+    "batch_wait_ms": 0,
+}
+
+
+@pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
+def test_snapshot_pool_combines_distinct_verifiers_on_one_gpu_owner(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b, peer(a, "blocker") as blocker:
+        ka, kb, kc = (
+            c.open_sequence(0, deadline=c.deadline()) for c in (a, b, blocker)
+        )
+        oracle.release.clear()
+        with ThreadPoolExecutor(max_workers=3) as threads:
+            blocked = threads.submit(propose, blocker, snapshot(blocker, kc))
+            assert oracle.entered.wait(2)
+            pa = threads.submit(propose, a, snapshot(a, ka, length=9))
+            pb = threads.submit(propose, b, snapshot(b, kb, length=13))
+            until(lambda: server.work_queue.depth == 3)
+            assert server.pending_snapshot_jobs == 3
+            oracle.release.set()
+            assert blocked.result().token_ids == (18,)
+            assert pa.result().token_ids == pb.result().token_ids == (18,)
+        assert oracle.batch_sizes == [1, 2]
+        assert {i.key.verifier_instance_id for i in oracle.batches[-1]} == {
+            "verifier",
+            "b",
+        }
+        assert len(oracle.threads) == 1
+        assert threading.get_ident() not in oracle.threads
+        until(lambda: server.pending_snapshot_jobs == 0)
+        assert server.pending_snapshot_bytes == server.work_queue.pending_bytes == 0
+        assert len(server.registry) == 3
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{**_POOL_LIMITS, "receiver_budget": SnapshotBudget(128, 1000, 64)}],
+    indirect=True,
+)
+def test_snapshot_pool_splits_legal_jobs_when_combined_receiver_cannot_fit(
+    wire_runtime,
+):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b, peer(a, "blocker") as blocker:
+        ka, kb, kc = (
+            c.open_sequence(0, deadline=c.deadline()) for c in (a, b, blocker)
+        )
+        oracle.release.clear()
+        with ThreadPoolExecutor(max_workers=3) as threads:
+            held = threads.submit(propose, blocker, snapshot(blocker, kc))
+            assert oracle.entered.wait(2)
+            pa = threads.submit(propose, a, snapshot(a, ka))
+            pb = threads.submit(propose, b, snapshot(b, kb))
+            until(lambda: server.work_queue.depth == 3)
+            oracle.release.set()
+            assert (
+                held.result().valid_length
+                == pa.result().valid_length
+                == pb.result().valid_length
+                == 1
+            )
+        assert oracle.batch_sizes == [1, 1, 1]
+        assert server.healthy
+        assert len(server.registry) == 3
+
+
+@pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
+def test_snapshot_pool_rejects_duplicate_live_verifier_without_affecting_owner(
+    wire_runtime,
+):
+    server, oracle, client = wire_runtime
+    key = client.open_sequence(0, deadline=client.deadline())
+    with pytest.raises(TransportError), peer(client, client.hello.verifier_instance_id):
+        pytest.fail("duplicate verifier was admitted")
+    assert propose(client, snapshot(client, key)).token_ids == (18,)
+    assert len(server.registry) == 1
+    assert server.healthy
+    client.close()
+    until(lambda: not server._connections)
+    with peer(client, client.hello.verifier_instance_id) as replacement:
+        key = replacement.open_sequence(0, deadline=replacement.deadline())
+        assert propose(replacement, snapshot(replacement, key)).token_ids == (18,)
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{**_POOL_LIMITS, "max_queued_snapshot_bytes": 1100}],
+    indirect=True,
+)
+def test_snapshot_pool_resident_credit_includes_active_and_queued_jobs(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b, peer(a, "excess") as excess:
+        ka, kb, kc = (c.open_sequence(0, deadline=c.deadline()) for c in (a, b, excess))
+        oracle.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            pa = threads.submit(propose, a, snapshot(a, ka))
+            assert oracle.entered.wait(2)
+            pb = threads.submit(propose, b, snapshot(b, kb))
+            until(lambda: server.work_queue.depth == 2)
+            assert server.pending_snapshot_jobs == 2
+            assert server.pending_snapshot_bytes == 1088
+            with pytest.raises(RemoteDraftError):
+                propose(excess, snapshot(excess, kc))
+            assert server.pending_snapshot_jobs == 2
+            assert server.pending_snapshot_bytes == 1088
+            oracle.release.set()
+            assert pa.result().valid_length == pb.result().valid_length == 1
+        until(lambda: not server.pending_snapshot_jobs)
+        assert server.pending_snapshot_bytes == 0 and server.healthy
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{**_POOL_LIMITS, "max_sequences": 4, "max_sequences_per_verifier": 2}],
+    indirect=True,
+)
+def test_snapshot_pool_sequence_credits_preserve_other_verifier_progress(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b:
+        keys = a.open_sequences((0, 1), deadline=a.deadline())
+        kb = b.open_sequence(0, deadline=b.deadline())
+        assert len(server.registry) == 3
+        with pytest.raises(RemoteDraftError, match="open"):
+            a.open_sequence(2, deadline=a.deadline())
+        assert all(a.active(key) for key in keys)
+        rejected = tuple(key for key in a.records if key not in keys)
+        assert len(rejected) == 1 and not a.active(rejected[0])
+        assert propose(a, snapshot(a, keys[0])).token_ids == (18,)
+        assert propose(b, snapshot(b, kb)).token_ids == (18,)
+        assert server.registry.count("verifier") == 2
+        assert len(server.registry) == 3 and server.healthy
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{**_POOL_LIMITS, "max_queued_snapshot_bytes": 600}],
+    indirect=True,
+)
+def test_snapshot_pool_reserves_credit_before_receiving_any_payload(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b:
+        ka, kb = (c.open_sequence(0, deadline=c.deadline()) for c in (a, b))
+        q = TargetKVQuery(ka, a.epoch, 0, 9, 10, 1000)
+        a._send(TargetKVBatchQuery((q,), 1000), next(a._ids), a.deadline())
+        until(lambda: server.pending_snapshot_jobs == 1)
+        assert server.pending_snapshot_bytes == 544
+        assert server.work_queue.depth == 0 and not oracle.calls
+        with pytest.raises(RemoteDraftError):
+            propose(b, snapshot(b, kb))
+        assert server.pending_snapshot_bytes == 544
+        a.close()
+        until(lambda: server.pending_snapshot_jobs == 0)
+        assert server.pending_snapshot_bytes == 0
+    with peer(a, "replacement") as replacement:
+        key = replacement.open_sequence(0, deadline=replacement.deadline())
+        assert propose(replacement, snapshot(replacement, key)).token_ids == (18,)
+
+
+@pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
+def test_snapshot_pool_expired_queued_job_does_not_fail_healthy_sibling(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b, peer(a, "blocker") as blocker:
+        ka, kb, kc = (
+            c.open_sequence(0, deadline=c.deadline()) for c in (a, b, blocker)
+        )
+        oracle.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            held = threads.submit(propose, blocker, snapshot(blocker, kc))
+            assert oracle.entered.wait(2)
+            handle = a.dispatch(
+                snapshot(a, ka),
+                10,
+                torch.ones((1, 8), dtype=torch.bfloat16),
+                deadline=time.monotonic() + 0.05,
+            )
+            healthy = threads.submit(propose, b, snapshot(b, kb))
+            until(lambda: server.work_queue.depth == 3)
+            with pytest.raises(RemoteDraftError):
+                a.collect(handle)
+            oracle.release.set()
+            assert held.result().token_ids == healthy.result().token_ids == (18,)
+        assert {i.key.verifier_instance_id for i, _ in oracle.calls} == {"blocker", "b"}
+        until(lambda: not server.pending_snapshot_jobs)
+        assert server.pending_snapshot_bytes == 0 and server.healthy
+
+
+@pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
+def test_snapshot_pool_unknown_completion_fences_queued_verifier_work(wire_runtime):
+    server, oracle, a = wire_runtime
+    with peer(a, "b") as b:
+        ka, kb = (c.open_sequence(0, deadline=c.deadline()) for c in (a, b))
+        oracle.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            pa = threads.submit(propose, a, snapshot(a, ka))
+            assert oracle.entered.wait(2)
+            pb = threads.submit(propose, b, snapshot(b, kb))
+            until(lambda: server.work_queue.depth == 2)
+            oracle.error = SnapshotCompletionError("injected unknown GPU completion")
+            oracle.release.set()
+            for future in (pa, pb):
+                with pytest.raises(RemoteDraftError):
+                    future.result()
+        assert not server.healthy
+        assert len(oracle.attempts) == 1
+        until(lambda: server.pending_snapshot_jobs == 0)
+        assert server.pending_snapshot_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{**_POOL_LIMITS, "shutdown_timeout_s": 0.05}],
+    indirect=True,
+)
+def test_snapshot_pool_shutdown_retains_running_owner_until_process_restart(
+    wire_runtime,
+):
+    server, oracle, client = wire_runtime
+    key = client.open_sequence(0, deadline=client.deadline())
+    oracle.release.clear()
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        pending = threads.submit(propose, client, snapshot(client, key))
+        assert oracle.entered.wait(2)
+        try:
+            with pytest.raises(ServerShutdownTimeout):
+                server.stop()
+            assert not server.healthy
+            assert server.pending_snapshot_jobs == len(server.registry) == 1
+            with pytest.raises(RuntimeError, match="unhealthy"):
+                server.start(client.endpoint)
+        finally:
+            oracle.release.set()
+        with pytest.raises(RemoteDraftError):
+            pending.result()
+    until(lambda: server.pending_snapshot_jobs == 0)
+    assert len(server.registry) == 1  # Logical state retained after unsafe shutdown.
+    assert len(oracle.attempts) == 1
+    until(lambda: not server._connections and not server._acceptor.is_alive())
