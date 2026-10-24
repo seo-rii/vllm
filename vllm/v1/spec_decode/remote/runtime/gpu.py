@@ -359,7 +359,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
         target_shell = materialize_target_shell(
-            config.model_config, device, shared_weights_source=shared_weights_source
+            config.model_config,
+            device,
+            shared_weights_source=shared_weights_source,
+            include_lm_head=self.contract.requires_target_lm_head,
         )
         spec = config.speculative_config
         assert spec is not None
@@ -370,6 +373,12 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
         speculator = speculator_cls(config, device)
         speculator.load_model(target_shell)
+        if not self.contract.requires_target_lm_head and not getattr(
+            speculator.model, "has_own_lm_head", False
+        ):
+            raise ValueError(
+                "standalone MTP contract requires checkpoint-owned LM heads"
+            )
         if spec.use_multi_module_mtp():
             group_standalone_kv_specs(get_kv_cache_spec(config))
         else:
