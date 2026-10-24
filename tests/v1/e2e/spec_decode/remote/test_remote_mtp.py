@@ -1192,7 +1192,7 @@ def _compare_native_and_remote_draft(
         disable_log_stats=False,
     )
     if independent:
-        kwargs.update(tokenizer_mode="hf", per_request_spec_decode_metrics="detailed")
+        kwargs["tokenizer_mode"] = "hf"
     moe_backend = None if mtp_family.startswith("exaone") else "triton"
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
@@ -1660,7 +1660,12 @@ def _compare_native_and_remote_draft(
         check_recurrence(baseline, "target")
         expected = generate(baseline, "target")
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
-    with vllm_runner(model, speculative_config=config, **kwargs) as native:
+    with vllm_runner(
+        model,
+        speculative_config=config,
+        per_request_spec_decode_metrics="detailed" if independent else "none",
+        **kwargs,
+    ) as native:
         policy = native.llm.collective_rpc(draft_kv_policy)
         assert policy == [
             [
@@ -1716,17 +1721,28 @@ def _compare_native_and_remote_draft(
         trust_remote_code=False,
         moe_backend=moe_backend,
     ) as endpoint:
-        remote_config = dict(
-            config,
-            remote_draft=dict(
-                endpoint=endpoint,
-                transport="inline",
-                failure_policy="error",
-                request_timeout_ms=5000,
-                startup_timeout_ms=600000,
-            ),
+        remote_options = dict(
+            transport="inline",
+            failure_policy="error",
+            request_timeout_ms=5000,
+            startup_timeout_ms=600000,
         )
-        with vllm_runner(model, speculative_config=remote_config, **kwargs) as remote:
+        remote_config = dict(config)
+        if independent:
+            remote_config["execution"] = dict(
+                placement="remote",
+                policy="on_demand",
+                endpoints=[endpoint],
+                **remote_options,
+            )
+        else:
+            remote_config["remote_draft"] = dict(endpoint=endpoint, **remote_options)
+        with vllm_runner(
+            model,
+            speculative_config=remote_config,
+            per_request_spec_decode_metrics="detailed" if independent else "none",
+            **kwargs,
+        ) as remote:
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
