@@ -300,14 +300,21 @@ def _resolve_eagle3_features(vllm_config: "VllmConfig") -> Eagle3FeatureContract
     config = draft.hf_config
     target_type = target.hf_config.model_type
     architectures = config.architectures or []
-    if target_type == "llama":
-        if target.hf_config.architectures != [
-            "LlamaForCausalLM"
-        ] or architectures not in (
+    native_target = {
+        "llama": "LlamaForCausalLM",
+        "qwen2": "Qwen2ForCausalLM",
+        "mistral": "MistralForCausalLM",
+    }.get(target_type)
+    if native_target is not None:
+        name = native_target.removesuffix("ForCausalLM")
+        if target.hf_config.architectures != [native_target] or architectures not in (
             ["Eagle3LlamaForCausalLM"],
             ["LlamaForCausalLMEagle3"],
         ):
-            raise ValueError("standalone Llama EAGLE3 requires native Llama models")
+            raise ValueError(
+                f"standalone {name} EAGLE3 requires native {name} "
+                "and Llama EAGLE3 models"
+            )
         if any(
             model.using_transformers_backend()
             or model.is_multimodal_model
@@ -318,26 +325,58 @@ def _resolve_eagle3_features(vllm_config: "VllmConfig") -> Eagle3FeatureContract
             for model in (target, draft)
         ):
             raise ValueError(
-                "standalone Llama EAGLE3 requires unquantized causal text models"
+                f"standalone {name} EAGLE3 requires unquantized causal text models"
             )
         if target.get_vocab_size() != draft.get_vocab_size():
             raise ValueError(
-                "standalone Llama EAGLE3 requires equal target/draft vocabularies"
+                f"standalone {name} EAGLE3 requires equal target/draft vocabularies"
             )
         if target.get_hidden_size() != draft.get_hidden_size():
             raise ValueError(
-                "standalone Llama EAGLE3 requires equal target/draft hidden widths"
+                f"standalone {name} EAGLE3 requires equal target/draft hidden widths"
             )
         if vllm_config.parallel_config.tensor_parallel_size != 1:
-            raise ValueError("standalone Llama EAGLE3 requires target TP1")
+            raise ValueError(f"standalone {name} EAGLE3 requires target TP1")
         remote = spec.get_remote_draft_config()
         if remote is not None and (
             remote.transport not in ("auto", "inline")
             or len(spec.get_remote_draft_endpoints()) != 1
         ):
-            raise ValueError("standalone Llama EAGLE3 requires one inline endpoint")
+            raise ValueError(f"standalone {name} EAGLE3 requires one inline endpoint")
+        if target_type in ("qwen2", "mistral"):
+            for model in (target, draft):
+                layers = getattr(model.hf_text_config, "layer_types", None)
+                if (
+                    model.get_sliding_window() is not None
+                    or vllm_config.cache_config.sliding_window is not None
+                    or model.attention_chunk_size is not None
+                    or (
+                        layers is not None
+                        and (
+                            not isinstance(layers, (list, tuple))
+                            or len(layers) != model.get_total_num_hidden_layers()
+                            or any(layer != "full_attention" for layer in layers)
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 requires full attention "
+                        "without a target, draft or global sliding window"
+                    )
+                if getattr(model.hf_text_config, "dual_chunk_attention_config", None):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 does not support "
+                        "dual-chunk attention"
+                    )
+                if getattr(model.hf_text_config, "ada_rms_norm_t_cond", False):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 does not support conditional state"
+                    )
     elif target_type not in ("gpt_oss", "qwen3"):
-        raise ValueError("standalone EAGLE3 supports GPT-OSS, Qwen3 and Llama targets")
+        raise ValueError(
+            "standalone EAGLE3 supports GPT-OSS, Qwen3, Llama, Qwen2 "
+            "and Mistral targets"
+        )
 
     target_width, draft_width = target.get_hidden_size(), draft.get_hidden_size()
     eagle = getattr(config, "eagle_config", None) or {}

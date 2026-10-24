@@ -113,15 +113,24 @@ def test_eagle_contract_rejects_projection_and_selected_layer_count_mismatch(
 def _llama_eagle_config(
     tmp_path,
     *,
+    target_kind="llama",
     target_layers=4,
     draft_options=None,
     target_options=None,
     spec_options=None,
     target_tp=1,
     load_model=False,
+    cache_options=None,
 ):
     """Construct actual HF/native models and the public speculative config."""
-    from transformers import LlamaConfig, LlamaForCausalLM
+    from transformers import (
+        LlamaConfig,
+        LlamaForCausalLM,
+        MistralConfig,
+        MistralForCausalLM,
+        Qwen2Config,
+        Qwen2ForCausalLM,
+    )
 
     from vllm.config import (
         CacheConfig,
@@ -146,12 +155,25 @@ def _llama_eagle_config(
         max_position_embeddings=128,
     )
     target_path, draft_path = tmp_path / "target", tmp_path / "draft"
-    target_config = LlamaConfig(
-        **(common | {"num_hidden_layers": target_layers} | (target_options or {}))
+    target_config_cls, target_model_cls = {
+        "llama": (LlamaConfig, LlamaForCausalLM),
+        "qwen2": (Qwen2Config, Qwen2ForCausalLM),
+        "mistral": (MistralConfig, MistralForCausalLM),
+    }[target_kind]
+    target_config = target_config_cls(
+        **(
+            common
+            | {
+                "architectures": [target_model_cls.__name__],
+                "num_hidden_layers": target_layers,
+                "sliding_window": None,
+            }
+            | (target_options or {})
+        )
     )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
-        LlamaForCausalLM(target_config).save_pretrained(target_path)
+        target_model_cls(target_config).save_pretrained(target_path)
     (target_path / "tokenizer.json").write_text('{"model":{"vocab":{"a":0}}}')
     options = dict(
         num_hidden_layers=1,
@@ -186,7 +208,9 @@ def _llama_eagle_config(
             parallel_config=parallel,
             speculative_config=spec,
             device_config=DeviceConfig("cpu"),
-            cache_config=CacheConfig(enable_prefix_caching=False),
+            cache_config=CacheConfig(
+                **({"enable_prefix_caching": False} | (cache_options or {}))
+            ),
             scheduler_config=SchedulerConfig(
                 max_num_seqs=4,
                 max_num_batched_tokens=128,
@@ -275,6 +299,83 @@ def test_llama_eagle_contract_matches_actual_native_projection(
         )
 
 
+@pytest.mark.parametrize("target_kind", ["qwen2", "mistral"])
+@pytest.mark.parametrize("use_aux", [False, True])
+def test_full_attention_eagle_contract_matches_native_target(
+    tmp_path, target_kind, use_aux
+):
+    """Real target captures and the loaded Llama draft agree on feature shape."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.mistral import MistralForCausalLM
+    from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        set_eagle3_aux_hidden_state_layers,
+    )
+
+    config, model = _llama_eagle_config(
+        tmp_path,
+        target_kind=target_kind,
+        draft_options={"eagle_config": {"use_aux_hidden_state": use_aux}},
+        load_model=True,
+    )
+    assert config.model_config.hf_config.model_type == target_kind
+    assert config.model_config.get_sliding_window() is None
+    assert config.cache_config.sliding_window is None
+    contract = create_runtime_contract(config)
+    feature = contract.eagle3_features
+    assert feature is not None
+    assert feature.aux_layer_ids == ((1, 2, 4) if use_aux else None)
+    feature.validate_model(model)
+    target_cls = {"qwen2": Qwen2ForCausalLM, "mistral": MistralForCausalLM}[target_kind]
+    with set_current_vllm_config(config):
+        target = target_cls(vllm_config=config)
+    if use_aux:
+        set_eagle3_aux_hidden_state_layers(target, config.speculative_config)
+        assert target.model.aux_hidden_state_layers == (1, 2, 4)
+    width = 192 if use_aux else 64
+    assert contract.schema.slots[2].trailing_shape == (width,)
+    inputs = torch.arange(3 * width, dtype=torch.float32).reshape(3, width)
+    actual = model.combine_hidden_states(inputs)
+    if use_aux:
+        assert torch.equal(
+            actual, torch.nn.functional.linear(inputs, model.model.fc.weight)
+        )
+    else:
+        assert not hasattr(model.model, "fc")
+        assert actual is inputs
+
+
+@pytest.mark.parametrize(
+    "target_kind,options,match",
+    [
+        (
+            "qwen2",
+            {"target_options": {"use_sliding_window": True, "sliding_window": 16}},
+            "full attention",
+        ),
+        ("mistral", {"target_options": {"sliding_window": 16}}, "full attention"),
+        ("qwen2", {"cache_options": {"sliding_window": 16}}, "full attention"),
+        ("mistral", {"draft_options": {"sliding_window": 16}}, "full attention"),
+        (
+            "qwen2",
+            {"target_options": {"dual_chunk_attention_config": {"chunk_size": 16}}},
+            "dual-chunk",
+        ),
+        (
+            "mistral",
+            {"target_options": {"ada_rms_norm_t_cond": True}},
+            "conditional",
+        ),
+    ],
+)
+def test_full_attention_eagle_contract_rejects_unsupported_attention(
+    tmp_path, target_kind, options, match
+):
+    config, _ = _llama_eagle_config(tmp_path, target_kind=target_kind, **options)
+    with pytest.raises(ValueError, match=match):
+        create_runtime_contract(config)
+
+
 @pytest.mark.parametrize(
     "options,match",
     [
@@ -305,8 +406,11 @@ def test_llama_eagle_contract_rejects_unusable_target_features(
         create_runtime_contract(config)
 
 
+@pytest.mark.parametrize("target_kind", ["llama", "qwen2", "mistral"])
 @pytest.mark.parametrize("placement", ["tp2", "ipc", "pool"])
-def test_llama_eagle_contract_rejects_unvalidated_placement(tmp_path, placement):
+def test_llama_eagle_contract_rejects_unvalidated_placement(
+    tmp_path, placement, target_kind
+):
     from vllm.config.speculative import SpeculativeExecutionConfig
 
     execution = SpeculativeExecutionConfig(
@@ -317,10 +421,11 @@ def test_llama_eagle_contract_rejects_unvalidated_placement(tmp_path, placement)
     )
     config, _ = _llama_eagle_config(
         tmp_path,
+        target_kind=target_kind,
         target_tp=2 if placement == "tp2" else 1,
         spec_options={"execution": execution},
     )
-    with pytest.raises(ValueError, match="Llama EAGLE3 requires.*TP1|one inline"):
+    with pytest.raises(ValueError, match="EAGLE3 requires.*TP1|one inline"):
         create_runtime_contract(config)
 
 

@@ -1073,6 +1073,10 @@ def _save_eagle3_models(directory: str, target_family: str) -> None:
     from transformers import (
         LlamaConfig,
         LlamaForCausalLM,
+        MistralConfig,
+        MistralForCausalLM,
+        Qwen2Config,
+        Qwen2ForCausalLM,
         Qwen3Config,
         Qwen3ForCausalLM,
         TokenizersBackend,
@@ -1118,18 +1122,31 @@ def _save_eagle3_models(directory: str, target_family: str) -> None:
         attention_bias=False,
         mlp_bias=False,
     )
-    assert target_family in ("llama", "qwen3")
+    assert target_family in ("llama", "qwen3", "qwen2", "mistral")
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(20261025)
         if target_family == "llama":
             target = LlamaForCausalLM(LlamaConfig(num_hidden_layers=4, **common))
-        else:
+        elif target_family == "qwen3":
             target = Qwen3ForCausalLM(
                 Qwen3Config(
                     num_hidden_layers=4,
                     layer_types=["full_attention"] * 4,
                     **common,
                 )
+            )
+        elif target_family == "qwen2":
+            target = Qwen2ForCausalLM(
+                Qwen2Config(
+                    num_hidden_layers=4,
+                    use_sliding_window=False,
+                    layer_types=["full_attention"] * 4,
+                    **common,
+                )
+            )
+        else:
+            target = MistralForCausalLM(
+                MistralConfig(num_hidden_layers=4, sliding_window=None, **common)
             )
         target = target.to(dtype=torch.bfloat16).eval()
         with torch.no_grad():
@@ -1552,7 +1569,7 @@ def test_remote_independent_draft_with_hybrid_or_mla_target(
     )
 
 
-@pytest.mark.parametrize("eagle_target", ["llama", "qwen3"])
+@pytest.mark.parametrize("eagle_target", ["llama", "qwen3", "qwen2", "mistral"])
 @pytest.mark.parametrize("k", [1, 3])
 def test_remote_eagle3_matches_native_and_target(
     vllm_runner,
@@ -1940,6 +1957,8 @@ def _compare_native_and_remote_draft(
                 == {
                     "llama": "LlamaForCausalLM",
                     "qwen3": "Qwen3ForCausalLM",
+                    "qwen2": "Qwen2ForCausalLM",
+                    "mistral": "MistralForCausalLM",
                 }[mtp_family]
             )
             assert policy["attention_backends"] == ["TRITON_ATTN"] * 4
@@ -2114,6 +2133,8 @@ def _compare_native_and_remote_draft(
             == {
                 "llama": "LlamaForCausalLM",
                 "qwen3": "Qwen3ForCausalLM",
+                "qwen2": "Qwen2ForCausalLM",
+                "mistral": "MistralForCausalLM",
             }[mtp_family]
         )
         spec = worker.vllm_config.speculative_config
