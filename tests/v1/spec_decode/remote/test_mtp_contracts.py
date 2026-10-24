@@ -410,6 +410,248 @@ def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_d
         create_runtime_contract(config)
 
 
+def _mimo_flash_public_config(
+    tmp_path,
+    *,
+    k=3,
+    target_options=None,
+    draft_options=None,
+    wrong_target=False,
+    identity=True,
+    transport="inline",
+):
+    options = dict(
+        architectures=["MiMoV2FlashForCausalLM"],
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=192,
+        v_head_dim=128,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=2,
+        swa_head_dim=192,
+        swa_v_head_dim=128,
+        hybrid_layer_pattern=[0, 1],
+        sliding_window=128,
+        sliding_window_size=128,
+        attention_chunk_size=128,
+        attention_bias=False,
+        add_swa_attention_sink_bias=True,
+        add_full_attention_sink_bias=False,
+        attention_value_scale=0.707,
+        partial_rotary_factor=0.334,
+        rope_theta=5000000,
+        swa_rope_theta=10000,
+        layernorm_epsilon=1e-5,
+        max_position_embeddings=256,
+        hidden_act="silu",
+        moe_layer_freq=[0, 1],
+        moe_intermediate_size=128,
+        n_routed_experts=4,
+        n_shared_experts=None,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        scoring_func="sigmoid",
+        n_group=1,
+        topk_group=1,
+        topk_method="noaux_tc",
+        routed_scaling_factor=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        torch_dtype="bfloat16",
+    )
+
+    def checkpoint(path, hf):
+        hf.save_pretrained(path)
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+            bos_token="token1",
+            eos_token="token2",
+            pad_token="token0",
+        ).save_pretrained(path)
+        if identity:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                model = AutoModelForCausalLM.from_config(hf, dtype=torch.bfloat16)
+            embedding = model.get_input_embeddings().weight.detach()
+            save_file(
+                {"model.embed_tokens.weight": embedding}, path / "model.safetensors"
+            )
+
+    target_path = draft_path = tmp_path
+    if target_options or draft_options or wrong_target:
+        target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target_hf = (
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            vocab_size=128,
+            max_position_embeddings=256,
+        )
+        if wrong_target
+        else AutoConfig.for_model("mimo_v2_flash", **(options | (target_options or {})))
+    )
+    checkpoint(target_path, target_hf)
+    if draft_path != target_path:
+        checkpoint(
+            draft_path,
+            AutoConfig.for_model("mimo_v2_flash", **(options | (draft_options or {}))),
+        )
+    target = ModelConfig(
+        model=str(target_path),
+        dtype="bfloat16",
+        max_model_len=128,
+        skip_tokenizer_init=True,
+    )
+    parallel = ParallelConfig()
+    spec = SpeculativeConfig(
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=1,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        remote_draft=RemoteDraftConfig(
+            endpoint="unix:///tmp/mimo-flash-contract.sock", transport=transport
+        ),
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_mimo_flash_public_override_resolves_native_diffkv_mtp(tmp_path, k):
+    config = _mimo_flash_public_config(tmp_path, k=k)
+    target = config.model_config.hf_config
+    spec = config.speculative_config
+    assert spec is not None and spec.method == "mtp"
+    draft = spec.draft_model_config
+    assert draft is not None
+    assert type(target).__module__.startswith("transformers.models.mimo_v2_flash")
+    assert not getattr(target, "auto_map", None)
+    assert target.architectures == ["MiMoV2FlashForCausalLM"]
+    assert draft.hf_config.architectures == ["MiMoV2MTPModel"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.hybrid_layer_pattern == [0, 1]
+    assert (target.num_key_value_heads, target.swa_num_key_value_heads) == (1, 2)
+    assert (target.head_dim, target.v_head_dim) == (192, 128)
+    assert (target.swa_head_dim, target.swa_v_head_dim) == (192, 128)
+    assert target.add_swa_attention_sink_bias and target.n_routed_experts == 4
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (64,)
+
+
+@pytest.mark.parametrize(
+    "role,field,width",
+    [
+        ("target", "head_dim", 128),
+        ("draft", "v_head_dim", 64),
+        ("draft", "swa_head_dim", 128),
+        ("target", "swa_v_head_dim", 64),
+    ],
+)
+def test_mimo_flash_public_config_rejects_incompatible_diffkv_widths(
+    tmp_path, role, field, width
+):
+    config = _mimo_flash_public_config(
+        tmp_path, identity=False, **{f"{role}_options": {field: width}}
+    )
+    with pytest.raises(ValueError, match="QK192/V128 DiffKV"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "role,heads",
+    [
+        ("target", {"num_attention_heads": 0}),
+        ("draft", {"swa_num_attention_heads": 3, "swa_num_key_value_heads": 2}),
+    ],
+)
+def test_mimo_flash_public_config_requires_valid_global_and_swa_heads(
+    tmp_path, role, heads
+):
+    config = _mimo_flash_public_config(
+        tmp_path, identity=False, **{f"{role}_options": heads}
+    )
+    with pytest.raises(ValueError, match="divisible Q/KV heads"):
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_public_config_rejects_nonpositive_swa_window(tmp_path):
+    config = _mimo_flash_public_config(
+        tmp_path,
+        identity=False,
+        draft_options={"sliding_window": -1, "sliding_window_size": -1},
+    )
+    with pytest.raises(ValueError, match="positive SWA window"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("pattern", [[0], [0, 2]])
+def test_mimo_flash_public_config_requires_a_complete_layer_pattern(tmp_path, pattern):
+    with pytest.raises(ValueError, match="layer pattern|layer_types|length"):
+        config = _mimo_flash_public_config(
+            tmp_path, identity=False, target_options={"hybrid_layer_pattern": pattern}
+        )
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_public_config_requires_its_actual_target_family(tmp_path):
+    config = _mimo_flash_public_config(tmp_path, identity=False, wrong_target=True)
+    with pytest.raises(ValueError, match="matching target architecture"):
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_public_override_preserves_rejected_fp8_metadata(tmp_path):
+    quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    with pytest.raises(ValueError, match="quant|fp8|bfloat16"):
+        config = _mimo_flash_public_config(
+            tmp_path,
+            identity=False,
+            draft_options={"quantization_config": quantization},
+        )
+        create_runtime_contract(config)
+    saved = json.loads((tmp_path / "draft/config.json").read_text())
+    assert saved["quantization_config"] == quantization
+
+
+def test_mimo_flash_public_config_rejects_ipc_placement(tmp_path):
+    config = _mimo_flash_public_config(tmp_path, identity=False, transport="cuda_ipc")
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
+
+
 @pytest.mark.parametrize("model_type,target_arch,draft_arch,k", MODELS)
 def test_native_mtp_config_override_resolves_own_kv_contract(
     model_type, target_arch, draft_arch, k
@@ -657,7 +899,7 @@ def test_mtp_contract_does_not_accept_unrelated_target(kind):
 
 @pytest.mark.parametrize(
     "architecture",
-    ["MiMoMTP", "MiMoV2MTPModel", "Gemma4MTPModel", "Qwen3_5MTP", "DeepSeekV4MTPModel"],
+    ["MiMoMTP", "Gemma4MTPModel", "Qwen3_5MTP", "DeepSeekV4MTPModel"],
 )
 def test_unsupported_feature_and_state_families_remain_fail_closed(architecture):
     config = _config()

@@ -9,13 +9,14 @@ between target and draft computation.
 ## Model contracts
 
 The runtime checks the resolved draft architecture and its matching target,
-including hidden width, vocabulary size and the number of checkpoint MTP modules.
+including hidden width, vocabulary size and the native MTP module count.
 It accepts one MTP module, or the Exaone module chain described
 below. All supported paths use scalar token positions.
 
 | Resolved draft architecture | Matching target | Draft cache | K restriction |
 | --- | --- | --- | --- |
 | `MiMoMTPModel` | `MiMoForCausalLM` | Full attention | 1 |
+| `MiMoV2MTPModel` | `MiMoV2FlashForCausalLM` | Sliding-window DiffKV, QK192/V128 | First native head, sequential rollout |
 | `ErnieMTPModel` | `Ernie4_5_MoeForCausalLM` | Full attention | 1 |
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
@@ -62,6 +63,29 @@ FP8 checkpoints require a separately validated loading and execution contract;
 passing a synthetic BF16 configuration does not establish their support.
 Select an MLA attention backend supported by the device for both native and
 remote comparison, and keep the MLA prefill backend consistent.
+
+### MiMo-V2 Flash
+
+MiMo-V2 Flash uses its native first MTP head, with sequential rollout for K>1.
+Additional heads in the checkpoint are not executed. The target uses its own
+global/sliding-window attention and MoE layers; the MTP block has its own
+sliding-window KV and a dense MLP. This is separate from the MiMo-7B K=1 path.
+
+The contract requires native unquantized BF16 target/draft weights and KV,
+target TP1, draft TP1 and one inline endpoint. Global and sliding attention must
+both use QK width 192 and V width 128. Global and sliding head counts can differ;
+each positive Q head count must be divisible by its positive KV head count.
+The target must declare one global/sliding entry
+per layer in `hybrid_layer_pattern`, and `sliding_window_size` must be positive.
+Use a native DiffKV backend supported by the device and keep it consistent
+between native and remote execution. Different V widths within one process
+are outside this contract.
+
+The standalone KV allocator retains the full context even though the native
+attention kernel applies the sliding window. BF16 synthetic checkpoint tests
+do not establish support for published FP8 weights. Pro's fused checkpoint
+format, Omni, quantization, additional MTP heads, pooled placement and CUDA IPC
+require separate validation and remain excluded.
 
 ### Exaone module chains
 
