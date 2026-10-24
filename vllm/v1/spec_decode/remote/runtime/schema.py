@@ -69,10 +69,12 @@ class _MTPModelContract:
 # attention KV. Other MTP architectures need a separate state/feature contract.
 _MTP_MODELS = {
     "MiMoMTPModel": _MTPModelContract(("MiMoForCausalLM",), 1),
+    "MiMoV2MTPModel": _MTPModelContract(("MiMoV2FlashForCausalLM",)),
     "ErnieMTPModel": _MTPModelContract(("Ernie4_5_MoeForCausalLM",), 1),
     "Qwen3NextMTP": _MTPModelContract(("Qwen3NextForCausalLM",)),
     "Glm4MoeMTPModel": _MTPModelContract(("Glm4MoeForCausalLM",)),
     "Glm4MoeLiteMTPModel": _MTPModelContract(("Glm4MoeLiteForCausalLM",)),
+    "DeepSeekMTPModel": _MTPModelContract(("DeepseekV3ForCausalLM",)),
     "ExaoneMoeMTP": _MTPModelContract(("ExaoneMoeForCausalLM", "ExaoneMoEForCausalLM")),
     "NemotronHMTPModel": _MTPModelContract(
         ("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
@@ -174,6 +176,64 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
             raise ValueError("standalone Nemotron MTP requires attention/MoE layers")
     if architecture == "Glm4MoeLiteMTPModel" and hasattr(config, "index_topk"):
         raise ValueError("standalone GLM MLA does not support a sparse indexer")
+    if architecture == "MiMoV2MTPModel":
+        for model in (target, draft):
+            hf_config = model.hf_config
+            if any(
+                type(getattr(hf_config, field, None)) is not int
+                or getattr(hf_config, field) != width
+                for field, width in (
+                    ("head_dim", 192),
+                    ("swa_head_dim", 192),
+                    ("v_head_dim", 128),
+                    ("swa_v_head_dim", 128),
+                )
+            ):
+                raise ValueError("standalone MiMo-V2 Flash requires QK192/V128 DiffKV")
+            for prefix in ("", "swa_"):
+                heads = getattr(hf_config, prefix + "num_attention_heads", None)
+                kv_heads = getattr(hf_config, prefix + "num_key_value_heads", None)
+                if (
+                    type(heads) is not int
+                    or type(kv_heads) is not int
+                    or heads < 1
+                    or kv_heads < 1
+                    or heads % kv_heads
+                ):
+                    raise ValueError(
+                        "standalone MiMo-V2 Flash requires divisible Q/KV heads"
+                    )
+            window = getattr(hf_config, "sliding_window_size", None)
+            if type(window) is not int or window < 1:
+                raise ValueError(
+                    "standalone MiMo-V2 Flash requires a positive SWA window"
+                )
+        pattern = getattr(target.hf_config, "hybrid_layer_pattern", None)
+        if (
+            not isinstance(pattern, (list, tuple))
+            or len(pattern) != target.get_total_num_hidden_layers()
+            or any(type(layer) is not int or layer not in (0, 1) for layer in pattern)
+        ):
+            raise ValueError(
+                "standalone MiMo-V2 Flash requires a full global/SWA layer pattern"
+            )
+    if architecture == "DeepSeekMTPModel":
+        for model in (target, draft):
+            if hasattr(model.hf_config, "index_topk"):
+                raise ValueError(
+                    "standalone DeepSeek MTP does not support a sparse indexer"
+                )
+    if architecture in ("DeepSeekMTPModel", "MiMoV2MTPModel"):
+        for model in (target, draft):
+            if (
+                model.using_transformers_backend()
+                or model.quantization is not None
+                or getattr(model.hf_config, "quantization_config", None) is not None
+                or str(model.dtype) != "torch.bfloat16"
+            ):
+                raise ValueError(
+                    f"standalone {architecture} requires native unquantized bfloat16"
+                )
 
 
 def _fingerprint(value: Any) -> str:
@@ -438,6 +498,24 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         eagle3_features = _resolve_eagle3_features(vllm_config)
     elif spec.method == "mtp":
         _validate_mtp_contract(target, spec)
+        if draft.hf_config.architectures[0] in ("DeepSeekMTPModel", "MiMoV2MTPModel"):
+            name = draft.hf_config.architectures[0]
+            if (
+                vllm_config.parallel_config.tensor_parallel_size != 1
+                or spec.draft_parallel_config.tensor_parallel_size != 1
+            ):
+                raise ValueError(f"standalone {name} requires target TP1 and draft TP1")
+            remote = spec.get_remote_draft_config()
+            if remote is not None and (
+                remote.transport not in ("auto", "inline")
+                or len(spec.get_remote_draft_endpoints()) != 1
+            ):
+                raise ValueError(f"standalone {name} requires one inline endpoint")
+            if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16") or (
+                spec.kv_cache_dtype is not None
+                and spec.kv_cache_dtype not in ("auto", "bfloat16")
+            ):
+                raise ValueError(f"standalone {name} requires bfloat16 KV")
     else:
         raise ValueError(f"unsupported standalone method: {spec.method}")
     if spec.parallel_drafting or spec.draft_sample_method != "greedy":
