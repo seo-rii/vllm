@@ -219,8 +219,8 @@ def test_multi_module_feature_memory_bounds_include_retained_and_staged_storage(
     requests, tokens, length, expected
 ):
     schema = multi_module_schema(depth=3)
-    schema = replace(
-        schema,
+    schema = TargetFeatureSchema(
+        schema_id=schema.schema_id,
         slots=schema.slots
         + (
             FeatureSlot(
