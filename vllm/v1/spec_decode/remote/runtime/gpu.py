@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    group_standalone_kv_specs,
     make_grouped_standalone_kv_config,
     select_standalone_kv_spec,
 )
@@ -343,7 +344,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
         speculator = speculator_cls(config, device)
         speculator.load_model(target_shell)
-        select_standalone_kv_spec(get_kv_cache_spec(config))
+        if spec.use_multi_module_mtp():
+            group_standalone_kv_specs(get_kv_cache_spec(config))
+        else:
+            select_standalone_kv_spec(get_kv_cache_spec(config))
         return speculator
 
     def _init_sampling_buffers(self, max_num_reqs: int) -> None:

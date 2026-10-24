@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Authoritative target inputs for two native MTP modules.
+"""Authoritative target inputs for a native MTP module chain.
 
-The second module's last KV row depends on the first proposed token. When
-that token was not accepted (including an effective K of zero), replay the
-previous real target row together with the new accepted prefix. Native MTP
-then receives compact inputs with zero rejections and performs its usual
-token shift and both module forwards.
+Later modules' trailing KV rows depend on proposed tokens. Replay the affected
+real target rows together with the new accepted prefix, including after reduced
+effective K. Native MTP receives compact inputs with zero rejections and
+performs its usual token shift and all configured module forwards.
 """
 
 from dataclasses import dataclass, replace
@@ -40,7 +39,7 @@ class MultiModuleHistoryUpdate:
 
 
 class MultiModuleReplay:
-    """One independently owned target row per sequence generation.
+    """At most depth-1 independently owned target rows per sequence generation.
 
     ``prepare_row`` only reads committed history. Stage updates before a
     forward, commit them after its completion, or discard the returned tuple
@@ -49,6 +48,18 @@ class MultiModuleReplay:
 
     def __init__(self, schema: TargetFeatureSchema) -> None:
         self._schema = schema
+        lookahead = next(
+            slot
+            for slot in schema.slots
+            if slot.kind == TargetFeatureKind.NEXT_PREFILL_TOKENS.value
+        )
+        if (
+            not lookahead.per_sequence
+            or len(lookahead.trailing_shape) != 1
+            or lookahead.trailing_shape[0] < 2
+        ):
+            raise ValueError("multi-module MTP requires depth-wide prefill lookahead")
+        self._history_rows = lookahead.trailing_shape[0] - 1
         self._position_slot = next(
             i
             for i, slot in enumerate(schema.slots)
@@ -65,7 +76,8 @@ class MultiModuleReplay:
         self, row: DraftStepRow, features: Features
     ) -> tuple[DraftStepRow, Features]:
         if (
-            row.num_replayed
+            row.num_tokens <= 0
+            or row.num_replayed
             or row.num_sampled < 0
             or not 0 <= row.num_rejected < row.num_tokens
             or (row.num_sampled == 0 and row.num_rejected != 0)
@@ -107,8 +119,10 @@ class MultiModuleReplay:
                 SpeculatorStatusCode.SEQUENCE_DESYNC,
                 "MTP acceptance does not match the target prefix",
             )
-        replay = int(
-            history is not None and history.speculative and row.num_sampled == 1
+        replay = (
+            min(start, max(0, self._history_rows + 1 - row.num_sampled))
+            if history is not None and history.speculative
+            else 0
         )
         prepared: Features = []
         for i, (slot, tensor) in enumerate(zip(self._schema.slots, features)):
@@ -119,12 +133,12 @@ class MultiModuleReplay:
             if replay:
                 assert history is not None
                 previous = history.features[i]
-                if previous is None:
+                if previous is None or previous.shape[0] < replay:
                     raise AdapterError(
                         SpeculatorStatusCode.SEQUENCE_DESYNC,
-                        "MTP replay requires the previous target feature",
+                        "MTP replay requires the previous target features",
                     )
-                prefix = torch.cat((previous.to(tensor.device), prefix))
+                prefix = torch.cat((previous[-replay:].to(tensor.device), prefix))
             prepared.append(prefix)
         return (
             replace(
@@ -136,21 +150,40 @@ class MultiModuleReplay:
     def stage_history(
         self, plan: DraftStepPlan, features: Features
     ) -> tuple[MultiModuleHistoryUpdate, ...]:
-        """Clone only the last real target row, before native scratch is used."""
+        """Own the completed target suffix before native scratch is used."""
         histories = []
         for i, row in enumerate(plan.rows):
             end = int(plan.query_start_loc[i + 1]) - row.num_rejected
             last = end - 1
-            if last < int(plan.query_start_loc[i]) + row.num_replayed:
+            start = int(plan.query_start_loc[i]) + row.num_replayed
+            if last < start:
                 raise ValueError("MTP history needs a new target row")
+            position = int(plan.positions[last])
+            keep = min(position + 1, self._history_rows)
+            previous = self._history.get(row.key)
+            owned: list[torch.Tensor | None] = []
+            for slot_index, (slot, tensor) in enumerate(
+                zip(self._schema.slots, features)
+            ):
+                if tensor is None or slot.per_sequence:
+                    owned.append(None)
+                    continue
+                suffix = tensor[max(start, end - keep) : end].detach()
+                needed = keep - suffix.shape[0]
+                if needed:
+                    old = None if previous is None else previous.features[slot_index]
+                    if old is None or old.shape[0] < needed:
+                        raise AdapterError(
+                            SpeculatorStatusCode.SEQUENCE_DESYNC,
+                            "MTP history requires the previous target features",
+                        )
+                    suffix = torch.cat((old[-needed:].to(tensor.device), suffix))
+                else:
+                    suffix = suffix.clone()
+                owned.append(suffix)
             history = _History(
-                position=int(plan.positions[last]),
-                features=tuple(
-                    None
-                    if tensor is None or slot.per_sequence
-                    else tensor[last:end].detach().clone()
-                    for slot, tensor in zip(self._schema.slots, features)
-                ),
+                position=position,
+                features=tuple(owned),
                 speculative=row.num_sampled > 0,
             )
             histories.append((row.key, history))
