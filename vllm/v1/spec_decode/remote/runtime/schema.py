@@ -57,12 +57,14 @@ class RuntimeContract:
     tokenizer_fingerprint: str
     draft_fingerprint: str
     eagle3_features: Eagle3FeatureContract | None = None
+    requires_target_lm_head: bool = True
 
 
 @dataclass(frozen=True)
 class _MTPModelContract:
     target_architectures: tuple[str, ...]
     max_speculative_tokens: int | None = None
+    requires_target_lm_head: bool = True
 
 
 # These native implementations consume one target hidden vector and own their
@@ -80,10 +82,13 @@ _MTP_MODELS = {
         ("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
     ),
     "HYV3MTPModel": _MTPModelContract(("HYV3ForCausalLM",)),
+    "Step3p5MTP": _MTPModelContract(
+        ("Step3p5ForCausalLM",), requires_target_lm_head=False
+    ),
 }
 
 
-def _validate_mtp_contract(target: Any, spec: Any) -> None:
+def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
     draft = spec.draft_model_config
     config = draft.hf_config
     architectures = getattr(config, "architectures", None) or []
@@ -143,6 +148,61 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
             )
             if type(window) is not int or window <= 0:
                 raise ValueError("Exaone MTP sliding layers require positive windows")
+    elif architecture == "Step3p5MTP":
+        layers = getattr(config, "mtp_layer_types", None)
+        mlp_layers = getattr(config, "mtp_mlp_layer_types", None)
+        if (
+            not isinstance(layers, (list, tuple))
+            or len(layers) != num_modules
+            or len(set(layers)) != 1
+            or layers[0] not in ("full_attention", "sliding_attention")
+            or mlp_layers != ["dense"] * num_modules
+        ):
+            raise ValueError(
+                "standalone Step3.5 requires homogeneous full/SWA dense MTP layers"
+            )
+        if num_modules > 1 and (
+            spec.num_speculative_tokens != 1 or layers[0] != "sliding_attention"
+        ):
+            raise ValueError(
+                "standalone Step3.5 multiple checkpoint heads require SWA and K=1"
+            )
+        rope = getattr(config, "rope_parameters", None) or {}
+        if not isinstance(rope.get(layers[0]), dict):
+            raise ValueError(
+                "standalone Step3.5 requires MTP attention RoPE parameters"
+            )
+        if layers[0] == "sliding_attention":
+            window = getattr(config, "sliding_window", None)
+            heads = getattr(config, "num_sliding_attention_heads", None)
+            if (
+                type(window) is not int
+                or window < 1
+                or type(heads) is not int
+                or heads < 1
+            ):
+                raise ValueError(
+                    "standalone Step3.5 SWA requires positive window/head geometry"
+                )
+        else:
+            heads = getattr(config, "num_attention_heads", None)
+            if getattr(config, "is_heterogeneous", False):
+                per_layer = getattr(config, "per_layer_config", ())
+                if len(per_layer) < config.num_hidden_layers + num_modules:
+                    raise ValueError(
+                        "standalone Step3.5 requires explicit MTP head geometry"
+                    )
+                heads = per_layer[config.num_hidden_layers].num_attention_heads
+        kv_heads = getattr(config, "num_attention_groups", None)
+        if (
+            type(heads) is not int
+            or type(kv_heads) is not int
+            or kv_heads <= 1
+            or heads < 1
+            or heads % kv_heads
+            or getattr(config, "att_impl_type", "GQA") != "GQA"
+        ):
+            raise ValueError("standalone Step3.5 requires divisible GQA head groups")
     elif num_modules != 1:
         raise ValueError(
             "standalone MTP requires one checkpoint MTP module, "
@@ -223,7 +283,7 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
                 raise ValueError(
                     "standalone DeepSeek MTP does not support a sparse indexer"
                 )
-    if architecture in ("DeepSeekMTPModel", "MiMoV2MTPModel"):
+    if architecture in ("DeepSeekMTPModel", "MiMoV2MTPModel", "Step3p5MTP"):
         for model in (target, draft):
             if (
                 model.using_transformers_backend()
@@ -234,6 +294,7 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
                 raise ValueError(
                     f"standalone {architecture} requires native unquantized bfloat16"
                 )
+    return contract
 
 
 def _fingerprint(value: Any) -> str:
@@ -494,11 +555,18 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     target = vllm_config.model_config
     draft = spec.draft_model_config
     eagle3_features = None
+    requires_target_lm_head = True
     if spec.method == "eagle3":
         eagle3_features = _resolve_eagle3_features(vllm_config)
     elif spec.method == "mtp":
-        _validate_mtp_contract(target, spec)
-        if draft.hf_config.architectures[0] in ("DeepSeekMTPModel", "MiMoV2MTPModel"):
+        requires_target_lm_head = _validate_mtp_contract(
+            target, spec
+        ).requires_target_lm_head
+        if draft.hf_config.architectures[0] in (
+            "DeepSeekMTPModel",
+            "MiMoV2MTPModel",
+            "Step3p5MTP",
+        ):
             name = draft.hf_config.architectures[0]
             if (
                 vllm_config.parallel_config.tensor_parallel_size != 1
@@ -564,15 +632,18 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     )
     schema = TargetFeatureSchema(schema_id=1, slots=tuple(slots))
     layout = [(s.kind, s.dtype, s.trailing_shape) for s in slots]
-    feature_identity = (
+    feature_identity: dict[str, Any] = (
         {"eagle3_features": asdict(eagle3_features)}
         if eagle3_features is not None
         else {}
     )
+    if not requires_target_lm_head:
+        feature_identity["requires_target_lm_head"] = False
     target_identity = _model_identity(target)
     return RuntimeContract(
         schema=schema,
         eagle3_features=eagle3_features,
+        requires_target_lm_head=requires_target_lm_head,
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),
