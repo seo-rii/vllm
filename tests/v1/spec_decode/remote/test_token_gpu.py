@@ -3,7 +3,7 @@
 """Native entrypoint/metadata CPU controls; model, attention and CUDA are doubles."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +16,214 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
     StandaloneARSpeculator,
 )
+
+
+def test_recurrent_executor_config_uses_native_ordinary_state_without_lookahead(
+    tmp_path, monkeypatch
+):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        create_recurrent_executor_config,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+        spec_options={"attention_backend": "TRITON_ATTN"},
+    )
+    draft = config.speculative_config.draft_model_config
+    resource = create_recurrent_executor_config(config)
+    assert resource.speculative_config is None and resource.num_speculative_tokens == 0
+    assert resource.model_config.model == draft.model
+    assert resource.model_config.architecture == "NemotronHForCausalLM"
+    assert resource.model_config.hf_config.num_nextn_predict_layers == 0
+    assert resource.model_config.dtype is torch.bfloat16
+    assert resource.parallel_config.tensor_parallel_size == 1
+    assert (
+        resource.scheduler_config.max_num_seqs == config.scheduler_config.max_num_seqs
+    )
+    assert resource.scheduler_config.max_num_batched_tokens == 64
+    assert resource.model_config.max_model_len == 64
+    assert resource.cache_config.cache_dtype == "bfloat16"
+    assert resource.cache_config.mamba_cache_dtype == "bfloat16"
+    assert resource.cache_config.mamba_ssm_cache_dtype == "float32"
+    assert not resource.cache_config.use_replayssm
+    assert resource.cache_config.mamba_cache_mode == "none"
+    assert resource.cache_config is not config.cache_config
+    assert NemotronHForCausalLM.get_mamba_state_dtype_from_config(resource) == (
+        torch.bfloat16,
+        torch.float32,
+    )
+    shapes = NemotronHForCausalLM.get_mamba_state_shape_from_config(resource)
+    assert len(shapes) == 2
+    assert sorted(shapes[0]) == [3, 48]
+    assert shapes[1] == (2, 16, 8)
+
+
+def test_recurrent_executor_rejects_full_prefix_beyond_server_token_budget(
+    tmp_path, monkeypatch
+):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        create_recurrent_executor_config,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+        scheduler_options={"max_num_batched_tokens": 32},
+    )
+    with pytest.raises(
+        ValueError, match="full-prefix replay must fit one token budget"
+    ):
+        create_recurrent_executor_config(config)
+
+
+def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        create_recurrent_executor_config,
+    )
+
+    config = create_recurrent_executor_config(
+        token_config(
+            tmp_path,
+            draft_type="nemotron_h",
+            dtype="bfloat16",
+            num_nextn_predict_layers=0,
+            cache_options={"mamba_ssm_cache_dtype": "float32"},
+            scheduler_options={"max_num_seqs": max_num_reqs},
+            spec_options={"attention_backend": "TRITON_ATTN"},
+        )
+    )
+    return config, {
+        "model.layers.0.mixer": MambaSpec(
+            block_size=config.cache_config.mamba_block_size,
+            shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(config),
+            dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(config),
+        ),
+        "model.layers.1.mixer.attn": FullAttentionSpec(
+            block_size=config.cache_config.block_size,
+            num_kv_heads=config.model_config.get_num_kv_heads(config.parallel_config),
+            head_size=config.model_config.get_head_size(),
+            dtype=config.model_config.dtype,
+        ),
+    }
+
+
+@pytest.mark.parametrize("attention_blocks,recurrent_blocks", [(9, 3), (2, 5)])
+def test_recurrent_native_allocation_separates_token_pages_and_live_state_slots(
+    tmp_path, monkeypatch, attention_blocks, recurrent_blocks
+):
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=recurrent_blocks - 1)
+    state_name, attention_name = specs
+    state_spec, attention_spec = specs.values()
+    budget = (
+        recurrent_blocks * state_spec.page_size_bytes
+        + attention_blocks * attention_spec.page_size_bytes
+    )
+    cache = make_recurrent_kv_config(
+        config, specs, budget, recurrent_blocks - 1, KVCacheLayout.LBNHC
+    )
+    assert cache.num_blocks == attention_blocks
+    assert cache.recurrent_num_blocks == recurrent_blocks
+    assert all(tensor.size == budget for tensor in cache.kv_cache_tensors)
+    allocated = allocate_kv_cache(cache, torch.device("cpu"), KVCacheLayout.LBNHC)
+    state_bytes, attention = allocated[state_name], allocated[attention_name]
+    assert attention.shape[0] == attention_blocks
+    assert state_bytes.shape == (recurrent_blocks, 1, 1, state_spec.page_size_bytes)
+    assert (
+        len({tensor.untyped_storage().data_ptr() for tensor in allocated.values()}) == 1
+    )
+    assert all(
+        tensor.untyped_storage().nbytes() == budget for tensor in allocated.values()
+    )
+    spans = sorted(
+        (
+            tensor.data_ptr(),
+            tensor.data_ptr()
+            + tensor.element_size()
+            * (
+                1
+                + sum(
+                    (n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride())
+                )
+            ),
+        )
+        for tensor in allocated.values()
+    )
+    assert spans[0][1] <= spans[1][0]
+    attention[1:].fill_(3)
+    assert not state_bytes.count_nonzero()
+    pages = state_bytes.squeeze(dim=(1, 2))
+    conv_shape, ssm_shape = state_spec.shapes
+    conv_bytes = torch.empty(conv_shape, dtype=torch.bfloat16).numel() * 2
+    convolution = (
+        pages[:, :conv_bytes].view(torch.bfloat16).view(recurrent_blocks, *conv_shape)
+    )
+    ssm = pages[:, conv_bytes:].view(torch.float32).view(recurrent_blocks, *ssm_shape)
+    convolution[1:].fill_(7)
+    assert not ssm.count_nonzero()
+    ssm[1:].fill_(11)
+    assert torch.all(convolution[1:] == 7) and torch.all(ssm[1:] == 11)
+    assert torch.all(attention[1:] == 3)
+    assert not attention[0].count_nonzero()
+    assert not convolution[0].count_nonzero() and not ssm[0].count_nonzero()
+
+
+@pytest.mark.parametrize("invalid", ["empty", "mixed", "unknown", "host"])
+def test_recurrent_cache_rejects_descriptor_without_one_device_capacity(
+    tmp_path, monkeypatch, invalid
+):
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=2)
+    state, attention = specs.values()
+    budget = 3 * state.page_size_bytes + 9 * attention.page_size_bytes
+    cache = make_recurrent_kv_config(config, specs, budget, 2, KVCacheLayout.LBNHC)
+    descriptor = cache.kv_cache_tensors[0]
+    if invalid == "empty":
+        descriptor = replace(descriptor, layers=[])
+    elif invalid == "mixed":
+        descriptor = replace(descriptor, layers=list(specs))
+    elif invalid == "unknown":
+        descriptor = replace(descriptor, layers=["unknown.layer"])
+    else:
+        descriptor = replace(descriptor, host_resident=True)
+    with pytest.raises(ValueError, match="known device-only|cannot mix token pages"):
+        cache.num_blocks_of(descriptor)
+
+
+def test_recurrent_cache_budget_keeps_live_states_before_admitting_token_pages(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=2)
+    state, attention = specs.values()
+    budget = 3 * state.page_size_bytes + attention.page_size_bytes
+    with pytest.raises(ValueError, match="recurrent slots and two token pages"):
+        make_recurrent_kv_config(config, specs, budget, 2, KVCacheLayout.LBNHC)
 
 
 @pytest.mark.parametrize("kind", ["features", "custom_state"])

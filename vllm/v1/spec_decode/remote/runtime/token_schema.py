@@ -128,6 +128,30 @@ def _validate_token_target(model) -> None:
 def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
     """Validate the dense KV contract and each layer's attention window."""
     _validate_token_inputs(model, role)
+    if role == "draft" and model.architecture == "NemotronHForCausalLM":
+        hf = model.hf_text_config
+        pattern = getattr(hf, "hybrid_override_pattern", None)
+        if (
+            hf.model_type != "nemotron_h"
+            or hf.architectures != ["NemotronHForCausalLM"]
+            or not model.is_hybrid
+            or not model.has_inner_state
+            or model.use_mla
+            or getattr(hf, "num_nextn_predict_layers", 0) != 0
+            or not isinstance(pattern, str)
+            or len(pattern) != model.get_total_num_hidden_layers()
+            or "M" not in pattern
+            or "*" not in pattern
+            or any(layer not in "M*-" for layer in pattern)
+            or model.get_sliding_window() is not None
+        ):
+            raise ValueError(
+                "token-only recurrent draft requires native Mamba2 and full "
+                "attention without MTP or experts"
+            )
+        if model.quantization is not None or str(model.dtype) != "torch.bfloat16":
+            raise ValueError("token-only recurrent draft requires unquantized bfloat16")
+        return (None,) * model.get_total_num_hidden_layers()
     if role == "draft" and model.architecture == "DeepseekV2ForCausalLM":
         hf = model.hf_text_config
         layers = getattr(hf, "layer_types", None)
@@ -215,6 +239,52 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     ):
         raise ValueError("token-only stateful target requires a single remote endpoint")
     _validate_token_model(draft, "draft")
+    recurrent = draft.architecture == "NemotronHForCausalLM"
+    if recurrent:
+        from vllm.config.mamba import MambaBackendEnum
+
+        if (
+            target.architecture != "Qwen3ForCausalLM"
+            or _validate_token_model(target, "target")
+            != (None,) * target.get_total_num_hidden_layers()
+            or config.cache_config.sliding_window is not None
+        ):
+            raise ValueError("token-only recurrent draft requires a dense Qwen3 target")
+        if target.quantization is not None or str(target.dtype) != "torch.bfloat16":
+            raise ValueError("token-only recurrent draft requires unquantized bfloat16")
+        if (
+            config.parallel_config.tensor_parallel_size != 1
+            or spec.draft_parallel_config.tensor_parallel_size != 1
+        ):
+            raise ValueError(
+                "token-only recurrent draft requires target TP1 and draft TP1"
+            )
+        remote = spec.get_remote_draft_config()
+        if remote is not None and (
+            remote.transport not in ("auto", "inline")
+            or len(spec.get_remote_draft_endpoints()) != 1
+        ):
+            raise ValueError("token-only recurrent draft requires one inline endpoint")
+        cache = config.cache_config
+        if (
+            (spec.kv_cache_dtype or cache.cache_dtype) not in ("auto", "bfloat16")
+            or cache.mamba_cache_dtype not in ("auto", "bfloat16")
+            or cache.mamba_ssm_cache_dtype not in ("auto", "float32")
+        ):
+            raise ValueError(
+                "token-only recurrent draft requires bfloat16 KV/conv and float32 SSM"
+            )
+        if (
+            cache.mamba_cache_mode != "none"
+            or cache.use_replayssm
+            or cache.use_kda_recoverssm
+            or config.mamba_config.backend != MambaBackendEnum.TRITON
+            or config.mamba_config.enable_stochastic_rounding
+        ):
+            raise ValueError(
+                "token-only recurrent draft requires ordinary Mamba state "
+                "with deterministic Triton"
+            )
     if draft.use_mla:
         if (
             target.architecture != "Qwen3ForCausalLM"
@@ -260,6 +330,17 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     draft_special = {key: getattr(draft.hf_config, key, None) for key in target_special}
     if target_special != draft_special:
         raise ValueError("target and draft special token IDs differ")
+    draft_identity = {
+        "model": _model_identity(draft),
+        "method": "draft_model",
+        "k": spec.num_speculative_tokens,
+    }
+    if recurrent:
+        draft_identity["state_contract"] = {
+            "policy": "computed_prefix_replay_v1",
+            "conv_dtype": "bfloat16",
+            "ssm_dtype": "float32",
+        }
     return RuntimeContract(
         schema=TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
         capabilities=SpeculatorPlacementCapabilities(
@@ -276,11 +357,5 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
                 "special_ids": target_special,
             }
         ),
-        draft_fingerprint=_fingerprint(
-            {
-                "model": _model_identity(draft),
-                "method": "draft_model",
-                "k": spec.num_speculative_tokens,
-            }
-        ),
+        draft_fingerprint=_fingerprint(draft_identity),
     )
