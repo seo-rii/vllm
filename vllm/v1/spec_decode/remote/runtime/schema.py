@@ -447,10 +447,10 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
             raise ValueError("standalone multi-module MTP requires target TP1")
         remote = spec.get_remote_draft_config()
         if remote is not None and (
-            remote.transport not in ("auto", "inline")
+            remote.transport not in ("auto", "inline", "cuda_ipc")
             or len(spec.get_remote_draft_endpoints()) != 1
         ):
-            raise ValueError("standalone multi-module MTP requires one inline endpoint")
+            raise ValueError("standalone multi-module MTP requires one endpoint")
 
     hidden_size = target.get_hidden_size()
     dtype = str(target.dtype).removeprefix("torch.")
