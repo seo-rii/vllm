@@ -19,6 +19,12 @@ from vllm.v1.spec_decode.remote.runtime.schema import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+_STATEFUL_TOKEN_TARGETS = (
+    "Qwen3NextForCausalLM",
+    "NemotronHForCausalLM",
+    "Glm4MoeLiteForCausalLM",
+)
+
 _ASSETS = (
     "tokenizer.json",
     "tokenizer.model",
@@ -77,8 +83,8 @@ def tokenizer_artifact_fingerprint(source: str, revision: str | None) -> str:
     return _fingerprint(artifacts)
 
 
-def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
-    """Validate the token/KV contract and return each layer's attention window."""
+def _validate_token_inputs(model, role: str) -> None:
+    """Require native text-only causal tokens in both execution roles."""
     if (
         model.runner_type not in ("generate", "draft")
         or model.using_transformers_backend()
@@ -86,11 +92,8 @@ def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
         or model.is_multimodal_model
         or model.is_diffusion
         or model.is_attention_free
-        or model.is_hybrid
-        or model.has_inner_state
         or model.has_noops
         or model.uses_mrope
-        or model.use_mla
         or not getattr(model.hf_text_config, "is_causal", True)
     ):
         raise ValueError(
@@ -98,6 +101,37 @@ def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
         )
     if model.attention_chunk_size is not None:
         raise ValueError(f"token-only {role} does not support chunked attention")
+    if model.get_total_num_hidden_layers() < 1:
+        raise ValueError(f"token-only {role} requires at least one attention layer")
+
+
+def _validate_token_target(model) -> None:
+    if model.architecture not in _STATEFUL_TOKEN_TARGETS:
+        _validate_token_model(model, "target")
+        return
+    _validate_token_inputs(model, "target")
+    # The verifier owns all target recurrence/MLA state. The remote model
+    # receives only authoritative token deltas and must still pass the dense
+    # draft contract below.
+    if model.architecture == "Glm4MoeLiteForCausalLM":
+        if (
+            not model.use_mla
+            or model.is_hybrid
+            or model.has_inner_state
+            or hasattr(model.hf_text_config, "index_topk")
+        ):
+            raise ValueError("token-only GLM4MoELite target requires dense MLA")
+    elif not model.is_hybrid or not model.has_inner_state or model.use_mla:
+        raise ValueError("token-only hybrid target requires native recurrent state")
+
+
+def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
+    """Validate the dense KV contract and each layer's attention window."""
+    _validate_token_inputs(model, role)
+    if model.is_hybrid or model.has_inner_state or model.use_mla:
+        raise ValueError(
+            f"token-only {role} requires a native decoder-only causal attention model"
+        )
     window = model.get_sliding_window()
     if window is not None and (type(window) is not int or window <= 0):
         raise ValueError(
@@ -105,8 +139,6 @@ def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
         )
     layers = getattr(model.hf_text_config, "layer_types", None)
     num_layers = model.get_total_num_hidden_layers()
-    if num_layers < 1:
-        raise ValueError(f"token-only {role} requires at least one attention layer")
     if layers is None:
         return (window,) * num_layers
     if not isinstance(layers, (list, tuple)) or len(layers) != num_layers:
@@ -153,7 +185,12 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
         raise ValueError(
             "token-only runtime requires the built-in HF tokenizer implementation"
         )
-    _validate_token_model(target, "target")
+    _validate_token_target(target)
+    if (
+        target.architecture in _STATEFUL_TOKEN_TARGETS
+        and len(spec.get_remote_draft_endpoints()) > 1
+    ):
+        raise ValueError("token-only stateful target requires a single remote endpoint")
     _validate_token_model(draft, "draft")
     if target.get_vocab_size() != draft.get_vocab_size():
         raise ValueError("token-only runtime requires equal model vocabulary sizes")

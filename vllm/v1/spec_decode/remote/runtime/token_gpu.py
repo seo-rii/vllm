@@ -12,6 +12,7 @@ import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.gpu import (
@@ -35,6 +36,8 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenStateMachine,
     TokenStepExecutor,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -60,7 +63,7 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
     spec = config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
     windows = _validate_token_model(spec.draft_model_config, "draft")
-    return replace(
+    resource = replace(
         config,
         model_config=spec.draft_model_config,
         parallel_config=spec.draft_parallel_config,
@@ -73,6 +76,7 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
             sliding_window=windows[0] if len(set(windows)) == 1 else None,
         ),
     )
+    return spec.apply_draft_overrides(resource)
 
 
 def validate_token_model_kv_specs(
@@ -133,6 +137,38 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         # target modules, embeddings or output head are constructed here.
         resource = create_token_executor_config(config)
         super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
+
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        layouts = []
+        for group in self.kv_config.kv_cache_groups:
+            layout = group.kv_cache_spec
+            assert isinstance(layout, AttentionSpec)
+            layouts.append(
+                dict(
+                    kind=type(layout).__name__,
+                    layers=len(group.layer_names),
+                    kv_heads=layout.num_kv_heads,
+                    head_size=layout.head_size,
+                    window=getattr(layout, "sliding_window", None),
+                    dtype=str(layout.dtype),
+                )
+            )
+        logger.info(
+            "Token-only draft loaded: speculator=%s model=%s state=%s "
+            "attention_backends=%s kv_layouts=%s",
+            type(self.speculator).__name__,
+            type(self.speculator.model).__name__,
+            type(self.model_state).__name__,
+            sorted(
+                {
+                    group.backend.get_name()
+                    for groups in self.attn_groups
+                    for group in groups
+                }
+            ),
+            layouts,
+        )
 
     def _create_contract(self, config):
         return self._token_contract
