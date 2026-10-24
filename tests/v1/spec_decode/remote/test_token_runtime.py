@@ -2024,18 +2024,123 @@ def test_full_attention_layer_declarations_ignore_unused_window(tmp_path):
     assert create_token_executor_config(config).cache_config.sliding_window is None
 
 
+@pytest.mark.parametrize("family", ["llama", "mistral"])
+def test_token_contract_preserves_independent_mixed_attention_order(tmp_path, family):
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type=family,
+        draft_type=family,
+        target_options={
+            "sliding_window": 32,
+            "layer_types": ["sliding_attention", "full_attention"],
+        },
+        sliding_window=16,
+        layer_types=["full_attention", "sliding_attention"],
+    )
+    contract = create_token_runtime_contract(config)
+    resource = create_token_executor_config(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert resource.cache_config.sliding_window is None
+    assert config.cache_config.sliding_window is None
+    assert resource.model_config.hf_text_config.layer_types == [
+        "full_attention",
+        "sliding_attention",
+    ]
+    assert resource.model_config.get_sliding_window() == 16
+    assert config.model_config.get_sliding_window() == 32
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_token_contract_rejects_mixed_windows_ignored_by_native_qwen(tmp_path, role):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    options = {
+        "sliding_window": 16,
+        "layer_types": ["full_attention", "sliding_attention"],
+        "use_sliding_window": True,
+        "max_window_layers": 2,
+    }
+    config = token_config(
+        tmp_path,
+        target_options=options if role == "target" else None,
+        **(options if role == "draft" else {}),
+    )
+    with pytest.raises(ValueError, match=f"{role} mixed attention requires native"):
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "actual_names,actual_windows,error",
+    [
+        ((1, 0), (16, None), None),
+        ((0, 1), (16, None), "layer 0 differs from its contract"),
+        ((0, 1), (None, 32), "layer 1 differs from its contract"),
+        ((0, 1), (None, None), "layer 1 differs from its contract"),
+        ((0,), (None,), "one attention KV per model layer"),
+        ((0, 0), (None, 16), "indices must be unique and complete"),
+        ((0, 2), (None, 16), "indices must be unique and complete"),
+        ((0, None), (None, 16), "KV must identify its model layer"),
+    ],
+)
+def test_loaded_token_kv_matches_attention_by_layer_not_group_counts(
+    tmp_path, actual_names, actual_windows, error
+):
+    import torch
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+        validate_token_model_kv_specs,
+    )
+
+    config = create_token_executor_config(
+        token_config(
+            tmp_path,
+            draft_type="mistral",
+            sliding_window=16,
+            layer_types=["full_attention", "sliding_attention"],
+        )
+    )
+    specs = {}
+    for n, (index, window) in enumerate(zip(actual_names, actual_windows)):
+        name = "draft.model.attn" if index is None else f"draft.model.layers.{index}"
+        # The duplicate-index case has distinct module names within one layer.
+        name += f".{'self_attn' if n == 0 else 'other_attn'}.attn"
+        geometry = dict(block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float32)
+        specs[name] = (
+            FullAttentionSpec(**geometry)
+            if window is None
+            else SlidingWindowSpec(**geometry, sliding_window=window)
+        )
+    if error is None:
+        validate_token_model_kv_specs(config, specs)
+        assert config.cache_config.sliding_window is None
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate_token_model_kv_specs(config, specs)
+
+
 @pytest.mark.parametrize(
     "options,error_type,reason",
     [
         (
             {"layer_types": ["full_attention", "sliding_attention"]},
             ValueError,
-            "homogeneous full or sliding-window attention",
+            "with a declared sliding window",
         ),
         (
             {"layer_types": ["sliding_attention", "sliding_attention"]},
             ValueError,
-            "homogeneous full or sliding-window attention",
+            "with a declared sliding window",
         ),
         ({"sliding_window": -1}, ValueError, "positive integer sliding window"),
         (
@@ -2056,7 +2161,7 @@ def test_full_attention_layer_declarations_ignore_unused_window(tmp_path):
         ({"is_causal": False}, ValueError, "native decoder-only causal"),
     ],
 )
-def test_token_contract_rejects_nonuniform_or_invalid_attention(
+def test_token_contract_rejects_invalid_attention(
     tmp_path, options, error_type, reason
 ):
     from vllm.v1.spec_decode.remote.runtime.token_schema import (

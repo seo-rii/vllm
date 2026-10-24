@@ -129,20 +129,24 @@ tail KV cannot be treated as committed state.
 
 A standalone loader and forward path reuse native model execution without a
 target shell or a second inference engine. The supported mode is greedy,
-text-only native decoder models with homogeneous causal full or sliding-window
-attention, same-host inline, target TP1 and draft TP1, with no heterogeneous
-vocabulary or parallel drafting. Qwen3, Llama and Mistral are examples; the runtime
-checks model capabilities and the loaded draft's
-actual KV specification rather than requiring a model-type name. Loaded drafts
+text-only native decoder models with causal full or sliding-window attention,
+same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
+parallel drafting. Qwen3, Llama and Mistral support homogeneous attention.
+Llama and Mistral also support a mixture of full and sliding-window layers via
+their checkpoint's `layer_types`. The runtime checks model capabilities and the
+loaded draft's actual per-layer KV specification. Loaded drafts
 must accept token IDs and positions alone and use the default decoder model
 state. Target and
 draft may have different hidden sizes, layer counts, attention geometry and
-window sizes. Each model uses its own attention window; all draft layers must
-share one KV layout and window. The standalone draft retains full-context KV
+window sizes and layer ordering. Each layer uses its own attention window.
+Distinct windows and dense KV head geometry receive separate cache groups with
+disjoint storage. All groups share one dtype, scheduler block size and logical
+block allocation; the KV budget accounts for every layer's page size. The
+standalone draft retains full-context KV
 blocks, including positions outside the current window, so rejection and replay
 never depend on evicted pages. Sliding-window support therefore does not reduce
 the draft KV reservation to the window size.
-Mixed full/sliding attention, chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
+Chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
 multimodal and Transformers-backend execution remain unsupported. Select the built-in
 `tokenizer_mode="hf"` explicitly.
 Tokenizer compatibility is checked against the draft checkpoint's own artifacts,
