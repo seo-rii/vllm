@@ -1055,7 +1055,9 @@ def test_remote_native_mtp_matches_native_and_target(
 ):
     """Compare native and standalone MTP across chunk/window boundaries and reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
+    # GDN/Mamba backends do not implement batch-invariant kernels.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     model = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
@@ -1084,7 +1086,6 @@ def test_remote_native_mtp_matches_native_and_target(
     moe_backend = None if mtp_family == "exaone" else "triton"
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
-    hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     if hybrid_target:
         kwargs.update(mamba_backend="triton", use_replayssm=False)
     if mtp_family == "qwen3_next":
@@ -1100,17 +1101,57 @@ def test_remote_native_mtp_matches_native_and_target(
         [prompts[i] for i in (5, 3, 2, 0)],
     )
     sampling = SamplingParams(
-        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+        temperature=0,
+        max_tokens=8,
+        ignore_eos=True,
+        detokenize=False,
+        logprobs=5 if hybrid_target else None,
     )
+    record_property("comparison", "top5_logprobs" if hybrid_target else "exact_tokens")
+    record_property("batch_invariant", not hybrid_target)
 
     def generate(runner):
         return [
             [
-                list(output.outputs[0].token_ids)
+                (
+                    list(output.outputs[0].token_ids),
+                    output.outputs[0].text,
+                    output.outputs[0].logprobs,
+                )
                 for output in runner.llm.generate(batch, sampling, use_tqdm=False)
             ]
             for batch in batches
         ]
+
+    def compare_outputs(actual, reference, mode):
+        from tests.models.utils import check_logprobs_close
+
+        assert len(actual) == len(reference) == len(batches)
+        mismatches = 0
+        for outputs, expected_outputs, prompts in zip(actual, reference, batches):
+            assert len(outputs) == len(expected_outputs) == len(prompts)
+            assert all(len(output[0]) == 8 for output in outputs)
+            mismatches += sum(
+                token != expected_token
+                for output, expected_output in zip(outputs, expected_outputs)
+                for token, expected_token in zip(output[0], expected_output[0])
+            )
+            if hybrid_target:
+                assert all(
+                    output[2] is not None and len(output[2]) == 8
+                    for output in (*outputs, *expected_outputs)
+                )
+                check_logprobs_close(
+                    outputs_0_lst=expected_outputs,
+                    outputs_1_lst=outputs,
+                    name_0="target",
+                    name_1=mode,
+                )
+            else:
+                assert [output[0] for output in outputs] == [
+                    output[0] for output in expected_outputs
+                ]
+        record_property(f"{mode}.token_mismatches", mismatches)
 
     def speculation_counts(runner, mode):
         runner.llm.llm_engine.do_log_stats()
@@ -1305,7 +1346,7 @@ def test_remote_native_mtp_matches_native_and_target(
         record_property("target.moe_backends", backends)
         check_recurrence(baseline, "target")
         expected = generate(baseline)
-    assert all(len(tokens) == 8 for batch in expected for tokens in batch)
+    assert all(len(output[0]) == 8 for batch in expected for output in batch)
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
         policy = native.llm.collective_rpc(draft_kv_policy)
         spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
@@ -1325,7 +1366,7 @@ def test_remote_native_mtp_matches_native_and_target(
         assert recurrent_layers == [0]
         record_property("native.recurrent_layers", recurrent_layers)
         native_recurrence = check_recurrence(native, "native")
-        assert generate(native) == expected
+        compare_outputs(generate(native), expected, "native")
         native_counts = speculation_counts(native, "native")
     server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
@@ -1354,7 +1395,7 @@ def test_remote_native_mtp_matches_native_and_target(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
             assert check_recurrence(remote, "remote") == native_recurrence
-            assert generate(remote) == expected
+            compare_outputs(generate(remote), expected, "remote")
             assert speculation_counts(remote, "remote") == native_counts
     if dense_mla:
         assert any(
