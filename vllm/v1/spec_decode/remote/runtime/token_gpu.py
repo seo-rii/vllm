@@ -84,14 +84,33 @@ def validate_token_model_kv_specs(
 ) -> None:
     """Verify loaded attention semantics by layer index, not group counts."""
     from vllm.model_executor.models.utils import extract_layer_index
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
+    )
     from vllm.v1.spec_decode.remote.runtime.kv_layout import (
         group_standalone_kv_specs,
     )
 
     expected = _validate_token_model(config.model_config, "draft")
     groups = group_standalone_kv_specs(specs)
-    if any(
+    if config.model_config.use_mla:
+        for group in groups:
+            layout = group.kv_cache_spec
+            if type(layout) is not MLAAttentionSpec:
+                raise ValueError("token-only loaded draft requires MLA KV")
+            if layout.topk_buffer_width is not None or layout.alignment is not None:
+                raise ValueError(
+                    "token-only draft requires dense MLA without an indexer"
+                )
+            if (
+                layout.head_size != config.model_config.get_head_size()
+                or layout.dtype != config.model_config.dtype
+                or layout.block_size != config.cache_config.block_size
+            ):
+                raise ValueError("token-only loaded MLA KV geometry differs from model")
+    elif any(
         type(group.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
         for group in groups
     ):
@@ -220,6 +239,12 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             or len({row.req_index for row in rows}) != len(rows)
         ):
             raise ValueError("token forward must fit the configured batch budgets")
+        original_indices = list(range(len(rows)))
+        if self.vllm_config.model_config.use_mla:
+            # MLA metadata expects a uniform short-query prefix, followed by
+            # longer prefills. Preserve caller identities when returning tokens.
+            original_indices.sort(key=lambda index: len(rows[index].tokens))
+            rows = tuple(rows[index] for index in original_indices)
         lengths = np.array([len(row.tokens) for row in rows], dtype=np.int32)
         starts = np.array([row.start for row in rows], dtype=np.int32)
         qsl = np.concatenate(
@@ -306,7 +331,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
                     None,
                 )
                 for row, token in zip(sample_rows, sampled.cpu().tolist()):
-                    result[row] = int(token)
+                    result[original_indices[row]] = int(token)
             else:
                 # Prefill/K0 must complete before ACK and shared buffer reuse.
                 torch.accelerator.synchronize(self.device)

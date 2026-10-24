@@ -155,7 +155,19 @@ only committed token IDs reach the independent draft. This uses
 Their target-state recovery must use the native verifier, not draft KV replay.
 These combinations require the same tokenizer contract as dense targets.
 
-Sparse MLA targets and recurrent, hybrid or MLA drafts remain unsupported.
+An independent native `DeepseekV2ForCausalLM` draft supports dense MLA with a
+native full-attention `Qwen3ForCausalLM` target. Both models must use unquantized
+BF16 weights, target TP1 and draft TP1, with one inline endpoint and BF16 KV
+(`kv_cache_dtype="auto"` or `"bfloat16"`). This is the complete standalone
+language model, not a DeepSeek MTP head. Target and draft need identical
+tokenizer artifacts but may have different hidden sizes and attention geometry.
+The runtime validates the loaded latent-cache width, dtype, block size and
+complete layer indices; it reuses the same bounded KV allocator and
+authoritative token correction path. Sparse indexers, sliding-window MLA,
+compressed/quantized MLA caches and pooled MLA drafts are not supported.
+
+Sparse MLA targets and recurrent or hybrid drafts remain unsupported. Other MLA
+draft architectures and target/draft combinations remain unsupported.
 Chunked attention, encoder-decoder, multimodal and Transformers-backend models
 remain unsupported in either role. Select the built-in `tokenizer_mode="hf"`
 explicitly.
@@ -179,7 +191,7 @@ model state, attention backends and KV geometry.
 For a native local comparison using different target/draft head geometry,
 set the public speculative option `kv_cache_dtype="auto"` when the target KV
 cache also uses `auto`; this selects native draft metadata without changing
-cache precision. For a dense MLA target with a dense draft, select native
+cache precision. When either the target or draft uses dense MLA, select native
 attention by KV kind:
 
 ```python
