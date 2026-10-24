@@ -155,7 +155,19 @@ only committed token IDs reach the independent draft. This uses
 Their target-state recovery must use the native verifier, not draft KV replay.
 These combinations require the same tokenizer contract as dense targets.
 
-Sparse MLA targets and recurrent, hybrid or MLA drafts remain unsupported.
+An independent native `DeepseekV2ForCausalLM` draft supports dense MLA with a
+native full-attention `Qwen3ForCausalLM` target. Both models must use unquantized
+BF16 weights, target TP1 and draft TP1, with one inline endpoint and BF16 KV
+(`kv_cache_dtype="auto"` or `"bfloat16"`). This is the complete standalone
+language model, not a DeepSeek MTP head. Target and draft need identical
+tokenizer artifacts but may have different hidden sizes and attention geometry.
+The runtime validates the loaded latent-cache width, dtype, block size and
+complete layer indices; it reuses the same bounded KV allocator and
+authoritative token correction path. Sparse indexers, sliding-window MLA,
+compressed/quantized MLA caches and pooled MLA drafts are not supported.
+
+Sparse MLA targets and recurrent or hybrid drafts remain unsupported. Other MLA
+draft architectures and target/draft combinations remain unsupported.
 Chunked attention, encoder-decoder, multimodal and Transformers-backend models
 remain unsupported in either role. Select the built-in `tokenizer_mode="hf"`
 explicitly.
@@ -179,7 +191,7 @@ model state, attention backends and KV geometry.
 For a native local comparison using different target/draft head geometry,
 set the public speculative option `kv_cache_dtype="auto"` when the target KV
 cache also uses `auto`; this selects native draft metadata without changing
-cache precision. For a dense MLA target with a dense draft, select native
+cache precision. When either the target or draft uses dense MLA, select native
 attention by KV kind:
 
 ```python
@@ -198,6 +210,17 @@ use their native GDN or Mamba kernels; the token server never executes those
 target layers. Native and remote comparisons must retain the same target kernel
 settings and inspect the loaded draft backend, rather than assuming a requested
 backend string was used.
+
+Native Qwen3-target/MLA-draft execution currently builds draft metadata with
+the target's head dimension, even with explicit draft KV dtype. A routed draft
+also requires an expert group that a dense native target does not initialize.
+The standalone server owns its draft configuration and distributed groups.
+DeepSeek-V2 validation compares both dense-FFN and routed-expert remote serving
+against target-only output, with actual accepted drafts. A separate standalone
+native DeepSeek-V2 LLM checks proposal tokens from authoritative committed
+prefixes after the remote executor exits. Exact latent-KV replay retains the
+same attention paths; the standalone token check uses full-prefix execution.
+These controls do not establish native mixed local placement parity.
 
 For the verifier, combine `tokenizer_mode="hf"` with this speculative configuration:
 

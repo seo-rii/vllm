@@ -128,6 +128,29 @@ def _validate_token_target(model) -> None:
 def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
     """Validate the dense KV contract and each layer's attention window."""
     _validate_token_inputs(model, role)
+    if role == "draft" and model.architecture == "DeepseekV2ForCausalLM":
+        hf = model.hf_text_config
+        layers = getattr(hf, "layer_types", None)
+        if (
+            hf.model_type != "deepseek_v2"
+            or hf.architectures != ["DeepseekV2ForCausalLM"]
+            or not model.use_mla
+            or model.is_hybrid
+            or model.has_inner_state
+            or hasattr(hf, "index_topk")
+            or model.get_sliding_window() is not None
+            or (
+                layers is not None
+                and (
+                    len(layers) != model.get_total_num_hidden_layers()
+                    or any(layer != "full_attention" for layer in layers)
+                )
+            )
+        ):
+            raise ValueError("token-only draft requires dense MLA without an indexer")
+        if model.quantization is not None or str(model.dtype) != "torch.bfloat16":
+            raise ValueError("token-only MLA draft requires unquantized bfloat16")
+        return (None,) * model.get_total_num_hidden_layers()
     if model.is_hybrid or model.has_inner_state or model.use_mla:
         raise ValueError(
             f"token-only {role} requires a native decoder-only causal attention model"
@@ -192,6 +215,32 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     ):
         raise ValueError("token-only stateful target requires a single remote endpoint")
     _validate_token_model(draft, "draft")
+    if draft.use_mla:
+        if (
+            target.architecture != "Qwen3ForCausalLM"
+            or _validate_token_model(target, "target")
+            != (None,) * target.get_total_num_hidden_layers()
+            or config.cache_config.sliding_window is not None
+        ):
+            raise ValueError("token-only MLA draft requires a dense Qwen3 target")
+        if target.quantization is not None or str(target.dtype) != "torch.bfloat16":
+            raise ValueError("token-only MLA draft requires unquantized bfloat16")
+        if (
+            config.parallel_config.tensor_parallel_size != 1
+            or spec.draft_parallel_config.tensor_parallel_size != 1
+        ):
+            raise ValueError("token-only MLA draft requires target TP1 and draft TP1")
+        remote = spec.get_remote_draft_config()
+        if remote is not None and (
+            remote.transport not in ("auto", "inline")
+            or len(spec.get_remote_draft_endpoints()) != 1
+        ):
+            raise ValueError("token-only MLA draft requires one inline endpoint")
+        if (spec.kv_cache_dtype or config.cache_config.cache_dtype) not in (
+            "auto",
+            "bfloat16",
+        ):
+            raise ValueError("token-only MLA draft requires bfloat16 KV")
     if target.get_vocab_size() != draft.get_vocab_size():
         raise ValueError("token-only runtime requires equal model vocabulary sizes")
     if target.max_model_len > draft.max_model_len:
