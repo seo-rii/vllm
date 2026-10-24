@@ -4,6 +4,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 import pytest
 from huggingface_hub.errors import (
@@ -1840,6 +1841,8 @@ def token_config(
     target_type="qwen3",
     draft_type="qwen3",
     target_options=None,
+    spec_options=None,
+    attention_config=None,
     **draft_options,
 ):
     import torch
@@ -1847,13 +1850,17 @@ def token_config(
     from tokenizers.models import WordLevel
     from transformers import (
         AutoModelForCausalLM,
+        Glm4MoeLiteConfig,
         LlamaConfig,
         MistralConfig,
+        NemotronHConfig,
         Qwen3Config,
+        Qwen3NextConfig,
         TokenizersBackend,
     )
 
     from vllm.config import (
+        AttentionConfig,
         CacheConfig,
         DeviceConfig,
         ModelConfig,
@@ -1867,6 +1874,9 @@ def token_config(
         "qwen3": (Qwen3Config, "Qwen3ForCausalLM"),
         "llama": (LlamaConfig, "LlamaForCausalLM"),
         "mistral": (MistralConfig, "MistralForCausalLM"),
+        "qwen3_next": (Qwen3NextConfig, "Qwen3NextForCausalLM"),
+        "nemotron_h": (NemotronHConfig, "NemotronHForCausalLM"),
+        "glm4_moe_lite": (Glm4MoeLiteConfig, "Glm4MoeLiteForCausalLM"),
     }
     tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
@@ -1877,6 +1887,44 @@ def token_config(
 
     def model(path, family, *, hidden_size, **options):
         hf_class, architecture = families[family]
+        family_options: dict[str, Any] = {
+            "mistral": {"sliding_window": None},
+            "qwen3_next": {
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32,
+            },
+            "nemotron_h": {
+                "layers_block_type": ["linear_attention", "full_attention"],
+                "mamba_num_heads": 2,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 8,
+                "n_groups": 1,
+                "conv_kernel": 4,
+                "chunk_size": 32,
+            },
+            "glm4_moe_lite": {
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "n_group": 1,
+                "topk_group": 1,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
+        }.get(family, {})
         hf = hf_class(
             architectures=[architecture],
             hidden_size=hidden_size,
@@ -1890,7 +1938,7 @@ def token_config(
             bos_token_id=0,
             eos_token_id=1,
             pad_token_id=2,
-            **(({"sliding_window": None} if family == "mistral" else {}) | options),
+            **(family_options | options),
         )
         with torch.random.fork_rng():
             torch.manual_seed(0)
@@ -1912,14 +1960,15 @@ def token_config(
     spec = SpeculativeConfig(
         model=draft.model,
         method="draft_model",
-        num_speculative_tokens=3,
         target_model_config=target,
         target_parallel_config=parallel,
+        **({"num_speculative_tokens": 3} | (spec_options or {})),
     )
     return VllmConfig(
         model_config=target,
         parallel_config=parallel,
         speculative_config=spec,
+        attention_config=attention_config or AttentionConfig(),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=64,
@@ -1941,6 +1990,112 @@ def token_config(
         ),
         device_config=DeviceConfig("cpu"),
     )
+
+
+@pytest.mark.parametrize("family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_token_contract_keeps_recurrent_and_mla_state_on_target(tmp_path, family, k):
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path, target_type=family, spec_options={"num_speculative_tokens": k}
+    )
+    contract = create_token_runtime_contract(config)
+    resource = create_token_executor_config(config)
+    assert config.model_config.is_hybrid == (family != "glm4_moe_lite")
+    assert config.model_config.use_mla == (family == "glm4_moe_lite")
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.num_prefill_lookahead == 0
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert resource.model_config.architecture == "Qwen3ForCausalLM"
+    assert not resource.model_config.is_hybrid and not resource.model_config.use_mla
+    assert not resource.model_config.has_inner_state
+
+
+@pytest.mark.parametrize("family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+def test_token_contract_still_rejects_recurrent_and_mla_drafts(tmp_path, family):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import _validate_token_model
+
+    # SpeculativeConfig can reinterpret these checkpoints as MTP. Exercise the
+    # dense-draft gate on their real original ModelConfig, without that rewrite.
+    config = token_config(tmp_path, target_type=family)
+    with pytest.raises(
+        ValueError, match="token-only draft requires a native decoder-only"
+    ):
+        _validate_token_model(config.model_config, "draft")
+
+
+@pytest.mark.parametrize(
+    "family,options,reason",
+    [
+        ("glm4_moe_lite", {"index_topk": 8}, "dense MLA"),
+        ("qwen3_next", {"is_causal": False}, "native decoder-only causal"),
+        ("nemotron_h", {"attention_chunk_size": 16}, "chunked attention"),
+    ],
+)
+def test_token_target_extension_preserves_unsupported_state_checks(
+    tmp_path, family, options, reason
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(tmp_path, target_type=family, target_options=options)
+    with pytest.raises(ValueError, match=reason):
+        create_token_runtime_contract(config)
+
+
+def test_token_recurrent_target_requires_single_endpoint(tmp_path):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type="qwen3_next",
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/draft-a.sock", "unix:///tmp/draft-b.sock"],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="target requires a single remote endpoint"):
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize("kv_dtype", [None, "auto"])
+def test_token_executor_applies_draft_backends_without_mutating_target(
+    tmp_path, kv_dtype
+):
+    from vllm.config import AttentionConfig
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type="glm4_moe_lite",
+        attention_config=AttentionConfig(backend="TRITON_MLA"),
+        spec_options={"attention_backend": "TRITON_ATTN", "kv_cache_dtype": kv_dtype},
+    )
+    resource = create_token_executor_config(config)
+    assert resource.attention_config.backend is not None
+    assert resource.attention_config.backend.name == "TRITON_ATTN"
+    assert config.attention_config.backend.name == "TRITON_MLA"
+    assert resource.attention_config is not config.attention_config
+    assert (
+        resource.cache_config.cache_dtype == config.cache_config.cache_dtype == "auto"
+    )
+    assert resource.cache_config is not config.cache_config
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert resource.model_config.get_head_size() != config.model_config.get_head_size()
 
 
 @pytest.mark.parametrize(
