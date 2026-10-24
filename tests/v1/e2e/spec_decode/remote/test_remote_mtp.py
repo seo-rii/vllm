@@ -1669,6 +1669,8 @@ def _run_two_module_oracle(model_path: str, result_path: str) -> None:
         prefill(key, ids, features, chunked=True)
     recovery = [17, 23, 29]
     drafts: list[list[int]] = [[], [], []]
+    max_model_len = config.model_config.max_model_len
+    max_length_truncations = []
     # Each accepted count refers to the preceding submitted K, including zero.
     rounds = [
         (2, (0, 0, 0)),
@@ -1687,11 +1689,25 @@ def _run_two_module_oracle(model_path: str, result_path: str) -> None:
             if step == 0:
                 query, positions, features = [], [], hidden[row][:0]
             else:
-                assert accepted[row] <= len(drafts[row])
-                query = [recovery[row], *drafts[row]]
                 start = len(tokens[row])
+                # Match scheduler admission, including the target's bonus slot.
+                max_query_tokens = max_model_len - start - 1
+                assert max_query_tokens >= 1
+                submitted_drafts = drafts[row][: max_query_tokens - 1]
+                assert accepted[row] <= len(submitted_drafts)
+                if len(submitted_drafts) < len(drafts[row]):
+                    max_length_truncations.append(
+                        {
+                            "round": step,
+                            "row": row,
+                            "start": start,
+                            "returned_k": len(drafts[row]),
+                            "submitted_k": len(submitted_drafts),
+                        }
+                    )
+                query = [recovery[row], *submitted_drafts]
                 positions = list(range(start, start + len(query)))
-                assert positions[-1] < 128
+                assert positions[-1] < max_model_len - 1
                 features = target_features(tokens[row] + query)[start:]
                 valid = accepted[row] + 1
                 tokens[row] += query[:valid]
@@ -1723,6 +1739,9 @@ def _run_two_module_oracle(model_path: str, result_path: str) -> None:
                 f"round-{step}",
             )
         recovery = next_recovery
+    assert max_length_truncations == [
+        {"round": 7, "row": 2, "start": 126, "returned_k": 2, "submitted_k": 0}
+    ]
     adapter.close_sequences(tuple(keys))
     assert adapter.planner.num_open == 0
     # Reuse the same external ID and request slot with a fresh generation.
@@ -1747,6 +1766,7 @@ def _run_two_module_oracle(model_path: str, result_path: str) -> None:
                 "target_features": "real ExaoneMoeForCausalLM eager CPU forward",
                 "comparison": "exact proposals and authoritative per-module KV",
                 "checks": checks,
+                "max_length_truncations": max_length_truncations,
             },
             indent=2,
         )
@@ -1791,4 +1811,7 @@ def test_remote_two_module_mtp_dynamic_k_matches_full_prefix(
     assert len(receipt["checks"]) == 26
     assert {check["effective_k"] for check in receipt["checks"]} == {0, 1, 2}
     assert max(check["length"] for check in receipt["checks"]) == 127
+    assert receipt["max_length_truncations"] == [
+        {"round": 7, "row": 2, "start": 126, "returned_k": 2, "submitted_k": 0}
+    ]
     record_property("native.full_prefix_oracle", receipt)
