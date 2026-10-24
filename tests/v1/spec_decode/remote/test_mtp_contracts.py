@@ -30,6 +30,12 @@ MODELS = (
     ("nemotron_h", "NemotronHForCausalLM", "NemotronHMTPModel", 3),
     ("hy_v3", "HYV3ForCausalLM", "HYV3MTPModel", 3),
 )
+NEMOTRON_EMBEDDING_NAMES = (
+    "model.embed_tokens.weight",
+    "model.embeddings.weight",
+    "backbone.embed_tokens.weight",
+    "backbone.embeddings.weight",
+)
 
 pytestmark = pytest.mark.usefixtures("cpu_parallel_state")
 
@@ -187,8 +193,9 @@ def test_glm_dense_mla_contract_rejects_sparse_indexer_variant():
         create_runtime_contract(config)
 
 
+@pytest.mark.parametrize("embedding_name", NEMOTRON_EMBEDDING_NAMES)
 def test_nemotron_shared_embedding_uses_checkpoint_mapper_and_pinned_revision(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, embedding_name
 ):
     import vllm.v1.spec_decode.remote.runtime.weights as weights
 
@@ -199,7 +206,7 @@ def test_nemotron_shared_embedding_uses_checkpoint_mapper_and_pinned_revision(
     calls = []
 
     save_file(
-        {"backbone.embeddings.weight": embedding, "lm_head.weight": head},
+        {embedding_name: embedding, "lm_head.weight": head},
         tmp_path / "model.safetensors",
     )
 
@@ -219,9 +226,7 @@ def test_nemotron_shared_embedding_uses_checkpoint_mapper_and_pinned_revision(
     ]
 
 
-@pytest.mark.parametrize(
-    "embedding_name", ["model.embed_tokens.weight", "backbone.embeddings.weight"]
-)
+@pytest.mark.parametrize("embedding_name", NEMOTRON_EMBEDDING_NAMES)
 def test_tied_nemotron_checkpoint_needs_no_separate_head(tmp_path, embedding_name):
     config = _config("nemotron_h", "NemotronHForCausalLM", 3).model_config
     config.model = str(tmp_path)
@@ -229,6 +234,8 @@ def test_tied_nemotron_checkpoint_needs_no_separate_head(tmp_path, embedding_nam
     embedding = torch.randn(32, 16, dtype=torch.bfloat16)
     save_file({embedding_name: embedding}, tmp_path / "model.safetensors")
     shell = materialize_target_shell(config, torch.device("cpu"))
+    assert shell.model.embed_tokens.weight is shell.lm_head.weight
+    torch.testing.assert_close(shell.model.embed_tokens.weight[:32], embedding)
     torch.testing.assert_close(shell.lm_head.weight[:32], embedding)
 
 
@@ -275,16 +282,27 @@ def test_shared_weight_storage_preserves_tying(tmp_path, device, tied, include_h
     )
 
 
-def test_conflicting_nemotron_embedding_aliases_are_rejected(tmp_path):
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize(
+    "embedding_names",
+    [
+        ("model.embed_tokens.weight", "backbone.embeddings.weight"),
+        ("model.embed_tokens.weight", "model.embeddings.weight"),
+        ("backbone.embeddings.weight", "backbone.embed_tokens.weight"),
+    ],
+)
+def test_conflicting_nemotron_embedding_aliases_are_rejected(
+    tmp_path, tied, embedding_names
+):
     config = _config("nemotron_h", "NemotronHForCausalLM", 3).model_config
     config.model = str(tmp_path)
-    save_file(
-        {
-            "model.embed_tokens.weight": torch.zeros(32, 16),
-            "backbone.embeddings.weight": torch.ones(32, 16),
-        },
-        tmp_path / "model.safetensors",
-    )
+    config.hf_config.tie_word_embeddings = tied
+    # Even identical values cannot disambiguate two checkpoint names that map
+    # to the same native embedding parameter.
+    checkpoint = {name: torch.zeros(32, 16) for name in embedding_names}
+    if not tied:
+        checkpoint["lm_head.weight"] = torch.ones(32, 16)
+    save_file(checkpoint, tmp_path / "model.safetensors")
     with pytest.raises(ValueError, match="exactly one embedding weight"):
         materialize_target_shell(config, torch.device("cpu"))
 
