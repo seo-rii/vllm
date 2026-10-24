@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native entrypoint/metadata CPU controls; model, attention and CUDA are doubles."""
+"""Native CPU model/metadata and isolated execution-boundary controls."""
 
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -122,10 +126,8 @@ def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
     }
 
 
-def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(
-    tmp_path, monkeypatch
-):
-    """Native checkpoint export metadata does not reserve align-mode states."""
+def _run_recurrent_native_cache_allocation(tmp_path):
+    """Load native state in a fresh process without changing the test worker."""
     from safetensors import safe_open
 
     import vllm.ir
@@ -148,7 +150,10 @@ def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(
     from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
     from vllm.v1.worker.utils import allocate_kv_cache
 
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    tmp_path = Path(tmp_path)
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+    assert os.environ["VLLM_TARGET_DEVICE"] == "cpu"
+    assert os.environ["VLLM_BATCH_INVARIANT"] == "0"
     config = create_recurrent_executor_config(
         token_config(
             tmp_path,
@@ -234,6 +239,40 @@ def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(
                 destroy_distributed_environment()
     assert not torch.distributed.is_initialized()
     assert not torch.cuda.is_initialized()
+
+
+def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(tmp_path):
+    """Native checkpoint export metadata does not reserve align-mode states."""
+    before = torch.cuda.is_initialized(), torch.distributed.is_initialized()
+    log_path = tmp_path / "native-cache-spec.log"
+    try:
+        with log_path.open("w") as log:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from tests.v1.spec_decode.remote.test_token_gpu "
+                    "import _run_recurrent_native_cache_allocation; "
+                    "_run_recurrent_native_cache_allocation(sys.argv[1])",
+                    str(tmp_path),
+                ],
+                cwd=Path(__file__).resolve().parents[4],
+                env=dict(
+                    os.environ,
+                    CUDA_VISIBLE_DEVICES="",
+                    VLLM_TARGET_DEVICE="cpu",
+                    VLLM_BATCH_INVARIANT="0",
+                ),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+            )
+    finally:
+        assert (
+            torch.cuda.is_initialized(),
+            torch.distributed.is_initialized(),
+        ) == before
+    assert result.returncode == 0, log_path.read_text()[-12000:]
 
 
 @pytest.mark.parametrize("attention_blocks,recurrent_blocks", [(9, 3), (2, 5)])
