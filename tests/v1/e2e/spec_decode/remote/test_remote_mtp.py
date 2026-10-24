@@ -1747,7 +1747,7 @@ def _check_independent_recurrent_state(model, model_state, config):
     assert (attn_spec.num_kv_heads, attn_spec.head_size, attn_spec.block_size) == (
         2,
         32,
-        16,
+        config.cache_config.block_size,
     )
     assert attn_spec.dtype == torch.bfloat16
     assert attention[0].get_attn_backend().get_name() == "TRITON_ATTN"
@@ -1765,6 +1765,8 @@ def _check_independent_recurrent_state(model, model_state, config):
         attention_backend="TRITON_ATTN",
         attention_heads=attn_spec.num_kv_heads,
         attention_head_size=attn_spec.head_size,
+        attention_block_size=attn_spec.block_size,
+        configured_attention_block_size=config.cache_config.block_size,
     )
 
 
@@ -3019,6 +3021,12 @@ def _run_independent_recurrent_oracle(
     assert identity["state_slots"] == live_slots + 1
     assert executor.kv_config.kv_cache_tensors[0].size == budget
     assert executor.max_num_reqs == 1
+    assert identity["attention_block_size"] == 16
+    assert [
+        group.kv_cache_spec
+        for group in executor.kv_config.kv_cache_groups
+        if type(group.kv_cache_spec) is FullAttentionSpec
+    ] == [attention_spec]
     assert [
         group.kv_cache_spec
         for group in executor.kv_config.kv_cache_groups
@@ -3434,13 +3442,64 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
     cases = receipt["proposal_references"]
 
     def identity(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MambaSpec,
+            iter_layer_specs,
+        )
+
         runner = worker.model_runner
+        config = worker.vllm_config
         result = _check_independent_recurrent_state(
-            runner.get_model(), runner.model_state, worker.vllm_config
+            runner.get_model(), runner.model_state, config
         )
         result["checkpoint_weights"] = _check_independent_recurrent_weights(
             runner.get_model(), draft
         )
+        groups = runner.kv_cache_config.kv_cache_groups
+        attention = next(
+            layer
+            for layer in runner.get_model().modules()
+            if isinstance(layer, Attention)
+        )
+        public_attention_spec = attention.get_kv_cache_spec(config)
+        assert type(public_attention_spec) is FullAttentionSpec
+        full_specs = []
+        native_groups = []
+        for index, group in enumerate(groups):
+            specs = list(iter_layer_specs(group.kv_cache_spec))
+            assert len(specs) == 1
+            spec = specs[0]
+            assert isinstance(spec, (FullAttentionSpec, MambaSpec))
+            if type(spec) is FullAttentionSpec:
+                assert group.layer_names == [attention.layer_name]
+                assert (
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    spec.dtype,
+                ) == (
+                    public_attention_spec.num_kv_heads,
+                    public_attention_spec.head_size,
+                    public_attention_spec.dtype,
+                )
+                full_specs.append(spec)
+            native_groups.append(
+                dict(
+                    kind=type(spec).__name__,
+                    layers=list(group.layer_names),
+                    block_size=spec.block_size,
+                    page_size_bytes=spec.page_size_bytes,
+                    page_size_padded=spec.page_size_padded,
+                    kernel_block_size=runner.kernel_block_sizes[index],
+                )
+            )
+        assert len(full_specs) == 1
+        assert {group["kind"] for group in native_groups} == {
+            "FullAttentionSpec",
+            "MambaSpec",
+        }
+        result["kv_groups"] = native_groups
         return result
 
     observations = []
