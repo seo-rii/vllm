@@ -1493,11 +1493,14 @@ def _tiny_independent_qwen3_draft(tmp_path, target_path):
 
 
 @pytest.fixture
-def tiny_independent_mla_models(tmp_path):
-    return _tiny_independent_mla_models(tmp_path)
+def tiny_independent_mla_models(tmp_path, request):
+    return _tiny_independent_mla_models(
+        tmp_path,
+        dense_ffn=getattr(request, "param", "moe") == "dense",
+    )
 
 
-def _tiny_independent_mla_models(tmp_path):
+def _tiny_independent_mla_models(tmp_path, *, dense_ffn=False):
     """Real independent MLA weights; fixed heads exercise accepted-state paths."""
     import hashlib
     import json
@@ -1540,11 +1543,11 @@ def _tiny_independent_mla_models(tmp_path):
         qk_nope_head_dim=192,
         qk_rope_head_dim=64,
         v_head_dim=256,
-        n_routed_experts=4,
+        n_routed_experts=0 if dense_ffn else 4,
         n_shared_experts=1,
         num_experts_per_tok=2,
         moe_intermediate_size=128,
-        first_k_dense_replace=1,
+        first_k_dense_replace=2 if dense_ffn else 1,
         n_group=1,
         topk_group=1,
         topk_method="greedy",
@@ -1583,6 +1586,9 @@ def _tiny_independent_mla_models(tmp_path):
                 target_architecture="Qwen3ForCausalLM",
                 draft_architecture="DeepseekV2ForCausalLM",
                 independent_full_model=True,
+                ffn_layout="dense" if dense_ffn else "moe",
+                routed_experts=0 if dense_ffn else 4,
+                first_k_dense_replace=2 if dense_ffn else 1,
                 target_hidden_size=64,
                 draft_hidden_size=128,
                 latent_width=576,
@@ -1634,22 +1640,22 @@ def _check_independent_mla_weights(model, model_path):
                 f"{prefix}.self_attn.kv_a_proj_with_mqa.weight",
             ],
         )
+        experts = [
+            module
+            for module in layer.mlp.modules()
+            if isinstance(module, RoutedExperts)
+        ]
         dense = (
-            [(layer.mlp, f"{prefix}.mlp")]
-            if index == 0
-            else [(layer.mlp.shared_experts, f"{prefix}.mlp.shared_experts")]
+            [(layer.mlp.shared_experts, f"{prefix}.mlp.shared_experts")]
+            if experts
+            else [(layer.mlp, f"{prefix}.mlp")]
         )
         for mlp, name in dense:
             equal(
                 mlp.gate_up_proj.weight,
                 [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"],
             )
-        if index == 1:
-            experts = [
-                module
-                for module in layer.mlp.modules()
-                if isinstance(module, RoutedExperts)
-            ]
+        if experts:
             assert len(experts) == 1
             method = experts[0].quant_method
             assert isinstance(method, UnquantizedFusedMoEMethod)
@@ -1742,8 +1748,9 @@ def test_remote_independent_draft_with_hybrid_or_mla_target(
     )
 
 
+@pytest.mark.parametrize("tiny_independent_mla_models", ["dense", "moe"], indirect=True)
 @pytest.mark.parametrize("k", [1, 3])
-def test_remote_independent_mla_draft_matches_native_and_target(
+def test_remote_independent_mla_draft_preserves_target(
     vllm_runner,
     monkeypatch,
     tmp_path,
@@ -1752,11 +1759,12 @@ def test_remote_independent_mla_draft_matches_native_and_target(
     tiny_independent_mla_models,
     record_property,
 ):
-    """Preserve native standalone AR proposals with a distinct dense-MLA draft."""
+    """Check native parity for dense FFNs and original MoE remote correctness."""
     import json
 
     target, draft = tiny_independent_mla_models
-    record_property("fixture", json.loads((tmp_path / "mla-fixture.json").read_text()))
+    fixture = json.loads((tmp_path / "mla-fixture.json").read_text())
+    record_property("fixture", fixture)
     _compare_native_and_remote_draft(
         vllm_runner,
         monkeypatch,
@@ -1769,6 +1777,7 @@ def test_remote_independent_mla_draft_matches_native_and_target(
         target_model=target,
         independent_draft=draft,
         independent_draft_kind="deepseek_v2",
+        native_control=fixture["ffn_layout"] == "dense",
     )
 
 
@@ -1819,10 +1828,21 @@ def _compare_native_and_remote_draft(
     independent_draft_kind="qwen3",
     target_model=None,
     eagle3_draft=None,
+    native_control=True,
 ):
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     independent = independent_draft is not None
     mla_draft = independent and independent_draft_kind == "deepseek_v2"
+    if not native_control:
+        import json
+
+        assert mla_draft
+        assert (
+            json.loads((Path(independent_draft) / "config.json").read_text())[
+                "n_routed_experts"
+            ]
+            == 4
+        )
     eagle3 = eagle3_draft is not None
     detailed = independent or eagle3
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
@@ -1902,7 +1922,16 @@ def _compare_native_and_remote_draft(
         "target_comparison",
         "top5_logprobs" if compare_target_logprobs else "exact_tokens",
     )
-    record_property("placement_comparison", "exact_tokens")
+    record_property(
+        "placement_comparison",
+        "exact_tokens" if native_control else "remote_target_exact_tokens",
+    )
+    if not native_control:
+        record_property(
+            "native.unavailable",
+            "Dense target does not initialize the expert group required by the "
+            "native MoE draft; this case makes no native placement parity claim.",
+        )
     record_property("batch_invariant", not hybrid_target)
 
     def generate(runner, mode):
@@ -2288,6 +2317,14 @@ def _compare_native_and_remote_draft(
         if mla_draft:
             assert worker.vllm_config.speculative_config.method == "draft_model"
             assert config.model_config.use_mla and not draft.use_mha
+            from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLP
+
+            assert draft.config.n_routed_experts == 0
+            assert draft.config.first_k_dense_replace == 2
+            assert len(draft.model.layers) == 2
+            assert all(
+                isinstance(layer.mlp, DeepseekV2MLP) for layer in draft.model.layers
+            )
             assert mla_layout(draft) == [expected_mla_layout] * 2
             for groups in speculator.attn_groups:
                 for group in groups:
@@ -2309,6 +2346,7 @@ def _compare_native_and_remote_draft(
                     for group in groups
                 ],
                 "kv_cache_dtype": config.cache_config.cache_dtype,
+                "dense_mlp_layers": 2,
                 "mla_layout": mla_layout(draft),
                 "checkpoint_weights": _check_independent_mla_weights(
                     draft, independent_draft
@@ -2453,56 +2491,59 @@ def _compare_native_and_remote_draft(
         check_recurrence(baseline, "target")
         expected = generate(baseline, "target")
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
-    with vllm_runner(
-        model,
-        speculative_config=config,
-        per_request_spec_decode_metrics="detailed" if detailed else "none",
-        **kwargs,
-    ) as native:
-        policy = native.llm.collective_rpc(draft_kv_policy)
-        assert policy == [
-            [
-                (
-                    window,
-                    "MLAAttentionSpec"
-                    if mla_draft or (dense_mla and not independent)
-                    else "FullAttentionSpec"
-                    if window is None
-                    else "SlidingWindowSpec",
-                    window,
-                )
-                for window in ((None, None) if independent else mtp_windows)
+    if native_control:
+        with vllm_runner(
+            model,
+            speculative_config=config,
+            per_request_spec_decode_metrics="detailed" if detailed else "none",
+            **kwargs,
+        ) as native:
+            policy = native.llm.collective_rpc(draft_kv_policy)
+            assert policy == [
+                [
+                    (
+                        window,
+                        "MLAAttentionSpec"
+                        if mla_draft or (dense_mla and not independent)
+                        else "FullAttentionSpec"
+                        if window is None
+                        else "SlidingWindowSpec",
+                        window,
+                    )
+                    for window in ((None, None) if independent else mtp_windows)
+                ]
             ]
-        ]
-        record_property("native.kv_policy", policy)
-        if num_modules > 1:
-            identity = native.llm.collective_rpc(draft_module_identity)
-            record_property("native.module_identity", identity)
-        if independent:
-            identity = native.llm.collective_rpc(independent_draft_identity)
-            record_property("native.independent_draft", identity)
-        if eagle3:
-            record_property("native.eagle3", native.llm.collective_rpc(eagle_identity))
-        if dense_mla and not independent:
-            layout = native.llm.collective_rpc(draft_mla_layout)
-            assert layout == [[expected_mla_layout]]
-            record_property("native.mla_layout", layout)
-        backends = native.llm.collective_rpc(draft_moe_backends)
-        draft_has_moe = mla_draft or (
-            not independent
-            and not eagle3
-            and not mtp_family.startswith("exaone")
-            and mtp_family != "ernie"
-        )
-        assert backends == [["TRITON"] if draft_has_moe else []]
-        record_property("native.moe_backends", backends)
-        recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
-        assert recurrent_layers == [0]
-        record_property("native.recurrent_layers", recurrent_layers)
-        native_recurrence = check_recurrence(native, "native")
-        native_outputs = generate(native, "native")
-        compare_outputs(native_outputs, expected, "native")
-        native_counts = speculation_counts(native, "native")
+            record_property("native.kv_policy", policy)
+            if num_modules > 1:
+                identity = native.llm.collective_rpc(draft_module_identity)
+                record_property("native.module_identity", identity)
+            if independent:
+                identity = native.llm.collective_rpc(independent_draft_identity)
+                record_property("native.independent_draft", identity)
+            if eagle3:
+                record_property(
+                    "native.eagle3", native.llm.collective_rpc(eagle_identity)
+                )
+            if dense_mla and not independent:
+                layout = native.llm.collective_rpc(draft_mla_layout)
+                assert layout == [[expected_mla_layout]]
+                record_property("native.mla_layout", layout)
+            backends = native.llm.collective_rpc(draft_moe_backends)
+            draft_has_moe = (
+                not independent
+                and not eagle3
+                and not mtp_family.startswith("exaone")
+                and mtp_family != "ernie"
+            )
+            assert backends == [["TRITON"] if draft_has_moe else []]
+            record_property("native.moe_backends", backends)
+            recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
+            assert recurrent_layers == [0]
+            record_property("native.recurrent_layers", recurrent_layers)
+            native_recurrence = check_recurrence(native, "native")
+            native_outputs = generate(native, "native")
+            compare_outputs(native_outputs, expected, "native")
+            native_counts = speculation_counts(native, "native")
     server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
         model,
@@ -2549,7 +2590,9 @@ def _compare_native_and_remote_draft(
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_endpoints() == (endpoint,)
-            assert check_recurrence(remote, "remote") == native_recurrence
+            remote_recurrence = check_recurrence(remote, "remote")
+            if native_control:
+                assert remote_recurrence == native_recurrence
             if independent:
                 record_property(
                     "remote.backend", remote.llm.collective_rpc(token_remote_identity)
@@ -2560,22 +2603,25 @@ def _compare_native_and_remote_draft(
                 )
             remote_outputs = generate(remote, "remote")
             compare_outputs(remote_outputs, expected, "remote")
-            for actual_batch, native_batch in zip(remote_outputs, native_outputs):
-                assert [output[0] for output in actual_batch] == [
-                    output[0] for output in native_batch
-                ]
-                if dense_mla or detailed:
-                    assert [output[2] for output in actual_batch] == [
-                        output[2] for output in native_batch
+            if native_control:
+                for actual_batch, native_batch in zip(remote_outputs, native_outputs):
+                    assert [output[0] for output in actual_batch] == [
+                        output[0] for output in native_batch
                     ]
-            if dense_mla or detailed:
-                record_property("placement.logprobs", "exact_returned_top5")
+                    if dense_mla or detailed:
+                        assert [output[2] for output in actual_batch] == [
+                            output[2] for output in native_batch
+                        ]
+                if dense_mla or detailed:
+                    record_property("placement.logprobs", "exact_returned_top5")
             remote_counts = speculation_counts(remote, "remote")
-            if detailed:
-                record_property(
-                    "placement.speculation_counts_equal", remote_counts == native_counts
-                )
-            assert remote_counts == native_counts
+            if native_control:
+                if detailed:
+                    record_property(
+                        "placement.speculation_counts_equal",
+                        remote_counts == native_counts,
+                    )
+                assert remote_counts == native_counts
     if eagle3:
         identity = (
             "Standalone EAGLE3 features: model=Eagle3LlamaForCausalLM "

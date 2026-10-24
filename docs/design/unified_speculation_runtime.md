@@ -211,6 +211,13 @@ target layers. Native and remote comparisons must retain the same target kernel
 settings and inspect the loaded draft backend, rather than assuming a requested
 backend string was used.
 
+The native dense-target/MoE-draft combination currently lacks the expert group
+required to load the draft. The standalone server initializes groups from its
+own draft configuration. DeepSeek-V2 validation therefore uses a dense-FFN
+checkpoint for native/remote parity, and separately checks the routed-expert
+checkpoint against target-only output and an authoritative latent-KV replay.
+The routed-expert case does not establish native local placement parity.
+
 For the verifier, combine `tokenizer_mode="hf"` with this speculative configuration:
 
 ```json
