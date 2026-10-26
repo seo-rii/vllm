@@ -518,7 +518,7 @@ class TargetKVRemoteSession:
             identity.key in keys for identity in self._pending.identities
         ):
             self.cancel(self._pending)
-        if self.hello.max_num_seqs > 1 and self._conn is not None:
+        if self._conn is not None:
             self._closing.update(keys)
         for key in keys:
             self.records.pop(key, None)

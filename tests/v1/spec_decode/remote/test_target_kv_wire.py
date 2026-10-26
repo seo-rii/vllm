@@ -966,6 +966,35 @@ def test_snapshot_pool_sequence_credits_preserve_other_verifier_progress(wire_ru
 
 @pytest.mark.parametrize(
     "wire_runtime",
+    [{"max_num_seqs": n, "max_connections": 2, "max_sequences": n} for n in (1, 2)],
+    indirect=True,
+)
+def test_snapshot_pool_close_returns_sequence_credit_without_disconnect(wire_runtime):
+    server, _, a = wire_runtime
+    with peer(a, "b") as b:
+        keys = a.open_sequences(
+            tuple(range(a.hello.max_num_seqs)), deadline=a.deadline()
+        )
+        assert propose(a, snapshot(a, keys[0])).token_ids == (18,)
+        epoch = a.epoch
+        a.close_sequences(keys)
+        assert not a.records
+        assert len(server.registry) == 0
+
+        key = b.open_sequence(0, deadline=b.deadline())
+        assert propose(b, snapshot(b, key)).token_ids == (18,)
+        b.close_sequences((key,))
+        assert len(server.registry) == 0
+
+        reopened = a.open_sequence(0, deadline=a.deadline())
+        assert a.epoch == epoch and reopened.generation > keys[0].generation
+        assert propose(a, snapshot(a, reopened, 1)).token_ids == (18,)
+        a.close_sequences((reopened,))
+        assert len(server.registry) == 0 and server.healthy
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
     [{**_POOL_LIMITS, "max_queued_snapshot_bytes": 600}],
     indirect=True,
 )

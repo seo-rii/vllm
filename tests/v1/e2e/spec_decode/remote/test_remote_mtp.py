@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -35,6 +35,7 @@ def draft_server(
     *,
     target_kv: bool = False,
     token_only_draft: str | None = None,
+    max_num_seqs: int = 4,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
@@ -96,7 +97,9 @@ def draft_server(
                 "--device",
                 "cuda:0",
                 "--max-num-seqs",
-                "4",
+                str(max_num_seqs),
+                "--max-connections",
+                "2",
                 "--max-model-len",
                 "128",
                 "--max-feature-tokens",
@@ -162,24 +165,27 @@ def draft_server(
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv,num_workers",
+    "transport,target_kv,num_workers,max_num_seqs",
     [
-        ("inline", False, 1),
-        ("cuda_ipc", False, 1),
-        ("inline", False, 2),
-        ("cuda_ipc", False, 2),
-        ("inline", True, 1),
-        ("inline", True, 2),
+        ("inline", False, 1, 4),
+        ("cuda_ipc", False, 1, 4),
+        ("inline", False, 2, 4),
+        ("cuda_ipc", False, 2, 4),
+        ("inline", True, 1, 4),
+        ("inline", True, 2, 4),
+        ("inline", True, 1, 1),
     ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport, target_kv, num_workers
+    vllm_runner, monkeypatch, tmp_path, transport, target_kv, num_workers, max_num_seqs
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if max_num_seqs == 1:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     model = maybe_model_redirect(GEMMA_MODEL if target_kv else MODEL)
     revision = GEMMA_REVISION if target_kv else REVISION
     backend = "TRITON_ATTN" if target_kv else "FLASH_ATTN"
@@ -190,7 +196,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
-        max_num_seqs=4,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=64,
         enable_chunked_prefill=True,
         enable_prefix_caching=False,
@@ -216,7 +222,12 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     with ExitStack() as servers:
         endpoints = tuple(
             servers.enter_context(
-                draft_server(model, tmp_path / f"draft-{i}.log", target_kv=target_kv)
+                draft_server(
+                    model,
+                    tmp_path / f"draft-{i}.log",
+                    target_kv=target_kv,
+                    max_num_seqs=max_num_seqs,
+                )
             )
             for i in range(num_workers)
         )
@@ -246,6 +257,38 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_config().transport == transport
             assert actual_config.get_remote_draft_endpoints() == endpoints
+            sibling = None
+            if target_kv and max_num_seqs == 1:
+                from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
+                    create_target_kv_contract,
+                )
+                from vllm.v1.spec_decode.remote.target_kv_protocol import TargetKVHello
+                from vllm.v1.spec_decode.remote.target_kv_session import (
+                    TargetKVRemoteSession,
+                )
+
+                contract = create_target_kv_contract(remote.llm.llm_engine.vllm_config)
+                budget = contract.snapshot_budget
+                sibling = servers.enter_context(
+                    closing(
+                        TargetKVRemoteSession(
+                            endpoints[0],
+                            TargetKVHello(
+                                "completed-request-credit",
+                                contract.fingerprint,
+                                contract.hidden_size,
+                                contract.vocab_size,
+                                budget.max_model_len,
+                                budget.max_pages,
+                                budget.max_bytes,
+                                max_num_seqs=contract.max_num_seqs,
+                            ),
+                            expected_specs=contract.expected_specs,
+                            request_timeout_ms=5000,
+                            startup_timeout_ms=600000,
+                        )
+                    )
+                )
             for inputs, reference in (
                 (prompts, expected),
                 (list(reversed(prompts)), list(reversed(expected))),
@@ -256,6 +299,17 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                     list(x.outputs[0].token_ids) for x in reference
                 ]
                 assert all(len(x.outputs[0].token_ids) == 16 for x in outputs)
+                if sibling is not None:
+                    # Drain finished-request cleanup without closing the engine's
+                    # draft connection or changing its GPU allocations.
+                    remote.llm.sleep(level=0, mode="wait")
+                    try:
+                        key = sibling.open_sequence(0, deadline=sibling.deadline())
+                        assert sibling.active(key)
+                        sibling.close_sequences((key,))
+                        assert not sibling.records
+                    finally:
+                        remote.llm.wake_up(tags=["scheduling"])
             remote.llm.llm_engine.do_log_stats()
             metrics = remote.llm.get_metrics()
             for name in (
