@@ -179,9 +179,16 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         self.planner.commit(plan)
 
     def advance_and_propose(
-        self, batch: StandaloneProposalBatch
+        self,
+        batch: StandaloneProposalBatch,
+        *,
+        row_deadlines: Sequence[float | None] | None = None,
     ) -> StandaloneProposalResult:
         num_rows = len(batch.keys)
+        if row_deadlines is None:
+            row_deadlines = (batch.execution_deadline,) * num_rows
+        if len(row_deadlines) != num_rows:
+            raise ValueError("proposal deadlines do not match the rows")
         effective_k = batch.effective_num_speculative_tokens
         if effective_k is None:
             effective_k = batch.num_speculative_tokens
@@ -195,7 +202,17 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         rows: list[DraftStepRow] = []
         batch_rows: list[int] = []
         sources: list[Features] = []
+
+        def expired(index: int) -> bool:
+            deadline = row_deadlines[index]
+            if deadline is not None and time.monotonic() >= deadline:
+                statuses[index] = SpeculatorStatusCode.TIMEOUT
+                return True
+            return False
+
         for i in batch.active_rows:
+            if expired(i):
+                continue
             key = batch.keys[i]
             query_len = batch.query_lens[i]
             last_chunk = self._last_chunks.get(key)
@@ -246,13 +263,8 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_rows, batch.num_speculative_tokens, dtype=torch.int64
         )
         for group in groups:
-            if (
-                batch.execution_deadline is not None
-                and time.monotonic() >= batch.execution_deadline
-            ):
-                for index in group:
-                    statuses[batch_rows[index]] = SpeculatorStatusCode.TIMEOUT
-                continue
+            # A preceding forward can consume another verifier's remaining budget.
+            group = [i for i in group if not expired(batch_rows[i])]
             plan, failures = self.planner.plan(
                 [rows[i] for i in group], num_speculative_tokens=effective_k
             )
@@ -299,9 +311,16 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         )
 
     def advance_many(
-        self, batches: Sequence[StandaloneProposalBatch]
+        self,
+        batches: Sequence[StandaloneProposalBatch],
+        *,
+        deadlines: Sequence[float | None] | None = None,
     ) -> list[StandaloneProposalResult | Exception]:
         """Batch compatible verifier rounds without changing any row's K budget."""
+        if deadlines is None:
+            deadlines = tuple(batch.execution_deadline for batch in batches)
+        if len(deadlines) != len(batches):
+            raise ValueError("proposal deadlines do not match the batches")
         groups: dict[tuple[int, tuple[bool, ...]], list[int]] = {}
         for i, batch in enumerate(batches):
             k = batch.effective_num_speculative_tokens
@@ -321,8 +340,13 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
                 continue
             try:
                 group = [batches[i] for i in indexes]
+                row_deadlines = tuple(
+                    deadlines[i] for i in indexes for _ in batches[i].keys
+                )
                 if len(group) == 1:
-                    results[indexes[0]] = self.advance_and_propose(group[0])
+                    results[indexes[0]] = self.advance_and_propose(
+                        group[0], row_deadlines=row_deadlines
+                    )
                     continue
                 starts = list(
                     itertools.accumulate((len(b.keys) for b in group), initial=0)
@@ -377,7 +401,7 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
                     ),
                     effective_num_speculative_tokens=k,
                 )
-                result = self.advance_and_propose(merged)
+                result = self.advance_and_propose(merged, row_deadlines=row_deadlines)
                 tokens, lengths = (
                     frame_to_tensor(result.token_ids),
                     frame_to_tensor(result.valid_lengths),

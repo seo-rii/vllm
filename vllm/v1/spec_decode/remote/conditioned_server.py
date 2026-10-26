@@ -137,7 +137,10 @@ class ConditionedDraftServer(RemoteDraftServer):
                     None
                 ] * len(jobs)
                 if batches:
-                    results = self.adapter.advance_many(batches)
+                    results = self.adapter.advance_many(
+                        batches,
+                        deadlines=tuple(jobs[i].payload[1].deadline for i in locations),
+                    )
                     for i, result in zip(locations, results):
                         if isinstance(result, Exception):
                             self._adapter_failed(result)
