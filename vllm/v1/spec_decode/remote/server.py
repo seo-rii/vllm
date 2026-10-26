@@ -159,6 +159,8 @@ class StandaloneProposalBatch:
     query_lens: tuple[int, ...]
     effective_num_speculative_tokens: int | None = None
     """This round's budget; num_speculative_tokens remains the result width."""
+    execution_deadline: float | None = None
+    """Absolute server monotonic deadline shared by every internal draft step."""
 
 
 @dataclass(frozen=True)
@@ -1372,6 +1374,8 @@ class _ServerSession:
     def _prefill(self, message: PrefillChunk, request_id: int) -> None:
         deadline = self._execution_deadline(message)
         copy_deadline = self._copy_deadline(message)
+        if deadline is not None:
+            copy_deadline = min(copy_deadline, deadline)
         key = message.key
         schema = self.server.adapter.feature_schema()
         frames = self._take_frames(message.feature_slot, len(schema.slots))
@@ -1436,7 +1440,12 @@ class _ServerSession:
                 except (TransportError, RuntimeError) as e:
                     self.server._adapter_failed(e)
                     self._discard_owned_sequences((key,))
-                    status, detail = SpeculatorStatusCode.INTERNAL_ERROR, str(e)
+                    status = (
+                        SpeculatorStatusCode.TIMEOUT
+                        if isinstance(e, TransportTimeout)
+                        else SpeculatorStatusCode.INTERNAL_ERROR
+                    )
+                    detail = str(e)
                 else:
                     failure = self._call_adapter(
                         self.server.adapter.prefill,
@@ -1477,6 +1486,8 @@ class _ServerSession:
     def _propose(self, message: AdvanceAndPropose, request_id: int) -> None:
         deadline = self._execution_deadline(message)
         copy_deadline = self._copy_deadline(message)
+        if deadline is not None:
+            copy_deadline = min(copy_deadline, deadline)
         schema = self.server.adapter.feature_schema()
         accepted = self.inbound.pop(message.accepted_counts_slot, None)
         recovery = self.inbound.pop(message.recovery_tokens_slot, None)
@@ -1628,8 +1639,13 @@ class _ServerSession:
                             ),
                             query_lens=tuple(query_lens),
                             effective_num_speculative_tokens=effective_k,
+                            execution_deadline=deadline,
                         )
                     )
+                except TransportTimeout as e:
+                    self.server._adapter_failed(e)
+                    failure = str(e)
+                    failure_status = SpeculatorStatusCode.TIMEOUT
                 except Exception as e:
                     self.server._adapter_failed(e)
                     logger.exception(
@@ -1803,6 +1819,8 @@ class _ServerSession:
                 self.conn.close()
                 raise
             resolved.append(DeviceFeature(frame.slot, frame.dtype, frame.shape, tensor))
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TransportTimeout("feature import exhausted its execution budget")
         return tuple(resolved)
 
 
