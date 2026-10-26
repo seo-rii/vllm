@@ -23,6 +23,7 @@ import itertools
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Sequence
+from dataclasses import replace
 
 import torch
 
@@ -37,6 +38,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     TargetFeatureSchema,
 )
 from vllm.v1.spec_decode.remote.runtime.step import (
+    BlockTableUpdate,
     DraftStepPlan,
     DraftStepPlanner,
     DraftStepRow,
@@ -263,40 +265,48 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_rows, batch.num_speculative_tokens, dtype=torch.int64
         )
         for group in groups:
-            # A preceding forward can consume another verifier's remaining budget.
-            group = [i for i in group if not expired(batch_rows[i])]
-            plan, failures = self.planner.plan(
-                [rows[i] for i in group], num_speculative_tokens=effective_k
-            )
-            for index, (status, _) in failures.items():
-                statuses[batch_rows[group[index]]] = status
-            planned = [
-                (batch_rows[i], sources[i])
-                for index, i in enumerate(group)
-                if index not in failures
-            ]
-            if not planned:
-                continue
-            step_features = self._step_features(features, planned)
-            if (
-                batch.execution_deadline is not None
-                and time.monotonic() >= batch.execution_deadline
-            ):
-                for index, _ in planned:
-                    statuses[index] = SpeculatorStatusCode.TIMEOUT
-                continue
-            drafts = self.executor.execute(
-                plan,
-                step_features,
-                num_speculative_tokens=effective_k,
-            )
-            self.planner.commit(plan)
-            row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
-            token_ids[row_index, :effective_k] = drafts[:, :effective_k].to(
-                "cpu", torch.int64
-            )
-            for row in plan.rows:
-                self._last_chunks.pop(row.key, None)
+            pending_updates: dict[int, BlockTableUpdate] = {}
+            while group:
+                # Earlier work can consume another verifier's remaining budget.
+                group = [i for i in group if not expired(batch_rows[i])]
+                plan, failures = self.planner.plan(
+                    [rows[i] for i in group], num_speculative_tokens=effective_k
+                )
+                pending_updates.update(plan.block_table_updates)
+                for index, (status, _) in failures.items():
+                    statuses[batch_rows[group[index]]] = status
+                group = [i for index, i in enumerate(group) if index not in failures]
+                planned = [(batch_rows[i], sources[i]) for i in group]
+                if not planned:
+                    break
+                # Replanning reserves no new blocks for surviving rows, so retain
+                # the unapplied table updates from their first reservation.
+                plan = replace(
+                    plan,
+                    block_table_updates={
+                        int(index): pending_updates[int(index)]
+                        for index in plan.req_indices
+                        if int(index) in pending_updates
+                    },
+                )
+                step_features = self._step_features(features, planned)
+                live = [i for i in group if not expired(batch_rows[i])]
+                if len(live) != len(group):
+                    group = live
+                    continue
+                drafts = self.executor.execute(
+                    plan,
+                    step_features,
+                    num_speculative_tokens=effective_k,
+                )
+                self.planner.commit(plan)
+                row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
+                token_ids[row_index, :effective_k] = drafts[:, :effective_k].to(
+                    "cpu", torch.int64
+                )
+                for row in plan.rows:
+                    self._last_chunks.pop(row.key, None)
+                break
         valid_lengths = torch.tensor(
             [
                 effective_k if status is SpeculatorStatusCode.OK else 0
