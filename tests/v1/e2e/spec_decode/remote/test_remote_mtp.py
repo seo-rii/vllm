@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ def draft_server(
     max_feature_tokens: int = 64,
     trust_remote_code: bool = True,
     moe_backend: str | None = None,
+    on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
@@ -164,6 +166,8 @@ def draft_server(
                             f"draft server did not listen after warmup: {log_path}"
                         )
                     time.sleep(0.1)
+                if on_ready is not None:
+                    on_ready(process)
                 yield f"unix://{path}"
             finally:
                 if process.poll() is None:
@@ -175,6 +179,27 @@ def draft_server(
                         process.wait(timeout=5)
                         pytest.fail(f"draft server did not shut down: {log_path}")
                 assert process.returncode == 0, f"draft server failed: {log_path}"
+
+
+@contextmanager
+def paused_draft_server(process: subprocess.Popen):
+    """Stop an owned draft process until the caller finishes its timeout check."""
+    try:
+        process.send_signal(signal.SIGSTOP)
+        deadline = time.monotonic() + 5
+        while True:
+            stopped = os.waitid(os.P_PID, process.pid, os.WSTOPPED | os.WNOHANG)
+            if stopped is not None:
+                assert stopped.si_status == signal.SIGSTOP
+                break
+            assert process.poll() is None, "draft server exited before stopping"
+            if time.monotonic() >= deadline:
+                pytest.fail("draft server did not stop")
+            time.sleep(0.01)
+        yield
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGCONT)
 
 
 @pytest.mark.parametrize(
@@ -599,6 +624,92 @@ def tiny_exaone_two_mtp_model(tmp_path):
 @pytest.fixture
 def tiny_exaone_three_mtp_model(tmp_path):
     return _tiny_exaone_mtp_model(tmp_path, (None, 16, 32))
+
+
+@pytest.mark.parametrize("mtp_window", [None])
+def test_remote_mtp_timeout_falls_back_to_target(
+    vllm_runner, monkeypatch, tmp_path, tiny_exaone_mtp_model
+):
+    """A stalled draft process must preserve complete target-only generation."""
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    model = tiny_exaone_mtp_model
+    kwargs = dict(
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
+        for length in (17, 33)
+    ]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+
+    def generate(runner):
+        outputs = runner.llm.generate(prompts, sampling, use_tqdm=False)
+        assert len(outputs) == len(prompts)
+        tokens = [list(output.outputs[0].token_ids) for output in outputs]
+        assert all(len(row) == 8 for row in tokens)
+        return tokens
+
+    def draft_tokens(runner):
+        runner.llm.llm_engine.do_log_stats()
+        return get_spec_decode_metric_value(
+            runner.llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
+        )
+
+    with vllm_runner(model, **kwargs) as baseline:
+        expected = generate(baseline)
+    processes: list[subprocess.Popen] = []
+    with draft_server(
+        model,
+        tmp_path / "timeout-draft.log",
+        revision=None,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+        trust_remote_code=False,
+        on_ready=processes.append,
+    ) as endpoint:
+        config = dict(
+            method="mtp",
+            model=model,
+            num_speculative_tokens=1,
+            draft_tensor_parallel_size=1,
+            draft_sample_method="greedy",
+            attention_backend="TRITON_ATTN",
+            remote_draft=dict(
+                endpoint=endpoint,
+                transport="inline",
+                failure_policy="target_only",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
+            ),
+        )
+        with vllm_runner(model, speculative_config=config, **kwargs) as remote:
+            assert generate(remote) == expected
+            drafted = draft_tokens(remote)
+            assert drafted > 0
+            (process,) = processes
+            with paused_draft_server(process):
+                assert generate(remote) == expected
+                assert draft_tokens(remote) == drafted
 
 
 def _unpack_mtp_experts(state):

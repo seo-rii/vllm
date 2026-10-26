@@ -207,6 +207,73 @@ def test_conditioned_queued_expiry_retires_only_the_expired_verifier(tmp_path):
         assert server.healthy
 
 
+class GatedDigestExecutor(OwnerDigestExecutor):
+    def __init__(self, pool):
+        super().__init__(pool)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, *args, **kwargs):
+        if not self.plans:
+            self.entered.set()
+            assert self.release.wait(5), "test must release the running forward"
+        return super().execute(*args, **kwargs)
+
+
+def test_expiry_between_split_forwards_skips_expired_rows_and_keeps_live_client(
+    tmp_path,
+):
+    with runtime(tmp_path, executor_type=GatedDigestExecutor) as (
+        server,
+        oracle,
+        client,
+    ):
+        timeout_ms = 500
+        short, live = client("short", timeout_ms=timeout_ms), client("live")
+        expired = short.open_sequences((0, 1))
+        healthy = live.open_sequence(0)
+        for key in expired:
+            short.prefill(key, chunk([11, 12, 13, 14, 15]), is_final=True)
+        live.prefill(healthy, chunk([21]), is_final=True)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold():
+            entered.set()
+            assert release.wait(3)
+
+        held = server.work_queue.submit(DraftWork("gate", hold))
+        assert entered.wait(3)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                short_result = threads.submit(
+                    round_, short, 0, expired, [0, 0], [], [0, 0], [16, 16]
+                )
+                until(lambda: server.work_queue.depth == 2)
+                live_result = threads.submit(
+                    round_, live, 0, [healthy], [0], [], [0], [22]
+                )
+                until(lambda: server.work_queue.depth == 3)
+                release.set()
+                held.wait()
+                assert oracle.entered.wait(3)
+                expiry_bound = time.monotonic() + timeout_ms / 1000
+                assert short_result.result(3).output.valid_lengths.tolist() == [0, 0]
+                # The relative server budget starts after receipt, so also pass
+                # its upper bound before releasing the running forward.
+                until(lambda: time.monotonic() >= expiry_bound)
+                oracle.release.set()
+                assert live_result.result(3).output.token_ids.tolist() == [
+                    digest_row([21], 22)
+                ]
+        finally:
+            release.set()
+            oracle.release.set()
+        executed = [row.key for plan in oracle.plans for row in plan.rows]
+        assert executed == [expired[0], healthy]
+        assert live.sequence_state(healthy) is SequenceState.READY
+        assert server.healthy
+
+
 class FatalDigestExecutor(OwnerDigestExecutor):
     def execute(self, plan, *args, **kwargs):
         self.threads.add(threading.get_ident())
