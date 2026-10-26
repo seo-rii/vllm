@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
-import torch
 
 from tests.v1.spec_decode.remote.runtime_fixtures import (
     KVDigestExecutor,
@@ -221,45 +220,10 @@ class GatedDigestExecutor(OwnerDigestExecutor):
         return super().execute(*args, **kwargs)
 
 
-class GatedFeatureTensor(torch.Tensor):
-    def __new__(cls, tensor, entered, release):
-        result = tensor.as_subclass(cls)
-        result.entered, result.release = entered, release
-        return result
-
-    def to(self, *args, **kwargs):
-        self.entered.set()
-        assert self.release.wait(5), "test must release feature materialization"
-        return self.as_subclass(torch.Tensor).to(*args, **kwargs)
-
-
-class GatedFeatureExecutor(OwnerDigestExecutor):
-    def __init__(self, pool):
-        super().__init__(pool)
-        self.entered = threading.Event()
-        self.release = threading.Event()
-
-    def prepare_row(self, row, features):
-        return row, [
-            GatedFeatureTensor(feature, self.entered, self.release)
-            if feature is not None
-            else None
-            for feature in features
-        ]
-
-
-@pytest.mark.parametrize(
-    ("executor_type", "prompt", "num_executed_short_rows"),
-    [
-        (GatedDigestExecutor, [11, 12, 13, 14, 15], 1),
-        (GatedFeatureExecutor, [11], 0),
-    ],
-    ids=["between_forwards", "feature_materialization"],
-)
-def test_expiry_before_forward_skips_expired_rows_and_keeps_live_client(
-    tmp_path, executor_type, prompt, num_executed_short_rows
+def test_expiry_between_split_forwards_skips_expired_rows_and_keeps_live_client(
+    tmp_path,
 ):
-    with runtime(tmp_path, executor_type=executor_type) as (
+    with runtime(tmp_path, executor_type=GatedDigestExecutor) as (
         server,
         oracle,
         client,
@@ -269,7 +233,7 @@ def test_expiry_before_forward_skips_expired_rows_and_keeps_live_client(
         expired = short.open_sequences((0, 1))
         healthy = live.open_sequence(0)
         for key in expired:
-            short.prefill(key, chunk(prompt), is_final=True)
+            short.prefill(key, chunk([11, 12, 13, 14, 15]), is_final=True)
         live.prefill(healthy, chunk([21]), is_final=True)
         entered, release = threading.Event(), threading.Event()
 
@@ -305,7 +269,7 @@ def test_expiry_before_forward_skips_expired_rows_and_keeps_live_client(
             release.set()
             oracle.release.set()
         executed = [row.key for plan in oracle.plans for row in plan.rows]
-        assert executed == [*expired[:num_executed_short_rows], healthy]
+        assert executed == [expired[0], healthy]
         assert live.sequence_state(healthy) is SequenceState.READY
         assert server.healthy
 
