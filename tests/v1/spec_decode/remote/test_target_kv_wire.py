@@ -1021,6 +1021,7 @@ def test_snapshot_pool_reserves_credit_before_receiving_any_payload(wire_runtime
 @pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
 def test_snapshot_pool_expired_queued_job_does_not_fail_healthy_sibling(wire_runtime):
     server, oracle, a = wire_runtime
+    timeout_s = 0.05
     with peer(a, "b") as b, peer(a, "blocker") as blocker:
         ka, kb, kc = (
             c.open_sequence(0, deadline=c.deadline()) for c in (a, b, blocker)
@@ -1033,12 +1034,15 @@ def test_snapshot_pool_expired_queued_job_does_not_fail_healthy_sibling(wire_run
                 snapshot(a, ka),
                 10,
                 torch.ones((1, 8), dtype=torch.bfloat16),
-                deadline=time.monotonic() + 0.05,
+                deadline=time.monotonic() + timeout_s,
             )
             healthy = threads.submit(propose, b, snapshot(b, kb))
             until(lambda: server.work_queue.depth == 3)
+            # The server's relative budget starts later than the client deadline.
+            server_expiry_upper_bound = time.monotonic() + timeout_s
             with pytest.raises(RemoteDraftError):
                 a.collect(handle)
+            until(lambda: time.monotonic() >= server_expiry_upper_bound)
             oracle.release.set()
             assert held.result().token_ids == healthy.result().token_ids == (18,)
         assert {i.key.verifier_instance_id for i, _ in oracle.calls} == {"blocker", "b"}
