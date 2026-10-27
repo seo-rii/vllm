@@ -1079,6 +1079,122 @@ def tiny_hyv3_mtp_model(tmp_path):
     return _save_mtp_checkpoint(tmp_path / "hyv3", config, weights)
 
 
+@pytest.mark.parametrize(
+    ("omitted", "tied"),
+    [
+        ("eh_proj", False),
+        ("self_attn.q_proj", False),
+        ("mlp.experts.0.down_proj", False),
+        (None, False),
+        (None, True),
+    ],
+)
+def test_hyv3_mtp_loads_only_complete_owned_parameters_through_llm(
+    tiny_hyv3_mtp_model, tmp_path, omitted, tied
+):
+    """Reject missing owned weights while sharing target embeddings and heads."""
+    import json
+
+    from safetensors.torch import load_file, save_file
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    path = Path(tiny_hyv3_mtp_model) / "model.safetensors"
+    weights = load_file(path)
+    spec = {"method": "mtp", "num_speculative_tokens": 1}
+    if omitted is None:
+        config_path = path.parent / "config.json"
+        config = json.loads(config_path.read_text())
+        config["tie_word_embeddings"] = tied
+        config_path.write_text(json.dumps(config))
+        if tied:
+            del weights["lm_head.weight"]
+            save_file(weights, path, metadata={"format": "pt"})
+        draft_path = tmp_path / "draft-only"
+        draft_path.mkdir()
+        (draft_path / "config.json").write_text(json.dumps(config))
+        save_file(
+            {
+                name: tensor
+                for name, tensor in weights.items()
+                if name.startswith("model.layers.2.")
+            },
+            draft_path / "model.safetensors",
+            metadata={"format": "pt"},
+        )
+        spec["model"] = str(draft_path)
+    else:
+        del weights[f"model.layers.2.{omitted}.weight"]
+        save_file(weights, path, metadata={"format": "pt"})
+    missing = {
+        "self_attn.q_proj": "qkv_proj",
+        "mlp.experts.0.down_proj": "w2_weight",
+    }.get(omitted, omitted or "")
+    options = dict(
+        model=tiny_hyv3_mtp_model,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config=spec,
+    )
+    program = """
+import json
+import sys
+from vllm import LLM, SamplingParams
+if sys.argv[2]:
+    try:
+        LLM(**json.loads(sys.argv[1]))
+    except ValueError as error:
+        assert "not initialized from checkpoint" in str(error), error
+        assert sys.argv[2] in str(error), error
+    else:
+        raise AssertionError("LLM admitted an incomplete HYV3 MTP checkpoint")
+else:
+    llm = LLM(**json.loads(sys.argv[1]))
+
+    def shared_parameters(worker):
+        target = worker.model_runner.model
+        draft = worker.model_runner.get_draft_model()
+        return (
+            draft.model.embed_tokens is target.model.embed_tokens,
+            all(layer.shared_head.head is target.lm_head
+                for layer in draft.model.layers.values()),
+        )
+
+    assert llm.collective_rpc(shared_parameters) == [(True, True)]
+    outputs = llm.generate(
+        {"prompt_token_ids": [4, 5, 6]},
+        SamplingParams(temperature=0, max_tokens=2, min_tokens=2, ignore_eos=True),
+    )
+    tokens = outputs[0].outputs[0].token_ids
+    assert len(tokens) == 2 and all(0 <= token < 128 for token in tokens), tokens
+"""
+    log_path = tmp_path / "hyv3-mtp-loading.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [sys.executable, "-c", program, json.dumps(options), missing],
+            env=dict(
+                os.environ,
+                VLLM_ENABLE_V1_MULTIPROCESSING="0",
+                VLLM_USE_V2_MODEL_RUNNER="1",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    assert result.returncode == 0, log_path.read_text()[-12000:]
+
+
 @pytest.fixture
 def tiny_ernie_mtp_model(tmp_path):
     """Use a routed ERNIE target and its native dense, single-token MTP block."""
