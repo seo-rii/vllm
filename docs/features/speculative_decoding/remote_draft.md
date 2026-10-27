@@ -26,6 +26,10 @@ prevent late replies from reactivating retired state. Replies for another sessio
 request, or batch are discarded before their ordering counters or draft tokens are
 used.
 
+For token-only placement, errors while closing a failed socket preserve the
+selected failure policy. Cancellation and shutdown retire pending proposals
+even when socket cleanup reports an error.
+
 Protocol v2.2 assigns one server execution deadline to each pipelined prefill
 group. Waiting behind an earlier chunk consumes that group's remaining budget.
 With older peers, the client waits for each prefill ACK before sending the next
