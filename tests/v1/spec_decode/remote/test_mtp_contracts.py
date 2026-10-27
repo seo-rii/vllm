@@ -235,6 +235,65 @@ def test_exaone_checkpoint_depth_determines_prefill_lookahead(depth):
     assert config.num_prefill_lookahead_tokens == depth
 
 
+@pytest.mark.parametrize(
+    "target_windows,draft_windows",
+    [((32,), (16,)), ((None,), (16,)), ((32, 32), (None, 16))],
+)
+def test_exaone_native_mtp_uses_separate_draft_attention_policy(
+    tmp_path, target_windows, draft_windows
+):
+    from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
+        _tiny_exaone_mtp_model,
+    )
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import destroy_model_parallel, initialize_model_parallel
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    target_path = _tiny_exaone_mtp_model(tmp_path / "target", target_windows)
+    draft_path = _tiny_exaone_mtp_model(tmp_path / "draft", draft_windows)
+    config = EngineArgs(
+        model=target_path,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        enforce_eager=True,
+        async_scheduling=False,
+        speculative_config={
+            "method": "mtp",
+            "model": draft_path,
+            "num_speculative_tokens": len(draft_windows),
+        },
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    draft = config.speculative_config.draft_model_config
+    assert draft is not None
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == len(draft_windows)
+    loader = get_model_loader(config.load_config)
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        destroy_model_parallel()
+        initialize_model_parallel(backend="gloo")
+        model = loader.create_model(config, draft)
+        loader.load_weights(model, draft)
+        assert (
+            tuple(layer.self_attn.sliding_window_size for layer in model.model.layers)
+            == draft_windows
+        )
+        assert config.model_config.hf_config.mtp_layer_types == [
+            "full_attention" if window is None else "sliding_attention"
+            for window in target_windows
+        ]
+        assert config.model_config.hf_config.mtp_sliding_windows == [
+            window or 32 for window in target_windows
+        ]
+
+
 @pytest.mark.parametrize("transport", ["auto", "inline"])
 @pytest.mark.parametrize("depth", [2, 3, 4])
 def test_exaone_module_chain_accepts_single_inline_endpoint(transport, depth):

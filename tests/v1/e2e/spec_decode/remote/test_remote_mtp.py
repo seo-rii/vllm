@@ -620,6 +620,78 @@ def tiny_exaone_three_mtp_model(tmp_path):
     return _tiny_exaone_mtp_model(tmp_path, (None, 16, 32))
 
 
+@pytest.mark.parametrize(
+    "target_windows,draft_windows",
+    [((None,), (16,)), ((32, 32), (None, 16))],
+)
+def test_separate_exaone_mtp_checkpoint_retains_attention_policy_through_llm(
+    vllm_runner, monkeypatch, tmp_path, target_windows, draft_windows
+):
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    target = _tiny_exaone_mtp_model(tmp_path / "target", target_windows)
+    draft = _tiny_exaone_mtp_model(tmp_path / "draft", draft_windows)
+    kwargs = dict(
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
+        for length in (17, 33)
+    ]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+
+    def generate(runner):
+        outputs = runner.llm.generate(prompts, sampling, use_tqdm=False)
+        assert len(outputs) == len(prompts)
+        result = [list(output.outputs[0].token_ids) for output in outputs]
+        assert all(len(row) == 8 for row in result)
+        return result
+
+    def draft_attention_windows(worker):
+        model = worker.model_runner.get_draft_model()
+        return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+
+    with vllm_runner(target, **kwargs) as baseline:
+        expected = generate(baseline)
+    with vllm_runner(
+        target,
+        speculative_config={
+            "method": "mtp",
+            "model": draft,
+            "num_speculative_tokens": len(draft_windows),
+        },
+        **kwargs,
+    ) as native:
+        assert native.llm.collective_rpc(draft_attention_windows) == [
+            list(draft_windows)
+        ]
+        assert generate(native) == expected
+        native.llm.llm_engine.do_log_stats()
+        assert (
+            get_spec_decode_metric_value(
+                native.llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
+            )
+            > 0
+        )
+
+
 @pytest.mark.parametrize("mtp_window", [None])
 def test_remote_mtp_timeout_falls_back_to_target(
     vllm_runner, monkeypatch, tmp_path, tiny_exaone_mtp_model
