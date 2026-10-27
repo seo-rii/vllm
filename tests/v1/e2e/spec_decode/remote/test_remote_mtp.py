@@ -1722,6 +1722,50 @@ def _separate_mtp_draft(source, destination):
     return str(destination)
 
 
+def test_remote_mtp_rejects_short_draft_context_through_llm(
+    vllm_runner, monkeypatch, tmp_path, tiny_ernie_mtp_model
+):
+    """Reject a short draft before opening its remote session or running RoPE."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    draft = _separate_mtp_draft(tiny_ernie_mtp_model, tmp_path / "short-draft")
+    config_path = Path(draft) / "config.json"
+    draft_config = json.loads(config_path.read_text())
+    draft_config["max_position_embeddings"] = 16
+    config_path.write_text(json.dumps(draft_config))
+    with (
+        pytest.raises(ValueError, match="standalone MTP.*draft.*max_model_len"),
+        vllm_runner(
+            tiny_ernie_mtp_model,
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            max_model_len=64,
+            max_num_seqs=2,
+            max_num_batched_tokens=32,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            attention_config={"backend": "TRITON_ATTN"},
+            moe_backend="triton",
+            kv_cache_memory_bytes=32 << 20,
+            gpu_memory_utilization=0.2,
+            speculative_config={
+                "method": "mtp",
+                "model": draft,
+                "num_speculative_tokens": 1,
+                "remote_draft": {
+                    "endpoint": f"unix://{tmp_path / 'never-opened.sock'}",
+                    "failure_policy": "error",
+                },
+            },
+        ),
+    ):
+        pass
+
+
 @pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
 def test_separate_mtp_checkpoint_settings_reach_public_llm(
     vllm_runner, monkeypatch, tmp_path, request, mtp_family

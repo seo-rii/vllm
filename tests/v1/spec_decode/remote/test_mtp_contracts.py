@@ -48,6 +48,100 @@ NEMOTRON_EMBEDDING_NAMES = (
 pytestmark = pytest.mark.usefixtures("cpu_parallel_state")
 
 
+def _mtp_context_config(
+    source, destination, *, target_length, draft_length=16, draft_max_length=None, k=1
+):
+    from vllm.engine.arg_utils import EngineArgs
+
+    draft_path = _separate_mtp_draft(source, destination)
+    config_path = Path(draft_path) / "config.json"
+    draft_config = json.loads(config_path.read_text())
+    draft_config["max_position_embeddings"] = draft_length
+    config_path.write_text(json.dumps(draft_config))
+    speculative_config = {
+        "method": "mtp",
+        "model": draft_path,
+        "num_speculative_tokens": k,
+    }
+    if draft_max_length is not None:
+        speculative_config["max_model_len"] = draft_max_length
+    return EngineArgs(
+        model=source,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=target_length,
+        enforce_eager=True,
+        speculative_config=speculative_config,
+    ).create_engine_config()
+
+
+@pytest.mark.parametrize("family,k", [("ernie", 1), ("hyv3", 3)])
+@pytest.mark.parametrize("draft_length,draft_max_length", [(16, None), (128, 16)])
+def test_mtp_public_contract_rejects_short_draft_context(
+    request, tmp_path, family, k, draft_length, draft_max_length
+):
+    """Reject a short native draft before prefill, decode or rollout can run."""
+    source = request.getfixturevalue(f"tiny_{family}_mtp_model")
+    config = _mtp_context_config(
+        source,
+        tmp_path / "short-draft",
+        target_length=64,
+        draft_length=draft_length,
+        draft_max_length=draft_max_length,
+        k=k,
+    )
+    assert config.speculative_config.draft_model_config.max_model_len == 16
+    with pytest.raises(ValueError, match="standalone MTP.*draft.*max_model_len"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("prefill_length", [15, 16, 17])
+def test_mtp_admitted_context_keeps_planned_positions_inside_native_rope(
+    request, tmp_path, prefill_length
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.step import DraftStepPlanner, DraftStepRow
+
+    config = _mtp_context_config(
+        request.getfixturevalue("tiny_ernie_mtp_model"),
+        tmp_path / "short-draft",
+        target_length=16,
+    )
+    create_runtime_contract(config)
+    draft = config.speculative_config.draft_model_config
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        model = get_model_loader(config.load_config).create_model(config, draft)
+    rope = next(iter(model.model.layers.values())).mtp_block.self_attn.rotary_emb
+    assert rope.cos_sin_cache.shape[0] == 16
+    planner = DraftStepPlanner(
+        DraftBlockPool(32, 2),
+        max_num_reqs=1,
+        max_model_len=config.model_config.max_model_len,
+        num_speculative_tokens=1,
+    )
+    key = SequenceKey("context-boundary", 0, 1)
+    assert planner.open(key)
+    plan, failures = planner.plan([DraftStepRow(key, prefill_length, 1)])
+    if prefill_length > 16:
+        assert not plan.rows
+        assert "max_model_len=16" in failures[0][1]
+    else:
+        assert not failures
+        positions = torch.from_numpy(plan.positions)
+        query = torch.zeros(prefill_length, draft.get_hidden_size())
+        actual, _ = rope.forward_native(positions, query, query.clone())
+        assert torch.equal(actual, query)
+        assert positions.tolist() == list(range(prefill_length))
+
+
 @pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
 def test_native_mtp_uses_separate_draft_checkpoint_settings(
     request, tmp_path, mtp_family
