@@ -1171,3 +1171,21 @@ def test_cleanup_error_finishes_cancelled_handle(wire_runtime, monkeypatch, oper
             client.connect()
     else:
         assert propose(client, snapshot(client, key, 1)).valid_length == 0
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{"max_num_seqs": 3, "max_sequences_per_verifier": 1}],
+    indirect=True,
+)
+def test_partial_batch_open_retires_unreturned_sequences(wire_runtime):
+    """A strict rejection after the first open returns every local credit."""
+    server, _, client = wire_runtime
+    with pytest.raises(RemoteDraftError, match="sequence credit exhausted"):
+        client.open_sequences((0, 1, 2), deadline=client.deadline())
+    assert not client.records
+    until(lambda: len(server.registry) == 0)
+    key = client.open_sequence(3, deadline=client.deadline())
+    assert client.active(key)
+    client.close_sequences((key,))
+    assert not client.records
