@@ -626,6 +626,78 @@ def tiny_exaone_three_mtp_model(tmp_path):
     return _tiny_exaone_mtp_model(tmp_path, (None, 16, 32))
 
 
+@pytest.mark.parametrize(
+    "target_windows,draft_windows",
+    [((None,), (16,)), ((32, 32), (None, 16))],
+)
+def test_separate_exaone_mtp_checkpoint_retains_attention_policy_through_llm(
+    vllm_runner, monkeypatch, tmp_path, target_windows, draft_windows
+):
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    target = _tiny_exaone_mtp_model(tmp_path / "target", target_windows)
+    draft = _tiny_exaone_mtp_model(tmp_path / "draft", draft_windows)
+    kwargs = dict(
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
+        for length in (17, 33)
+    ]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+
+    def generate(runner):
+        outputs = runner.llm.generate(prompts, sampling, use_tqdm=False)
+        assert len(outputs) == len(prompts)
+        result = [list(output.outputs[0].token_ids) for output in outputs]
+        assert all(len(row) == 8 for row in result)
+        return result
+
+    def draft_attention_windows(worker):
+        model = worker.model_runner.get_draft_model()
+        return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+
+    with vllm_runner(target, **kwargs) as baseline:
+        expected = generate(baseline)
+    with vllm_runner(
+        target,
+        speculative_config={
+            "method": "mtp",
+            "model": draft,
+            "num_speculative_tokens": len(draft_windows),
+        },
+        **kwargs,
+    ) as native:
+        assert native.llm.collective_rpc(draft_attention_windows) == [
+            list(draft_windows)
+        ]
+        assert generate(native) == expected
+        native.llm.llm_engine.do_log_stats()
+        assert (
+            get_spec_decode_metric_value(
+                native.llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
+            )
+            > 0
+        )
+
+
 @pytest.mark.parametrize("mtp_window", [None])
 def test_remote_mtp_timeout_falls_back_to_target(
     vllm_runner, monkeypatch, tmp_path, tiny_exaone_mtp_model
@@ -1109,6 +1181,122 @@ def tiny_hyv3_mtp_model(tmp_path):
         assert name not in weights
         weights[name] = tensor
     return _save_mtp_checkpoint(tmp_path / "hyv3", config, weights)
+
+
+@pytest.mark.parametrize(
+    ("omitted", "tied"),
+    [
+        ("eh_proj", False),
+        ("self_attn.q_proj", False),
+        ("mlp.experts.0.down_proj", False),
+        (None, False),
+        (None, True),
+    ],
+)
+def test_hyv3_mtp_loads_only_complete_owned_parameters_through_llm(
+    tiny_hyv3_mtp_model, tmp_path, omitted, tied
+):
+    """Reject missing owned weights while sharing target embeddings and heads."""
+    import json
+
+    from safetensors.torch import load_file, save_file
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    path = Path(tiny_hyv3_mtp_model) / "model.safetensors"
+    weights = load_file(path)
+    spec = {"method": "mtp", "num_speculative_tokens": 1}
+    if omitted is None:
+        config_path = path.parent / "config.json"
+        config = json.loads(config_path.read_text())
+        config["tie_word_embeddings"] = tied
+        config_path.write_text(json.dumps(config))
+        if tied:
+            del weights["lm_head.weight"]
+            save_file(weights, path, metadata={"format": "pt"})
+        draft_path = tmp_path / "draft-only"
+        draft_path.mkdir()
+        (draft_path / "config.json").write_text(json.dumps(config))
+        save_file(
+            {
+                name: tensor
+                for name, tensor in weights.items()
+                if name.startswith("model.layers.2.")
+            },
+            draft_path / "model.safetensors",
+            metadata={"format": "pt"},
+        )
+        spec["model"] = str(draft_path)
+    else:
+        del weights[f"model.layers.2.{omitted}.weight"]
+        save_file(weights, path, metadata={"format": "pt"})
+    missing = {
+        "self_attn.q_proj": "qkv_proj",
+        "mlp.experts.0.down_proj": "w2_weight",
+    }.get(omitted, omitted or "")
+    options = dict(
+        model=tiny_hyv3_mtp_model,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config=spec,
+    )
+    program = """
+import json
+import sys
+from vllm import LLM, SamplingParams
+if sys.argv[2]:
+    try:
+        LLM(**json.loads(sys.argv[1]))
+    except ValueError as error:
+        assert "not initialized from checkpoint" in str(error), error
+        assert sys.argv[2] in str(error), error
+    else:
+        raise AssertionError("LLM admitted an incomplete HYV3 MTP checkpoint")
+else:
+    llm = LLM(**json.loads(sys.argv[1]))
+
+    def shared_parameters(worker):
+        target = worker.model_runner.model
+        draft = worker.model_runner.get_draft_model()
+        return (
+            draft.model.embed_tokens is target.model.embed_tokens,
+            all(layer.shared_head.head is target.lm_head
+                for layer in draft.model.layers.values()),
+        )
+
+    assert llm.collective_rpc(shared_parameters) == [(True, True)]
+    outputs = llm.generate(
+        {"prompt_token_ids": [4, 5, 6]},
+        SamplingParams(temperature=0, max_tokens=2, min_tokens=2, ignore_eos=True),
+    )
+    tokens = outputs[0].outputs[0].token_ids
+    assert len(tokens) == 2 and all(0 <= token < 128 for token in tokens), tokens
+"""
+    log_path = tmp_path / "hyv3-mtp-loading.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [sys.executable, "-c", program, json.dumps(options), missing],
+            env=dict(
+                os.environ,
+                VLLM_ENABLE_V1_MULTIPROCESSING="0",
+                VLLM_USE_V2_MODEL_RUNNER="1",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    assert result.returncode == 0, log_path.read_text()[-12000:]
 
 
 @pytest.fixture
@@ -3844,3 +4032,71 @@ def test_remote_multi_module_mtp_dynamic_k_matches_full_prefix(
     assert all(chunk["lookahead"] == depth for chunk in chunks if not chunk["final"])
     assert all(chunk["final"] for chunk in chunks if chunk["prompt_length"] < depth)
     record_property("native.full_prefix_oracle", receipt)
+
+
+def _separate_mtp_draft(source, destination):
+    """Keep real checkpoint weights while changing the draft's scalar settings."""
+    import json
+    import shutil
+
+    shutil.copytree(source, destination, copy_function=os.link)
+    path = destination / "config.json"
+    config = json.loads(path.read_text())
+    config["rms_norm_eps"] = 0.001
+    config["rope_parameters"]["rope_theta"] *= 2
+    path.unlink()
+    path.write_text(json.dumps(config))
+    return str(destination)
+
+
+@pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
+def test_separate_mtp_checkpoint_settings_reach_public_llm(
+    vllm_runner, monkeypatch, tmp_path, request, mtp_family
+):
+    """A separately published MTP head must retain its own normalization/RoPE."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    source = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    draft = _separate_mtp_draft(source, tmp_path / "separate-draft")
+    target_config = json.loads((Path(source) / "config.json").read_text())
+    draft_config = json.loads((Path(draft) / "config.json").read_text())
+
+    def settings(worker):
+        model = worker.model_runner.get_draft_model()
+        layer = next(iter(model.model.layers.values()))
+        norm = layer.enorm if mtp_family == "hyv3" else layer.mtp_emb_norm
+        return (
+            worker.vllm_config.model_config.hf_config.rms_norm_eps,
+            norm.variance_epsilon,
+            layer.mtp_block.self_attn.rotary_emb.base,
+        )
+
+    with vllm_runner(
+        source,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config={
+            "method": "mtp",
+            "model": draft,
+            "num_speculative_tokens": 1,
+        },
+    ) as runner:
+        assert runner.llm.collective_rpc(settings) == [
+            (
+                target_config["rms_norm_eps"],
+                draft_config["rms_norm_eps"],
+                draft_config["rope_parameters"]["rope_theta"],
+            )
+        ]
