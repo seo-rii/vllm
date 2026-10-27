@@ -7,6 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
@@ -47,6 +48,7 @@ from vllm.v1.spec_decode.remote.transport import (
 )
 
 OK = SpeculatorStatusCode.OK
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -118,14 +120,17 @@ class TokenOnlyRemoteSession:
         return self.clock() + self.request_timeout_s
 
     def _invalidate(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-        self._conn = None
+        connection, self._conn = self._conn, None
         for state in self.records.values():
             state.terminal = True
         for key in self._deferred_closes:
             self.records.pop(key, None)
         self._deferred_closes.clear()
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError as error:
+                logger.warning("Token-only connection cleanup failed: %s", error)
 
     def fail(self, detail: str) -> None:
         self._invalidate()
@@ -427,9 +432,9 @@ class TokenOnlyRemoteSession:
             or not handle.active
         ):
             raise RuntimeError("cannot cancel a stale token handle")
-        self._invalidate()
         handle.active = False
         self._pending = None
+        self._invalidate()
 
     def close_sequences(
         self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
@@ -459,9 +464,9 @@ class TokenOnlyRemoteSession:
                 self.records.pop(key, None)
 
     def close(self) -> None:
-        self._invalidate()
         self._closed = True
         if self._pending is not None:
             self._pending.active = False
             self._pending = None
+        self._invalidate()
         self.records.clear()
