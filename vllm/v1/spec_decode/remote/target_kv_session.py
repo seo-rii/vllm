@@ -146,12 +146,15 @@ class TargetKVRemoteSession:
         return self._epoch
 
     def _invalidate(self):
-        if self._conn is not None:
-            self._conn.close()
-        self._conn = None
+        connection, self._conn = self._conn, None
         self._closing.clear()
         for key in self.records:
             self.records[key] = False
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError as error:
+                logger.warning("Target-KV connection cleanup failed: %s", error)
 
     def fail(self, detail: str) -> None:
         self._invalidate()
@@ -233,6 +236,9 @@ class TargetKVRemoteSession:
         key = SequenceKey(
             self.hello.verifier_instance_id, sequence_id, next(self._generations)
         )
+        return self._open_sequence(key, deadline=deadline)
+
+    def _open_sequence(self, key: SequenceKey, *, deadline: float) -> SequenceKey:
         self.records[key] = True
         row_error = None
         try:
@@ -257,13 +263,31 @@ class TargetKVRemoteSession:
     def open_sequences(
         self, sequence_ids: tuple[int, ...], *, deadline: float
     ) -> tuple[SequenceKey, ...]:
+        if self._pending is not None:
+            raise RuntimeError("target-KV open overlaps a proposal")
         if len(self.records) + len(sequence_ids) > self.hello.max_num_seqs:
             raise ValueError("target-KV open exceeds negotiated sequence capacity")
         if len(set(sequence_ids)) != len(sequence_ids) or any(
             key.sequence_id in sequence_ids for key in self.records
         ):
             raise ValueError("target-KV sequence IDs must be distinct and unopened")
-        return tuple(self.open_sequence(i, deadline=deadline) for i in sequence_ids)
+        keys = tuple(
+            SequenceKey(self.hello.verifier_instance_id, i, next(self._generations))
+            for i in sequence_ids
+        )
+        try:
+            for key in keys:
+                self._open_sequence(key, deadline=deadline)
+            return keys
+        except BaseException:
+            try:
+                self.close_sequences(keys, deadline=deadline)
+            except Exception as error:
+                self._invalidate()
+                for key in keys:
+                    self.records.pop(key, None)
+                logger.warning("Target-KV open rollback failed: %s", error)
+            raise
 
     def dispatch(
         self,
@@ -485,9 +509,9 @@ class TargetKVRemoteSession:
             or not handle.active
         ):
             raise RuntimeError("cannot cancel stale target-KV handle")
-        self._invalidate()
         handle.active = False
         self._pending = None
+        self._invalidate()
 
     def _flush_closes(self, deadline: float) -> None:
         if self._conn is None or not self._closing:
@@ -530,9 +554,9 @@ class TargetKVRemoteSession:
                 self._invalidate()
 
     def close(self):
-        self._invalidate()
         self._closed = True
         if self._pending is not None:
             self._pending.active = False
             self._pending = None
+        self._invalidate()
         self.records.clear()
