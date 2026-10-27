@@ -13,6 +13,10 @@ import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, PreTrainedConfig, Qwen3Config
 
+from tests.v1.e2e.spec_decode.remote.test_remote_mtp import _separate_mtp_draft
+from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
+    tiny_ernie_mtp_model as tiny_ernie_mtp_model,
+)
 from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
     tiny_hyv3_mtp_model as tiny_hyv3_mtp_model,
 )
@@ -42,6 +46,61 @@ NEMOTRON_EMBEDDING_NAMES = (
 )
 
 pytestmark = pytest.mark.usefixtures("cpu_parallel_state")
+
+
+@pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
+def test_native_mtp_uses_separate_draft_checkpoint_settings(
+    request, tmp_path, mtp_family
+):
+    """Admitted draft metadata must determine the loaded native head's math."""
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import destroy_model_parallel, initialize_model_parallel
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    source = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    draft_path = _separate_mtp_draft(source, tmp_path / "separate-draft")
+    config = EngineArgs(
+        model=source,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        enforce_eager=True,
+        speculative_config={
+            "method": "mtp",
+            "model": draft_path,
+            "num_speculative_tokens": 1,
+        },
+    ).create_engine_config()
+    target_config = config.model_config.hf_config.to_dict()
+    assert config.speculative_config is not None
+    draft = config.speculative_config.draft_model_config
+    create_runtime_contract(config)
+    loader = get_model_loader(config.load_config)
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        destroy_model_parallel()
+        initialize_model_parallel(backend="gloo")
+        model = loader.create_model(config, draft)
+        loader.load_weights(model, draft)
+        layer = next(iter(model.model.layers.values()))
+        norm = layer.enorm if mtp_family == "hyv3" else layer.mtp_emb_norm
+        inputs = torch.full((1, draft.get_hidden_size()), 0.01, dtype=torch.float32)
+        expected = inputs * torch.rsqrt(
+            inputs.square().mean(-1, keepdim=True) + draft.hf_config.rms_norm_eps
+        )
+        expected = (expected.to(norm.weight.dtype) * norm.weight).to(inputs.dtype)
+        assert torch.equal(norm.forward_native(inputs), expected)
+        assert norm.variance_epsilon == draft.hf_config.rms_norm_eps
+        assert (
+            layer.mtp_block.self_attn.rotary_emb.base
+            == draft.hf_config.rope_parameters["rope_theta"]
+        )
+    assert config.model_config.hf_config.to_dict() == target_config
 
 
 @cache

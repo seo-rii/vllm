@@ -1648,3 +1648,71 @@ def test_remote_native_mtp_matches_native_and_target(
             for line in server_log.read_text().splitlines()
         )
         record_property("remote.decode_backend_from_server_log", "TRITON_MLA")
+
+
+def _separate_mtp_draft(source, destination):
+    """Keep real checkpoint weights while changing the draft's scalar settings."""
+    import json
+    import shutil
+
+    shutil.copytree(source, destination, copy_function=os.link)
+    path = destination / "config.json"
+    config = json.loads(path.read_text())
+    config["rms_norm_eps"] = 0.001
+    config["rope_parameters"]["rope_theta"] *= 2
+    path.unlink()
+    path.write_text(json.dumps(config))
+    return str(destination)
+
+
+@pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
+def test_separate_mtp_checkpoint_settings_reach_public_llm(
+    vllm_runner, monkeypatch, tmp_path, request, mtp_family
+):
+    """A separately published MTP head must retain its own normalization/RoPE."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    source = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    draft = _separate_mtp_draft(source, tmp_path / "separate-draft")
+    target_config = json.loads((Path(source) / "config.json").read_text())
+    draft_config = json.loads((Path(draft) / "config.json").read_text())
+
+    def settings(worker):
+        model = worker.model_runner.get_draft_model()
+        layer = next(iter(model.model.layers.values()))
+        norm = layer.enorm if mtp_family == "hyv3" else layer.mtp_emb_norm
+        return (
+            worker.vllm_config.model_config.hf_config.rms_norm_eps,
+            norm.variance_epsilon,
+            layer.mtp_block.self_attn.rotary_emb.base,
+        )
+
+    with vllm_runner(
+        source,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config={
+            "method": "mtp",
+            "model": draft,
+            "num_speculative_tokens": 1,
+        },
+    ) as runner:
+        assert runner.llm.collective_rpc(settings) == [
+            (
+                target_config["rms_norm_eps"],
+                draft_config["rms_norm_eps"],
+                draft_config["rope_parameters"]["rope_theta"],
+            )
+        ]
