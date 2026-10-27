@@ -203,26 +203,37 @@ def paused_draft_server(process: subprocess.Popen):
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv,num_workers,max_num_seqs",
+    "transport,target_kv,num_workers,max_num_seqs,registration_oom",
     [
-        ("inline", False, 1, 4),
-        ("cuda_ipc", False, 1, 4),
-        ("inline", False, 2, 4),
-        ("cuda_ipc", False, 2, 4),
-        ("inline", True, 1, 4),
-        ("inline", True, 2, 4),
-        ("inline", True, 1, 1),
+        ("inline", False, 1, 4, False),
+        ("cuda_ipc", False, 1, 4, False),
+        ("inline", False, 2, 4, False),
+        ("cuda_ipc", False, 2, 4, False),
+        ("inline", True, 1, 4, False),
+        ("inline", True, 2, 4, False),
+        ("inline", True, 1, 1, False),
+        ("inline", True, 1, 1, True),
     ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport, target_kv, num_workers, max_num_seqs
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    transport,
+    target_kv,
+    num_workers,
+    max_num_seqs,
+    registration_oom,
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    if max_num_seqs == 1:
+    if registration_oom:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        monkeypatch.setenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
+    elif max_num_seqs == 1:
         monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     model = maybe_model_redirect(GEMMA_MODEL if target_kv else MODEL)
     revision = GEMMA_REVISION if target_kv else REVISION
@@ -280,7 +291,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
         )
         remote_options = dict(
             transport=transport,
-            failure_policy="error",
+            failure_policy="target_only" if registration_oom else "error",
             request_timeout_ms=5000,
             startup_timeout_ms=600000,
         )
@@ -295,8 +306,47 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_config().transport == transport
             assert actual_config.get_remote_draft_endpoints() == endpoints
+            metric_names = (
+                "vllm:spec_decode_num_draft_tokens",
+                "vllm:spec_decode_num_accepted_tokens",
+            )
+            before_recovery = None
+            if registration_oom:
+
+                class RegistrationRequestId(str):
+                    injected = False
+
+                    def __hash__(self):
+                        frame = sys._getframe(1)
+                        if (
+                            not self.injected
+                            and frame.f_code.co_name == "_dispatch_snapshot"
+                            and frame.f_locals.get("keys")
+                        ):
+                            self.injected = True
+                            raise MemoryError("target-KV request map insertion")
+                        return super().__hash__()
+
+                engine = remote.llm.llm_engine
+                request_id = RegistrationRequestId("registration-oom")
+                engine.add_request(request_id, prompts[0], sampling)
+                completed: list[Any] = []
+                while engine.has_unfinished_requests():
+                    completed.extend(
+                        output for output in engine.step() if output.finished
+                    )
+                assert request_id.injected
+                assert len(completed) == 1
+                assert list(completed[0].outputs[0].token_ids) == list(
+                    expected[0].outputs[0].token_ids
+                )
+                engine.do_log_stats()
+                before_recovery = {
+                    name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                    for name in metric_names
+                }
             sibling = None
-            if target_kv and max_num_seqs == 1:
+            if target_kv and max_num_seqs == 1 and not registration_oom:
                 from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
                     create_target_kv_contract,
                 )
@@ -337,6 +387,15 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                     list(x.outputs[0].token_ids) for x in reference
                 ]
                 assert all(len(x.outputs[0].token_ids) == 16 for x in outputs)
+                if before_recovery is not None:
+                    remote.llm.llm_engine.do_log_stats()
+                    metrics = remote.llm.get_metrics()
+                    for name in metric_names:
+                        assert (
+                            get_spec_decode_metric_value(metrics, name)
+                            > before_recovery[name]
+                        )
+                    before_recovery = None
                 if sibling is not None:
                     # Drain finished-request cleanup without closing the engine's
                     # draft connection or changing its GPU allocations.
@@ -350,10 +409,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                         remote.llm.wake_up(tags=["scheduling"])
             remote.llm.llm_engine.do_log_stats()
             metrics = remote.llm.get_metrics()
-            for name in (
-                "vllm:spec_decode_num_draft_tokens",
-                "vllm:spec_decode_num_accepted_tokens",
-            ):
+            for name in metric_names:
                 assert get_spec_decode_metric_value(metrics, name) > 0
 
 
@@ -4047,6 +4103,50 @@ def _separate_mtp_draft(source, destination):
     path.unlink()
     path.write_text(json.dumps(config))
     return str(destination)
+
+
+def test_remote_mtp_rejects_short_draft_context_through_llm(
+    vllm_runner, monkeypatch, tmp_path, tiny_ernie_mtp_model
+):
+    """Reject a short draft before opening its remote session or running RoPE."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    draft = _separate_mtp_draft(tiny_ernie_mtp_model, tmp_path / "short-draft")
+    config_path = Path(draft) / "config.json"
+    draft_config = json.loads(config_path.read_text())
+    draft_config["max_position_embeddings"] = 16
+    config_path.write_text(json.dumps(draft_config))
+    with (
+        pytest.raises(ValueError, match="standalone MTP.*draft.*max_model_len"),
+        vllm_runner(
+            tiny_ernie_mtp_model,
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            max_model_len=64,
+            max_num_seqs=2,
+            max_num_batched_tokens=32,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            attention_config={"backend": "TRITON_ATTN"},
+            moe_backend="triton",
+            kv_cache_memory_bytes=32 << 20,
+            gpu_memory_utilization=0.2,
+            speculative_config={
+                "method": "mtp",
+                "model": draft,
+                "num_speculative_tokens": 1,
+                "remote_draft": {
+                    "endpoint": f"unix://{tmp_path / 'never-opened.sock'}",
+                    "failure_policy": "error",
+                },
+            },
+        ),
+    ):
+        pass
 
 
 @pytest.mark.parametrize("mtp_family", ["hyv3", "ernie"])
