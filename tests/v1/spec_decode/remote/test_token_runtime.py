@@ -442,6 +442,86 @@ def socket_runtime(tmp_path):
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
 
 
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_token_cleanup_error_preserves_failure_policy_and_terminal_state(
+    socket_runtime, monkeypatch, policy
+):
+    import errno
+    import socket
+
+    _, _, _, session = socket_runtime
+    session.failure_policy = policy
+    key, deferred = (
+        session.open_sequence(i, deadline=session.deadline()) for i in range(2)
+    )
+    session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+    handle = session.dispatch(
+        0, (TokenAdvanceRow(key, 1, None, 0, 0, (2,)),), 1, deadline=session.deadline()
+    )
+    session.close_sequences((deferred,))
+    connection = session._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="original token failure"):
+                session.fail("original token failure")
+        else:
+            session.fail("original token failure")
+    assert connection.closed and session._conn is None
+    assert not session.active(key)
+    assert deferred not in session.records and not session._deferred_closes
+    assert session.collect(handle).valid_lengths == (0,)
+    assert not handle.active and session._pending is None
+
+
+@pytest.mark.parametrize("operation", ["cancel", "close"])
+def test_token_cleanup_error_finishes_cancelled_handle(
+    socket_runtime, monkeypatch, operation
+):
+    import errno
+    import socket
+
+    _, _, _, session = socket_runtime
+    key = session.open_sequence(0, deadline=session.deadline())
+    session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+    handle = session.dispatch(
+        0, (TokenAdvanceRow(key, 1, None, 0, 0, (2,)),), 1, deadline=session.deadline()
+    )
+    connection = session._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if operation == "cancel":
+            session.cancel(handle)
+        else:
+            session.close()
+    assert connection.closed and session._conn is None
+    assert not session.active(key)
+    assert not handle.active and session._pending is None
+    with pytest.raises(RuntimeError, match="stale, foreign or collected"):
+        session.collect(handle)
+    if operation == "close":
+        assert not session.records
+        with pytest.raises(RuntimeError, match="closed"):
+            session.connect()
+    else:
+        next_handle = session.dispatch(1, (), 0, deadline=session.deadline())
+        assert session.collect(next_handle).valid_lengths == ()
+
+
 def test_token_socket_batches_rows_at_each_draft_depth(socket_runtime):
     state, oracle, _, session = socket_runtime
     keys = tuple(
@@ -1771,8 +1851,8 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         AutoModelForCausalLM,
         LlamaConfig,
         MistralConfig,
-        PreTrainedTokenizerFast,
         Qwen3Config,
+        TokenizersBackend,
     )
 
     from vllm.config import (
@@ -1790,7 +1870,7 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         "llama": (LlamaConfig, "LlamaForCausalLM"),
         "mistral": (MistralConfig, "MistralForCausalLM"),
     }
-    tokenizer = PreTrainedTokenizerFast(
+    tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
         bos_token="token0",
         eos_token="token1",
