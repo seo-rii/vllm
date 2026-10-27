@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.errors import (
     host_allocation_failure,
@@ -53,6 +54,8 @@ from vllm.v1.spec_decode.remote.transport import (
     connect,
     is_local_endpoint,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -138,12 +141,15 @@ class TargetKVRemoteSession:
         return self.records.get(key, False)
 
     def _invalidate(self):
-        if self._conn is not None:
-            self._conn.close()
-        self._conn = None
+        connection, self._conn = self._conn, None
         self._closing.clear()
         for key in self.records:
             self.records[key] = False
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError as error:
+                logger.warning("Target-KV connection cleanup failed: %s", error)
 
     def fail(self, detail: str) -> None:
         self._invalidate()
@@ -473,9 +479,9 @@ class TargetKVRemoteSession:
             or not handle.active
         ):
             raise RuntimeError("cannot cancel stale target-KV handle")
-        self._invalidate()
         handle.active = False
         self._pending = None
+        self._invalidate()
 
     def _flush_closes(self, deadline: float) -> None:
         if self._conn is None or not self._closing:
@@ -512,9 +518,9 @@ class TargetKVRemoteSession:
             self._flush_closes(self.deadline())
 
     def close(self):
-        self._invalidate()
         self._closed = True
         if self._pending is not None:
             self._pending.active = False
             self._pending = None
+        self._invalidate()
         self.records.clear()

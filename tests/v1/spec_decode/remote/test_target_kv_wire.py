@@ -787,3 +787,77 @@ def test_batch_total_page_limit_rejects_manifest_before_any_data(wire_runtime):
     with pytest.raises(TransportError):
         client._conn.recv(timeout=1)
     assert not executor.calls
+
+
+@pytest.mark.parametrize("wire_runtime", [2], indirect=True)
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_cleanup_error_preserves_failure_policy_and_terminal_state(
+    wire_runtime, monkeypatch, policy
+):
+    _, _, client = wire_runtime
+    client.failure_policy = policy
+    key, deferred = client.open_sequences((0, 1), deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    client.close_sequences((deferred,))
+    connection = client._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="original target-KV failure"):
+                client.fail("original target-KV failure")
+        else:
+            client.fail("original target-KV failure")
+    assert connection.closed and client._conn is None
+    assert not client.active(key)
+    assert deferred not in client.records and not client._closing
+    assert client.collect(handle).valid_length == 0
+    assert not handle.active and client._pending is None
+
+
+@pytest.mark.parametrize("operation", ["cancel", "close"])
+def test_cleanup_error_finishes_cancelled_handle(wire_runtime, monkeypatch, operation):
+    _, _, client = wire_runtime
+    key = client.open_sequence(0, deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    connection = client._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if operation == "cancel":
+            client.cancel(handle)
+        else:
+            client.close()
+    assert connection.closed and client._conn is None
+    assert not client.active(key)
+    assert not handle.active and client._pending is None
+    with pytest.raises(RuntimeError, match="collected"):
+        client.collect(handle)
+    if operation == "close":
+        assert not client.records
+        with pytest.raises(RuntimeError, match="closed"):
+            client.connect()
+    else:
+        assert propose(client, snapshot(client, key, 1)).valid_length == 0
