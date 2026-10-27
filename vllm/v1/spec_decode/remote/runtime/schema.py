@@ -71,6 +71,12 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
         or target.get_vocab_size() != draft.get_vocab_size()
     ):
         raise ValueError("standalone MTP requires matching target hidden/vocab sizes")
+    if target.max_model_len > draft.max_model_len:
+        raise ValueError(
+            "standalone MTP requires draft max_model_len "
+            f"({draft.max_model_len}) to cover target max_model_len "
+            f"({target.max_model_len}); reduce the target context limit"
+        )
     num_modules = getattr(config, "num_nextn_predict_layers", None)
     if type(num_modules) is not int or num_modules < 1:
         raise ValueError(
