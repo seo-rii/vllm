@@ -1021,6 +1021,7 @@ def test_snapshot_pool_reserves_credit_before_receiving_any_payload(wire_runtime
 @pytest.mark.parametrize("wire_runtime", [_POOL_LIMITS], indirect=True)
 def test_snapshot_pool_expired_queued_job_does_not_fail_healthy_sibling(wire_runtime):
     server, oracle, a = wire_runtime
+    timeout_s = 0.05
     with peer(a, "b") as b, peer(a, "blocker") as blocker:
         ka, kb, kc = (
             c.open_sequence(0, deadline=c.deadline()) for c in (a, b, blocker)
@@ -1033,12 +1034,15 @@ def test_snapshot_pool_expired_queued_job_does_not_fail_healthy_sibling(wire_run
                 snapshot(a, ka),
                 10,
                 torch.ones((1, 8), dtype=torch.bfloat16),
-                deadline=time.monotonic() + 0.05,
+                deadline=time.monotonic() + timeout_s,
             )
             healthy = threads.submit(propose, b, snapshot(b, kb))
             until(lambda: server.work_queue.depth == 3)
+            # The server's relative budget starts later than the client deadline.
+            server_expiry_upper_bound = time.monotonic() + timeout_s
             with pytest.raises(RemoteDraftError):
                 a.collect(handle)
+            until(lambda: time.monotonic() >= server_expiry_upper_bound)
             oracle.release.set()
             assert held.result().token_ids == healthy.result().token_ids == (18,)
         assert {i.key.verifier_instance_id for i, _ in oracle.calls} == {"blocker", "b"}
@@ -1097,3 +1101,95 @@ def test_snapshot_pool_shutdown_retains_running_owner_until_process_restart(
     assert len(server.registry) == 1  # Logical state retained after unsafe shutdown.
     assert len(oracle.attempts) == 1
     until(lambda: not server._connections and not server._acceptor.is_alive())
+
+
+@pytest.mark.parametrize("wire_runtime", [2], indirect=True)
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_cleanup_error_preserves_failure_policy_and_terminal_state(
+    wire_runtime, monkeypatch, policy
+):
+    _, _, client = wire_runtime
+    client.failure_policy = policy
+    key, deferred = client.open_sequences((0, 1), deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    client.close_sequences((deferred,))
+    connection = client._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="original target-KV failure"):
+                client.fail("original target-KV failure")
+        else:
+            client.fail("original target-KV failure")
+    assert connection.closed and client._conn is None
+    assert not client.active(key)
+    assert deferred not in client.records and not client._closing
+    assert client.collect(handle).valid_length == 0
+    assert not handle.active and client._pending is None
+
+
+@pytest.mark.parametrize("operation", ["cancel", "close"])
+def test_cleanup_error_finishes_cancelled_handle(wire_runtime, monkeypatch, operation):
+    _, _, client = wire_runtime
+    key = client.open_sequence(0, deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    connection = client._conn
+    close_socket = socket.socket.close
+
+    def close_then_fail(sock):
+        close_socket(sock)
+        if sock is connection._sock:
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(socket.socket, "close", close_then_fail)
+        if operation == "cancel":
+            client.cancel(handle)
+        else:
+            client.close()
+    assert connection.closed and client._conn is None
+    assert not client.active(key)
+    assert not handle.active and client._pending is None
+    with pytest.raises(RuntimeError, match="collected"):
+        client.collect(handle)
+    if operation == "close":
+        assert not client.records
+        with pytest.raises(RuntimeError, match="closed"):
+            client.connect()
+    else:
+        assert propose(client, snapshot(client, key, 1)).valid_length == 0
+
+
+@pytest.mark.parametrize(
+    "wire_runtime",
+    [{"max_num_seqs": 3, "max_sequences_per_verifier": 1}],
+    indirect=True,
+)
+def test_partial_batch_open_retires_unreturned_sequences(wire_runtime):
+    """A strict rejection after the first open returns every local credit."""
+    server, _, client = wire_runtime
+    with pytest.raises(RemoteDraftError, match="sequence credit exhausted"):
+        client.open_sequences((0, 1, 2), deadline=client.deadline())
+    assert not client.records
+    until(lambda: len(server.registry) == 0)
+    key = client.open_sequence(3, deadline=client.deadline())
+    assert client.active(key)
+    client.close_sequences((key,))
+    assert not client.records
