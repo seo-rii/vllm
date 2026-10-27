@@ -3,6 +3,8 @@
 """Verify native query selection, profiling and terminal fallback without CUDA."""
 
 import errno
+import os
+import sys
 from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -22,7 +24,10 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotCompletionError,
     TargetKVSnapshot,
 )
-from vllm.v1.spec_decode.remote.target_kv_session import TargetKVResult
+from vllm.v1.spec_decode.remote.target_kv_session import (
+    TargetKVRemoteSession,
+    TargetKVResult,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import target_kv_remote as remote
 
@@ -507,3 +512,119 @@ def test_oom_in_first_preparation_allocation_is_terminal(verifier, monkeypatch):
         ).valid_lengths.tolist() == [0]
     assert check.call_count == 1
     assert not any(instance._session.records.values())
+
+
+@pytest.mark.parametrize("count,failed_row", [(1, 0), (3, 0), (3, 1), (3, 2)])
+@pytest.mark.parametrize("policy", ["target_only", "error"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_registration_oom_retires_open_sequences_and_stays_terminal(
+    tmp_path, count, failed_row, policy, cleanup_failure
+):
+    """A failed ownership transfer must not strand real session credits."""
+    from tests.v1.spec_decode.remote.test_target_kv_runtime import _native_config
+    from tests.v1.spec_decode.remote.test_target_kv_wire import SnapshotOracle, until
+    from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
+        create_target_kv_contract,
+    )
+    from vllm.v1.spec_decode.remote.target_kv_server import TargetKVDraftServer
+
+    class RequestId(str):
+        failed = False
+
+        def __hash__(self):
+            frame = sys._getframe(1)
+            if (
+                self == f"request-{failed_row}"
+                and not self.failed
+                and frame.f_code.co_name == "_dispatch_snapshot"
+                and frame.f_locals.get("keys")
+            ):
+                self.failed = True
+                if cleanup_failure:
+                    assert isinstance(instance._session, TargetKVRemoteSession)
+                    connection = instance._session._conn
+                    assert connection is not None
+                    os.close(connection._sock.fileno())
+                raise MemoryError("request map insertion")
+            return super().__hash__()
+
+    config = _native_config(tmp_path, max_model_len=64, max_num_seqs=count)
+    contract = create_target_kv_contract(config)
+    executor = SnapshotOracle(contract.expected_specs, contract.receiver_budget)
+    server = TargetKVDraftServer(
+        executor,
+        contract_fingerprint=contract.fingerprint,
+        hidden_size=contract.hidden_size,
+        vocab_size=contract.vocab_size,
+        expected_specs=contract.expected_specs,
+        snapshot_budget=contract.snapshot_budget,
+        receiver_budget=contract.receiver_budget,
+        max_num_seqs=count,
+    )
+    endpoint = server.start(f"unix://{tmp_path}/registration.sock")
+    config.speculative_config = replace(
+        config.speculative_config,
+        prompt_lookup_max=None,
+        prompt_lookup_min=None,
+        remote_draft=RemoteDraftConfig(
+            endpoint=endpoint, failure_policy=policy, request_timeout_ms=1000
+        ),
+    )
+    instance = remote.TargetKVRemoteSpeculator(config, torch.device("cpu"))
+    request_ids = [RequestId(f"request-{row}") for row in range(count)]
+
+    def context_for(ids):
+        batch = replace(
+            InputBatch.make_dummy(
+                len(ids), len(ids), InputBuffers(count, count, torch.device("cpu"))
+            ),
+            req_ids=ids,
+        )
+        return LocalExecutionContext(
+            batch,
+            None,
+            None,
+            None,
+            None,
+            torch.ones(count, dtype=torch.int32),
+            torch.zeros(count, dtype=torch.int32),
+            torch.ones(count, dtype=torch.int64),
+            torch.zeros(count, dtype=torch.int64),
+            torch.zeros(count),
+            torch.zeros(count, dtype=torch.int64),
+        )
+
+    try:
+        context = context_for(request_ids)
+        step = DraftStep.from_batch(context.input_batch, 0)
+        handle = instance.dispatch(step, context)
+        assert request_ids[failed_row].failed
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="allocation failed"):
+                instance.collect(handle)
+        else:
+            assert instance.collect(handle).valid_lengths.tolist() == [0] * count
+        assert not instance._requests
+        assert not instance._session.records
+        until(lambda: len(server.registry) == 0)
+        until(lambda: not server._connections)
+
+        # The same requests remain target-only, without opening new identities.
+        assert instance.collect(
+            instance.dispatch(step, context)
+        ).valid_lengths.tolist() == ([0] * count)
+        assert not instance._session.records
+        instance.close_requests(request_ids)
+
+        # Even the one-credit server can admit another request after retirement.
+        following = context_for(["following"])
+        instance.collect(
+            instance.dispatch(DraftStep.from_batch(following.input_batch, 0), following)
+        )
+        assert len(instance._session.records) == 1
+        assert all(instance._session.records.values())
+        instance.close_requests(["following"])
+        assert not instance._session.records
+    finally:
+        instance.close()
+        server.stop()

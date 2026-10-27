@@ -137,6 +137,10 @@ terminal target-only, or raise under `failure_policy="error"`; a late reply
 cannot reactivate them. A new request can reconnect. A recoverable assistant
 forward OOM fences all rows submitted in that forward while preserving unrelated
 open requests. A verifier preparation or transport failure fences its connection.
+Socket cleanup errors preserve the selected failure policy and retire cancelled
+proposals. If registering a new request runs out of memory, its opened sequence
+credits are returned and the request remains terminal target-only until it ends.
+New requests can use the recovered capacity.
 Unknown CUDA completion and context-fatal errors propagate and
 require process restart. Closing a socket never serves as a GPU completion fence.
 

@@ -6,6 +6,7 @@ import errno
 import socket
 import struct
 import threading
+import time
 from dataclasses import replace
 
 import pytest
@@ -45,6 +46,13 @@ from vllm.v1.spec_decode.remote.transport import (
     TransportError,
     connect,
 )
+
+
+def until(predicate):
+    deadline = time.monotonic() + 3
+    while not predicate():
+        assert time.monotonic() < deadline
+        threading.Event().wait(0.001)
 
 
 class SnapshotOracle:

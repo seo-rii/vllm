@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.proposal import ProposalHandle, SpeculatorOutput
@@ -37,6 +38,8 @@ from vllm.v1.spec_decode.remote.target_kv_session import (
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 
+logger = init_logger(__name__)
+
 
 @dataclass(eq=False)
 class _SnapshotHandle(ProposalHandle):
@@ -60,6 +63,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         self._owner = object()
         self._pending: _SnapshotHandle | None = None
         self._requests: dict[str, SequenceKey] = {}
+        self._terminal_requests: set[str] = set()
         self._sequences = itertools.count()
         self._rounds = itertools.count()
         self._closed = False
@@ -188,17 +192,33 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         if context.mm_inputs is not None:
             raise ValueError("remote Gemma4 requires text-only inputs")
         new_ids = tuple(
-            req_id for req_id in handle.step.request_ids if req_id not in self._requests
+            req_id
+            for req_id in handle.step.request_ids
+            if req_id not in self._requests and req_id not in self._terminal_requests
         )
         if new_ids:
-            keys = session.open_sequences(
-                tuple(next(self._sequences) for _ in new_ids), deadline=deadline
-            )
-            self._requests.update(zip(new_ids, keys, strict=True))
+            # Reserve terminal ownership before opening any remote sequences.
+            self._terminal_requests.update(new_ids)
+            keys: tuple[SequenceKey, ...] = ()
+            try:
+                keys = session.open_sequences(
+                    tuple(next(self._sequences) for _ in new_ids), deadline=deadline
+                )
+                self._requests.update(zip(new_ids, keys, strict=True))
+            except BaseException:
+                for req_id in new_ids:
+                    self._requests.pop(req_id, None)
+                try:
+                    session.close_sequences(keys, deadline=deadline)
+                except Exception as error:
+                    logger.warning("Target-KV registration rollback failed: %s", error)
+                raise
+            self._terminal_requests.difference_update(new_ids)
         active_rows = [
             row
             for row, req_id in enumerate(handle.step.request_ids)
-            if session.active(self._requests[req_id])
+            if req_id not in self._terminal_requests
+            and session.active(self._requests[req_id])
         ]
         self.stats["fallback"] += len(handle.step.request_ids) - len(active_rows)
         if not active_rows:
@@ -356,6 +376,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         keys = tuple(
             self._requests.pop(req_id) for req_id in req_ids if req_id in self._requests
         )
+        self._terminal_requests.difference_update(req_ids)
         if keys:
             self._session.close_sequences(keys)
 
@@ -363,6 +384,7 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         self._closed = True
         self._session.close()
         self._requests.clear()
+        self._terminal_requests.clear()
         if self._pending is not None:
             self._discard(self._pending)
 

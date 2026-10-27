@@ -231,6 +231,9 @@ class TargetKVRemoteSession:
         key = SequenceKey(
             self.hello.verifier_instance_id, sequence_id, next(self._generations)
         )
+        return self._open_sequence(key, deadline=deadline)
+
+    def _open_sequence(self, key: SequenceKey, *, deadline: float) -> SequenceKey:
         self.records[key] = True
         try:
             self.connect(deadline=deadline)
@@ -251,13 +254,31 @@ class TargetKVRemoteSession:
     def open_sequences(
         self, sequence_ids: tuple[int, ...], *, deadline: float
     ) -> tuple[SequenceKey, ...]:
+        if self._pending is not None:
+            raise RuntimeError("target-KV open overlaps a proposal")
         if len(self.records) + len(sequence_ids) > self.hello.max_num_seqs:
             raise ValueError("target-KV open exceeds negotiated sequence capacity")
         if len(set(sequence_ids)) != len(sequence_ids) or any(
             key.sequence_id in sequence_ids for key in self.records
         ):
             raise ValueError("target-KV sequence IDs must be distinct and unopened")
-        return tuple(self.open_sequence(i, deadline=deadline) for i in sequence_ids)
+        keys = tuple(
+            SequenceKey(self.hello.verifier_instance_id, i, next(self._generations))
+            for i in sequence_ids
+        )
+        try:
+            for key in keys:
+                self._open_sequence(key, deadline=deadline)
+            return keys
+        except BaseException:
+            try:
+                self.close_sequences(keys, deadline=deadline)
+            except Exception as error:
+                self._invalidate()
+                for key in keys:
+                    self.records.pop(key, None)
+                logger.warning("Target-KV open rollback failed: %s", error)
+            raise
 
     def dispatch(
         self,
@@ -502,7 +523,9 @@ class TargetKVRemoteSession:
         except Exception as error:
             self.fail(f"target-KV close failed: {error}")
 
-    def close_sequences(self, keys: tuple[SequenceKey, ...]):
+    def close_sequences(
+        self, keys: tuple[SequenceKey, ...], *, deadline: float | None = None
+    ):
         keys = tuple(key for key in dict.fromkeys(keys) if key in self.records)
         if not keys:
             return
@@ -510,12 +533,16 @@ class TargetKVRemoteSession:
             identity.key in keys for identity in self._pending.identities
         ):
             self.cancel(self._pending)
-        if self.hello.max_num_seqs > 1 and self._conn is not None:
+        if self._conn is not None:
             self._closing.update(keys)
         for key in keys:
             self.records.pop(key, None)
         if self._pending is None:
-            self._flush_closes(self.deadline())
+            deadline = self.deadline() if deadline is None else deadline
+            if self.clock() < deadline:
+                self._flush_closes(deadline)
+            elif not any(self.records.values()):
+                self._invalidate()
 
     def close(self):
         self._closed = True
