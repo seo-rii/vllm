@@ -6,6 +6,7 @@ import contextlib
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from itertools import chain
 
 import torch
 
@@ -327,6 +328,17 @@ class ConditionedDraftPool:
             )
         return result
 
+    @staticmethod
+    def _cuda_tensors(batch, chunks):
+        tensors = (tensor for _, features, _ in chunks for tensor in features.slots)
+        if batch is not None:
+            tensors = chain(
+                tensors,
+                batch.features.slots,
+                (batch.accepted_counts, batch.recovery_tokens),
+            )
+        return (tensor for tensor in tensors if tensor is not None and tensor.is_cuda)
+
     def _run(self, index, batch, chunks, reserved, deadline, ready):
         session = self._sessions[index]
         stream = self._streams[index] if self._streams else None
@@ -336,16 +348,10 @@ class ConditionedDraftPool:
                 if stream is not None
                 else contextlib.nullcontext()
             ):
-                if ready is not None:
-                    assert stream is not None
-                    stream.wait_event(ready)
-                    features = [features for _, features, _ in chunks]
-                    if batch is not None:
-                        features.append(batch.features)
-                    for feature in features:
-                        for tensor in feature.slots:
-                            if tensor is not None and tensor.is_cuda:
-                                tensor.record_stream(stream)
+                for device, event in ready.items():
+                    torch.cuda.current_stream(device).wait_event(event)
+                for tensor in self._cuda_tensors(batch, chunks):
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
                 if reserved:
                     session.open_reserved(reserved, deadline=deadline)
                 session.prefill_many(chunks, deadline=deadline)
@@ -373,10 +379,12 @@ class ConditionedDraftPool:
             raise ValueError(
                 "reserved pool sequences require prefill in the same round"
             )
-        ready = None
-        if self._streams:
-            ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self._streams[0].device))
+        ready = {}
+        for tensor in self._cuda_tensors(batch, chunks):
+            if tensor.device not in ready:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                ready[tensor.device] = event
         handle = ConditionedPoolHandle(
             self._owner,
             batch,

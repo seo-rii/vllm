@@ -143,6 +143,91 @@ def proposal(client, key, *, token=2, k=3, batch_id=0):
     )
 
 
+@pytest.mark.parametrize("kind", ["token", "conditioned"])
+def test_pool_shutdown_preserves_socket_and_owner_failures(tmp_path, monkeypatch, kind):
+    import errno
+    import socket
+
+    from tests.v1.spec_decode.remote.test_conditioned_pool_server import (
+        runtime as conditioned_runtime,
+    )
+
+    fail_close = False
+    socket_error = OSError(errno.EIO, "injected listener cleanup failure")
+
+    class FailingSocket(socket.socket):
+        listening = False
+
+        def listen(self, *args):
+            self.listening = True
+            return super().listen(*args)
+
+        def close(self):
+            nonlocal fail_close
+            super().close()
+            if self.listening and fail_close:
+                fail_close = False
+                raise socket_error
+
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    factory = runtime if kind == "token" else conditioned_runtime
+    with factory(tmp_path, shutdown_timeout_s=0.1) as values:
+        server = values[2] if kind == "token" else values[0]
+        entered, release = threading.Event(), threading.Event()
+
+        def hold():
+            entered.set()
+            assert release.wait(3)
+
+        work = server.work_queue.submit(DraftWork("held", hold))
+        try:
+            assert entered.wait(2)
+            fail_close = True
+            with pytest.raises(ServerShutdownTimeout) as caught:
+                server.stop()
+            failures = caught.value.__cause__.exceptions
+            assert len(failures) == 2
+            assert socket_error in failures[0].__cause__.exceptions
+            assert isinstance(failures[1], ServerShutdownTimeout)
+            assert not server.healthy
+        finally:
+            release.set()
+            work.wait()
+
+
+@pytest.mark.parametrize("kind", ["token", "conditioned"])
+@pytest.mark.parametrize("started", [False, True])
+def test_pool_start_rollback_joins_gpu_owner(tmp_path, monkeypatch, kind, started):
+    from tests.v1.spec_decode.remote.test_conditioned_pool_server import (
+        runtime as conditioned_runtime,
+    )
+
+    factory = runtime if kind == "token" else conditioned_runtime
+    with factory(tmp_path) as values:
+        server = values[2] if kind == "token" else values[0]
+        server.stop()
+        path = tmp_path / "retry.sock"
+        endpoint = f"unix://{path}"
+
+        class FailingThread(threading.Thread):
+            def start(self):
+                if self.name.endswith("acceptor"):
+                    if started:
+                        super().start()
+                    raise RuntimeError("injected acceptor startup failure")
+                return super().start()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "Thread", FailingThread)
+            with pytest.raises(RuntimeError, match="injected acceptor"):
+                server.start(endpoint)
+        assert not path.exists()
+        assert server.endpoint is None
+        assert not server.work_queue._thread.is_alive()
+        assert server.healthy
+        server.start(endpoint)
+
+
 @pytest.mark.parametrize("previous", ["warmup", "bind", "stop", "fatal"])
 def test_token_server_restarts_only_after_a_recoverable_completed_owner(previous):
     from vllm.v1.spec_decode.remote.errors import CudaRuntimeError
@@ -324,6 +409,150 @@ def test_queue_shutdown_retains_running_work_and_its_credits():
     finally:
         release.set()
         queue.stop(time.monotonic() + 3)
+
+
+@pytest.mark.parametrize("fault", ["dequeue", "batch", "execute", "credit"])
+def test_queue_owner_failure_completes_all_admitted_work(monkeypatch, fault):
+    """Allocation failures cannot strand dequeued work or its waiting callers."""
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+
+    class Completion(threading.Event):
+        count = 0
+
+        def set(self):
+            self.count += 1
+            super().set()
+
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=4,
+        max_bytes=16,
+        max_jobs_per_owner=4,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+        on_failure=failures.append,
+    )
+    queue.start(lambda: None)
+
+    def hold():
+        entered.set()
+        assert release.wait(3)
+
+    held = queue.submit(DraftWork("hold", hold))
+    assert entered.wait(3)
+    jobs = [
+        queue.submit(
+            DraftWork(
+                "a", None, num_rows=1, num_tokens=1, num_bytes=4, done=Completion()
+            )
+        )
+        for _ in range(3)
+    ]
+    error = MemoryError(f"injected {fault}")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    if fault == "dequeue":
+        original = queue._pop
+
+        def dequeue():
+            original()
+            raise error
+
+        monkeypatch.setattr(queue, "_pop", dequeue)
+    elif fault == "batch":
+        monkeypatch.setattr(module, "tuple", fail, raising=False)
+    elif fault == "execute":
+        monkeypatch.setattr(queue, "_execute", fail)
+    else:
+
+        class BrokenCredits(dict):
+            def __getitem__(self, key):
+                if key == "a":
+                    raise error
+                return super().__getitem__(key)
+
+        monkeypatch.setattr(queue, "_credits", BrokenCredits(queue._credits))
+    release.set()
+    held.wait()
+    assert all(work.done.wait(3) for work in jobs)
+    assert all(work.done.count == 1 for work in jobs)
+    for work in jobs:
+        with pytest.raises(MemoryError, match=f"injected {fault}"):
+            work.wait()
+    assert queue.depth == queue.pending_bytes == 0
+    assert failures == [error]
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.stop(time.monotonic() + 3)
+    with pytest.raises(ServerShutdownTimeout):
+        queue.submit(DraftWork("new", lambda: None))
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.start(lambda: pytest.fail("failed GPU owner was restarted"))
+
+
+def test_token_owner_failure_marks_server_unhealthy_and_wakes_stop(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+
+    _, _, server = make_server()
+    server.start(f"unix://{tmp_path}/failed-owner.sock")
+    error = MemoryError("owner batch allocation")
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(module, "tuple", fail, raising=False)
+    work = server.work_queue.submit(DraftWork("a", None, num_rows=1, num_tokens=1))
+    assert work.done.wait(3)
+    assert work.error is error
+    assert server.wait(timeout=0) and not server.healthy
+    assert server.queue_depth == 0
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        server.stop()
+
+
+@pytest.mark.parametrize("fault", ["before", "uncertain", "after"])
+def test_queue_start_failure_retains_uncertain_thread_ownership(monkeypatch, fault):
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+    )
+    start = threading.Thread.start
+    error = RuntimeError("start refused") if fault == "before" else MemoryError("start")
+
+    def fail(thread):
+        if fault == "after":
+            start(thread)
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail)
+        with pytest.raises(type(error)) as caught:
+            queue.start(lambda: None)
+        assert caught.value is error
+    if fault == "before":
+        queue.stop(time.monotonic() + 3)
+        queue.start(lambda: None)
+        assert queue.call("a", lambda: 7) == 7
+        queue.stop(time.monotonic() + 3)
+    else:
+        for _ in range(2):
+            with pytest.raises(ServerShutdownTimeout, match="restart required"):
+                queue.stop(time.monotonic() + 3)
+        with pytest.raises(ServerShutdownTimeout, match="restart required"):
+            queue.start(lambda: None)
 
 
 def test_expired_queued_client_skips_forward_and_healthy_client_progresses(tmp_path):

@@ -678,6 +678,44 @@ def test_token_server_socket_close_error_releases_connection_admission(
         replacement.close()
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_token_acceptor_start_failure_rolls_back_and_allows_restart(
+    socket_runtime, monkeypatch, tmp_path, started
+):
+    import threading
+
+    _, _, server, original = socket_runtime
+    original.close()
+    server.stop()
+    path = tmp_path / "restart.sock"
+    endpoint = f"unix://{path}"
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            if self.name == "token-draft-acceptor":
+                if started:
+                    super().start()
+                raise RuntimeError("injected token acceptor start failure")
+            return super().start()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Thread", FailingThread)
+        with pytest.raises(RuntimeError, match="injected token acceptor"):
+            server.start(endpoint)
+    assert not path.exists()
+    assert server.endpoint is None
+    assert server.healthy
+    server.start(endpoint)
+    replacement = TokenOnlyRemoteSession(endpoint, original.hello)
+    try:
+        key = replacement.open_sequence(55, deadline=replacement.deadline())
+        replacement.prefill(key, (1,), is_final=True, deadline=replacement.deadline())
+        assert key in server.adapter.state.sequences
+    finally:
+        replacement.close()
+        server.stop()
+
+
 @pytest.mark.parametrize("policy", ["error", "target_only"])
 def test_token_cleanup_error_preserves_failure_policy_and_terminal_state(
     socket_runtime, monkeypatch, policy
