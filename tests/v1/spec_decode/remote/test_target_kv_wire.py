@@ -3,6 +3,7 @@
 """Actual v4 socket boundaries with CPU snapshots; no GPU/model claims."""
 
 import errno
+import os
 import socket
 import struct
 import threading
@@ -377,6 +378,63 @@ def test_second_connection_is_refused_without_running_adapter(wire_runtime):
         assert not executor.calls
     finally:
         second.close()
+
+
+@pytest.mark.parametrize(
+    "wire_runtime", [{"max_connections": 1}, {"max_connections": 2}], indirect=True
+)
+def test_server_close_error_returns_connection_and_sequence_credit(
+    wire_runtime, monkeypatch
+):
+    """A failed accepted socket cannot retain pool or verifier admission."""
+    server, executor, client = wire_runtime
+    key = client.open_sequence(0, deadline=client.deadline())
+    assert propose(client, snapshot(client, key)).token_ids == (18,)
+    assert len(server.registry) == 1
+    with server._connections_lock:
+        connection = next(iter(server._connections))
+        worker = server._workers[0]
+    errors: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    replacement = TargetKVRemoteSession(
+        client.endpoint,
+        client.hello,
+        expected_specs=client.expected_specs,
+        startup_timeout_ms=1000,
+        request_timeout_ms=1000,
+    )
+    other = TargetKVRemoteSession(
+        client.endpoint,
+        msgspec.structs.replace(client.hello, verifier_instance_id="other-verifier"),
+        expected_specs=client.expected_specs,
+        startup_timeout_ms=1000,
+        request_timeout_ms=1000,
+    )
+    try:
+        # Close the real descriptor only after its snapshot job has completed.
+        os.close(connection._sock.fileno())
+        client.close()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+        assert not server._connections and not server._handshaking
+        assert not server._verifiers
+        assert len(server.registry) == 0 and server.healthy
+        assert server.pending_snapshot_jobs == server.pending_snapshot_bytes == 0
+        assert connection.closed
+        assert not errors, [error.exc_value for error in errors]
+        # Both the same identity and an unrelated verifier must recover capacity.
+        replacement.connect()
+        key = replacement.open_sequence(0, deadline=replacement.deadline())
+        assert propose(replacement, snapshot(replacement, key)).token_ids == (18,)
+        replacement.close()
+        until(lambda: not server._connections and not len(server.registry))
+        other.connect()
+        key = other.open_sequence(0, deadline=other.deadline())
+        assert propose(other, snapshot(other, key)).token_ids == (18,)
+        assert len(executor.calls) == 3
+    finally:
+        replacement.close()
+        other.close()
 
 
 def test_session_construction_failure_releases_connection_admission(

@@ -244,10 +244,14 @@ class TokenDraftServer(RemoteDraftServer):
                     getattr(session, "session_id", "<initializing>"),
                 )
             finally:
-                conn.close()
-                with self._connections_lock:
-                    self._connections.discard(conn)
-                    self._handshaking.discard(conn)
+                try:
+                    conn.close()
+                except OSError as error:
+                    logger.warning("Token connection cleanup failed: %s", error)
+                finally:
+                    with self._connections_lock:
+                        self._connections.discard(conn)
+                        self._handshaking.discard(conn)
 
 
 class _TokenServerSession(_ServerSession):
