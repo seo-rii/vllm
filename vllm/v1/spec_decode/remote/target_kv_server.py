@@ -152,6 +152,7 @@ class TargetKVDraftServer(RemoteDraftServer):
             max_batch_rows=max_num_seqs,
             max_batch_tokens=max_num_seqs,
             batch_wait_s=batch_wait_ms / 1000,
+            on_failure=self._lifecycle_failed,
         )
 
     @property
