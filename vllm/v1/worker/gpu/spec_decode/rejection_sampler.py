@@ -144,6 +144,19 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+def get_num_invalid_spec_tokens(
+    verify_draft_sampled: torch.Tensor, cu_num_logits: torch.Tensor
+) -> torch.Tensor:
+    """Count invalid verification slots, excluding each request's bonus row."""
+    cumulative = torch.cat(
+        (
+            cu_num_logits.new_zeros(1),
+            (verify_draft_sampled < 0).cumsum(0, dtype=torch.int32),
+        )
+    )
+    return cumulative[cu_num_logits[1:]] - cumulative[cu_num_logits[:-1] + 1]
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -152,9 +165,11 @@ class RejectionSampler:
         device: torch.device,
         *,
         watermark_key: int | None = None,
+        report_invalid_spec_tokens: bool = False,
     ):
         self.sampler = sampler
         self.watermark_key = watermark_key
+        self.report_invalid_spec_tokens = report_invalid_spec_tokens
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -441,6 +456,12 @@ class RejectionSampler:
         if invalid_drafts is not None:
             verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
 
+        num_invalid_spec_tokens = (
+            get_num_invalid_spec_tokens(verify_draft_sampled, input_batch.cu_num_logits)
+            if self.report_invalid_spec_tokens
+            else None
+        )
+
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
@@ -476,4 +497,5 @@ class RejectionSampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
+            num_invalid_spec_tokens=num_invalid_spec_tokens,
         )

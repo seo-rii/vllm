@@ -32,6 +32,84 @@ def _make_model_runner_output(
     )
 
 
+def test_worker_invalid_drafts_follow_queued_step_and_grammar_union(tmp_path):
+    """Physical placeholders roll back fully; only valid drafts enter metrics."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=32,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        per_request_spec_decode_metrics="detailed",
+    )
+    assert isinstance(scheduler, AsyncScheduler)
+    requests = create_requests(
+        num_requests=2, num_tokens=1, max_tokens=32, ignore_eos=True
+    )
+    ids = [request.request_id for request in requests]
+    for request in requests:
+        scheduler.add_request(request)
+
+    def deliver(plan, tokens, invalid=None):
+        # Worker batch order can differ from scheduler request order.
+        reversed_ids = ids[::-1]
+        output = ModelRunnerOutput(
+            req_ids=reversed_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(reversed_ids)},
+            sampled_token_ids=[tokens[req_id] for req_id in reversed_ids],
+            num_invalid_spec_tokens=invalid,
+        )
+        result = scheduler.update_from_output(plan, output)
+        return result[0].scheduler_stats.spec_decoding_stats
+
+    deliver(scheduler.schedule(), {ids[0]: [10], ids[1]: [11]})
+    first, following = scheduler.schedule(), scheduler.schedule()
+    assert all(len(first.scheduled_spec_decode_tokens[req_id]) == 3 for req_id in ids)
+    assert all(request.num_output_placeholders == 8 for request in requests)
+
+    first.num_invalid_spec_tokens = {ids[0]: 1, ids[1]: 2}
+    stats = deliver(
+        first,
+        {ids[0]: [12, 13], ids[1]: [14]},
+        {ids[0]: 2, ids[1]: 1},
+    )
+    assert (stats.num_draft_tokens, stats.num_accepted_tokens) == (2, 1)
+    assert [request.num_computed_tokens for request in requests] == [7, 6]
+    assert all(request.num_output_placeholders == 4 for request in requests)
+
+    # The second queued result has a different actual length. Its all-invalid
+    # suffix overlaps the grammar suffix and must be subtracted only once.
+    following.num_invalid_spec_tokens = {ids[1]: 3}
+    stats = deliver(
+        following,
+        {ids[0]: [15, 16, 17], ids[1]: [18]},
+        {ids[0]: 0, ids[1]: 3},
+    )
+    assert (stats.num_draft_tokens, stats.num_accepted_tokens) == (3, 2)
+    assert [request.num_computed_tokens for request in requests] == [6, 3]
+    assert all(request.num_output_placeholders == 0 for request in requests)
+
+    # Outputs from native callers without worker metadata retain their grammar
+    # adjustment and do not inherit either earlier step's invalid counts.
+    legacy = scheduler.schedule()
+    legacy.num_invalid_spec_tokens = {ids[0]: 1, ids[1]: 2}
+    stats = deliver(legacy, {ids[0]: [19], ids[1]: [20]})
+    assert (stats.num_draft_tokens, stats.num_accepted_tokens) == (3, 0)
+    for request, drafted, accepted in zip(
+        requests, ([1, 3, 2], [1, 0, 1]), ([1, 2, 0], [0, 0, 0])
+    ):
+        metrics = request.spec_decode_metrics.to_dict()
+        assert metrics["per_step_drafted"] == drafted
+        assert metrics["per_step_accepted"] == accepted
+        assert metrics["num_draft_tokens"] == sum(drafted)
+    assert all(request.num_output_placeholders == 0 for request in requests)
+
+
 @pytest.mark.parametrize("max_tokens", [1, 2, 3, 5])
 def test_stop_by_max_tokens(max_tokens: int):
     scheduler = create_scheduler(async_scheduling=True)

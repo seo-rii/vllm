@@ -17,12 +17,22 @@ if TYPE_CHECKING:
 
 
 class InputBuffers:
-    def __init__(self, max_num_reqs: int, max_num_tokens: int, device: torch.device):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_num_tokens: int,
+        device: torch.device,
+        *,
+        separate_model_input_ids: bool = False,
+    ):
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens
         self.device = device
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+        self.model_input_ids = (
+            torch.empty_like(self.input_ids) if separate_model_input_ids else None
+        )
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
         self.query_start_loc = torch.zeros(
@@ -33,6 +43,15 @@ class InputBuffers:
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+
+    def get_model_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Keep logical draft sentinels out of the model's embedding input."""
+        if self.model_input_ids is None:
+            return input_ids
+        physical = self.model_input_ids[: input_ids.shape[0]]
+        physical.copy_(input_ids)
+        physical.masked_fill_(input_ids == -1, 0)
+        return physical
 
 
 @dataclass

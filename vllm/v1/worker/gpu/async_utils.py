@@ -147,6 +147,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.num_invalid_spec_tokens: np.ndarray | None = None
+            if sampler_output.num_invalid_spec_tokens is not None:
+                self.num_invalid_spec_tokens = async_copy_to_np(
+                    sampler_output.num_invalid_spec_tokens
+                )
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -182,6 +187,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
+
+        if self.num_invalid_spec_tokens is not None:
+            self.model_runner_output.num_invalid_spec_tokens = dict(
+                zip(
+                    self.model_runner_output.req_ids,
+                    self.num_invalid_spec_tokens.tolist(),
+                )
+            )
 
         if self.sampling_mask_tensors is not None:
             self.model_runner_output.sampling_masks = (

@@ -22,6 +22,34 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("invalid", [None, {}, {"second": 3, "first": 1}])
+def test_model_runner_invalid_draft_metadata_round_trip(invalid):
+    """The serialized current-step counts retain request identity and absence."""
+    from vllm.utils.system_utils import get_mp_context
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    output = ModelRunnerOutput(
+        req_ids=["second", "first"],
+        req_id_to_index={"second": 0, "first": 1},
+        sampled_token_ids=[[7], [8, 9]],
+        num_invalid_spec_tokens=invalid,
+    )
+    receiver, sender = get_mp_context().Pipe(duplex=False)
+    try:
+        sender.send(output)
+        decoded = receiver.recv()
+    finally:
+        sender.close()
+        receiver.close()
+    assert decoded.req_ids == output.req_ids
+    assert decoded.sampled_token_ids == [[7], [8, 9]]
+    assert decoded.num_invalid_spec_tokens == invalid
+    assert (
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}).num_invalid_spec_tokens
+        is None
+    )
+
+
 class UnrecognizedType(UserDict):
     def __init__(self, an_int: int):
         super().__init__()

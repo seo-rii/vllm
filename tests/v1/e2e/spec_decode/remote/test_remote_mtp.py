@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real model coverage of process-separated MTP on one NVIDIA GPU."""
 
+import asyncio
 import os
 import signal
 import socket
@@ -12,6 +13,7 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,13 +32,21 @@ def draft_server(
     model: str,
     log_path: Path,
     *,
+    token_only_draft: str | None = None,
+    max_num_seqs: int = 4,
+    eagle3_draft: str | None = None,
     revision: str | None = REVISION,
     num_speculative_tokens: int = 1,
     attention_backend: str = "FLASH_ATTN",
+    target_attention_backend: str | None = None,
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
+    max_model_len: int = 128,
+    block_size: int = 16,
     trust_remote_code: bool = True,
     moe_backend: str | None = None,
+    batch_invariant: bool | None = None,
+    owned_processes: list[subprocess.Popen] | None = None,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
@@ -52,9 +62,9 @@ def draft_server(
             "--target-model",
             model,
             "--draft-model",
-            model,
+            eagle3_draft or model,
             "--method",
-            "mtp",
+            "eagle3" if eagle3_draft is not None else "mtp",
             "--num-speculative-tokens",
             str(num_speculative_tokens),
             "--device",
@@ -64,17 +74,17 @@ def draft_server(
             "--max-batch-size",
             "4",
             "--max-model-len",
-            "128",
+            str(max_model_len),
             "--max-feature-tokens",
             str(max_feature_tokens),
             "--draft-kv-cache-gib",
             str(draft_kv_cache_gib),
             "--block-size",
-            "16",
+            str(block_size),
             "--attention-backend",
             attention_backend,
             "--target-attention-backend",
-            attention_backend,
+            target_attention_backend or attention_backend,
         ]
         if trust_remote_code:
             command.append("--trust-remote-code")
@@ -84,9 +94,44 @@ def draft_server(
             command.extend(
                 ["--target-revision", revision, "--draft-revision", revision]
             )
+        if token_only_draft is not None:
+            command = [
+                sys.executable,
+                "-m",
+                "vllm.v1.spec_decode.remote.runtime.token_cli",
+                "--endpoint",
+                f"unix://{path}",
+                "--target-model",
+                model,
+                "--draft-model",
+                token_only_draft,
+                "--num-speculative-tokens",
+                str(num_speculative_tokens),
+                "--max-batch-size",
+                "4",
+                "--max-model-len",
+                "128",
+                "--max-feature-tokens",
+                str(max_feature_tokens),
+                "--draft-kv-cache-gib",
+                str(draft_kv_cache_gib),
+                "--attention-backend",
+                attention_backend,
+                "--target-attention-backend",
+                target_attention_backend or attention_backend,
+            ]
+        environment = None
+        if batch_invariant is not None:
+            environment = dict(
+                os.environ, VLLM_BATCH_INVARIANT=str(int(batch_invariant))
+            )
         with log_path.open("w") as log:
             process = subprocess.Popen(
-                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
             )
             try:
                 deadline = time.monotonic() + 600
@@ -103,11 +148,15 @@ def draft_server(
                             f"draft server did not listen after warmup: {log_path}"
                         )
                     time.sleep(0.1)
+                if owned_processes is not None:
+                    owned_processes.append(process)
                 if on_ready is not None:
                     on_ready(process)
                 yield f"unix://{path}"
             finally:
                 if process.poll() is None:
+                    # A fault-injection test may have stopped this owned child.
+                    os.kill(process.pid, signal.SIGCONT)
                     os.killpg(process.pid, signal.SIGINT)
                     try:
                         process.wait(timeout=30)
@@ -1458,3 +1507,877 @@ def test_separate_mtp_checkpoint_settings_reach_public_llm(
                 draft_config["rope_parameters"]["rope_theta"],
             )
         ]
+
+
+@contextmanager
+def _paused_draft_server(process: subprocess.Popen):
+    """Stop only this helper's child, and resume it even when validation fails."""
+    assert process.poll() is None
+    status = Path(f"/proc/{process.pid}/status")
+    try:
+        os.kill(process.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 5
+        while True:
+            state = next(
+                line.split()[1]
+                for line in status.read_text().splitlines()
+                if line.startswith("State:")
+            )
+            if state in ("T", "t"):
+                break
+            assert process.poll() is None, "owned draft server exited before stopping"
+            assert time.monotonic() < deadline, "owned draft server did not stop"
+            time.sleep(0.01)
+        yield
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGCONT)
+
+
+def _save_token_prefix_models(directory):
+    """Create the exact prefix-control weights in a fresh CPU process."""
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    assert not torch.cuda.is_initialized()
+    directory = Path(directory)
+    target_config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=128,
+        max_position_embeddings=128,
+        layer_types=["full_attention"] * 2,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261024)
+        target_model = Qwen3ForCausalLM(target_config)
+    _two_candidate_head(target_model.lm_head.weight)
+    target = _save_mtp_checkpoint(
+        directory / "prefix-target", target_config, target_model.state_dict()
+    )
+    del target_model
+    draft = _tiny_independent_qwen3_draft(directory, target)
+    assert not torch.cuda.is_initialized()
+    return target, draft
+
+
+@pytest.mark.parametrize(
+    "async_scheduling,prefix_caching",
+    [(False, True), (True, False), (True, True)],
+    ids=["sync-prefix-on", "async-prefix-off", "async-prefix-on"],
+)
+def test_remote_token_cached_prefix_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    record_property,
+    async_scheduling,
+    prefix_caching,
+):
+    """Keep remote tokens exact with async scheduling and cached-prefix replay."""
+    import hashlib
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        str(tmp_path),
+    ]
+    with (tmp_path / "prefix-fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    target = str(tmp_path / "prefix-target")
+    draft = str(tmp_path / "independent-qwen3")
+    record_property(
+        "prefix_replay.fixture",
+        {
+            role: {
+                str(path.relative_to(directory)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in sorted(directory.rglob("*"))
+                if path.is_file()
+            }
+            for role, directory in (("target", Path(target)), ("draft", Path(draft)))
+        },
+    )
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=prefix_caching,
+        async_scheduling=async_scheduling,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    spec = dict(
+        method="draft_model",
+        model=draft,
+        num_speculative_tokens=3,
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        attention_backend="TRITON_ATTN",
+    )
+    prompts = [{"prompt_token_ids": [3 + (i * 7) % 125 for i in range(65)]}]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+    cached, tokens, warm_counts, warm_requests = {}, {}, {}, {}
+    resolved = {}
+    metric_names = (
+        "vllm:spec_decode_num_drafts",
+        "vllm:spec_decode_num_draft_tokens",
+        "vllm:spec_decode_num_accepted_tokens",
+    )
+
+    def counts(runner):
+        runner.llm.llm_engine.do_log_stats()
+        metrics = runner.llm.get_metrics()
+        return tuple(
+            get_spec_decode_metric_value(metrics, name) for name in metric_names
+        )
+
+    def run_mode(mode, speculative_config=None):
+        with vllm_runner(
+            target,
+            speculative_config=speculative_config,
+            per_request_spec_decode_metrics=(
+                "detailed" if speculative_config is not None else "none"
+            ),
+            **kwargs,
+        ) as runner:
+            actual = runner.llm.llm_engine.vllm_config
+            assert actual.scheduler_config.async_scheduling is async_scheduling
+            assert actual.cache_config.enable_prefix_caching is prefix_caching
+            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert actual.parallel_config.tensor_parallel_size == 1
+            draft_tp = None
+            if actual.speculative_config is not None:
+                draft_parallel = actual.speculative_config.draft_parallel_config
+                assert draft_parallel is not None
+                draft_tp = draft_parallel.tensor_parallel_size
+                assert draft_tp == 1
+            resolved[mode] = dict(
+                async_scheduling=actual.scheduler_config.async_scheduling,
+                prefix_caching=actual.cache_config.enable_prefix_caching,
+                enforce_eager=actual.model_config.enforce_eager,
+                use_v2_model_runner=actual.use_v2_model_runner,
+                target_tp=actual.parallel_config.tensor_parallel_size,
+                draft_tp=draft_tp,
+            )
+            cold = runner.llm.generate(prompts, sampling, use_tqdm=False)[0]
+            before = counts(runner) if speculative_config is not None else None
+            warm = runner.llm.generate(prompts, sampling, use_tqdm=False)[0]
+            cached[mode] = warm.num_cached_tokens
+            if prefix_caching:
+                assert warm.num_cached_tokens > 32
+            else:
+                assert warm.num_cached_tokens == 0
+            tokens[mode] = {
+                label: list(output.outputs[0].token_ids)
+                for label, output in (("cold", cold), ("warm", warm))
+            }
+            assert all(len(ids) == 8 for ids in tokens[mode].values())
+            assert tokens[mode]["cold"] == tokens[mode]["warm"]
+            if before is not None:
+                warm_counts[mode] = tuple(a - b for a, b in zip(counts(runner), before))
+                proposals, drafted, accepted = warm_counts[mode]
+                assert proposals > 0 and drafted > 0 and 0 < accepted <= drafted
+                detail = warm.outputs[0].spec_decode_metrics
+                assert detail is not None and detail.num_spec_tokens == 3
+                assert sum(detail.per_step_accepted) > 0
+                warm_requests[mode] = detail.to_dict()
+
+    run_mode("target")
+    run_mode("native", spec)
+    with draft_server(
+        target,
+        tmp_path / "prefix-draft.log",
+        token_only_draft=draft,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+    ) as endpoint:
+        run_mode(
+            "remote",
+            dict(
+                spec,
+                execution=dict(
+                    placement="remote",
+                    policy="on_demand",
+                    endpoints=[endpoint],
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                    startup_timeout_ms=600000,
+                ),
+            ),
+        )
+    assert tokens["remote"] == tokens["native"] == tokens["target"]
+    record_property(
+        "prefix_replay.config",
+        dict(
+            k=3,
+            prompt_tokens=65,
+            max_num_batched_tokens=32,
+            prefix_caching=prefix_caching,
+            transport="inline",
+            policy="error",
+            async_scheduling=async_scheduling,
+        ),
+    )
+    record_property("prefix_replay.resolved_config", resolved)
+    record_property("prefix_replay.cached_tokens", cached)
+    record_property("prefix_replay.output_token_ids", tokens)
+    record_property("prefix_replay.warm_request_speculation", warm_requests)
+    for index, label in enumerate(("proposals", "drafted", "accepted")):
+        record_property(
+            f"prefix_replay.{label}",
+            {mode: values[index] for mode, values in warm_counts.items()},
+        )
+
+
+def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
+    vllm_runner, monkeypatch, tmp_path, record_property
+):
+    """Resume drafting after a concurrent K0 phase without losing own-KV state."""
+    import hashlib
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        str(tmp_path),
+    ]
+    with (tmp_path / "dynamic-k-fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    target = str(tmp_path / "prefix-target")
+    draft = str(tmp_path / "independent-qwen3")
+    record_property(
+        "dynamic_k.fixture",
+        {
+            role: {
+                str(path.relative_to(directory)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in sorted(directory.rglob("*"))
+                if path.is_file()
+            }
+            for role, directory in (("target", Path(target)), ("draft", Path(draft)))
+        },
+    )
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=True,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    schedule = [(1, 1, 3), (2, 4, 0)]
+    spec = dict(
+        method="draft_model",
+        model=draft,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=schedule,
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        attention_backend="TRITON_ATTN",
+    )
+    prompt = {"prompt_token_ids": [3] * 17}
+    lengths = (8, 32)
+    sampling = [
+        SamplingParams(
+            temperature=0, max_tokens=length, ignore_eos=True, detokenize=False
+        )
+        for length in lengths
+    ]
+    tokens, resolved, aggregate = {}, {}, {}
+    details: dict[str, list[dict[str, Any]]] = {}
+    timing: dict[str, list[dict[str, float]]] = {}
+
+    def counts(runner):
+        runner.llm.llm_engine.do_log_stats()
+        metrics = runner.llm.get_metrics()
+        return {
+            key: get_spec_decode_metric_value(metrics, name)
+            for key, name in (
+                ("proposals", "vllm:spec_decode_num_drafts"),
+                ("drafted", "vllm:spec_decode_num_draft_tokens"),
+                ("accepted", "vllm:spec_decode_num_accepted_tokens"),
+            )
+        }
+
+    def run_mode(mode, speculative_config=None):
+        with vllm_runner(
+            target,
+            speculative_config=speculative_config,
+            per_request_spec_decode_metrics=(
+                "detailed" if speculative_config is not None else "none"
+            ),
+            **kwargs,
+        ) as runner:
+            actual = runner.llm.llm_engine.vllm_config
+            assert actual.scheduler_config.async_scheduling
+            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert not actual.cache_config.enable_prefix_caching
+            assert actual.parallel_config.tensor_parallel_size == 1
+            draft_tp = None
+            if actual.speculative_config is not None:
+                assert (
+                    actual.speculative_config.num_speculative_tokens_per_batch_size
+                    == schedule
+                )
+                draft_parallel = actual.speculative_config.draft_parallel_config
+                assert draft_parallel is not None
+                draft_tp = draft_parallel.tensor_parallel_size
+                assert draft_tp == 1
+            resolved[mode] = dict(
+                async_scheduling=actual.scheduler_config.async_scheduling,
+                prefix_caching=actual.cache_config.enable_prefix_caching,
+                enforce_eager=actual.model_config.enforce_eager,
+                use_v2_model_runner=actual.use_v2_model_runner,
+                target_tp=actual.parallel_config.tensor_parallel_size,
+                draft_tp=draft_tp,
+                k_schedule=(
+                    schedule if actual.speculative_config is not None else None
+                ),
+            )
+            before = counts(runner) if speculative_config is not None else None
+            outputs = runner.llm.generate([prompt, prompt], sampling, use_tqdm=False)
+            tokens[mode] = [list(output.outputs[0].token_ids) for output in outputs]
+            assert tuple(map(len, tokens[mode])) == lengths
+            timing[mode] = []
+            for output in outputs:
+                metrics = output.metrics
+                assert metrics is not None
+                timing[mode].append(
+                    dict(
+                        scheduled=metrics.scheduled_ts,
+                        first_token=metrics.first_token_ts,
+                        last_token=metrics.last_token_ts,
+                    )
+                )
+            short_timing, survivor_timing = timing[mode]
+            assert 0 < short_timing["scheduled"] == survivor_timing["scheduled"]
+            assert survivor_timing["first_token"] < short_timing["last_token"]
+            if speculative_config is not None:
+                details[mode] = []
+                for output in outputs:
+                    metrics = output.outputs[0].spec_decode_metrics
+                    assert metrics is not None
+                    details[mode].append(metrics.to_dict())
+                assert before is not None
+                aggregate[mode] = {
+                    key: value - before[key] for key, value in counts(runner).items()
+                }
+
+    run_mode("target")
+    run_mode("native", spec)
+    with draft_server(
+        target,
+        tmp_path / "dynamic-k-draft.log",
+        token_only_draft=draft,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=64,
+    ) as endpoint:
+        run_mode(
+            "remote",
+            dict(
+                spec,
+                execution=dict(
+                    placement="remote",
+                    policy="on_demand",
+                    endpoints=[endpoint],
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                    startup_timeout_ms=600000,
+                ),
+            ),
+        )
+    assert tokens["remote"] == tokens["native"] == tokens["target"]
+    for mode in ("native", "remote"):
+        counters = aggregate[mode]
+        assert counters["proposals"] > 0
+        assert 0 < counters["accepted"] <= counters["drafted"]
+        assert counters["proposals"] == sum(
+            row["num_spec_steps"] for row in details[mode]
+        )
+        assert counters["drafted"] == sum(
+            row["num_draft_tokens"] for row in details[mode]
+        )
+        assert counters["accepted"] == sum(
+            row["num_accepted_draft_tokens"] for row in details[mode]
+        )
+    short, survivor = details["remote"]
+    assert short["num_draft_tokens"] == short["num_accepted_draft_tokens"] == 0
+    assert 3 in survivor["per_step_drafted"]
+    # K0 steps have no speculative metric row; the final prefill can supply
+    # only one of the tokens omitted by those rows.
+    unrecorded_tokens = (
+        lengths[1] - survivor["num_spec_steps"] - survivor["num_accepted_draft_tokens"]
+    )
+    assert unrecorded_tokens > 1
+    assert 0 < survivor["num_accepted_draft_tokens"] <= survivor["num_draft_tokens"]
+    record_property("dynamic_k.schedule", schedule)
+    record_property("dynamic_k.resolved_config", resolved)
+    record_property("dynamic_k.output_token_ids", tokens)
+    record_property("dynamic_k.request_speculation", details)
+    record_property("dynamic_k.aggregate_speculation", aggregate)
+    record_property("dynamic_k.unrecorded_output_tokens_lower_bound", unrecorded_tokens)
+    record_property("dynamic_k.request_timing", timing)
+
+
+def _fail_token_session_during_socket_cleanup(worker):
+    import errno
+    from unittest.mock import patch
+
+    from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
+
+    session = worker.model_runner.speculator._session
+    assert isinstance(session, TokenOnlyRemoteSession)
+    assert session.failure_policy == "target_only"
+    keys = tuple(session.records)
+    assert keys and any(session.active(key) for key in keys)
+    connection = session._conn
+    assert connection is not None
+    close_socket = socket.socket.close
+    injected = False
+
+    def close_then_fail(sock):
+        nonlocal injected
+        close_socket(sock)
+        if sock is connection._sock:
+            injected = True
+            raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    with patch.object(socket.socket, "close", close_then_fail):
+        session.fail("injected primary token failure")
+    return dict(
+        cleanup_error_injected=injected,
+        terminal_sequences=sum(not session.active(key) for key in keys),
+        sequence_count=len(keys),
+        connection_detached=session._conn is None and connection.closed,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lifecycle", ["abort-reuse", "timeout-recovery", "cleanup-error-fallback"]
+)
+async def test_remote_token_async_lifecycle_preserves_healthy_requests(
+    vllm_runner, monkeypatch, tmp_path, record_property, lifecycle, enable_pickle
+):
+    """Keep healthy transcripts exact across cancellation and terminal fallback."""
+    import hashlib
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        str(tmp_path),
+    ]
+    with (tmp_path / "lifecycle-fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    target = str(tmp_path / "prefix-target")
+    draft = str(tmp_path / "independent-qwen3")
+    record_property(
+        "async_lifecycle.fixture",
+        {
+            role: {
+                str(path.relative_to(directory)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in sorted(directory.rglob("*"))
+                if path.is_file()
+            }
+            for role, directory in (("target", Path(target)), ("draft", Path(draft)))
+        },
+    )
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=True,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [{"prompt_token_ids": [token] * 17} for token in (3, 7)]
+
+    def sampling(length):
+        return SamplingParams(
+            temperature=0,
+            max_tokens=length,
+            ignore_eos=True,
+            detokenize=False,
+            output_kind=RequestOutputKind.CUMULATIVE,
+        )
+
+    with vllm_runner(target, **kwargs) as runner:
+        expected = [
+            list(output.outputs[0].token_ids)
+            for output in runner.llm.generate(
+                prompts, [sampling(96), sampling(32)], use_tqdm=False
+            )
+        ]
+    assert tuple(map(len, expected)) == (96, 32)
+    assert expected[0][:32] != expected[1], "request reuse must change the transcript"
+
+    owned_processes: list[subprocess.Popen] = []
+    with draft_server(
+        target,
+        tmp_path / "lifecycle-draft.log",
+        token_only_draft=draft,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=64,
+        owned_processes=owned_processes,
+    ) as endpoint:
+        spec = dict(
+            method="draft_model",
+            model=draft,
+            num_speculative_tokens=3,
+            draft_tensor_parallel_size=1,
+            draft_sample_method="greedy",
+            attention_backend="TRITON_ATTN",
+            execution=dict(
+                placement="remote",
+                policy="on_demand",
+                endpoints=[endpoint],
+                transport="inline",
+                failure_policy="error" if lifecycle == "abort-reuse" else "target_only",
+                request_timeout_ms=1000,
+                startup_timeout_ms=600000,
+            ),
+        )
+        engine = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(
+                model=target,
+                speculative_config=spec,
+                per_request_spec_decode_metrics="detailed",
+                **kwargs,
+            )
+        )
+        tasks: list[asyncio.Task] = []
+        observed: dict[str, Any] = {}
+        outputs: dict[str, Any] = {}
+        events = {}
+        first_output = asyncio.Event()
+
+        async def collect(request_id, prompt, length):
+            final = None
+            async for output in engine.generate(prompt, sampling(length), request_id):
+                observed[request_id] = output
+                if (
+                    request_id == "reused"
+                    and output.outputs[0].token_ids
+                    and not first_output.is_set()
+                ):
+                    await engine.pause_generation(mode="keep", clear_cache=False)
+                    first_output.set()
+                final = output
+            assert final is not None and final.finished
+            assert final.request_id == request_id
+            return final
+
+        def assert_active(output, reference):
+            assert output.outputs[0].finish_reason == "length"
+            assert list(output.outputs[0].token_ids) == reference
+            metrics = output.outputs[0].spec_decode_metrics
+            assert metrics is not None and metrics.num_spec_tokens == 3
+            accepted = metrics.to_dict()["num_accepted_draft_tokens"]
+            assert 0 < accepted <= metrics.num_draft_tokens
+            assert metrics.num_draft_tokens == sum(metrics.per_step_drafted)
+            assert accepted == sum(metrics.per_step_accepted)
+
+        try:
+            actual = engine.vllm_config
+            assert actual.scheduler_config.async_scheduling
+            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert not actual.cache_config.enable_prefix_caching
+            assert actual.parallel_config.tensor_parallel_size == 1
+            assert actual.speculative_config is not None
+            assert actual.speculative_config.use_remote_draft()
+            assert actual.speculative_config.draft_parallel_config is not None
+            assert (
+                actual.speculative_config.draft_parallel_config.tensor_parallel_size
+                == 1
+            )
+            record_property(
+                "async_lifecycle.resolved_config",
+                dict(
+                    async_scheduling=actual.scheduler_config.async_scheduling,
+                    prefix_caching=actual.cache_config.enable_prefix_caching,
+                    enforce_eager=actual.model_config.enforce_eager,
+                    use_v2_model_runner=actual.use_v2_model_runner,
+                    target_tp=actual.parallel_config.tensor_parallel_size,
+                    draft_tp=actual.speculative_config.draft_parallel_config.tensor_parallel_size,
+                    execution=spec["execution"],
+                ),
+            )
+            async with asyncio.timeout(120):
+                if lifecycle == "abort-reuse":
+                    await engine.pause_generation(mode="keep", clear_cache=False)
+                    assert await engine.is_paused()
+                    tasks = [
+                        asyncio.create_task(collect("reused", prompts[0], 96)),
+                        asyncio.create_task(collect("healthy", prompts[1], 32)),
+                    ]
+                    async with asyncio.timeout(10):
+                        while engine.get_num_unfinished_requests() != 2:
+                            for task in tasks:
+                                if task.done():
+                                    task.result()
+                                    pytest.fail(
+                                        "request completed while generation was paused"
+                                    )
+                            await asyncio.sleep(0.01)
+                    events["queued_before_resume"] = (
+                        engine.get_num_unfinished_requests()
+                    )
+                    await engine.resume_generation()
+                    await first_output.wait()
+                    assert await engine.is_paused()
+                    partial = observed["reused"]
+                    assert not partial.finished
+                    assert 0 < len(partial.outputs[0].token_ids) < 96
+                    assert engine.get_num_unfinished_requests() in (1, 2)
+                    assert not tasks[0].done()
+                    events["tokens_before_abort"] = len(partial.outputs[0].token_ids)
+                    events["healthy_finished_before_abort"] = tasks[1].done()
+                    await engine.abort("reused")
+                    await engine.resume_generation()
+                    aborted, healthy = await asyncio.gather(*tasks)
+                    assert aborted.outputs[0].finish_reason == "abort"
+                    aborted_tokens = list(aborted.outputs[0].token_ids)
+                    assert 0 < len(aborted_tokens) < 96
+                    assert aborted_tokens == expected[0][: len(aborted_tokens)]
+                    assert_active(healthy, expected[1])
+                    reused = await collect("reused", prompts[1], 32)
+                    assert_active(reused, expected[1])
+                    outputs.update(aborted=aborted, healthy=healthy, reused=reused)
+                elif lifecycle == "cleanup-error-fallback":
+                    tasks = [asyncio.create_task(collect("reused", prompts[0], 96))]
+                    await first_output.wait()
+                    assert await engine.is_paused()
+                    partial = observed["reused"]
+                    partial_length = len(partial.outputs[0].token_ids)
+                    assert not partial.finished and 0 < partial_length < 96
+                    reports = await engine.collective_rpc(
+                        _fail_token_session_during_socket_cleanup
+                    )
+                    assert len(reports) == 1
+                    report = reports[0]
+                    assert report["cleanup_error_injected"]
+                    assert report["connection_detached"]
+                    assert report["terminal_sequences"] == report["sequence_count"] > 0
+                    events["cleanup_failure"] = report
+                    await engine.resume_generation()
+                    fallback = await tasks[0]
+                    assert fallback.outputs[0].finish_reason == "length"
+                    assert list(fallback.outputs[0].token_ids) == expected[0]
+                    assert len(fallback.outputs[0].token_ids) > partial_length
+                    recovered = await collect("recovered", prompts[1], 32)
+                    assert_active(recovered, expected[1])
+                    outputs.update(fallback=fallback, recovered=recovered)
+                else:
+                    warm = await collect("warm", prompts[1], 32)
+                    assert_active(warm, expected[1])
+                    assert len(owned_processes) == 1
+                    with _paused_draft_server(owned_processes[0]):
+                        fallback = await collect("timeout", prompts[0], 32)
+                        assert fallback.outputs[0].finish_reason == "length"
+                        assert list(fallback.outputs[0].token_ids) == expected[0][:32]
+                        metrics = fallback.outputs[0].spec_decode_metrics
+                        assert metrics is not None
+                        assert metrics.num_draft_tokens == 0
+                        assert metrics.to_dict()["num_accepted_draft_tokens"] == 0
+                        assert (
+                            "State:\tT"
+                            in Path(
+                                f"/proc/{owned_processes[0].pid}/status"
+                            ).read_text()
+                        )
+                        events["completed_while_owned_server_stopped"] = True
+                    recovered = await collect("recovered", prompts[1], 32)
+                    assert_active(recovered, expected[1])
+                    outputs.update(warm=warm, fallback=fallback, recovered=recovered)
+            assert engine.get_num_unfinished_requests() == 0
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            engine.shutdown(timeout=30)
+
+    record_property("async_lifecycle.case", lifecycle)
+    record_property("async_lifecycle.events", events)
+    record_property("async_lifecycle.reference_token_ids", expected)
+    record_property(
+        "async_lifecycle.finish_reasons",
+        {name: output.outputs[0].finish_reason for name, output in outputs.items()},
+    )
+    record_property(
+        "async_lifecycle.output_token_ids",
+        {name: list(output.outputs[0].token_ids) for name, output in outputs.items()},
+    )
+    record_property(
+        "async_lifecycle.request_speculation",
+        {
+            name: output.outputs[0].spec_decode_metrics.to_dict()
+            for name, output in outputs.items()
+            if output.outputs[0].spec_decode_metrics is not None
+        },
+    )
+
+
+def _two_candidate_head(weight):
+    import torch
+
+    with torch.no_grad():
+        weight[3].mul_(32)
+        weight[4].copy_(-weight[3])
+
+
+def _tiny_independent_qwen3_draft(tmp_path, target_path):
+    """Load a separate dense LM with the target's exact tokenizer artifacts."""
+    import shutil
+
+    import torch
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    target_path = Path(target_path)
+    target = AutoConfig.from_pretrained(target_path)
+    assert (
+        target.vocab_size,
+        target.bos_token_id,
+        target.eos_token_id,
+        target.pad_token_id,
+    ) == (128, 1, 2, 0)
+    config = Qwen3Config(
+        vocab_size=target.vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=128,
+        layer_types=["full_attention"] * 2,
+        bos_token_id=target.bos_token_id,
+        eos_token_id=target.eos_token_id,
+        pad_token_id=target.pad_token_id,
+        tie_word_embeddings=False,
+    )
+    assert config.hidden_size != target.hidden_size
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261025)
+        draft = Qwen3ForCausalLM(config)
+    _two_candidate_head(draft.lm_head.weight)
+    path = tmp_path / "independent-qwen3"
+    draft.save_pretrained(path)
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "vocab.txt",
+        "merges.txt",
+        "tokenizer.model",
+    ):
+        if (target_path / name).is_file():
+            shutil.copyfile(target_path / name, path / name)
+            assert (path / name).read_bytes() == (target_path / name).read_bytes()
+    assert all(
+        (path / name).is_file() for name in ("tokenizer.json", "tokenizer_config.json")
+    )
+    return str(path)

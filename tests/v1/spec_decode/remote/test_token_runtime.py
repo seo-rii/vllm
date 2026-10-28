@@ -4,9 +4,13 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
+from tests.v1.spec_decode.remote.runtime_fixtures import (
+    cpu_parallel_state as cpu_parallel_state,
+)
 from vllm.v1.spec_decode.remote.capabilities import SpeculatorPlacementCapabilities
 from vllm.v1.spec_decode.remote.protocol import (
     FeatureSlot,
@@ -1016,29 +1020,43 @@ def test_actual_socket_error_health_fencing(socket_runtime, monkeypatch, kind):
         state.close(tuple(state.sequences))
 
 
-def worker_for(session):
-    import itertools
-    from types import SimpleNamespace
-
+@pytest.fixture
+def worker_for(tmp_path, monkeypatch, request):
+    """Construct the native wrapper while supplying only its external RPC service."""
     import torch
 
-    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.worker.gpu.spec_decode import token_remote
 
-    worker = object.__new__(TokenOnlyRemoteSpeculator)
-    worker.device = torch.device("cpu")
-    worker.num_speculative_steps = 3
-    worker._tp = SimpleNamespace(
-        rank_in_group=0, broadcast_object=lambda value, src: value
+    request.getfixturevalue("cpu_parallel_state")
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/token-test.sock"],
+            }
+        },
     )
-    worker._owner = object()
-    worker._rounds = itertools.count()
-    worker._sequences = itertools.count()
-    worker._requests = {}
-    worker._terminal_requests = set()
-    worker._pending = None
-    worker._closed = False
-    worker._session = session
-    return worker
+    workers = []
+
+    def construct(session):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                token_remote, "TokenOnlyRemoteSession", lambda *args, **kwargs: session
+            )
+            with set_current_vllm_config(config):
+                worker = token_remote.TokenOnlyRemoteSpeculator(
+                    config, torch.device("cpu")
+                )
+        workers.append(worker)
+        return worker
+
+    yield construct
+    for worker in reversed(workers):
+        worker.close()
 
 
 def target_context(
@@ -1098,13 +1116,14 @@ def step(worker, context, k):
 
 
 @pytest.mark.parametrize("k", [0, 1, 3])
-def test_worker_empty_batch_preserves_result_shape_without_rpc(k):
+def test_worker_empty_batch_preserves_result_shape_without_rpc(worker_for, k):
     from unittest.mock import Mock, call
 
     from vllm.v1.spec_decode.contracts import DraftStep
 
     session = Mock()
     worker = worker_for(session)
+    session.reset_mock()
     context = target_context([], sampled=[], rejected=[], recovery=[])
     handle = worker.dispatch(DraftStep.from_batch(context.input_batch, k), context)
     output = worker.collect(handle)
@@ -1122,7 +1141,9 @@ def test_worker_empty_batch_preserves_result_shape_without_rpc(k):
         worker.collect(handle)
 
 
-def test_worker_actual_socket_ragged_chunks_reorder_rejection_and_k0(socket_runtime):
+def test_worker_actual_socket_ragged_chunks_reorder_rejection_and_k0(
+    worker_for, socket_runtime
+):
     state, oracle, _, session = socket_runtime
     worker = worker_for(session)
     first = target_context(
@@ -1176,7 +1197,7 @@ def test_worker_actual_socket_ragged_chunks_reorder_rejection_and_k0(socket_runt
     assert not worker._requests and not state.sequences
 
 
-def test_worker_cancel_fences_live_request_and_handle(socket_runtime):
+def test_worker_cancel_fences_live_request_and_handle(worker_for, socket_runtime):
     from vllm.v1.spec_decode.contracts import DraftStep
 
     _, _, _, session = socket_runtime
@@ -1199,7 +1220,7 @@ def test_worker_cancel_fences_live_request_and_handle(socket_runtime):
 
 @pytest.mark.parametrize("failure", ["timeout", "row_error"])
 def test_worker_terminal_batch_skips_metadata_and_admits_fresh_request(
-    socket_runtime, monkeypatch, failure
+    worker_for, socket_runtime, monkeypatch, failure
 ):
     import torch
 
@@ -1261,7 +1282,7 @@ def test_worker_terminal_batch_skips_metadata_and_admits_fresh_request(
 )
 @pytest.mark.parametrize("failure", ["memory", "allocator", "torch"])
 def test_worker_allocation_failure_obeys_policy_and_fences_state(
-    socket_runtime, monkeypatch, policy, phase, failure
+    worker_for, socket_runtime, monkeypatch, policy, phase, failure
 ):
     import torch
 
@@ -1338,7 +1359,7 @@ def test_worker_allocation_failure_obeys_policy_and_fences_state(
 @pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("fail_at", [0, 1, 2], ids=["control", "empty", "result"])
 def test_worker_collect_result_allocation_consumes_rpc_and_recovers(
-    socket_runtime, monkeypatch, policy, fail_at
+    worker_for, socket_runtime, monkeypatch, policy, fail_at
 ):
     from vllm.v1.spec_decode.contracts import DraftStep
     from vllm.v1.spec_decode.remote import token_session
@@ -1402,7 +1423,7 @@ def test_worker_collect_result_allocation_consumes_rpc_and_recovers(
     "failure", ["ordinary", "fatal", "wrapped_torch", "wrapped_memory"]
 )
 def test_worker_nonrecoverable_error_still_raises(
-    socket_runtime, monkeypatch, phase, failure
+    worker_for, socket_runtime, monkeypatch, phase, failure
 ):
     import torch
 
@@ -1443,7 +1464,7 @@ def test_worker_nonrecoverable_error_still_raises(
 
 
 def test_worker_persistent_result_allocation_failure_broadcasts_error(
-    socket_runtime, monkeypatch
+    worker_for, socket_runtime, monkeypatch
 ):
     import torch
 
@@ -1483,7 +1504,9 @@ def test_worker_persistent_result_allocation_failure_broadcasts_error(
 
 
 @pytest.mark.parametrize("policy", ["target_only", "error"])
-def test_worker_defers_unrelated_close_until_proposal_collected(socket_runtime, policy):
+def test_worker_defers_unrelated_close_until_proposal_collected(
+    worker_for, socket_runtime, policy
+):
     from vllm.v1.spec_decode.contracts import DraftStep
 
     state, _, _, session = socket_runtime
@@ -1519,7 +1542,7 @@ def test_worker_defers_unrelated_close_until_proposal_collected(socket_runtime, 
 @pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("failure", ["deadline", "collect"])
 def test_deferred_token_close_uses_pending_deadline(
-    socket_runtime, monkeypatch, policy, failure
+    worker_for, socket_runtime, monkeypatch, policy, failure
 ):
     import time
 
@@ -1583,7 +1606,9 @@ def test_deferred_token_close_uses_pending_deadline(
     assert not state.sequences
 
 
-def test_cancel_pending_token_proposal_clears_deferred_closes(socket_runtime):
+def test_cancel_pending_token_proposal_clears_deferred_closes(
+    worker_for, socket_runtime
+):
     from vllm.v1.spec_decode.contracts import DraftStep
 
     state, _, server, session = socket_runtime
@@ -1843,19 +1868,38 @@ def test_actual_socket_timeout_fences_late_completion(
         release.set()
 
 
-def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_options):
+def token_config(
+    tmp_path,
+    *,
+    target_type="qwen3",
+    draft_type="qwen3",
+    target_options=None,
+    spec_options=None,
+    attention_config=None,
+    cache_options=None,
+    scheduler_options=None,
+    dtype="float32",
+    enforce_eager=False,
+    target_tp=1,
+    **draft_options,
+):
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import (
         AutoModelForCausalLM,
+        DeepseekV2Config,
+        Glm4MoeLiteConfig,
         LlamaConfig,
         MistralConfig,
+        NemotronHConfig,
         Qwen3Config,
+        Qwen3NextConfig,
         TokenizersBackend,
     )
 
     from vllm.config import (
+        AttentionConfig,
         CacheConfig,
         DeviceConfig,
         ModelConfig,
@@ -1869,6 +1913,10 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         "qwen3": (Qwen3Config, "Qwen3ForCausalLM"),
         "llama": (LlamaConfig, "LlamaForCausalLM"),
         "mistral": (MistralConfig, "MistralForCausalLM"),
+        "qwen3_next": (Qwen3NextConfig, "Qwen3NextForCausalLM"),
+        "nemotron_h": (NemotronHConfig, "NemotronHForCausalLM"),
+        "glm4_moe_lite": (Glm4MoeLiteConfig, "Glm4MoeLiteForCausalLM"),
+        "deepseek_v2": (DeepseekV2Config, "DeepseekV2ForCausalLM"),
     }
     tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
@@ -1879,6 +1927,56 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
 
     def model(path, family, *, hidden_size, **options):
         hf_class, architecture = families[family]
+        family_options: dict[str, Any] = {
+            "mistral": {"sliding_window": None},
+            "qwen3_next": {
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32,
+            },
+            "nemotron_h": {
+                "layers_block_type": ["linear_attention", "full_attention"],
+                "mamba_num_heads": 2,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 8,
+                "n_groups": 1,
+                "conv_kernel": 4,
+                "chunk_size": 32,
+            },
+            "glm4_moe_lite": {
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "n_group": 1,
+                "topk_group": 1,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
+            "deepseek_v2": {
+                "kv_lora_rank": 512,
+                "q_lora_rank": 128,
+                "qk_rope_head_dim": 64,
+                "qk_nope_head_dim": 192,
+                "v_head_dim": 256,
+                "first_k_dense_replace": 1,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+            },
+        }.get(family, {})
         hf = hf_class(
             architectures=[architecture],
             hidden_size=hidden_size,
@@ -1892,7 +1990,7 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
             bos_token_id=0,
             eos_token_id=1,
             pad_token_id=2,
-            **(({"sliding_window": None} if family == "mistral" else {}) | options),
+            **(family_options | options),
         )
         with torch.random.fork_rng():
             torch.manual_seed(0)
@@ -1901,33 +1999,54 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         return ModelConfig(
             model=str(path),
             tokenizer_mode="hf",
-            dtype="float32",
+            dtype=dtype,
             max_model_len=64,
             skip_tokenizer_init=True,
+            enforce_eager=enforce_eager,
         )
 
-    target = model(tmp_path / "target", target_type, hidden_size=32)
+    target = model(
+        tmp_path / "target", target_type, hidden_size=32, **(target_options or {})
+    )
     draft = model(tmp_path / "draft", draft_type, hidden_size=16, **draft_options)
-    parallel = ParallelConfig()
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
     spec = SpeculativeConfig(
         model=draft.model,
         method="draft_model",
-        num_speculative_tokens=3,
         target_model_config=target,
         target_parallel_config=parallel,
+        **({"num_speculative_tokens": 3} | (spec_options or {})),
     )
     return VllmConfig(
         model_config=target,
         parallel_config=parallel,
         speculative_config=spec,
+        attention_config=attention_config or AttentionConfig(),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            max_model_len=64,
-            async_scheduling=False,
-            is_encoder_decoder=False,
+            **dict(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                max_model_len=64,
+                async_scheduling=False,
+                is_encoder_decoder=False,
+            )
+            | (scheduler_options or {}),
         ),
-        cache_config=CacheConfig(enable_prefix_caching=False),
+        cache_config=CacheConfig(
+            **dict(
+                enable_prefix_caching=False,
+                sliding_window=(
+                    target.get_sliding_window()
+                    if getattr(target.hf_text_config, "layer_types", None) is None
+                    or all(
+                        layer == "sliding_attention"
+                        for layer in target.hf_text_config.layer_types
+                    )
+                    else None
+                ),
+            )
+            | (cache_options or {}),
+        ),
         device_config=DeviceConfig("cpu"),
     )
 
@@ -2010,7 +2129,7 @@ def test_contract_requires_identifiable_builtin_hf_tokenizer(tmp_path, field, va
 
 @pytest.mark.parametrize("previous_k,accepted", [(0, 0), (1, 0), (1, 1)])
 def test_worker_physical_query_can_exceed_previous_logical_valid_prefix(
-    socket_runtime, previous_k, accepted
+    worker_for, socket_runtime, previous_k, accepted
 ):
     state, oracle, _, session = socket_runtime
     worker = worker_for(session)
@@ -2036,7 +2155,9 @@ def test_worker_physical_query_can_exceed_previous_logical_valid_prefix(
     worker.close_requests(["a"])
 
 
-def test_worker_refuses_accepted_physical_padding_beyond_logical_valid(socket_runtime):
+def test_worker_refuses_accepted_physical_padding_beyond_logical_valid(
+    worker_for, socket_runtime
+):
     _, _, _, session = socket_runtime
     worker = worker_for(session)
     context = target_context(
@@ -2129,7 +2250,7 @@ def test_custom_tokenizer_implementation_rejected_even_with_matching_vocab(tmp_p
 
 @pytest.mark.parametrize("prompt_len,computed", [(1, 0), (4, 2), (63, 62)])
 def test_worker_padded_final_prefill_sends_only_authoritative_prompt(
-    socket_runtime, prompt_len, computed
+    worker_for, socket_runtime, prompt_len, computed
 ):
     state, oracle, _, session = socket_runtime
     worker = worker_for(session)
@@ -2189,7 +2310,7 @@ def test_worker_padded_final_prefill_sends_only_authoritative_prompt(
 
 @pytest.mark.parametrize("sampled,rejected", [(0, 3), (2, 2), (1, 0), (1, 2), (1, 4)])
 def test_worker_padded_prefill_refuses_inconsistent_sampling_counts(
-    socket_runtime, sampled, rejected
+    worker_for, socket_runtime, sampled, rejected
 ):
     _, _, _, session = socket_runtime
     worker = worker_for(session)
@@ -2208,7 +2329,7 @@ def test_worker_padded_prefill_refuses_inconsistent_sampling_counts(
 @pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("stage", ["registration", "tokens"])
 def test_unregistered_token_allocation_failure_stays_terminal(
-    socket_runtime, monkeypatch, policy, stage
+    worker_for, socket_runtime, monkeypatch, policy, stage
 ):
     import torch
 
@@ -2256,3 +2377,399 @@ def test_unregistered_token_allocation_failure_stays_terminal(
     assert not worker._terminal_requests
     assert step(worker, context, 3).valid_lengths.tolist() == [3]
     worker.close()
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_socket_prefill_chunks_keep_offsets_and_only_finalize_last(tmp_path, final):
+    state, oracle = machine()
+    contract = RuntimeContract(
+        TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
+        SpeculatorPlacementCapabilities(
+            state_dependency="own_kv",
+            required_features=("token_ids",),
+            standalone_weights="complete",
+        ),
+        "target",
+        "tokenizer",
+        "draft",
+    )
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, contract), limits=RemoteServerLimits(4, 4, 4, 64)
+    )
+    endpoint = server.start(f"unix://{tmp_path}/p.sock")
+    session = TokenOnlyRemoteSession(
+        endpoint,
+        TokenHello("verifier", "target", "draft", "tokenizer", 3, 128, 4, 4, 64),
+        failure_policy="error",
+        request_timeout_ms=5000,
+    )
+    try:
+        key = session.open_sequence(0, deadline=session.deadline())
+        session.prefill(
+            key, tuple(range(1, 12)), is_final=final, deadline=session.deadline()
+        )
+        assert state.sequences[key].committed == 11
+        assert state.sequences[key].ready == final
+        assert [
+            (start, tokens, sample) for _, start, tokens, sample in oracle.calls
+        ] == [
+            (0, (1, 2, 3, 4), False),
+            (4, (5, 6, 7, 8), False),
+            (8, (9, 10, 11), False),
+        ]
+        if not final:
+            session.prefill(key, (12,), is_final=True, deadline=session.deadline())
+            assert state.sequences[key].committed == 12 and state.sequences[key].ready
+        session.close_sequences((key,))
+        assert not state.sequences
+        assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+    finally:
+        session.close()
+        server.stop()
+
+
+def prefix_replay_config(tmp_path, endpoint, *, family="qwen3", failure_policy="error"):
+    from vllm.engine.arg_utils import EngineArgs
+
+    assets = token_config(
+        tmp_path, target_type=family, draft_type=family, dtype="bfloat16"
+    )
+    assert assets.speculative_config is not None
+    assert assets.speculative_config.draft_model_config is not None
+    return EngineArgs(
+        model=assets.model_config.model,
+        tokenizer_mode="hf",
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_seqs=4,
+        max_num_batched_tokens=4,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        speculative_config={
+            "method": "draft_model",
+            "model": assets.speculative_config.draft_model_config.model,
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": 1,
+            "draft_sample_method": "greedy",
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": [endpoint],
+                "transport": "inline",
+                "failure_policy": failure_policy,
+                "request_timeout_ms": 5000,
+            },
+        },
+    ).create_engine_config()
+
+
+@pytest.mark.parametrize("family", ["qwen3", "llama", "mistral"])
+def test_public_engine_args_admit_full_attention_prefix_replay(tmp_path, family):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+        supports_token_prefix_replay,
+    )
+    from vllm.v1.worker.gpu.spec_decode.remote import RemoteSpeculator
+
+    config = prefix_replay_config(tmp_path, "unix:///tmp/prefix.sock", family=family)
+    assert config.cache_config.enable_prefix_caching
+    assert supports_token_prefix_replay(config)
+    RemoteSpeculator._validate_config(config)
+    contract = create_token_runtime_contract(config)
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.num_prefill_lookahead == 0
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_token_async_capability_requires_mrv2(tmp_path, monkeypatch, prefix_caching):
+    """MRV1 cannot enable remote async capability, independently of prefix caching."""
+    from vllm.platforms import current_platform
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        supports_token_async_scheduling,
+        supports_token_prefix_replay,
+    )
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        enforce_eager=True,
+        cache_options={"enable_prefix_caching": prefix_caching},
+        scheduler_options={"async_scheduling": True},
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/async.sock"],
+                "transport": "inline",
+            }
+        },
+    )
+    assert config.model_config.enforce_eager
+    if current_platform.is_cpu():
+        assert not config.scheduler_config.async_scheduling
+    assert not config.use_v2_model_runner
+    assert supports_token_prefix_replay(config)
+    assert not supports_token_async_scheduling(config)
+
+
+@pytest.mark.parametrize("unsupported", ["window", "recurrent", "mla", "pool", "tp2"])
+def test_prefix_replay_preserves_unsupported_state_and_topology_gates(
+    tmp_path, unsupported
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+        supports_token_prefix_replay,
+    )
+
+    options: dict[str, Any] = dict(
+        dtype="bfloat16",
+        cache_options={"enable_prefix_caching": True},
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/prefix.sock"],
+            }
+        },
+    )
+    if unsupported == "window":
+        options.update(target_type="mistral", target_options={"sliding_window": 16})
+    elif unsupported == "recurrent":
+        options["target_type"] = "qwen3_next"
+    elif unsupported == "mla":
+        options["target_type"] = "glm4_moe_lite"
+    elif unsupported == "pool":
+        options["spec_options"]["execution"]["endpoints"].append(
+            "unix:///tmp/prefix-b.sock"
+        )
+    else:
+        options["target_tp"] = 2
+    if unsupported == "pool":
+        with pytest.raises(ValueError, match="exactly one endpoint"):
+            token_config(tmp_path, **options)
+        return
+    config = token_config(tmp_path, **options)
+    # The CPU platform disables MLA prefix caching itself; exercise the remote
+    # admission contract with the original requested public setting.
+    config.cache_config.enable_prefix_caching = True
+    assert not supports_token_prefix_replay(config)
+    with pytest.raises(ValueError, match="prefix caching requires"):
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.usefixtures("cpu_parallel_state")
+def test_worker_registered_prefix_replays_bounded_chunks_before_remaining_prompt(
+    tmp_path,
+):
+    """A real wrapper must reconstruct omitted target tokens before drafting."""
+    import torch
+
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    endpoint = f"unix://{tmp_path}/p.sock"
+    config = prefix_replay_config(tmp_path, endpoint)
+    state, oracle = machine(executor=BatchedKVOracle(token_limit=4))
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, create_token_runtime_contract(config)),
+        limits=RemoteServerLimits(4, 4, 4, 64),
+    )
+    server.start(endpoint)
+    try:
+        with set_current_vllm_config(config):
+            worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        try:
+            with pytest.raises(ValueError, match="in-vocabulary"):
+                worker.register_cached_prefix("cached", (128,))
+            worker.register_cached_prefix("cached", tuple(range(1, 11)))
+            with pytest.raises(ValueError, match="already belongs"):
+                worker.register_cached_prefix("cached", (1, 2))
+            batch = InputBatch.make_dummy(
+                1, 2, InputBuffers(4, 4, torch.device("cpu")), is_padding=False
+            )
+            batch.req_ids = ["cached"]
+            batch.input_ids.copy_(torch.tensor([11, 12], dtype=torch.int32))
+            batch.positions.copy_(torch.tensor([10, 11], dtype=torch.int64))
+            batch.prefill_len_np[0] = 12
+            batch.num_computed_tokens_np[0] = 10
+            batch.num_computed_prefill_tokens_np[0] = 10
+            batch.is_prefilling_np[0] = True
+            batch.has_prefill = True
+            batch.decode_graph_eligible = False
+            batch.seq_lens.fill_(12)
+            batch.seq_lens_cpu_upper_bound.fill_(12)
+            context = LocalExecutionContext(
+                batch,
+                None,
+                None,
+                None,
+                None,
+                torch.tensor([1]),
+                torch.tensor([0]),
+                torch.tensor([13, 0, 0, 0]),
+                torch.empty((1, 4), dtype=torch.int32),
+                torch.zeros(4),
+                torch.zeros(4, dtype=torch.int64),
+            )
+            result = worker.collect(
+                worker.dispatch(DraftStep.from_batch(batch, 3), context)
+            )
+            expected = list(range(1, 14))
+            drafts = []
+            for _ in range(3):
+                drafts.append(KVOracle.predict(expected))
+                expected.append(drafts[-1])
+            assert result.valid_lengths.tolist() == [3]
+            assert result.token_ids.tolist() == [drafts]
+            assert [
+                (start, tokens, sample) for _, start, tokens, sample in oracle.calls[:4]
+            ] == [
+                (0, (1, 2, 3, 4), False),
+                (4, (5, 6, 7, 8), False),
+                (8, (9, 10), False),
+                (10, (11, 12), False),
+            ]
+            progress = next(iter(state.sequences.values()))
+            assert progress.committed == 13
+            assert [oracle.kv[progress.req_index][i] for i in range(13)] == list(
+                range(1, 14)
+            )
+            worker.close_requests(("cached",))
+            assert not state.sequences
+            assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+        finally:
+            worker.close()
+    finally:
+        server.stop()
+
+
+@pytest.mark.usefixtures("cpu_parallel_state")
+@pytest.mark.parametrize("failure_policy", ["target_only", "error"])
+@pytest.mark.parametrize("prefix_length", [None, 2])
+def test_prefix_allocation_failure_isolates_request_until_finish(
+    tmp_path, failure_policy, prefix_length
+):
+    """A failed prefix copy cannot terminate an existing remote sibling."""
+    import torch
+
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    class AllocationFailure(list):
+        # Inject at the input sequence's allocation boundary; the real backend,
+        # session, socket and state machine retain their ordinary behavior.
+        def __iter__(self):
+            raise MemoryError("injected prefix preparation allocation")
+
+        def __getitem__(self, index):
+            if isinstance(index, slice):
+                raise MemoryError("injected prefix preparation allocation")
+            return super().__getitem__(index)
+
+    endpoint = f"unix://{tmp_path}/p.sock"
+    config = prefix_replay_config(tmp_path, endpoint, failure_policy=failure_policy)
+    state, oracle = machine(executor=BatchedKVOracle(token_limit=4))
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, create_token_runtime_contract(config)),
+        limits=RemoteServerLimits(4, 4, 4, 64),
+    )
+    server.start(endpoint)
+    try:
+        with set_current_vllm_config(config):
+            worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        try:
+
+            def propose(req_id, token_ids, start, *, prefilling):
+                batch = InputBatch.make_dummy(
+                    1,
+                    len(token_ids),
+                    InputBuffers(4, 4, torch.device("cpu")),
+                    is_padding=False,
+                )
+                batch.req_ids = [req_id]
+                end = start + len(token_ids)
+                batch.input_ids.copy_(torch.tensor(token_ids, dtype=torch.int32))
+                batch.positions.copy_(torch.arange(start, end))
+                batch.prefill_len_np[0] = end if prefilling else 2
+                batch.num_computed_tokens_np[0] = start
+                batch.num_computed_prefill_tokens_np[0] = start
+                batch.is_prefilling_np[0] = prefilling
+                batch.has_prefill = prefilling
+                batch.decode_graph_eligible = False
+                batch.seq_lens.fill_(end)
+                batch.seq_lens_cpu_upper_bound.fill_(end)
+                context = LocalExecutionContext(
+                    batch,
+                    None,
+                    None,
+                    None,
+                    None,
+                    torch.tensor([1]),
+                    torch.tensor([0]),
+                    torch.tensor([token_ids[-1] + 1, 0, 0, 0]),
+                    torch.empty((1, 4), dtype=torch.int32),
+                    torch.zeros(4),
+                    torch.zeros(4, dtype=torch.int64),
+                )
+                return worker.collect(
+                    worker.dispatch(DraftStep.from_batch(batch, 3), context)
+                )
+
+            assert propose(
+                "healthy", (1, 2), 0, prefilling=True
+            ).valid_lengths.tolist() == [3]
+            healthy_key = next(iter(state.sequences))
+            failed = AllocationFailure([1, 2, 3])
+            options = (
+                {}
+                if prefix_length is None
+                else {
+                    "num_computed_tokens": prefix_length,
+                }
+            )
+            if failure_policy == "error":
+                with pytest.raises(RemoteDraftError, match="prefix"):
+                    worker.register_cached_prefix("affected", failed, **options)
+            else:
+                worker.register_cached_prefix("affected", failed, **options)
+                calls = len(oracle.calls)
+                for _ in range(2):
+                    fallback = propose("affected", (3,), 2, prefilling=True)
+                    assert fallback.valid_lengths.tolist() == [0]
+                assert len(oracle.calls) == calls
+                assert set(state.sequences) == {healthy_key}
+                with pytest.raises(ValueError, match="already belongs"):
+                    worker.register_cached_prefix("affected", (1, 2))
+
+            assert propose(
+                "healthy", (3,), 2, prefilling=False
+            ).valid_lengths.tolist() == [3]
+            assert state.sequences[healthy_key].committed == 4
+            worker.close_requests(("affected",))
+            worker.register_cached_prefix("affected", (1, 2))
+            assert propose(
+                "affected", (3,), 2, prefilling=True
+            ).valid_lengths.tolist() == [3]
+            assert len(state.sequences) == 2
+            worker.close_requests(("healthy", "affected"))
+            assert not state.sequences
+            assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+        finally:
+            worker.close()
+    finally:
+        server.stop()

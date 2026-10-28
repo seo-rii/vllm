@@ -169,6 +169,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
+    get_num_invalid_spec_tokens,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import (
@@ -208,6 +209,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self._remote_async = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "draft_model"
+            and self.speculative_config.use_remote_draft()
+            and self.scheduler_config.async_scheduling
+        )
         self._draft_workspace_lane = int(
             self.speculative_config is not None and self.speculative_config.use_dspark()
         )
@@ -339,6 +346,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             device=self.device,
+            separate_model_input_ids=self._remote_async,
         )
         self.fast_prefill: FastPrefillHelper | None = None
         if self.use_pp:
@@ -529,6 +537,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     watermark_key=speculative_target_watermark_key(
                         self.vllm_config.watermark_config
                     ),
+                    report_invalid_spec_tokens=self._remote_async,
                 )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
@@ -1039,6 +1048,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
+        if self._remote_async:
+            # Budget the packed verification scratch at the full token capacity.
+            get_num_invalid_spec_tokens(
+                self.input_buffers.input_ids, dummy_input_batch.cu_num_logits
+            )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1251,15 +1265,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if (
                 self.speculative_config is not None
                 and self.speculative_config.use_remote_draft()
-                and (
-                    req_id in self.req_states.req_id_to_index
-                    or new_req_data.num_computed_tokens != 0
-                )
             ):
-                raise ValueError(
-                    "remote drafter requires new requests to prefill from zero; "
-                    "streaming input updates and cached prefixes are unsupported"
-                )
+                if req_id in self.req_states.req_id_to_index:
+                    raise ValueError("remote drafter does not support input streaming")
+                cached = new_req_data.num_computed_tokens
+                if cached != 0:
+                    from vllm.v1.worker.gpu.spec_decode.token_remote import (
+                        TokenOnlyRemoteSpeculator,
+                    )
+
+                    if not isinstance(
+                        self.speculator, TokenOnlyRemoteSpeculator
+                    ) or not 0 < cached < len(new_req_data.prefill_token_ids):
+                        raise ValueError(
+                            "remote drafter requires new requests to prefill from zero "
+                            "or a supported token-only cached prefix"
+                        )
+                    self.speculator.register_cached_prefix(
+                        req_id,
+                        new_req_data.prefill_token_ids,
+                        num_computed_tokens=cached,
+                    )
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -2047,6 +2073,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if self._remote_async and model_inputs["input_ids"] is not None:
+            model_inputs["input_ids"] = self.input_buffers.get_model_input_ids(
+                model_inputs["input_ids"]
+            )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             if not requires_raw_input_tokens(self.model):

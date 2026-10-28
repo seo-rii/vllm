@@ -17,6 +17,73 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 DEVICE = current_platform.device_type
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("separate", [False, True])
+def test_model_input_padding_preserves_logical_tokens(separate):
+    """Only the model copy may replace rejected draft sentinels for embedding."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    buffers = InputBuffers(
+        max_num_reqs=2,
+        max_num_tokens=8,
+        device=torch.device("cpu"),
+        separate_model_input_ids=separate,
+    )
+    batch = InputBatch.make_dummy(2, 4, buffers)
+    logical = batch.input_ids
+    logical.copy_(torch.tensor([5, -1, 0, 7], dtype=torch.int32))
+    physical = buffers.get_model_input_ids(logical)
+    assert logical.tolist() == [5, -1, 0, 7]
+    if not separate:
+        assert physical is logical
+        return
+    assert physical.tolist() == [5, 0, 0, 7]
+    assert physical.untyped_storage().data_ptr() != logical.untyped_storage().data_ptr()
+    embedding = VocabParallelEmbedding(
+        num_embeddings=8,
+        embedding_dim=4,
+        params_dtype=torch.float32,
+        disable_tp=True,
+    )
+    with torch.no_grad():
+        embedding.weight.copy_(
+            torch.arange(embedding.weight.numel()).reshape_as(embedding.weight)
+        )
+    assert torch.equal(embedding(physical), embedding.weight[[5, 0, 0, 7]])
+    logical.copy_(torch.tensor([-2, -1, 8, 0], dtype=torch.int32))
+    following = buffers.get_model_input_ids(logical[:3])
+    assert following.data_ptr() == physical.data_ptr()
+    assert following.tolist() == [-2, 0, 8]
+    assert logical.tolist() == [-2, -1, 8, 0]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tokens,offsets,expected",
+    [
+        ([99, 1, -1, -1, 88, -1, 77, 0, 2, -1, -1], [0, 4, 6, 10, 11], [2, 1, 1, 0]),
+        ([-1, -1, -1], [0, 3], [2]),
+        ([], [0], []),
+    ],
+)
+def test_invalid_spec_tokens_use_current_packed_request_boundaries(
+    tokens, offsets, expected
+):
+    """Invalid counts exclude each bonus row, including K0 and empty batches."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        get_num_invalid_spec_tokens,
+    )
+
+    verified = torch.tensor(tokens, dtype=torch.int64)
+    counts = get_num_invalid_spec_tokens(
+        verified, torch.tensor(offsets, dtype=torch.int32)
+    )
+    assert counts.tolist() == expected
+    assert verified.tolist() == tokens
+
+
 @pytest.mark.parametrize(
     "num_reqs,num_tokens",
     [
