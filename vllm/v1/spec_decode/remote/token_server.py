@@ -108,6 +108,7 @@ class TokenDraftServer(RemoteDraftServer):
             max_batch_rows=self.limits.max_batch_size,
             max_batch_tokens=self.limits.max_feature_tokens,
             batch_wait_s=batch_wait_ms / 1000,
+            on_failure=self._lifecycle_failed,
             max_background_jobs=(
                 0 if adapter.cache is None else adapter.cache.max_branches
             ),
