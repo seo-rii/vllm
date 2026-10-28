@@ -14,6 +14,17 @@ def regression_nodes() -> list[str]:
     nodes = []
     groups = (
         (
+            source / "observability.py",
+            "test_token_runtime.py",
+            (
+                "test_token_rpc_metrics_include_server_resources_and_cleanup",
+                "test_remote_metrics_follow_stats_only_engine_output",
+                "test_token_otlp_context_links_across_real_socket",
+                "test_token_failed_row_metrics_count_terminal_transition_once",
+                "test_token_prefill_failure_metric_preserves_server_status",
+            ),
+        ),
+        (
             source / "token_session.py",
             "test_token_runtime.py",
             (

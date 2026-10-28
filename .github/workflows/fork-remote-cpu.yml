@@ -57,7 +57,7 @@ jobs:
           uv venv --python 3.12 .venv
           uv pip install --python .venv/bin/python \
             pytest==8.4.2 pytest-timeout==2.4.0 msgspec==0.19.0 ruff==0.14.0 \
-            numpy==2.3.5 regex==2026.9.29
+            numpy==2.3.5 regex==2026.9.29 'prometheus-client>=0.18.0'
           uv pip install --python .venv/bin/python \
             torch==2.14.0+cpu torchvision==0.29.1+cpu \
             --index-url https://download.pytorch.org/whl/cpu
@@ -125,8 +125,10 @@ jobs:
             cbor2 einops requests aiohttp oss-harmony 'mcp>=2,<3' openai \
             partial-json-parser pillow==12.3.0 compressed-tensors==0.17.0 depyf==0.20.0 \
             opencv-python-headless 'fastapi>=0.133.0,<0.137.0' pybase64 \
-            uvloop prometheus-client xgrammar==0.2.8 'llguidance>=1.7,<1.8' \
-            tiktoken 'mistral-common[image]>=1.11.6'
-      - name: Test socket cleanup, native loading, and resolved configuration
+            uvloop xgrammar==0.2.8 'llguidance>=1.7,<1.8' \
+            tiktoken 'mistral-common[image]>=1.11.6' \
+            'opentelemetry-api>=1.27.0' 'opentelemetry-sdk>=1.27.0' \
+            'opentelemetry-exporter-otlp>=1.27.0'
+      - name: Test socket cleanup, loading, configuration, and observability
         if: steps.regressions.outputs.enabled == 'true'
         run: .venv/bin/python .github/workflows/scripts/remote_cpu_regressions.py

@@ -212,6 +212,30 @@ def protocol_peer():
     assert not errors
 
 
+def test_observability_requires_peer_ack_before_sending_metadata(protocol_peer):
+    """An old server receives ordinary prefill envelopes after a new HELLO."""
+
+    def script(peer):
+        assert peer.hello.observability
+        envelope, message, _ = peer.recv()
+        assert isinstance(message, OpenSequence)
+        peer.reply(envelope, SequenceAck(message.key))
+        envelope, message, _ = peer.recv()
+        assert isinstance(message, PrefillChunk)
+        assert envelope.trace_context is None and envelope.observation is None
+        peer.reply(envelope, SequenceAck(message.key))
+
+    endpoint = protocol_peer(script, protocol_minor=2)
+    session = RemoteDraftSession(endpoint, IDENTITY, request_timeout_ms=5000)
+    try:
+        session.connect()
+        key = session.open_sequences((0,))[0]
+        session.prefill(key, features([1, 2]), is_final=True)
+        assert not session.observation.pending
+    finally:
+        session.close()
+
+
 def test_pipelined_prefills_cannot_renew_an_expired_round_budget():
     """An expired queued prefill must not delay an existing healthy request."""
 

@@ -4,6 +4,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -412,10 +413,9 @@ def test_token_open_metadata_oom_preserves_all_slots(monkeypatch, failure):
     assert {state.sequences[key].req_index for key in keys} == {0, 1, 2, 3}
 
 
-@pytest.fixture
-def socket_runtime(tmp_path, request):
+def _socket_runtime(tmp_path, max_connections=16, *, contract=None):
     state, oracle = machine(executor=BatchedKVOracle())
-    contract = RuntimeContract(
+    contract = contract or RuntimeContract(
         TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
         SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
@@ -429,19 +429,593 @@ def socket_runtime(tmp_path, request):
     server = TokenDraftServer(
         TokenOnlyDraftAdapter(state, contract),
         limits=RemoteServerLimits(4, 64, 4, 64),
-        max_connections=getattr(request, "param", 16),
+        max_connections=max_connections,
     )
     endpoint = server.start(f"unix://{tmp_path}/t.sock")
-    hello = TokenHello("verifier", "target", "draft", "tokenizer", 3, 128, 4, 64, 64)
+    hello = TokenHello(
+        "verifier",
+        contract.target_fingerprint,
+        contract.draft_fingerprint,
+        contract.tokenizer_fingerprint,
+        3,
+        128,
+        4,
+        64,
+        64,
+    )
     session = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
+    session.connect()
+    return state, oracle, server, session
+
+
+@pytest.fixture
+def socket_runtime(tmp_path, request):
+    state, oracle, server, session = _socket_runtime(
+        tmp_path, getattr(request, "param", 16)
+    )
     try:
-        session.connect()
         yield state, oracle, server, session
     finally:
         session.close()
         server.stop()
         assert not state.sequences
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+
+
+def test_token_rpc_metrics_include_server_resources_and_cleanup(socket_runtime):
+    """A real client exposes server execution and returns its reported KV credit."""
+    import urllib.request
+
+    from prometheus_client import CollectorRegistry, start_http_server
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from vllm.v1.spec_decode.remote.metrics import RemoteMetrics
+
+    state, _, _, session = socket_runtime
+    registry = CollectorRegistry()
+    publisher = RemoteMetrics(registry=registry)
+    httpd, thread = start_http_server(0, addr="127.0.0.1", registry=registry)
+
+    def publish():
+        stats = session.observation.take_stats()
+        assert stats is not None
+        publisher.observe(stats)
+        assert session.observation.take_stats() is None
+
+    def values():
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{httpd.server_port}/metrics", timeout=5
+        ) as response:
+            return [
+                sample
+                for metric in text_string_to_metric_families(response.read().decode())
+                if metric.name.startswith("vllm:remote_draft_")
+                for sample in metric.samples
+            ]
+
+    def value(name, **labels):
+        return sum(
+            sample.value
+            for sample in values()
+            if sample.name == name
+            and all(sample.labels.get(key) == val for key, val in labels.items())
+        )
+
+    before = value(
+        "vllm:remote_draft_rpc_seconds_count", backend="token", operation="proposal"
+    )
+    try:
+        key = session.open_sequence(71, deadline=session.deadline())
+        session.prefill(key, (1, 2), is_final=True, deadline=session.deadline())
+        result = session.collect(
+            session.dispatch(
+                0,
+                (TokenAdvanceRow(key, 2, None, 0, 0, (3,)),),
+                2,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (2,)
+        publish()
+        assert (
+            value(
+                "vllm:remote_draft_rpc_seconds_count",
+                backend="token",
+                operation="proposal",
+            )
+            == before + 1
+        )
+        for stage in ("queue", "execute"):
+            assert (
+                value(
+                    "vllm:remote_draft_server_seconds_count",
+                    backend="token",
+                    operation="proposal",
+                    stage=stage,
+                )
+                > 0
+            )
+        assert (
+            value(
+                "vllm:remote_draft_server_resources",
+                backend="token",
+                resource="kv_used_blocks",
+            )
+            > 0
+        )
+        for direction in ("sent", "received"):
+            assert (
+                value(
+                    "vllm:remote_draft_bytes_total",
+                    backend="token",
+                    direction=direction,
+                )
+                > 0
+            )
+        assert all(
+            set(sample.labels)
+            <= {
+                "backend",
+                "operation",
+                "stage",
+                "direction",
+                "reason",
+                "resource",
+                "le",
+            }
+            for sample in values()
+        )
+        session.close_sequences((key,))
+        publish()
+        assert (
+            value(
+                "vllm:remote_draft_server_resources",
+                backend="token",
+                resource="kv_used_blocks",
+            )
+            == 0
+        )
+        assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_remote_metrics_follow_stats_only_engine_output(tmp_path, monkeypatch):
+    """A frontend publishes worker deltas without a shared Prometheus registry."""
+    import math
+
+    import msgspec
+    from prometheus_client import generate_latest
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+    from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.spec_decode.remote.metrics import (
+        RemoteDraftStats,
+        RemoteHistogramStats,
+    )
+
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    config = token_config(tmp_path)
+    scheduler = create_scheduler(
+        model=config.model_config.model,
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+    )
+    frontend = PrometheusStatLogger(config)
+    durations = (0.0, 0.0001, 0.001, 0.003, 31.0)
+    histogram = RemoteHistogramStats()
+    for seconds in durations:
+        histogram.observe(seconds)
+    stats = RemoteDraftStats(
+        "token",
+        rounds={"proposal": histogram},
+        bytes={"sent": 123},
+        failures={"proposal": {"timeout": 2}},
+        rows={"CAPACITY_EXCEEDED": 3},
+        resources={"kv_used_blocks": 2},
+    )
+
+    def forward(delta):
+        outputs = scheduler.update_from_output(
+            scheduler.schedule(),
+            ModelRunnerOutput([], {}, remote_draft_stats=delta),
+        )
+        assert len(outputs) == 1
+        output = next(iter(outputs.values()))
+        assert not output.outputs
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(output), type=EngineCoreOutputs
+        )
+        frontend.record(decoded.scheduler_stats, None)
+
+    try:
+        assert "vllm:remote_draft_rpc_seconds" not in generate_latest().decode()
+        forward(stats)
+        samples = [
+            sample
+            for metric in text_string_to_metric_families(generate_latest().decode())
+            for sample in metric.samples
+        ]
+        remote = [s for s in samples if s.name.startswith("vllm:remote_draft_")]
+        assert all(s.labels["engine"] == "0" for s in remote)
+        assert all(s.labels["model_name"] == config.model_config.model for s in remote)
+        for sample in remote:
+            if sample.name == "vllm:remote_draft_rpc_seconds_bucket":
+                bound = float(sample.labels["le"])
+                assert sample.value == sum(seconds <= bound for seconds in durations)
+        for name, expected in (
+            ("rpc_seconds_count", len(durations)),
+            ("rpc_seconds_sum", sum(durations)),
+            ("bytes_total", 123),
+            ("rpc_failures_total", 2),
+            ("failed_rows_total", 3),
+        ):
+            matching = [
+                s.value for s in remote if s.name == f"vllm:remote_draft_{name}"
+            ]
+            assert matching == [expected]
+        # A metadata-only close publishes zero while idle, without replaying deltas.
+        forward(RemoteDraftStats("token", resources={"kv_used_blocks": 0}))
+        assert 'resource="kv_used_blocks"} 0.0' in generate_latest().decode()
+        assert frontend.remote_draft_prom is not None
+        for invalid in (
+            RemoteHistogramStats([1]),
+            RemoteHistogramStats([-1] + [0] * 16),
+            RemoteHistogramStats(sum=-1),
+            RemoteHistogramStats(sum=math.nan),
+            RemoteHistogramStats(sum=math.inf),
+        ):
+            with pytest.raises(ValueError, match="histogram aggregate"):
+                frontend.remote_draft_prom.observe(
+                    RemoteDraftStats("token", rounds={"proposal": invalid})
+                )
+    finally:
+        scheduler.shutdown()
+        unregister_vllm_metrics()
+
+
+def _check_worker_otlp_context(directory, received, tracer):
+    """Real worker construction and a ragged InputBatch with one proposal row."""
+    import numpy as np
+    import torch
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject
+
+    from vllm.config import set_current_vllm_config
+    from vllm.config.speculative import SpeculativeExecutionConfig
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+    from vllm.v1.spec_decode.contracts import LocalExecutionContext
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    directory = directory / "worker"
+    directory.mkdir()
+    config = token_config(
+        directory / "models",
+        execution=SpeculativeExecutionConfig(
+            placement="remote",
+            endpoints=(f"unix://{directory}/t.sock",),
+            request_timeout_ms=5000,
+        ),
+    )
+    _, _, server, probe = _socket_runtime(
+        directory, contract=create_token_runtime_contract(config)
+    )
+    probe.close()
+    worker = None
+    try:
+        with set_current_vllm_config(config):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=f"file://{directory}/gloo",
+                backend="gloo",
+            )
+            ensure_model_parallel_initialized(1, 1, backend="gloo")
+            worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        parents = {}
+        for req_id in ("a", "b", "unrelated"):
+            with tracer.start_as_current_span(f"worker.request.{req_id}") as span:
+                carrier: dict[str, str] = {}
+                inject(carrier)
+                worker.register_trace_context(req_id, carrier)
+                parents[req_id] = span.get_span_context().span_id
+        batch = replace(
+            InputBatch.make_dummy(2, 3, InputBuffers(2, 3, torch.device("cpu"))),
+            req_ids=["a", "b"],
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+            positions=torch.tensor([0, 0, 1]),
+            prefill_len_np=np.array([3, 2]),
+            is_prefilling_np=np.array([True, True]),
+            has_prefill=True,
+        )
+        context = LocalExecutionContext(
+            batch,
+            None,
+            None,
+            None,
+            None,
+            torch.tensor([0, 1]),
+            torch.tensor([0, 0]),
+            torch.tensor([0, 4]),
+            torch.empty((2, 3), dtype=torch.int32),
+            torch.zeros(2),
+            torch.zeros(2, dtype=torch.int64),
+        )
+        received.clear()
+        result = step(worker, context, 2)
+        assert result.valid_lengths.tolist() == [0, 2]
+        assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+        prefills = [s for s in received if s.name == "remote_draft.prefill"]
+        proposals = [s for s in received if s.name == "remote_draft.proposal"]
+        assert len(prefills) == 2 and len(proposals) == 1
+        assert {int.from_bytes(s.parent_span_id) for s in prefills} == {
+            parents["a"],
+            parents["b"],
+        }
+        assert int.from_bytes(proposals[0].parent_span_id) == parents["b"]
+        assert all(not span.links for span in (*prefills, *proposals))
+    finally:
+        if worker is not None:
+            worker.close()
+        server.stop()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+def _check_token_otlp_trace_links(directory):
+    import os
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from pathlib import Path
+
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+        ExportTraceServiceRequest,
+    )
+
+    from vllm.tracing import init_tracer
+
+    received: list[Any] = []
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            payload = ExportTraceServiceRequest.FromString(
+                self.rfile.read(int(self.headers["Content-Length"]))
+            )
+            received.extend(
+                span
+                for resource in payload.resource_spans
+                for scope in resource.scope_spans
+                for span in scope.spans
+            )
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    collector = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    collector_thread = threading.Thread(target=collector.serve_forever, daemon=True)
+    collector_thread.start()
+    os.environ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] = "http/protobuf"
+    tracer = init_tracer(
+        "test.remote_draft", f"http://127.0.0.1:{collector.server_port}/v1/traces"
+    )
+    state, _, server, session = _socket_runtime(Path(directory))
+    try:
+        request_spans = []
+        keys = []
+        for i in range(2):
+            with tracer.start_as_current_span(f"request.{i}") as span:
+                carrier: dict[str, str] = {}
+                inject(carrier)
+                carrier["tracestate"] = "vendor=test"
+                session.observation.register(str(i), carrier)
+                request_spans.append(span.get_span_context())
+            session.observation.select((str(i),))
+            key = session.open_sequence(i, deadline=session.deadline())
+            keys.append(key)
+            session.prefill(key, (i + 1,), is_final=True, deadline=session.deadline())
+        session.observation.select(("0", "1"))
+        result = session.collect(
+            session.dispatch(
+                0,
+                tuple(
+                    TokenAdvanceRow(key, 1, None, 0, 0, (i + 3,))
+                    for i, key in enumerate(keys)
+                ),
+                2,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (2, 2)
+        session.close_sequences(tuple(keys))
+        assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+        clients = [s for s in received if s.name == "remote_draft.proposal"]
+        servers = [s for s in received if s.name == "remote_draft.server.proposal"]
+        assert len(clients) == len(servers) == 1
+        client, remote = clients[0], servers[0]
+        assert remote.parent_span_id == client.span_id
+        assert remote.trace_id == client.trace_id
+        assert {
+            (int.from_bytes(link.trace_id), int.from_bytes(link.span_id))
+            for link in client.links
+        } == {(context.trace_id, context.span_id) for context in request_spans}
+        prefills = [s for s in received if s.name == "remote_draft.prefill"]
+        assert {int.from_bytes(s.parent_span_id) for s in prefills} == {
+            context.span_id for context in request_spans
+        }
+        assert all("vendor=test" in span.trace_state for span in prefills)
+        attributes = {
+            attribute.key: attribute.value.double_value
+            for attribute in remote.attributes
+        }
+        assert attributes["vllm.remote.queue_seconds"] >= 0
+        assert attributes["vllm.remote.execute_seconds"] > 0
+        assert not session.observation.pending
+        _check_worker_otlp_context(Path(directory), received, tracer)
+        from tests.v1.spec_decode.remote.test_session import IDENTITY, features
+        from vllm.v1.spec_decode.remote.server import (
+            FakeDraftAdapter,
+            RemoteDraftServer,
+        )
+        from vllm.v1.spec_decode.remote.session import RemoteDraftSession
+
+        conditioned_server = RemoteDraftServer(FakeDraftAdapter(vocab_size=50))
+        conditioned_server.start("tcp://127.0.0.1:0")
+        conditioned = RemoteDraftSession(
+            conditioned_server.endpoint, IDENTITY, request_timeout_ms=5000
+        )
+        received.clear()
+        try:
+            conditioned.connect()
+            conditioned_keys = conditioned.open_sequences((10, 11))
+            conditioned_parents = []
+            for req_id in ("a", "b", "unrelated"):
+                with tracer.start_as_current_span(req_id) as span:
+                    conditioned_carrier: dict[str, str] = {}
+                    inject(conditioned_carrier)
+                    conditioned.observation.register(req_id, conditioned_carrier)
+                    conditioned_parents.append(span.get_span_context().span_id)
+            conditioned.observation.select(("a", "b", "unrelated"))
+            conditioned.prefill_many(
+                [(key, features([1]), False) for key in conditioned_keys],
+                trace_request_ids=dict(zip(conditioned_keys, ("a", "b"), strict=True)),
+            )
+            # Missing metadata must not inherit a previous RPC's request links.
+            conditioned.observation.select(("unrelated",))
+            conditioned.prefill_many(
+                [(key, features([2]), True) for key in conditioned_keys]
+            )
+            assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+            conditioned_prefills = [
+                s for s in received if s.name == "remote_draft.prefill"
+            ]
+            assert len(conditioned_prefills) == 4
+            assert sorted(
+                int.from_bytes(s.parent_span_id) for s in conditioned_prefills
+            ) == sorted([*conditioned_parents[:2], 0, 0])
+            assert all(not span.links for span in conditioned_prefills)
+        finally:
+            conditioned.close()
+            conditioned_server.stop()
+    finally:
+        session.close()
+        server.stop()
+        trace.get_tracer_provider().shutdown()
+        collector.shutdown()
+        collector.server_close()
+        collector_thread.join(timeout=5)
+        assert not state.sequences
+
+
+def test_token_otlp_context_links_across_real_socket(tmp_path):
+    """A real HTTP OTLP exporter sees linked requests and child server spans."""
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "from tests.v1.spec_decode.remote.test_token_runtime import "
+            "_check_token_otlp_trace_links; import sys; "
+            "_check_token_otlp_trace_links(sys.argv[1])",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        env={**os.environ, "VLLM_TARGET_DEVICE": "cpu", "CUDA_VISIBLE_DEVICES": ""},
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime):
+    import msgspec
+
+    state, _, _, original = socket_runtime
+    session = TokenOnlyRemoteSession(
+        original.endpoint,
+        msgspec.structs.replace(original.hello, verifier_instance_id="metrics-client"),
+        failure_policy="target_only",
+        request_timeout_ms=5000,
+    )
+    try:
+        key = session.open_sequence(0, deadline=session.deadline())
+        session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+        result = session.collect(
+            session.dispatch(
+                0,
+                (TokenAdvanceRow(key, 1, None, 1, 1, (2,)),),
+                1,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (0,)
+        stats = session.observation.take_stats()
+        assert stats is not None
+        assert stats.rows == {"SEQUENCE_DESYNC": 1}
+        assert not session.active(key)
+        result = session.collect(
+            session.dispatch(
+                1,
+                (TokenAdvanceRow(key, 1, None, 1, 1, (2,)),),
+                1,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (0,)
+        stats = session.observation.take_stats()
+        assert stats is None or not stats.rows
+        session.close_sequences((key,))
+        assert not state.sequences
+    finally:
+        session.close()
+
+
+def test_token_prefill_failure_metric_preserves_server_status(socket_runtime):
+    import msgspec
+
+    _, _, _, original = socket_runtime
+    session = TokenOnlyRemoteSession(
+        original.endpoint,
+        msgspec.structs.replace(original.hello, verifier_instance_id="prefill-metrics"),
+        failure_policy="target_only",
+        request_timeout_ms=5000,
+    )
+    try:
+        key = session.open_sequence(0, deadline=session.deadline())
+        session.prefill(
+            key, (session.hello.vocab_size,), is_final=True, deadline=session.deadline()
+        )
+        assert not session.active(key)
+        stats = session.observation.take_stats()
+        assert stats is not None
+        assert stats.failures["prefill"]["PROTOCOL_ERROR"] == 1
+    finally:
+        session.close()
 
 
 @pytest.mark.parametrize("socket_runtime", [1], indirect=True)
@@ -605,7 +1179,7 @@ def test_protocol_majors_are_explicit_and_v2_unchanged():
     v3 = encode_token_message(Ping(1))
     assert decode_envelope(v2).protocol_major == 2
     assert decode_token_message(v3)[0].protocol_major == 3
-    assert decode_token_message(v3)[0].protocol_minor == 1
+    assert decode_token_message(v3)[0].protocol_minor == 2
     with pytest.raises(ProtocolVersionError):
         decode_token_message(v2)
     with pytest.raises(ProtocolVersionError):
@@ -1890,7 +2464,14 @@ def test_actual_socket_timeout_fences_late_completion(
         release.set()
 
 
-def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_options):
+def token_config(
+    tmp_path,
+    *,
+    target_type="qwen3",
+    draft_type="qwen3",
+    execution=None,
+    **draft_options,
+):
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -1962,6 +2543,7 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         num_speculative_tokens=3,
         target_model_config=target,
         target_parallel_config=parallel,
+        execution=execution,
     )
     return VllmConfig(
         model_config=target,

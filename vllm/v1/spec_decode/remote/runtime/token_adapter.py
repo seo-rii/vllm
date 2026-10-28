@@ -29,6 +29,11 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
     def warmup(self) -> None:
         self.state.executor.warmup()
 
+    def kv_statistics(self) -> tuple[int, int]:
+        pool = self.state.block_pool
+        capacity = pool.num_blocks - 1
+        return capacity - pool.num_free_blocks, capacity
+
     def open_sequence(self, key: SequenceKey) -> None:
         self.state.open(key)
 

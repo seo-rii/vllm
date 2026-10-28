@@ -15,17 +15,19 @@ from vllm.v1.spec_decode.remote.protocol import (
     PositiveInt,
     ProtocolError,
     ProtocolVersionError,
+    RemoteObservation,
     RemoteServerLimits,
     SequenceAck,
     SequenceKey,
     SpeculatorStatusCode,
+    TraceContext,
 )
 
 TOKEN_PROTOCOL_MAJOR = 3
-TOKEN_PROTOCOL_MINOR = 1
+TOKEN_PROTOCOL_MINOR = 2
 
 
-class TokenHello(msgspec.Struct):
+class TokenHello(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     verifier_instance_id: str
     target_fingerprint: str
     draft_fingerprint: str
@@ -37,13 +39,15 @@ class TokenHello(msgspec.Struct):
     max_model_len: PositiveInt
     method: str = "draft_model"
     transport: str = "inline"
+    observability: bool = False
 
 
-class TokenHelloAck(msgspec.Struct):
+class TokenHelloAck(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     session_id: str
     session_epoch: PositiveInt
     tokenizer_fingerprint: str
     limits: RemoteServerLimits
+    observability: bool = False
 
 
 class TokenPrefill(msgspec.Struct):
@@ -94,7 +98,12 @@ _NAMES = {kind: name for name, kind in _TYPES.items()}
 
 
 def encode_token_message(
-    message: msgspec.Struct, *, session_id: str = "", request_id: int = 0
+    message: msgspec.Struct,
+    *,
+    session_id: str = "",
+    request_id: int = 0,
+    trace_context: TraceContext | None = None,
+    observation: RemoteObservation | None = None,
 ) -> bytes:
     name = _NAMES.get(type(message))
     if name is None:
@@ -107,6 +116,8 @@ def encode_token_message(
             session_id,
             request_id,
             msgspec.msgpack.encode(message),
+            trace_context,
+            observation,
         )
     )
 

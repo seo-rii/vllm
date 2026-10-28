@@ -89,6 +89,11 @@ class DraftStepExecutor(ABC):
 class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
     """Feeds protocol rows through a DraftStepPlanner into an executor."""
 
+    def kv_statistics(self) -> tuple[int, int]:
+        pool = self.planner.block_pool
+        capacity = pool.num_blocks - 1
+        return capacity - pool.num_free_blocks, capacity
+
     def __init__(
         self,
         executor: DraftStepExecutor,
