@@ -2038,7 +2038,13 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
         max_connections=1,
     )
 
-    def close_verifier_socket(signum, frame):
+    fault_requested = False
+
+    def request_socket_close(signum, frame):
+        nonlocal fault_requested
+        fault_requested = True
+
+    def close_verifier_socket():
         with server._connections_lock:
             connections = tuple(
                 connection
@@ -2059,11 +2065,14 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
             receipt.write(payload)
         pending_receipt.replace(receipt_path)
 
-    signal.signal(signal.SIGUSR1, close_verifier_socket)
     try:
         endpoint = server.start(args.endpoint)
+        signal.signal(signal.SIGUSR1, request_socket_close)
         print(f"TOKEN_DRAFT_READY {endpoint}", flush=True)
-        server.wait()
+        while not server.wait(timeout=0.1):
+            if fault_requested:
+                close_verifier_socket()
+                fault_requested = False
     except KeyboardInterrupt:
         pass
     finally:
