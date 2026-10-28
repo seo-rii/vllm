@@ -2244,7 +2244,7 @@ def _compare_native_and_remote_draft(
             assert layer["type"] == ("GDN_ATTN" if is_gdn else "MAMBA2")
             conv_shape, state_shape = layer["shapes"]
             assert sorted(conv_shape) == [3 + policy["k"], 512 if is_gdn else 384]
-            assert state_shape == ((2, 128, 128) if is_gdn else (4, 64, 64))
+            assert tuple(state_shape) == ((2, 128, 128) if is_gdn else (4, 64, 64))
             assert layer["kernels"] == (
                 {"prefill": "triton", "decode": "triton"}
                 if is_gdn
