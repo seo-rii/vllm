@@ -7,6 +7,9 @@ from dataclasses import replace
 import pytest
 import torch
 
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -19,13 +22,14 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    SparseMLAKVContract,
     group_standalone_kv_specs,
     make_grouped_standalone_kv_config,
     make_standalone_kv_config,
     select_standalone_kv_spec,
 )
 from vllm.v1.spec_decode.remote.runtime.step import DraftStepPlanner, DraftStepRow
-from vllm.v1.worker.utils import allocate_kv_cache
+from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache_to_layers
 
 
 def _spec(kind):
@@ -256,6 +260,7 @@ def test_compressed_packed_padded_and_quantized_pages_are_rejected(spec):
     [
         {"model_version": "deepseek_v4"},
         {"is_index_group_leader": True},
+        {"topk_buffer_width": 512},
         {"cache_role": SparseCacheRole.INDEXER},
         {"non_causal_multi_token_decode": True},
         {"sliding_window": 8},
@@ -300,4 +305,178 @@ def test_all_cache_types_require_layer_compact_layout(kind, layout_name):
     with pytest.raises(ValueError, match="layer-compact"):
         make_standalone_kv_config(
             _spec(kind), ["draft"], 4096, KVCacheLayout[layout_name]
+        )
+
+
+@pytest.fixture
+def sparse_mla_pair():
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=64),
+    )
+    stem = "model.layers.1.mtp_block.self_attn"
+    with set_current_vllm_config(config):
+        indexer = DeepseekV32IndexerCache(
+            132, torch.uint8, f"{stem}.indexer.k_cache", config.cache_config
+        )
+    mla = FlashMLASparseBackend.customize_spec(
+        MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+            topk_buffer_width=512,
+            is_index_group_leader=True,
+        )
+    )
+    specs = {
+        f"{stem}.attn": mla,
+        indexer.prefix: indexer.get_kv_cache_spec(config),
+    }
+    return config, indexer, specs
+
+
+@pytest.mark.parametrize("layout_name", ["LBHNC", "LBNHC"])
+@pytest.mark.parametrize("indexer_first", [False, True])
+def test_sparse_pair_keeps_logical_blocks_and_native_byte_records_independent(
+    sparse_mla_pair, layout_name, indexer_first
+):
+    """One logical allocation must address disjoint MLA and FP8-indexer pages."""
+    native_config, indexer, specs = sparse_mla_pair
+    if indexer_first:
+        specs = dict(reversed(specs.items()))
+    layout = KVCacheLayout[layout_name]
+    page_bytes = sum(spec.page_size_bytes for spec in specs.values())
+    assert page_bytes == 64 * (576 * 2 + 132)
+    budget = 5 * page_bytes - 1
+    config = make_grouped_standalone_kv_config(
+        specs, budget, layout, sparse_mla=SparseMLAKVContract(512)
+    )
+    assert config.num_blocks == 4
+    assert len(config.kv_cache_groups) == 2
+    assert all(group.is_eagle_group for group in config.kv_cache_groups)
+    caches = allocate_kv_cache(config, torch.device("cpu"), layout, [64, 64])
+    bind_kv_cache_to_layers(
+        {indexer.prefix: caches[indexer.prefix]},
+        native_config.compilation_config.static_forward_context,
+        kv_cache_groups=config.kv_cache_groups,
+    )
+    assert indexer.kv_cache.shape == (4, 64, 132)
+    assert indexer.kv_cache.data_ptr() == caches[indexer.prefix].data_ptr()
+    mla = next(cache for cache in caches.values() if cache.dtype == torch.bfloat16)
+    assert mla.shape == (4, 1, 64, 576)
+    assert {cache.untyped_storage().data_ptr() for cache in caches.values()} == {
+        mla.untyped_storage().data_ptr()
+    }
+    assert mla.untyped_storage().nbytes() == 4 * page_bytes <= budget
+    for name, cache in caches.items():
+        assert (
+            cache.stride(0)
+            * cache.element_size()
+            % specs[name].get_block_stride_alignment()
+            == 0
+        )
+
+    pool = DraftBlockPool(config.num_blocks, 64)
+    planner = DraftStepPlanner(
+        pool, max_num_reqs=2, max_model_len=192, num_speculative_tokens=1
+    )
+    first, sibling = SequenceKey("verifier", 1, 1), SequenceKey("verifier", 2, 1)
+    assert planner.open(first) and planner.open(sibling)
+    plan, failures = planner.plan(
+        [DraftStepRow(first, 65, 1), DraftStepRow(sibling, 1, 1)]
+    )
+    assert not failures
+    planner.commit(plan)
+    first_blocks = pool.blocks(planner.req_index(first))
+    sibling_blocks = pool.blocks(planner.req_index(sibling))
+    assert len(first_blocks) == 2 and len(sibling_blocks) == 1
+    assert set(first_blocks).isdisjoint(sibling_blocks)
+    assert set(first_blocks + sibling_blocks) == {1, 2, 3}
+    for block in first_blocks + sibling_blocks:
+        mla[block].fill_(block)
+        record = indexer.kv_cache[block]
+        record[:, :128].fill_(10 + block)
+        record[:, 128:].view(torch.float32).fill_(block + 0.25)
+    for block in first_blocks + sibling_blocks:
+        assert torch.all(mla[block] == block)
+        assert torch.all(indexer.kv_cache[block, :, :128] == 10 + block)
+        expected_scale = torch.tensor([block + 0.25], dtype=torch.float32).view(
+            torch.uint8
+        )
+        assert torch.equal(
+            indexer.kv_cache[block, :, 128:], expected_scale.expand(64, 4)
+        )
+    assert not mla[0].count_nonzero().item()
+    assert not indexer.kv_cache[0].count_nonzero().item()
+    assert pool.num_free_blocks == 0
+    planner.close(first)
+    replacement = SequenceKey("verifier", 3, 1)
+    assert planner.open(replacement)
+    replacement_plan, failures = planner.plan([DraftStepRow(replacement, 65, 1)])
+    assert not failures
+    planner.commit(replacement_plan)
+    assert set(pool.blocks(planner.req_index(replacement))) == set(first_blocks)
+    assert pool.blocks(planner.req_index(sibling)) == sibling_blocks
+    assert torch.all(mla[sibling_blocks[0]] == sibling_blocks[0])
+    planner.close(replacement)
+    planner.close(sibling)
+    assert pool.num_free_blocks == 3
+    with pytest.raises(ValueError, match="null block plus one block"):
+        make_grouped_standalone_kv_config(
+            specs, 2 * page_bytes - 1, layout, sparse_mla=SparseMLAKVContract(512)
+        )
+
+
+def test_sparse_pair_requires_explicit_contract(sparse_mla_pair):
+    _, _, specs = sparse_mla_pair
+    with pytest.raises(ValueError, match="dense MLA without an indexer"):
+        group_standalone_kv_specs(specs)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_indexer",
+        "different_layer",
+        "extra_layer",
+        "wrong_role",
+        "wrong_width",
+        "wrong_dtype",
+        "wrong_topk",
+        "compressed",
+        "padded",
+        "noncausal",
+    ],
+)
+def test_sparse_pair_does_not_admit_unrelated_or_changed_cache_semantics(
+    sparse_mla_pair, mutation
+):
+    _, indexer, specs = sparse_mla_pair
+    specs = dict(specs)
+    mla_name = next(name for name in specs if name != indexer.prefix)
+    if mutation == "missing_indexer":
+        specs.pop(indexer.prefix)
+    elif mutation == "different_layer":
+        specs[indexer.prefix.replace("layers.1", "layers.2")] = specs.pop(
+            indexer.prefix
+        )
+    elif mutation == "extra_layer":
+        specs[mla_name.replace("layers.1", "layers.2")] = specs[mla_name]
+    else:
+        name, changes = {
+            "wrong_role": (indexer.prefix, {"cache_role": SparseCacheRole.SPARSE}),
+            "wrong_width": (indexer.prefix, {"head_size": 128}),
+            "wrong_dtype": (indexer.prefix, {"dtype": torch.bfloat16}),
+            "wrong_topk": (mla_name, {"topk_buffer_width": 1024}),
+            "compressed": (mla_name, {"tokens_per_state": 2}),
+            "padded": (mla_name, {"page_size_padded": 131072}),
+            "noncausal": (mla_name, {"non_causal": True}),
+        }[mutation]
+        specs[name] = replace(specs[name], **changes)
+    with pytest.raises(ValueError, match="standalone sparse MLA"):
+        make_grouped_standalone_kv_config(
+            specs, 1 << 20, KVCacheLayout.LBNHC, sparse_mla=SparseMLAKVContract(512)
         )

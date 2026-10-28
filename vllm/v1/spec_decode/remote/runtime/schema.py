@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.remote.runtime.quantization import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.spec_decode.remote.runtime.kv_layout import SparseMLAKVContract
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class RuntimeContract:
     eagle3_features: Eagle3FeatureContract | None = None
     requires_target_lm_head: bool = True
     weight_profile: NativeWeightProfile | None = None
+    sparse_mla_kv: "SparseMLAKVContract | None" = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ _MTP_MODELS = {
     "Glm4MoeMTPModel": _MTPModelContract(("Glm4MoeForCausalLM",)),
     "Glm4MoeLiteMTPModel": _MTPModelContract(("Glm4MoeLiteForCausalLM",)),
     "DeepSeekMTPModel": _MTPModelContract(("DeepseekV3ForCausalLM",)),
+    "DeepseekV32MTPModel": _MTPModelContract(("DeepseekV32ForCausalLM",)),
     "ExaoneMoeMTP": _MTPModelContract(("ExaoneMoeForCausalLM", "ExaoneMoEForCausalLM")),
     "NemotronHMTPModel": _MTPModelContract(
         ("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
@@ -365,8 +368,74 @@ def _validate_mtp_contract(
                     "standalone DeepSeek MTP does not support a sparse indexer"
                 )
     weight_profile = None
+    if architecture == "DeepseekV32MTPModel":
+        from vllm.v1.spec_decode.remote.runtime.kv_layout import SparseMLAKVContract
+
+        configs = []
+        for model, model_type in (
+            (target, "deepseek_v32"),
+            (draft, "deepseek_mtp"),
+        ):
+            hf_config = model.hf_config
+            if hf_config.model_type != model_type:
+                raise ValueError("standalone DeepSeek V3.2 requires native DSA configs")
+            if any(
+                type(getattr(hf_config, field, None)) is not int
+                or getattr(hf_config, field) != width
+                for field, width in (
+                    ("kv_lora_rank", 512),
+                    ("qk_rope_head_dim", 64),
+                    ("qk_nope_head_dim", 128),
+                    ("v_head_dim", 128),
+                )
+            ):
+                raise ValueError(
+                    "standalone DeepSeek V3.2 requires canonical MLA geometry"
+                )
+            if any(
+                type(getattr(hf_config, field, None)) is not int
+                or getattr(hf_config, field) != width
+                for field, width in (("index_n_heads", 64), ("index_head_dim", 128))
+            ):
+                raise ValueError(
+                    "standalone DeepSeek V3.2 requires canonical "
+                    "sparse indexer geometry"
+                )
+            q_rank = getattr(hf_config, "q_lora_rank", None)
+            if type(q_rank) is not int or q_rank < 1:
+                raise ValueError(
+                    "standalone DeepSeek V3.2 requires a positive query LoRA rank"
+                )
+            topk = getattr(hf_config, "index_topk", None)
+            if type(topk) is not int:
+                raise ValueError("standalone sparse MLA requires an integer top-k")
+            SparseMLAKVContract(topk)
+            if (
+                getattr(hf_config, "index_share_for_mtp_iteration", False)
+                or getattr(hf_config, "index_topk_freq", 1) != 1
+                or getattr(hf_config, "index_topk_pattern", None) is not None
+            ):
+                raise ValueError(
+                    "standalone DeepSeek V3.2 does not support index sharing"
+                )
+            config_dict = hf_config.to_dict()
+            for field in (
+                "architectures",
+                "model_type",
+                "n_predict",
+                "_name_or_path",
+                "transformers_version",
+                "_commit_hash",
+            ):
+                config_dict.pop(field, None)
+            configs.append(config_dict)
+        if configs[0] != configs[1]:
+            raise ValueError(
+                "standalone DeepSeek V3.2 requires matching native configs"
+            )
     if architecture in (
         "DeepSeekMTPModel",
+        "DeepseekV32MTPModel",
         "MiMoV2MTPModel",
         "Step3p5MTP",
         "Qwen3_5MTP",
@@ -700,6 +769,7 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     draft = spec.draft_model_config
     eagle3_features = None
     weight_profile = None
+    sparse_mla_kv = None
     requires_target_lm_head = True
     if spec.method == "eagle3":
         eagle3_features = _resolve_eagle3_features(vllm_config)
@@ -708,6 +778,7 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         requires_target_lm_head = mtp_contract.requires_target_lm_head
         if draft.hf_config.architectures[0] in (
             "DeepSeekMTPModel",
+            "DeepseekV32MTPModel",
             "MiMoV2MTPModel",
             "Step3p5MTP",
             "Qwen3_5MTP",
@@ -730,6 +801,32 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
                 and spec.kv_cache_dtype not in ("auto", "bfloat16")
             ):
                 raise ValueError(f"standalone {name} requires bfloat16 KV")
+        if draft.hf_config.architectures == ["DeepseekV32MTPModel"]:
+            from vllm.v1.spec_decode.remote.runtime.kv_layout import SparseMLAKVContract
+
+            if any(
+                parallel.prefill_context_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                for parallel in (
+                    vllm_config.parallel_config,
+                    spec.draft_parallel_config,
+                )
+            ):
+                raise ValueError("standalone DeepSeek V3.2 requires PCP1 and DCP1")
+            attention = vllm_config.attention_config
+            if (
+                attention.hisparse_config is not None
+                or attention.indexer_kv_dtype not in ("auto", "fp8")
+                or attention.indexer_sparse_logits
+                or attention.use_non_causal
+            ):
+                raise ValueError(
+                    "standalone DeepSeek V3.2 requires causal FP8 indexer KV "
+                    "without HiSparse"
+                )
+            sparse_mla_kv = SparseMLAKVContract(
+                draft.hf_config.index_topk, vllm_config.cache_config.block_size
+            )
     else:
         raise ValueError(f"unsupported standalone method: {spec.method}")
     if spec.parallel_drafting or spec.draft_sample_method != "greedy":
@@ -785,12 +882,15 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     )
     if not requires_target_lm_head:
         feature_identity["requires_target_lm_head"] = False
+    if sparse_mla_kv is not None:
+        feature_identity["sparse_mla_kv"] = asdict(sparse_mla_kv)
     target_identity = _model_identity(target)
     return RuntimeContract(
         schema=schema,
         eagle3_features=eagle3_features,
         requires_target_lm_head=requires_target_lm_head,
         weight_profile=weight_profile,
+        sparse_mla_kv=sparse_mla_kv,
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),
