@@ -74,6 +74,7 @@ def test_cuda_ipc_requires_unix_socket():
         {"failure_policy": "target_only"},
         {"request_timeout_ms": 100},
         {"startup_timeout_ms": 30_000},
+        {"routing_policy": "load_aware"},
     ],
 )
 def test_local_execution_rejects_remote_options(options):
@@ -87,6 +88,15 @@ def test_local_execution_rejects_remote_options(options):
 def test_remote_execution_requires_bounded_distinct_endpoints(endpoints):
     with pytest.raises(ValidationError, match="1..16 distinct endpoints"):
         SpeculativeExecutionConfig(placement="remote", endpoints=endpoints)
+
+
+def test_load_aware_routing_requires_multiple_token_workers():
+    with pytest.raises(ValidationError, match="multiple token workers"):
+        SpeculativeExecutionConfig(
+            placement="remote",
+            endpoints=("unix:///draft.sock",),
+            routing_policy="load_aware",
+        )
 
 
 def test_pool_validates_every_endpoint_and_rejects_unsupported_methods():

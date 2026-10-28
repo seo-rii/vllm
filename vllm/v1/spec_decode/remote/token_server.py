@@ -13,7 +13,6 @@ from vllm.v1.spec_decode.remote.protocol import (
     ErrorReply,
     OpenSequence,
     Ping,
-    Pong,
     ProtocolError,
     SpeculatorStatusCode,
     limit_shortfalls,
@@ -37,8 +36,10 @@ from vllm.v1.spec_decode.remote.token_protocol import (
     TokenAdvance,
     TokenHello,
     TokenHelloAck,
+    TokenPong,
     TokenPrefill,
     TokenProposal,
+    TokenWorkerLoad,
     decode_token_message,
     encode_token_message,
 )
@@ -107,6 +108,25 @@ class TokenDraftServer(RemoteDraftServer):
     @property
     def queue_depth(self) -> int:
         return max(super().queue_depth, self.work_queue.depth)
+
+    def worker_load(self, verifier_instance_id: str) -> TokenWorkerLoad:
+        pool = self.adapter.state.block_pool
+        capacity = self.limits.max_sequences
+        available = min(
+            capacity - len(self.registry),
+            self.max_sequences_per_verifier - self.registry.count(verifier_instance_id),
+        )
+        return TokenWorkerLoad(
+            max(0, available),
+            capacity,
+            pool.num_free_blocks,
+            pool.num_blocks - 1,
+            self.work_queue.depth,
+            self.work_queue.max_jobs,
+            self.work_queue.pending_bytes,
+            self.work_queue.max_bytes,
+            self.healthy,
+        )
 
     def _warmup_owner(self) -> None:
         device = getattr(self.adapter.state.executor, "device", None)
@@ -375,6 +395,7 @@ class _TokenServerSession(_ServerSession):
         self.verifier_instance_id = hello.verifier_instance_id
         self.num_speculative_tokens = hello.num_speculative_tokens
         self.selected_transport = "inline"
+        self.report_load = hello.report_load and envelope.protocol_minor >= 2
         self.max_pending_frames = 8
         slot = (1 << 64) - 1
         sizes = [check_data_frame_size(slot, "int64", (hello.max_num_seqs,))] * 5
@@ -392,6 +413,12 @@ class _TokenServerSession(_ServerSession):
                 self.session_epoch,
                 contract.tokenizer_fingerprint,
                 self.server.limits,
+                report_load=self.report_load,
+                load=(
+                    self.server.worker_load(self.verifier_instance_id)
+                    if self.report_load
+                    else None
+                ),
             ),
             envelope.request_id,
             deadline=deadline,
@@ -413,13 +440,18 @@ class _TokenServerSession(_ServerSession):
             self._advance_tokens(message, request_id)
         elif isinstance(message, Ping):
             self._send(
-                Pong(
+                TokenPong(
                     message.nonce,
                     queue_depth=self.server.queue_depth,
                     active_sequences=self.server.registry.count(
                         self.verifier_instance_id
                     ),
                     healthy=self.server.healthy,
+                    load=(
+                        self.server.worker_load(self.verifier_instance_id)
+                        if self.report_load
+                        else None
+                    ),
                 ),
                 request_id,
             )
@@ -577,7 +609,15 @@ class _TokenServerSession(_ServerSession):
         slot = self.next_result_slot
         self.next_result_slot += 5
         self._send(
-            TokenProposal(message.batch_id, slot),
+            TokenProposal(
+                message.batch_id,
+                slot,
+                load=(
+                    self.server.worker_load(self.verifier_instance_id)
+                    if self.report_load
+                    else None
+                ),
+            ),
             request_id,
             frames=[
                 ints_to_frame(

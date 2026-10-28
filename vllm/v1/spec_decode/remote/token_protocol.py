@@ -22,10 +22,22 @@ from vllm.v1.spec_decode.remote.protocol import (
 )
 
 TOKEN_PROTOCOL_MAJOR = 3
-TOKEN_PROTOCOL_MINOR = 1
+TOKEN_PROTOCOL_MINOR = 2
 
 
-class TokenHello(msgspec.Struct):
+class TokenWorkerLoad(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
+    available_sequences: NonNegativeInt
+    sequence_capacity: PositiveInt
+    available_kv_blocks: NonNegativeInt
+    kv_capacity_blocks: PositiveInt
+    queue_jobs: NonNegativeInt
+    queue_capacity: PositiveInt
+    queued_bytes: NonNegativeInt
+    byte_capacity: PositiveInt
+    healthy: bool = True
+
+
+class TokenHello(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     verifier_instance_id: str
     target_fingerprint: str
     draft_fingerprint: str
@@ -37,13 +49,20 @@ class TokenHello(msgspec.Struct):
     max_model_len: PositiveInt
     method: str = "draft_model"
     transport: str = "inline"
+    report_load: bool = False
 
 
-class TokenHelloAck(msgspec.Struct):
+class TokenHelloAck(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     session_id: str
     session_epoch: PositiveInt
     tokenizer_fingerprint: str
     limits: RemoteServerLimits
+    report_load: bool = False
+    load: TokenWorkerLoad | None = None
+
+
+class TokenPong(Pong, omit_defaults=True):  # type: ignore[call-arg]
+    load: TokenWorkerLoad | None = None
 
 
 class TokenPrefill(msgspec.Struct):
@@ -71,10 +90,11 @@ class TokenAdvance(msgspec.Struct):
     """Remaining relative budget; v3.0 peers do not enforce queued expiry."""
 
 
-class TokenProposal(msgspec.Struct):
+class TokenProposal(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     batch_id: NonNegativeInt
     result_slot: NonNegativeInt | None = None
     status: SpeculatorStatusCode = SpeculatorStatusCode.OK
+    load: TokenWorkerLoad | None = None
 
 
 _TYPES = {
@@ -87,10 +107,11 @@ _TYPES = {
     "sequence_ack": SequenceAck,
     "close_sequence": CloseSequence,
     "ping": Ping,
-    "pong": Pong,
+    "pong": TokenPong,
     "error": ErrorReply,
 }
 _NAMES = {kind: name for name, kind in _TYPES.items()}
+_NAMES[Pong] = "pong"
 
 
 def encode_token_message(

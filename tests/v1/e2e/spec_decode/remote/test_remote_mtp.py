@@ -431,8 +431,14 @@ def sliding_window_models(tmp_path):
     return tuple(str(path) for path in paths)
 
 
+@pytest.mark.parametrize("routing_policy", ["least_sequences", "load_aware"])
 def test_remote_sliding_window_draft_matches_native_and_target(
-    vllm_runner, monkeypatch, tmp_path, sliding_window_models, record_property
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    sliding_window_models,
+    record_property,
+    routing_policy,
 ):
     """Retain old KV positions while native attention applies the draft window."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
@@ -501,7 +507,7 @@ def test_remote_sliding_window_draft_matches_native_and_target(
     with vllm_runner(target, speculative_config=config, **kwargs) as native:
         assert generate(native) == expected
         assert_speculation(native, "native")
-    for num_workers in (1, 2):
+    for num_workers in (1, 2) if routing_policy == "least_sequences" else (2,):
         with ExitStack() as servers:
             endpoints = tuple(
                 servers.enter_context(
@@ -518,6 +524,7 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                 execution=dict(
                     placement="remote",
                     endpoints=endpoints,
+                    routing_policy=routing_policy,
                     transport="inline",
                     failure_policy="error",
                     request_timeout_ms=5000,
@@ -532,6 +539,16 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                 assert actual_config.get_remote_draft_endpoints() == endpoints
                 assert generate(remote) == expected
                 assert_speculation(remote, f"remote-{num_workers}")
+                if routing_policy == "load_aware":
+
+                    def routing_stats(worker):
+                        return worker.model_runner.draft_backend.get_routing_stats()
+
+                    stats = remote.llm.collective_rpc(routing_stats)[0]
+                    record_property(
+                        "load_aware_selections", stats["load_aware_selections"]
+                    )
+                    assert stats["load_aware_selections"] > 0
 
 
 @contextmanager

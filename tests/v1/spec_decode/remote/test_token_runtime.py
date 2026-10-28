@@ -676,7 +676,7 @@ def test_protocol_majors_are_explicit_and_v2_unchanged():
     v3 = encode_token_message(Ping(1))
     assert decode_envelope(v2).protocol_major == 2
     assert decode_token_message(v3)[0].protocol_major == 3
-    assert decode_token_message(v3)[0].protocol_minor == 1
+    assert decode_token_message(v3)[0].protocol_minor == 2
     with pytest.raises(ProtocolVersionError):
         decode_token_message(v2)
     with pytest.raises(ProtocolVersionError):

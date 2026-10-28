@@ -13,6 +13,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     ErrorReply,
     OpenSequence,
+    Ping,
     ProtocolError,
     SequenceAck,
     SequenceKey,
@@ -25,8 +26,10 @@ from vllm.v1.spec_decode.remote.token_protocol import (
     TokenAdvance,
     TokenHello,
     TokenHelloAck,
+    TokenPong,
     TokenPrefill,
     TokenProposal,
+    TokenWorkerLoad,
     decode_token_message,
     encode_token_message,
 )
@@ -77,6 +80,14 @@ class TokenBatchResult:
     valid_lengths: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class TokenLoadSnapshot:
+    load: TokenWorkerLoad
+    received_at: float
+    round_trip_s: float
+    local_sequences: int
+
+
 class TokenOnlyRemoteSession:
     def __init__(
         self,
@@ -115,12 +126,17 @@ class TokenOnlyRemoteSession:
         self._deferred_closes: set[SequenceKey] = set()
         self._closed = False
         self._last_batch = -1
+        self.load_reports_enabled = False
+        self.load_snapshot: TokenLoadSnapshot | None = None
+        self.load_refreshes = 0
 
     def deadline(self) -> float:
         return self.clock() + self.request_timeout_s
 
     def _invalidate(self) -> None:
         connection, self._conn = self._conn, None
+        self.load_reports_enabled = False
+        self.load_snapshot = None
         for state in self.records.values():
             state.terminal = True
         for key in self._deferred_closes:
@@ -210,6 +226,7 @@ class TokenOnlyRemoteSession:
         if deadline is None:
             deadline = self.clock() + self.startup_timeout_s
         try:
+            started = self.clock()
             self._conn = connect(self.endpoint, timeout=max(0, deadline - self.clock()))
             self._sid = ""
             request_id = next(self._ids)
@@ -228,9 +245,49 @@ class TokenOnlyRemoteSession:
             ):
                 raise ProtocolError("token server limits are too small")
             self._sid, self._epoch = ack.session_id, ack.session_epoch
+            self.load_reports_enabled = self.hello.report_load and ack.report_load
+            self._record_load(ack.load, self.clock() - started)
             self._reconnect.succeeded()
         except Exception:
             self._reconnect.failed()
+            self._invalidate()
+            raise
+
+    def _record_load(self, load: TokenWorkerLoad | None, round_trip_s: float) -> None:
+        if not self.load_reports_enabled or load is None:
+            return
+        if (
+            load.available_sequences > load.sequence_capacity
+            or load.available_kv_blocks > load.kv_capacity_blocks
+        ):
+            self.load_snapshot = None
+            return
+        self.load_snapshot = TokenLoadSnapshot(
+            load,
+            self.clock(),
+            max(0.0, round_trip_s),
+            sum(self.active(key) for key in self.records),
+        )
+
+    def refresh_load(self, *, deadline: float) -> None:
+        if self._closed or self._pending is not None:
+            raise RuntimeError("cannot probe a closed or busy token session")
+        if not self.load_reports_enabled or self._conn is None:
+            return
+        request_id = next(self._ids)
+        started = self.clock()
+        try:
+            self._send(Ping(request_id), request_id, deadline)
+            response, frames = self._recv(request_id, deadline)
+            if (
+                not isinstance(response, TokenPong)
+                or frames
+                or response.nonce != request_id
+            ):
+                raise ProtocolError("invalid token load acknowledgment")
+            self._record_load(response.load, self.clock() - started)
+            self.load_refreshes += 1
+        except Exception:
             self._invalidate()
             raise
 
@@ -386,6 +443,10 @@ class TokenOnlyRemoteSession:
                 or response.result_slot is None
             ):
                 raise ProtocolError("invalid token proposal response")
+            previous = self.load_snapshot
+            self._record_load(
+                response.load, 0.0 if previous is None else previous.round_trip_s
+            )
             slot = response.result_slot
             if set(frames) != set(range(slot, slot + 5)):
                 raise ProtocolError("incomplete token proposal result")
