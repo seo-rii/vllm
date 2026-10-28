@@ -141,6 +141,8 @@ Socket cleanup errors preserve the selected failure policy and retire cancelled
 proposals. If registering a new request runs out of memory, its opened sequence
 credits are returned and the request remains terminal target-only until it ends.
 New requests can use the recovered capacity.
+Server socket cleanup errors also return connection admission and sequence
+credits, so a fresh verifier can reconnect after the failed connection retires.
 Unknown CUDA completion and context-fatal errors propagate and
 require process restart. Closing a socket never serves as a GPU completion fence.
 
