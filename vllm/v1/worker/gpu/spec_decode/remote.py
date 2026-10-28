@@ -325,7 +325,6 @@ class RemoteSpeculator(BaseSpeculator):
             self._stats["proposal_calls"] += 1
             try:
                 assert self._session is not None
-                self._session.observation.select(step.request_ids)
                 handle.preparation_deadline = self._session.preparation_deadline()
                 if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(
@@ -602,6 +601,9 @@ class RemoteSpeculator(BaseSpeculator):
         recovery = last_sampled[batch.idx_mapping].reshape(-1).cpu()
         session_started = time.perf_counter()
         chunks = []
+        trace_request_ids: dict[SequenceKey, str] | None = (
+            {} if session.observation.contexts else None
+        )
         rows, keys, query_lens, accepted, sequence_rows = [], [], [], [], []
         token_indices: list[int] = []
         end = 0
@@ -637,6 +639,8 @@ class RemoteSpeculator(BaseSpeculator):
                         is_final,
                     )
                 )
+                if trace_request_ids is not None:
+                    trace_request_ids[request.key] = req_id
                 request.num_computed += prompt_len
                 if not is_final:
                     continue
@@ -653,7 +657,11 @@ class RemoteSpeculator(BaseSpeculator):
             query_lens.append(query_len)
             accepted.append(sampled[row] - 1)
             sequence_rows.append(feature_row)
-        session.prefill_many(chunks, deadline=preparation_deadline)
+        session.prefill_many(
+            chunks,
+            deadline=preparation_deadline,
+            trace_request_ids=trace_request_ids,
+        )
         if rows:
             proposal = RemoteProposalBatch(
                 batch_id=next(self._batch_ids),
@@ -664,6 +672,7 @@ class RemoteSpeculator(BaseSpeculator):
                 query_lens=torch.tensor(query_lens, dtype=torch.int32),
                 num_speculative_tokens=num_speculative_tokens,
             )
+            session.observation.select(tuple(batch.req_ids[row] for row in rows))
             handle.session_handle = session.dispatch(
                 proposal, deadline=preparation_deadline
             )

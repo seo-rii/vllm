@@ -99,8 +99,10 @@ export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
 
 The `remote_draft.prefill` and `remote_draft.proposal` client spans propagate
 bounded W3C trace context to corresponding `remote_draft.server.*` spans.
-Single-request RPCs use the request context as their parent; RPCs containing
-multiple traced requests use span links to all of them. The server records its
+Each prefill RPC uses its own request context as its parent. Proposal RPCs use
+only the requests they actually send: one request becomes the parent, while
+multiple traced requests use span links. Partial prefill and terminal rows that
+do not participate are excluded. The server records its
 queue and execution durations as span attributes. Request IDs, endpoints,
 prompts and token values are not metric labels or remote span attributes.
 Use the existing OpenTelemetry sampler to control span volume; exporting occurs

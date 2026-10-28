@@ -156,8 +156,6 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         if self._tp.rank_in_group == 0:
             try:
                 assert self._session is not None
-                if step.request_ids:
-                    self._session.observation.select(step.request_ids)
                 handle.output = self._empty(len(step.request_ids))
                 if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(
@@ -252,6 +250,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     or sampled[i] != int(final)
                 ):
                     raise ValueError("unexpected sampling counts in token prefill")
+                session.observation.select((req_id,))
                 session.prefill(
                     request.key,
                     tuple(tokens[start : start + prompt_tokens]),
@@ -296,6 +295,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             indices.append(i)
         handle.rows = tuple(indices)
         if rows:
+            session.observation.select(
+                tuple(handle.step.request_ids[i] for i in indices)
+            )
             handle.rpc = session.dispatch(
                 handle.round_id,
                 tuple(rows),

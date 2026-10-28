@@ -74,10 +74,12 @@ class RemoteClientObservation:
 
     def register(self, request_id: str, headers: Mapping[str, str]) -> None:
         if is_tracing_available():
+            from opentelemetry import trace
+
+            if isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider):
+                return
             context = extract_trace_context(headers)
             if context is not None:
-                from opentelemetry import trace
-
                 span_context = trace.get_current_span(context).get_span_context()
                 if span_context.is_valid:
                     self.contexts[request_id] = span_context
@@ -97,7 +99,8 @@ class RemoteClientObservation:
                 if request_id in self.contexts
             ]
         else:
-            self.links = []
+            if self.links:
+                self.links = []
 
     def start(self, request_id: int, operation: str, *, trace_enabled: bool):
         span = wire = None

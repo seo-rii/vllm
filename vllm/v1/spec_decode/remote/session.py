@@ -22,7 +22,7 @@ import contextlib
 import itertools
 import math
 import time
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -718,6 +718,7 @@ class RemoteDraftSession:
         chunks: Sequence[tuple[SequenceKey, FeatureBatch, bool]],
         *,
         deadline: float | None = None,
+        trace_request_ids: Mapping[SequenceKey, str] | None = None,
     ) -> None:
         """Send one prompt chunk for each of several sequences.
 
@@ -727,11 +728,14 @@ class RemoteDraftSession:
         instead of N. Chunks are applied in order with client-tracked
         offsets. A sequence that is already latched target-only silently
         ignores prefill so the request keeps running without speculation.
+        ``trace_request_ids`` selects an already registered context per chunk.
         """
         if deadline is None:
             deadline = self.preparation_deadline()
         try:
-            self._prefill_many(chunks, deadline=deadline)
+            self._prefill_many(
+                chunks, deadline=deadline, trace_request_ids=trace_request_ids
+            )
         except _CudaIpcExportError as exc:
             detail = f"CUDA IPC prefill failed: {exc}"
             self._invalidate(detail)
@@ -746,6 +750,7 @@ class RemoteDraftSession:
         chunks: Sequence[tuple[SequenceKey, FeatureBatch, bool]],
         *,
         deadline: float,
+        trace_request_ids: Mapping[SequenceKey, str] | None = None,
     ) -> None:
         self._require_no_inflight("prefill a sequence")
         if len({key for key, _, _ in chunks}) != len(chunks):
@@ -799,6 +804,7 @@ class RemoteDraftSession:
         replies, deadline = self._sequence_rpcs(
             [(chunk, chunk.key, frames) for _, chunk, frames in prepared],
             deadline=deadline,
+            trace_request_ids=trace_request_ids,
         )
         for (record, chunk, _), (status, detail) in zip(prepared, replies):
             if status is SpeculatorStatusCode.OK:
@@ -1551,6 +1557,7 @@ class RemoteDraftSession:
         calls: list[tuple[Any, SequenceKey, list[DataFrame] | None]],
         *,
         deadline: float | None = None,
+        trace_request_ids: Mapping[SequenceKey, str] | None = None,
     ) -> tuple[list[tuple[SpeculatorStatusCode, str]], float]:
         """Return sequence replies and the remaining acknowledgement deadline.
 
@@ -1585,7 +1592,14 @@ class RemoteDraftSession:
 
         lost = ""
         try:
-            for index, (message, _, frames) in enumerate(calls):
+            for index, (message, key, frames) in enumerate(calls):
+                if isinstance(message, PrefillChunk):
+                    req_id = (
+                        trace_request_ids.get(key)
+                        if trace_request_ids is not None
+                        else None
+                    )
+                    self.observation.select((req_id,) if req_id is not None else ())
                 request_id = self._send(
                     message,
                     frames=frames,

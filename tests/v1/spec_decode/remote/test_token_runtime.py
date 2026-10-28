@@ -413,9 +413,9 @@ def test_token_open_metadata_oom_preserves_all_slots(monkeypatch, failure):
     assert {state.sequences[key].req_index for key in keys} == {0, 1, 2, 3}
 
 
-def _socket_runtime(tmp_path, max_connections=16):
+def _socket_runtime(tmp_path, max_connections=16, *, contract=None):
     state, oracle = machine(executor=BatchedKVOracle())
-    contract = RuntimeContract(
+    contract = contract or RuntimeContract(
         TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
         SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
@@ -432,7 +432,17 @@ def _socket_runtime(tmp_path, max_connections=16):
         max_connections=max_connections,
     )
     endpoint = server.start(f"unix://{tmp_path}/t.sock")
-    hello = TokenHello("verifier", "target", "draft", "tokenizer", 3, 128, 4, 64, 64)
+    hello = TokenHello(
+        "verifier",
+        contract.target_fingerprint,
+        contract.draft_fingerprint,
+        contract.tokenizer_fingerprint,
+        3,
+        128,
+        4,
+        64,
+        64,
+    )
     session = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
     session.connect()
     return state, oracle, server, session
@@ -672,6 +682,104 @@ def test_remote_metrics_follow_stats_only_engine_output(tmp_path, monkeypatch):
         unregister_vllm_metrics()
 
 
+def _check_worker_otlp_context(directory, received, tracer):
+    """Real worker construction and a ragged InputBatch with one proposal row."""
+    import numpy as np
+    import torch
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject
+
+    from vllm.config import set_current_vllm_config
+    from vllm.config.speculative import SpeculativeExecutionConfig
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+    from vllm.v1.spec_decode.contracts import LocalExecutionContext
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    directory = directory / "worker"
+    directory.mkdir()
+    config = token_config(
+        directory / "models",
+        execution=SpeculativeExecutionConfig(
+            placement="remote",
+            endpoints=(f"unix://{directory}/t.sock",),
+            request_timeout_ms=5000,
+        ),
+    )
+    _, _, server, probe = _socket_runtime(
+        directory, contract=create_token_runtime_contract(config)
+    )
+    probe.close()
+    worker = None
+    try:
+        with set_current_vllm_config(config):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=f"file://{directory}/gloo",
+                backend="gloo",
+            )
+            ensure_model_parallel_initialized(1, 1, backend="gloo")
+            worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        parents = {}
+        for req_id in ("a", "b", "unrelated"):
+            with tracer.start_as_current_span(f"worker.request.{req_id}") as span:
+                carrier: dict[str, str] = {}
+                inject(carrier)
+                worker.register_trace_context(req_id, carrier)
+                parents[req_id] = span.get_span_context().span_id
+        batch = replace(
+            InputBatch.make_dummy(2, 3, InputBuffers(2, 3, torch.device("cpu"))),
+            req_ids=["a", "b"],
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+            positions=torch.tensor([0, 0, 1]),
+            prefill_len_np=np.array([3, 2]),
+            is_prefilling_np=np.array([True, True]),
+            has_prefill=True,
+        )
+        context = LocalExecutionContext(
+            batch,
+            None,
+            None,
+            None,
+            None,
+            torch.tensor([0, 1]),
+            torch.tensor([0, 0]),
+            torch.tensor([0, 4]),
+            torch.empty((2, 3), dtype=torch.int32),
+            torch.zeros(2),
+            torch.zeros(2, dtype=torch.int64),
+        )
+        received.clear()
+        result = step(worker, context, 2)
+        assert result.valid_lengths.tolist() == [0, 2]
+        assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+        prefills = [s for s in received if s.name == "remote_draft.prefill"]
+        proposals = [s for s in received if s.name == "remote_draft.proposal"]
+        assert len(prefills) == 2 and len(proposals) == 1
+        assert {int.from_bytes(s.parent_span_id) for s in prefills} == {
+            parents["a"],
+            parents["b"],
+        }
+        assert int.from_bytes(proposals[0].parent_span_id) == parents["b"]
+        assert all(not span.links for span in (*prefills, *proposals))
+    finally:
+        if worker is not None:
+            worker.close()
+        server.stop()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
 def _check_token_otlp_trace_links(directory):
     import os
     import threading
@@ -764,6 +872,52 @@ def _check_token_otlp_trace_links(directory):
         assert attributes["vllm.remote.queue_seconds"] >= 0
         assert attributes["vllm.remote.execute_seconds"] > 0
         assert not session.observation.pending
+        _check_worker_otlp_context(Path(directory), received, tracer)
+        from tests.v1.spec_decode.remote.test_session import IDENTITY, features
+        from vllm.v1.spec_decode.remote.server import (
+            FakeDraftAdapter,
+            RemoteDraftServer,
+        )
+        from vllm.v1.spec_decode.remote.session import RemoteDraftSession
+
+        conditioned_server = RemoteDraftServer(FakeDraftAdapter(vocab_size=50))
+        conditioned_server.start("tcp://127.0.0.1:0")
+        conditioned = RemoteDraftSession(
+            conditioned_server.endpoint, IDENTITY, request_timeout_ms=5000
+        )
+        received.clear()
+        try:
+            conditioned.connect()
+            conditioned_keys = conditioned.open_sequences((10, 11))
+            conditioned_parents = []
+            for req_id in ("a", "b", "unrelated"):
+                with tracer.start_as_current_span(req_id) as span:
+                    conditioned_carrier: dict[str, str] = {}
+                    inject(conditioned_carrier)
+                    conditioned.observation.register(req_id, conditioned_carrier)
+                    conditioned_parents.append(span.get_span_context().span_id)
+            conditioned.observation.select(("a", "b", "unrelated"))
+            conditioned.prefill_many(
+                [(key, features([1]), False) for key in conditioned_keys],
+                trace_request_ids=dict(zip(conditioned_keys, ("a", "b"), strict=True)),
+            )
+            # Missing metadata must not inherit a previous RPC's request links.
+            conditioned.observation.select(("unrelated",))
+            conditioned.prefill_many(
+                [(key, features([2]), True) for key in conditioned_keys]
+            )
+            assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+            conditioned_prefills = [
+                s for s in received if s.name == "remote_draft.prefill"
+            ]
+            assert len(conditioned_prefills) == 4
+            assert sorted(
+                int.from_bytes(s.parent_span_id) for s in conditioned_prefills
+            ) == sorted([*conditioned_parents[:2], 0, 0])
+            assert all(not span.links for span in conditioned_prefills)
+        finally:
+            conditioned.close()
+            conditioned_server.stop()
     finally:
         session.close()
         server.stop()
@@ -776,6 +930,7 @@ def _check_token_otlp_trace_links(directory):
 
 def test_token_otlp_context_links_across_real_socket(tmp_path):
     """A real HTTP OTLP exporter sees linked requests and child server spans."""
+    import os
     import subprocess
     import sys
 
@@ -790,6 +945,7 @@ def test_token_otlp_context_links_across_real_socket(tmp_path):
             str(tmp_path),
         ],
         capture_output=True,
+        env={**os.environ, "VLLM_TARGET_DEVICE": "cpu", "CUDA_VISIBLE_DEVICES": ""},
         text=True,
         timeout=60,
     )
@@ -2308,7 +2464,14 @@ def test_actual_socket_timeout_fences_late_completion(
         release.set()
 
 
-def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_options):
+def token_config(
+    tmp_path,
+    *,
+    target_type="qwen3",
+    draft_type="qwen3",
+    execution=None,
+    **draft_options,
+):
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -2380,6 +2543,7 @@ def token_config(tmp_path, *, target_type="qwen3", draft_type="qwen3", **draft_o
         num_speculative_tokens=3,
         target_model_config=target,
         target_parallel_config=parallel,
+        execution=execution,
     )
     return VllmConfig(
         model_config=target,
