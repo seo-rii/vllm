@@ -2432,6 +2432,65 @@ def test_session_thread_failure_releases_admission_and_preserves_sibling(
                         assert not worker.is_alive()
 
 
+@pytest.mark.parametrize("failure", ["construct", "start"])
+def test_session_thread_failure_preserves_connection_cleanup_error(
+    adapter, monkeypatch, failure
+):
+    original = (
+        MemoryError("injected session thread allocation failure")
+        if failure == "construct"
+        else RuntimeError("can't start new thread")
+    )
+    cleanup_error = OSError(errno.EIO, "injected accepted socket cleanup failure")
+    accepted = []
+
+    class FailingThread(threading.Thread):
+        def __init__(self, *args, **kwargs):
+            if kwargs.get("name") == "remote-draft-session" and failure == "construct":
+                raise original
+            super().__init__(*args, **kwargs)
+
+        def start(self):
+            if self.name == "remote-draft-session":
+                raise original
+            return super().start()
+
+    class FailingSocket(socket.socket):
+        fail_close = False
+
+        def accept(self):
+            conn, address = super().accept()
+            conn.fail_close = True
+            accepted.append(conn)
+            return conn, address
+
+        def close(self):
+            super().close()
+            if self.fail_close:
+                self.fail_close = False
+                raise cleanup_error
+
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    server = RemoteDraftServer(adapter)
+    endpoint = server.start("tcp://127.0.0.1:0")
+    client = connect(endpoint, timeout=1)
+    try:
+        assert server.wait(2)
+        assert not server.healthy
+        assert isinstance(server._lifecycle_error, BaseExceptionGroup)
+        assert server._lifecycle_error.exceptions == (original, cleanup_error)
+        with pytest.raises(ConnectionClosed):
+            client.recv(timeout=1)
+        assert len(accepted) == 1 and accepted[0].fileno() == -1
+        server.stop()
+        with pytest.raises(server_module.ServerShutdownTimeout, match="restart"):
+            server.start(endpoint)
+    finally:
+        client.close()
+        server.stop()
+
+
 def test_session_construction_failure_releases_admission_and_preserves_sibling(
     adapter, monkeypatch, caplog
 ):
