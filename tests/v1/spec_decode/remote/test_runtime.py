@@ -37,12 +37,14 @@ from vllm.v1.spec_decode.remote.runtime.kv import (
     DraftBlockPool,
     DraftKVExhausted,
 )
+from vllm.v1.spec_decode.remote.runtime.multi_module import MultiModuleReplay
 from vllm.v1.spec_decode.remote.runtime.step import (
     BlockTableUpdate,
     DraftStepPlanner,
     DraftStepRow,
 )
 from vllm.v1.spec_decode.remote.server import (
+    AdapterError,
     PrefillInputs,
     RemoteDraftServer,
     StandaloneProposalBatch,
@@ -194,6 +196,649 @@ def test_malformed_rows_are_caller_bugs(row):
     planner.open(key(1))
     with pytest.raises(ValueError):
         planner.plan([row])
+
+
+def multi_module_schema(depth=2):
+    return TargetFeatureSchema(
+        schema_id=1,
+        slots=(
+            FeatureSlot("token_ids", "int32", ()),
+            FeatureSlot("positions", "int64", ()),
+            FeatureSlot("last_hidden_states", "float32", (2,)),
+            FeatureSlot(
+                "next_prefill_tokens",
+                "int64",
+                (depth,),
+                optional=True,
+                per_sequence=True,
+            ),
+        ),
+    )
+
+
+MULTI_MODULE_SCHEMA = multi_module_schema()
+
+
+@pytest.mark.parametrize(
+    "requests,tokens,length,expected",
+    [
+        (6, 2, 9, (96, 32, 96, 16, 112, 16)),
+        (2, 10, 3, (32, 32, 48, 80, 112, 80)),
+    ],
+)
+def test_multi_module_feature_memory_bounds_include_retained_and_staged_storage(
+    requests, tokens, length, expected
+):
+    schema = multi_module_schema(depth=3)
+    schema = TargetFeatureSchema(
+        schema_id=schema.schema_id,
+        slots=schema.slots
+        + (
+            FeatureSlot(
+                "sequence_summary", "float64", (1024,), optional=True, per_sequence=True
+            ),
+        ),
+    )
+    replay = MultiModuleReplay(schema)
+    # Only the two FP32 values per token row count: integer token/position fields and
+    # floating sequence metadata are outside device token-history accounting.
+    bounds = replay.feature_memory_bounds(
+        max_num_reqs=requests, max_num_tokens=tokens, max_model_len=length
+    )
+    assert bounds == dict(
+        zip(
+            (
+                "history_bytes",
+                "staged_history_bytes",
+                "final_prefill_bytes",
+                "incoming_bytes",
+                "prepared_bytes",
+                "packed_bytes",
+                "total_bytes",
+            ),
+            (*expected, sum(expected)),
+        )
+    )
+    assert replay.num_sequences == 0
+
+
+def multi_module_planner(num_blocks=65, max_num_reqs=4, depth=2):
+    return DraftStepPlanner(
+        DraftBlockPool(num_blocks, 2),
+        max_num_reqs=max_num_reqs,
+        max_model_len=128,
+        num_speculative_tokens=depth,
+        num_prefill_lookahead=depth,
+        multi_module=True,
+    )
+
+
+def multi_module_features(start, tokens, lookahead=None):
+    token_ids = torch.tensor(tokens, dtype=torch.int32)
+    positions = torch.arange(start, start + len(tokens), dtype=torch.int64)
+    return [
+        token_ids,
+        positions,
+        torch.stack((positions.float(), token_ids.float()), dim=1),
+        None if lookahead is None else torch.tensor([lookahead], dtype=torch.int64),
+    ]
+
+
+def complete_multi_module_step(planner, replay, row, features, effective_k=2):
+    prepared, features = replay.prepare_row(row, features)
+    plan, failures = planner.plan([prepared], num_speculative_tokens=effective_k)
+    assert not failures
+    updates = replay.stage_history(plan, features)
+    planner.commit(plan)
+    replay.commit_history(updates)
+    return plan
+
+
+@pytest.mark.parametrize(
+    "depth,effective_k,accepted",
+    [(d, k, a) for d in (2, 3, 4) for k in range(d + 1) for a in range(k + 1)],
+)
+def test_multi_module_replay_preserves_only_authoritative_prefix(
+    depth, effective_k, accepted
+):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a = key(1)
+    assert planner.open(a)
+    complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 4, num_sampled=1),
+        multi_module_features(0, [11, 12, 13, 14]),
+        effective_k,
+    )
+    row = DraftStepRow(
+        a,
+        1 + effective_k,
+        num_sampled=accepted + 1,
+        num_rejected=effective_k - accepted,
+        last_sampled=31,
+    )
+    query = [30, *range(80, 80 + effective_k)]
+    source = multi_module_features(4, query)
+    source[2][accepted + 1 :] = torch.nan
+    prepared, features = replay.prepare_row(row, source)
+    repair = max(0, depth - 1 - accepted)
+    assert prepared.num_replayed == repair
+    assert prepared.num_rejected == 0
+    assert features[0] is not None
+    assert features[0].tolist() == list(range(15 - repair, 15)) + query[: accepted + 1]
+    assert features[2] is not None and torch.isfinite(features[2]).all()
+    plan, failures = planner.plan([prepared], num_speculative_tokens=effective_k)
+    assert not failures
+    assert plan.positions.tolist() == list(range(4 - repair, 5 + accepted))
+    assert plan.num_computed_tokens.tolist() == [4 - repair]
+    assert (
+        plan.slot_mapping.tolist()
+        == planner.block_pool.slot_mapping(
+            planner.req_index(a), plan.positions
+        ).tolist()
+    )
+    updates = replay.stage_history(plan, features)
+    planner.commit(plan)
+    replay.commit_history(updates)
+    assert planner.num_computed(a) == 5 + accepted
+    assert updates[0].history.position == 4 + accepted
+    assert updates[0].history.features[0] is not None
+    committed = [11, 12, 13, 14, *query[: accepted + 1]]
+    assert updates[0].history.features[0].tolist() == committed[-(depth - 1) :]
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_known_prefill_lookahead_does_not_need_replay(depth):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a = key(1)
+    planner.open(a)
+    lookahead = tuple(range(12, 12 + depth))
+    first = complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 1, num_sampled=0, next_prefill_tokens=lookahead),
+        multi_module_features(0, [11], lookahead),
+        effective_k=0,
+    )
+    assert first.next_prefill_tokens.tolist() == [list(lookahead)]
+    second = complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, depth, num_sampled=1, last_sampled=20),
+        multi_module_features(1, lookahead),
+        effective_k=depth,
+    )
+    assert second.rows[0].num_replayed == 0
+    assert second.positions.tolist() == list(range(1, depth + 1))
+    assert planner.num_computed(a) == depth + 1
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_short_prefix_keeps_history_across_single_token_steps(depth):
+    """K=0 still needs the real suffix from more than the last input chunk."""
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a = key(1)
+    planner.open(a)
+    transcript = [11]
+    complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 1, num_sampled=1),
+        multi_module_features(0, transcript),
+        effective_k=0,
+    )
+    for k in (depth, 0, 1, 0, depth):
+        start = len(transcript)
+        row, features = replay.prepare_row(
+            DraftStepRow(a, 1, num_sampled=1),
+            multi_module_features(start, [20 + start]),
+        )
+        assert features[0] is not None and features[1] is not None
+        tail = transcript[-(depth - 1) :]
+        assert row.num_replayed == len(tail)
+        assert features[0].tolist() == tail + [20 + start]
+        assert features[1].tolist() == list(range(start - len(tail), start + 1))
+        plan, failures = planner.plan([row], num_speculative_tokens=k)
+        assert not failures
+        staged = replay.stage_history(plan, features)
+        planner.commit(plan)
+        replay.commit_history(staged)
+        transcript.append(20 + start)
+        owned = staged[0].history.features[0]
+        assert owned is not None and owned.tolist() == transcript[-(depth - 1) :]
+        assert owned.untyped_storage().nbytes() == owned.numel() * owned.element_size()
+        assert planner.num_computed(a) == len(transcript)
+    replay.close_sequences((a,))
+    planner.close(a)
+    assert replay.num_sequences == 0
+    assert planner.block_pool.num_free_blocks == planner.block_pool.num_blocks - 1
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_history_owns_bounded_rows_and_fences_closed_generations(depth):
+    planner = multi_module_planner(max_num_reqs=1, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a = key(1)
+    planner.open(a)
+    source = multi_module_features(0, list(range(64)))
+    plan, failures = planner.plan([DraftStepRow(a, 64, num_sampled=1)])
+    assert not failures
+    staged = replay.stage_history(plan, source)
+    assert replay.num_sequences == 0
+    for tensor, retained in zip(source, staged[0].history.features):
+        if tensor is None:
+            assert retained is None
+        else:
+            assert retained is not None
+            assert retained.shape[0] == depth - 1
+            assert (
+                retained.untyped_storage().data_ptr()
+                != tensor.untyped_storage().data_ptr()
+            )
+            assert (
+                retained.untyped_storage().nbytes()
+                == retained.numel() * retained.element_size()
+            )
+            tensor.fill_(-1)
+    planner.commit(plan)
+    replay.commit_history(staged)
+    _, repaired = replay.prepare_row(
+        DraftStepRow(a, 1, num_sampled=1), multi_module_features(64, [70])
+    )
+    assert repaired[0] is not None and repaired[2] is not None
+    assert repaired[0].tolist() == [*range(65 - depth, 64), 70]
+    assert repaired[2].tolist() == [
+        *[[float(p), float(p)] for p in range(65 - depth, 64)],
+        [64.0, 70.0],
+    ]
+    with pytest.raises(ValueError, match="stale"):
+        replay.commit_history(staged)
+    replay.close_sequences((a,))
+    planner.close(a)
+    assert replay.num_sequences == 0
+    replacement = SequenceKey(a.verifier_instance_id, a.sequence_id, a.generation + 1)
+    assert planner.open(replacement)
+    new = complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(replacement, 1, num_sampled=1),
+        multi_module_features(0, [90]),
+    )
+    assert new.req_indices.tolist() == [0]
+    assert new.positions.tolist() == [0]
+    assert new.block_table_updates[0].start == 0
+    with pytest.raises(ValueError, match="stale"):
+        replay.commit_history(staged)
+    assert replay.num_sequences == 1
+
+
+def test_multi_module_close_fences_history_staged_before_first_completion():
+    planner = multi_module_planner()
+    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+    a = key(1)
+    planner.open(a)
+    plan, failures = planner.plan([DraftStepRow(a, 1, num_sampled=1)])
+    assert not failures
+    staged = replay.stage_history(plan, multi_module_features(0, [11]))
+    assert replay.num_sequences == 0
+    replay.close_sequences((a,))
+    current = replay.stage_history(plan, multi_module_features(0, [12]))
+    with pytest.raises(ValueError, match="stale"):
+        replay.commit_history(staged)
+    assert replay.num_sequences == 0
+    replay.commit_history(current)
+    assert replay.num_sequences == 1
+    _, features = replay.prepare_row(
+        DraftStepRow(a, 1, num_sampled=1), multi_module_features(1, [13])
+    )
+    assert features[0] is not None
+    assert features[0].tolist() == [12, 13]
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_failed_admission_preserves_history_and_pool(depth):
+    planner = multi_module_planner(num_blocks=4, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a, b = key(1), key(2)
+    for sequence, tokens in ((a, [11, 12, 13, 14]), (b, [21, 22])):
+        planner.open(sequence)
+        complete_multi_module_step(
+            planner,
+            replay,
+            DraftStepRow(sequence, len(tokens), num_sampled=1),
+            multi_module_features(0, tokens),
+        )
+    row = DraftStepRow(a, 3, num_sampled=1, num_rejected=2)
+    prepared, features = replay.prepare_row(row, multi_module_features(4, [30, 80, 81]))
+    owned = planner.block_pool.blocks(planner.req_index(a))
+    plan, failures = planner.plan([prepared])
+    assert failures[0][0] == SpeculatorStatusCode.OUT_OF_MEMORY
+    assert plan.rows == ()
+    assert planner.num_computed(a) == 4
+    assert planner.block_pool.blocks(planner.req_index(a)) == owned
+    assert planner.block_pool.num_free_blocks == 0
+    assert replay.num_sequences == 2
+    _, repeated = replay.prepare_row(row, multi_module_features(4, [30, 80, 81]))
+    assert repeated[0] is not None
+    assert repeated[0].tolist() == [*range(16 - depth, 15), 30]
+    planner.close(b)
+    replay.close_sequences((b,))
+    plan, failures = planner.plan([prepared])
+    assert not failures
+    updates = replay.stage_history(plan, features)
+    planner.commit(plan)
+    replay.commit_history(updates)
+    assert planner.num_computed(a) == 5
+    assert replay.num_sequences == 1
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_stale_history_rejects_the_whole_staged_batch(depth):
+    planner = multi_module_planner(depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    a, b = key(1), key(2)
+    for sequence in (a, b):
+        planner.open(sequence)
+        complete_multi_module_step(
+            planner,
+            replay,
+            DraftStepRow(sequence, 1, num_sampled=1),
+            multi_module_features(0, [11]),
+        )
+    prepared = [
+        replay.prepare_row(
+            DraftStepRow(sequence, 1, num_sampled=1), multi_module_features(1, [12])
+        )
+        for sequence in (a, b)
+    ]
+    plan, failures = planner.plan([row for row, _ in prepared])
+    assert not failures
+    features = [
+        torch.cat([source[slot] for _, source in prepared]) for slot in range(3)
+    ] + [None]
+    staged = replay.stage_history(plan, features)
+    # The valid update comes first; discovering the closed second key must not
+    # install the first update before rejecting the batch.
+    replay.close_sequences((b,))
+    with pytest.raises(ValueError, match="stale"):
+        replay.commit_history(staged)
+    assert planner.num_computed(a) == 1
+    row, repeated = replay.prepare_row(
+        DraftStepRow(a, 1, num_sampled=1), multi_module_features(1, [13])
+    )
+    assert row.num_replayed == 1
+    assert repeated[0] is not None and repeated[0].tolist() == [11, 13]
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_multi_module_replay_uses_submitted_budget_at_model_length_boundary(depth):
+    planner = multi_module_planner(num_blocks=193, depth=depth)
+    replay = MultiModuleReplay(multi_module_schema(depth))
+    rows, sources = [], []
+    for sequence_id, start in enumerate((126, 125, 120)):
+        sequence = key(sequence_id)
+        planner.open(sequence)
+        complete_multi_module_step(
+            planner,
+            replay,
+            DraftStepRow(sequence, start, num_sampled=1),
+            multi_module_features(0, list(range(start))),
+            effective_k=depth,
+        )
+        # The target reserves one bonus slot, regardless of returned K=depth.
+        submitted = min(depth, 128 - start - 2)
+        accepted = 1 if sequence_id == 2 else 0
+        row, source = replay.prepare_row(
+            DraftStepRow(
+                sequence,
+                submitted + 1,
+                num_sampled=accepted + 1,
+                num_rejected=submitted - accepted,
+            ),
+            multi_module_features(start, list(range(start, start + submitted + 1))),
+        )
+        assert source[1] is not None and int(source[1][-1]) < 127
+        rows.append(row)
+        sources.append(source)
+    assert [row.num_replayed for row in rows] == [depth - 1, depth - 1, depth - 2]
+    plan, failures = planner.plan(rows, num_speculative_tokens=0)
+    assert not failures
+    features = [
+        torch.cat([source[slot] for source in sources]) for slot in range(3)
+    ] + [None]
+    staged = replay.stage_history(plan, features)
+    planner.commit(plan)
+    replay.commit_history(staged)
+    assert [planner.num_computed(row.key) for row in rows] == [127, 126, 122]
+
+
+def test_multi_module_reserved_range_stops_at_real_model_boundary():
+    planner = multi_module_planner()
+    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+    a = key(1)
+    planner.open(a)
+    complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 127, num_sampled=1),
+        multi_module_features(0, list(range(127))),
+    )
+    plan = complete_multi_module_step(
+        planner,
+        replay,
+        DraftStepRow(a, 3, num_sampled=1, num_rejected=2),
+        multi_module_features(127, [130, 131, 132]),
+    )
+    assert plan.positions.tolist() == [126, 127]
+    assert planner.num_computed(a) == 128
+    assert planner.block_pool.num_free_blocks == 0
+    prepared, _ = replay.prepare_row(
+        DraftStepRow(a, 1, num_sampled=1), multi_module_features(128, [140])
+    )
+    failed, failures = planner.plan([prepared])
+    assert failed.rows == ()
+    assert failures[0][0] == SpeculatorStatusCode.OUT_OF_MEMORY
+    assert planner.num_computed(a) == 128
+
+
+@pytest.mark.parametrize("positions", [[1, 2], [0, 2]])
+def test_multi_module_rejects_missing_or_discontinuous_history(positions):
+    replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+    features = multi_module_features(0, [11, 12])
+    features[1] = torch.tensor(positions, dtype=torch.int64)
+    with pytest.raises(AdapterError, match="history") as caught:
+        replay.prepare_row(DraftStepRow(key(1), 2, num_sampled=1), features)
+    assert caught.value.status == SpeculatorStatusCode.SEQUENCE_DESYNC
+
+
+class MultiModuleDigestExecutor(KVDigestExecutor):
+    """External CPU service sharing the real replay and KV planner contract."""
+
+    def __init__(self, pool):
+        super().__init__(pool)
+        self.replay = MultiModuleReplay(MULTI_MODULE_SCHEMA)
+
+    def prepare_row(self, row, features):
+        return self.replay.prepare_row(row, features)
+
+    def execute(self, plan, features, *, num_speculative_tokens=None):
+        updates = self.replay.stage_history(plan, features)
+        result = super().execute(
+            plan,
+            features,
+            num_speculative_tokens=2
+            if num_speculative_tokens is None
+            else num_speculative_tokens,
+        )
+        self.replay.commit_history(updates)
+        return result[:, :2]
+
+    def close_sequences(self, keys):
+        self.replay.close_sequences(keys)
+
+
+@pytest.fixture
+def multi_module_runtime():
+    planner = multi_module_planner()
+    executor = MultiModuleDigestExecutor(planner.block_pool)
+    capabilities = SpeculatorPlacementCapabilities(
+        state_dependency="own_kv",
+        required_features=("token_ids", "positions", "last_hidden_states"),
+        num_prefill_lookahead=2,
+        supports_multi_module=True,
+        standalone_weights="complete",
+    )
+    adapter = TargetConditionedDraftAdapter(
+        executor,
+        planner,
+        capabilities=capabilities,
+        feature_schema=MULTI_MODULE_SCHEMA,
+        methods={"mtp"},
+    )
+    server = RemoteDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            max_batch_size=4,
+            max_feature_tokens=64,
+            max_sequences=4,
+            max_model_len=128,
+        ),
+    )
+    server.start("tcp://127.0.0.1:0")
+    session = RemoteDraftSession(
+        server.endpoint,
+        replace(
+            IDENTITY,
+            num_speculative_tokens=2,
+            max_model_len=128,
+            provided_features=capabilities.required_features,
+            uses_multi_module=True,
+        ),
+        request_timeout_ms=5000,
+    )
+    try:
+        session.connect()
+        assert session.selected_transport == "inline"
+        yield session, executor
+    finally:
+        session.close()
+        server.stop()
+
+
+def multi_module_round(
+    session, batch_id, keys, segments, accepted, recovery, effective_k=2
+):
+    parts = [multi_module_features(start, tokens) for start, tokens in segments]
+    packed = [torch.cat([part[i] for part in parts]) for i in range(3)] + [None]
+    return session.collect(
+        session.dispatch(
+            RemoteProposalBatch(
+                batch_id=batch_id,
+                keys=tuple(keys),
+                accepted_counts=torch.tensor(accepted, dtype=torch.int32),
+                recovery_tokens=torch.tensor(recovery, dtype=torch.int64),
+                features=FeatureBatch(1, tuple(packed)),
+                query_lens=torch.tensor(
+                    [len(tokens) for _, tokens in segments], dtype=torch.int32
+                ),
+                num_speculative_tokens=effective_k,
+            )
+        )
+    )
+
+
+def test_multi_module_adapter_reorders_replayed_rows_and_reuses_closed_slots(
+    multi_module_runtime,
+):
+    session, executor = multi_module_runtime
+    a, b = session.open_sequences((1, 2))
+    session.prefill(
+        a,
+        FeatureBatch(1, tuple(multi_module_features(0, [11, 12, 13], (14, 15)))),
+        is_final=False,
+    )
+    session.prefill_many(
+        [
+            (a, FeatureBatch(1, tuple(multi_module_features(3, [14, 15]))), True),
+            (b, FeatureBatch(1, tuple(multi_module_features(0, [21, 22]))), True),
+        ]
+    )
+    first = multi_module_round(session, 0, [a, b], [(0, []), (0, [])], [0, 0], [30, 40])
+    ad, bd = digest_row([11, 12, 13, 14, 15], 30)[:2], digest_row([21, 22], 40)[:2]
+    assert first.row_statuses == (OK, OK)
+    assert first.output.token_ids.tolist() == [ad, bd]
+    second = multi_module_round(
+        session,
+        1,
+        [b, a],
+        [(2, [40, *bd]), (5, [30, *ad])],
+        [0, 1],
+        [41, 31],
+    )
+    b_prefix, a_prefix = [21, 22, 40], [11, 12, 13, 14, 15, 30, ad[0]]
+    assert second.row_statuses == (OK, OK)
+    assert second.output.token_ids.tolist() == [
+        digest_row(b_prefix, 41)[:2],
+        digest_row(a_prefix, 31)[:2],
+    ]
+    plan = executor.plans[-1]
+    assert [row.key for row in plan.rows] == [b, a]
+    assert [row.num_replayed for row in plan.rows] == [1, 0]
+    assert plan.positions.tolist() == [1, 2, 5, 6]
+    session.close_sequences((b,))
+    assert executor.replay.num_sequences == 1
+    replacement = session.open_sequence(2)
+    assert replacement.generation != b.generation
+    session.prefill(
+        replacement,
+        FeatureBatch(1, tuple(multi_module_features(0, [7]))),
+        is_final=True,
+    )
+    verified = [31, *second.output.token_ids[1].tolist()]
+    last = multi_module_round(
+        session,
+        2,
+        [a, replacement],
+        [(7, verified), (0, [])],
+        [2, 0],
+        [32, 50],
+    )
+    assert last.row_statuses == (OK, OK)
+    assert last.output.token_ids.tolist() == [
+        digest_row([*a_prefix, *verified], 32)[:2],
+        digest_row([7], 50)[:2],
+    ]
+    assert executor.plans[-1].block_table_updates[1].start == 0
+    session.close_sequences((a, replacement))
+    assert executor.replay.num_sequences == 0
+    assert executor.pool.num_free_blocks == executor.pool.num_blocks - 1
+
+
+@pytest.mark.parametrize("effective_k", [0, 1, 2])
+def test_multi_module_adapter_zero_and_partial_budget_keep_context(
+    multi_module_runtime, effective_k
+):
+    session, executor = multi_module_runtime
+    a = session.open_sequence(1)
+    session.prefill(
+        a,
+        FeatureBatch(1, tuple(multi_module_features(0, [11, 12]))),
+        is_final=True,
+    )
+    first = multi_module_round(session, 0, [a], [(0, [])], [0], [30], effective_k)
+    drafts = digest_row([11, 12], 30)[:effective_k]
+    assert first.output.valid_lengths.tolist() == [effective_k]
+    assert first.output.token_ids.tolist() == [drafts + [0] * (2 - effective_k)]
+    verified = [30, *drafts]
+    second = multi_module_round(session, 1, [a], [(2, verified)], [effective_k], [31])
+    assert second.output.token_ids.tolist() == [digest_row([11, 12, *verified], 31)[:2]]
+    assert second.output.valid_lengths.tolist() == [2]
+    assert executor.plans[-1].rows[0].num_replayed == int(effective_k == 0)
+    assert executor.effective_ks == [effective_k, 2]
 
 
 # ----------------------------------------------------------------------

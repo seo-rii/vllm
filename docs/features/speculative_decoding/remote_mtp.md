@@ -10,7 +10,8 @@ between target and draft computation.
 
 The runtime checks the resolved draft architecture and its matching target,
 including hidden width, vocabulary size and the number of checkpoint MTP modules.
-It currently requires exactly one MTP module and scalar token positions.
+It accepts one MTP module, or the Exaone module chain described
+below. All supported paths use scalar token positions.
 
 | Resolved draft architecture | Matching target | Draft cache | K restriction |
 | --- | --- | --- | --- |
@@ -19,7 +20,7 @@ It currently requires exactly one MTP module and scalar token positions.
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeLiteMTPModel` | `Glm4MoeLiteForCausalLM` | Dense MLA | Native sequential rollout |
-| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Uniform full attention or sliding window | Native sequential rollout |
+| `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Full attention or sliding window, including mixed module groups | One module: native sequential rollout; multiple modules: configured K equals checkpoint module count |
 | `NemotronHMTPModel` | `NemotronHForCausalLM` / `NemotronHPuzzleForCausalLM` | Attention/MoE-only MTP block | Native sequential rollout |
 | `HYV3MTPModel` | `HYV3ForCausalLM` | Full attention | Native sequential rollout |
 
@@ -49,17 +50,61 @@ loading. Included tied heads load from the checkpoint embedding, and included
 untied heads load from its LM head. An explicit native loader
 `enable_weights_track=False` retains the existing unchecked-loading opt-out.
 
-The standalone allocator accepts one homogeneous, unquantized full-attention,
-dense MLA, or sliding-window group. It uses the shared vLLM KV allocator and
-retains a null block. Sliding-window attention conservatively reserves the full
+The standalone allocator accepts unquantized full-attention, dense MLA, or
+sliding-window KV. Exaone module chains can mix full and sliding-window groups
+with a common block size and dtype; other own-KV models require one homogeneous
+group. The runtime uses the shared vLLM KV allocator and retains a null block.
+Sliding-window attention conservatively reserves the full
 context; the attention backend applies the window, and this runtime does not
 recycle evicted window pages. Budget the draft KV accordingly.
 
 Sparse/indexer MLA (including any `index_topk` configuration), compressed or
-packed KV, mixed KV groups, multiple MTP modules, multimodal features, mRoPE and
-mHC are rejected. Nemotron MTP must contain only attention and MoE layers.
+packed KV, mixed MLA/dense groups, other multi-module model families, multimodal
+features, mRoPE and mHC are rejected. Nemotron MTP must contain only attention
+and MoE layers.
 Gemma4's Q-only assistant reads target-owned KV and is not supported by this
 own-KV adapter. Its native local path is unaffected.
+
+### Exaone module chains
+
+A checkpoint with `num_nextn_predict_layers=N`, where N is at least two, can use
+`num_speculative_tokens=N` with target TP1, draft TP1 and one same-host endpoint.
+Choose `transport="inline"` or explicitly choose `transport="cuda_ipc"` on
+NVIDIA CUDA. `transport="auto"` continues to select inline.
+Declare one `full_attention` or `sliding_attention` entry per module in
+`mtp_layer_types`. Sliding modules require positive windows, from
+`mtp_sliding_windows` or the checkpoint's existing window settings. The runtime
+loads all N checkpoint modules and calls the existing native multi-module
+speculator. Every nonfinal prefill chunk sends N known lookahead tokens.
+
+Later modules' trailing KV rows can depend on rejected proposals. The runtime
+retains at most N−1 independently owned target input/hidden-state rows per live
+sequence. It replays the affected suffix according to the actual accepted count,
+including after effective K=0 or scheduler truncation of submitted drafts. Short
+prompts retain only their real rows. History is committed only after execution
+completes and is released with its sequence generation. Inline history uses CPU
+memory; IPC history uses independently owned GPU storage. The receiver completes
+its copy before acknowledging the exporter, so retained final-prefill features
+and replay history survive exporter arena reuse. Old and staged new history can
+coexist during an update.
+
+The startup log reports separate floating-feature payload bounds. For `S` request
+slots, `T` feature tokens, model length `L`, module depth `N` and `R` bytes per
+floating feature row, committed history uses at most `S*(N-1)*R` bytes. Retained
+final-prefill copies can use up to `S*min(T,L)*R` bytes. Including staged history,
+incoming, prepared and packed features, a conservative single-verifier payload
+bound is `R * [S*min(T,L) + 3*T + 3*S*(N-1)]`. This is separate from native model
+buffers, weights, KV backing storage, IPC arenas and allocator overhead. The
+draft KV budget covers KV storage; it does not reserve this additional memory.
+Warmup executes bounded device-feature prefill before listening and exercises
+replay when the token and context budgets permit. It does not validate the peak
+of every admitted batch shape.
+
+Effective K can vary from 0 through N. The native forward still executes all N
+modules; effective K limits returned drafts and does not currently reduce module
+computation. Configured K values different from N and pooled placement remain
+unsupported for this path. The single-module path retains its native
+sequential rollout behavior.
 
 ## Shared weights and execution
 
