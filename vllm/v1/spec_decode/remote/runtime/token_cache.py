@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bounded full-copy prediction of one all-accepted token-draft outcome."""
+"""Bounded all-accepted prediction with immutable KV prefix sharing."""
 
 import itertools
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -66,6 +66,7 @@ class _Branch:
     copied: int = 0
     bonus: int | None = None
     tokens: tuple[int, ...] = ()
+    started_ns: int = field(default_factory=time.perf_counter_ns)
 
 
 class TokenOutcomeCache:
@@ -129,13 +130,15 @@ class TokenOutcomeCache:
             failed=0,
             budget_skipped=0,
             copied_blocks=0,
+            shared_blocks=0,
             build_forwards=0,
+            ready_latency_ns=0,
         )
 
     @property
     def branch_blocks(self) -> int:
         return sum(
-            len(self.state.block_pool.blocks(branch.progress.req_index))
+            self.state.block_pool.exclusive_blocks(branch.progress.req_index)
             for branch in self._builds.values()
         )
 
@@ -356,10 +359,15 @@ class TokenOutcomeCache:
         committed = source.committed + len(source.tokens) + 1
         k = min(source.requested_k, self.state.max_model_len - committed)
         needed = committed + max(k - 1, 0)
-        blocks = cdiv(needed, self.state.block_pool.block_size)
+        block_size = self.state.block_pool.block_size
+        blocks = cdiv(needed, block_size)
+        # Accepted context is immutable. The partial committed page and every
+        # speculative page remain private before either branch can write them.
+        shared = source.committed // block_size
+        private = blocks - shared
         if (
-            blocks + self.branch_blocks > self.max_branch_blocks
-            or blocks > self.state.block_pool.num_free_blocks
+            private + self.branch_blocks > self.max_branch_blocks
+            or private > self.state.block_pool.num_free_blocks
         ):
             self.counters["budget_skipped"] += 1
             return None
@@ -370,19 +378,35 @@ class TokenOutcomeCache:
             return None
         progress = self._branches.sequences[source.key]
         try:
-            self.state.block_pool.ensure(progress.req_index, needed)
+            self.state.block_pool.fork_prefix(
+                self.state.sequences[source.key].req_index,
+                progress.req_index,
+                shared,
+                needed,
+            )
             progress = replace(
                 self.state.sequences[source.key],
                 req_index=progress.req_index,
                 reserved_end=blocks * self.state.block_pool.block_size,
             )
-            branch = _Branch(source, progress)
+            branch = _Branch(
+                source,
+                progress,
+                phase=(
+                    "bonus"
+                    if shared == cdiv(source.written_end, block_size)
+                    else "copy"
+                ),
+                copied=shared,
+            )
             self._branches.sequences[source.key] = progress
             self._builds[source.key] = branch
         except BaseException:
             self._branches.close((source.key,))
+            self._builds.pop(source.key, None)
             raise
         self.counters["started"] += 1
+        self.counters["shared_blocks"] += shared
         return branch
 
     def step(self, source: TokenPredictionPlan) -> bool:
@@ -447,15 +471,23 @@ class TokenOutcomeCache:
             if len(branch.tokens) == k:
                 branch.phase = "ready"
                 self.counters["ready"] += 1
+                self.counters["ready_latency_ns"] += (
+                    time.perf_counter_ns() - branch.started_ns
+                )
                 logger.info(
                     "Token outcome cache ready: sequence=%s generation=%s source=%s "
-                    "build=%s branch_blocks=%s ready=%s",
+                    "build=%s branch_blocks=%s ready=%s copied_blocks=%s "
+                    "shared_blocks=%s build_forwards=%s ready_latency_ns=%s",
                     source.key.sequence_id,
                     source.key.generation,
                     source.proposal_id,
                     source.build_id,
                     self.branch_blocks,
                     self.counters["ready"],
+                    self.counters["copied_blocks"],
+                    self.counters["shared_blocks"],
+                    self.counters["build_forwards"],
+                    self.counters["ready_latency_ns"],
                 )
                 return False
             return True
