@@ -1006,6 +1006,74 @@ def test_owned_head_bytes_count_distinct_nested_heads_once(tmp_path):
     assert model_weight_bytes(shell) == (6, embedding_bytes, head_bytes)
 
 
+@pytest.mark.parametrize("profile", ["one_full", "three_swa"])
+@pytest.mark.parametrize(
+    "layout,omitted",
+    [("split", None), ("split", "q"), ("split", "k"), ("split", "v"), ("fused", None)],
+)
+def test_step35_native_load_requires_each_packed_attention_source(
+    tmp_path, profile, layout, omitted
+):
+    """A loaded sibling projection cannot hide an uninitialized Q/K/V slice."""
+    from tests.v1.e2e.spec_decode.remote.test_remote_mtp import _save_step3p5_mtp_model
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    source, _ = _save_step3p5_mtp_model(tmp_path, profile)
+    path = Path(source) / "model.safetensors"
+    weights = load_file(path)
+    expected = {}
+    heads = 3 if profile == "three_swa" else 1
+    for index in range(2, 2 + heads):
+        prefix = f"model.layers.{index}.self_attn."
+        parts = [prefix + part + "_proj.weight" for part in ("q", "k", "v")]
+        expected[index] = torch.cat([weights[name] for name in parts])
+        if layout == "fused":
+            weights[prefix + "qkv_proj.weight"] = expected[index]
+            for name in parts:
+                del weights[name]
+    if omitted is not None:
+        del weights[f"model.layers.{heads + 1}.self_attn.{omitted}_proj.weight"]
+    save_file(weights, path, metadata={"format": "pt"})
+    config = EngineArgs(
+        model=str(source),
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=256 if heads == 3 else 128,
+        enforce_eager=True,
+        model_loader_extra_config={"enable_weights_track": True},
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    draft = config.speculative_config.draft_model_config
+    loader = get_model_loader(config.load_config)
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        model = loader.create_model(config, draft)
+        if omitted is not None:
+            with pytest.raises(ValueError, match=rf"{omitted}_proj\.weight"):
+                loader.load_weights(model, draft)
+        else:
+            loader.load_weights(model, draft)
+            assert torch.equal(
+                model.model.embed_tokens.weight, weights["model.embed_tokens.weight"]
+            )
+            for index, qkv in expected.items():
+                layer = model.model.layers[str(index)]
+                assert torch.equal(layer.mtp_block.self_attn.qkv_proj.weight, qkv)
+                assert torch.equal(
+                    layer.shared_head.head.weight,
+                    weights[
+                        f"model.layers.{index}.transformer.shared_head.output.weight"
+                    ],
+                )
+
+
 @pytest.mark.parametrize("draft_dtype", [None, "auto", "fp8"])
 def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_dtype):
     options = {} if draft_dtype is None else {"kv_cache_dtype": draft_dtype}
