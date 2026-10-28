@@ -3,6 +3,10 @@
 """Inline stream transport: endpoint parsing, framing, deadlines, and
 integer frame helpers."""
 
+import json
+import multiprocessing
+import os
+import signal
 import socket
 import struct
 import threading
@@ -34,6 +38,166 @@ from vllm.v1.spec_decode.remote.transport import (
     parse_endpoint,
     validate_frame,
 )
+
+
+def _draft_tp_gloo_worker(channel, rank, init_method, failure):
+    """Exercise the real group channel and collectives without CUDA models."""
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as distributed
+
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPGeometry, TPReply
+
+    torch.set_num_threads(1)
+    distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=30),
+    )
+    channel.send(
+        TPReply(0, rank, "ready", geometry=TPGeometry(8, 4, 2, 8, 2, "cpu")),
+        time.monotonic() + 30,
+    )
+    forwards = 0
+    previous = 0
+    while True:
+        command = channel.receive_command()
+        assert command.command_id == previous + 1
+        previous = command.command_id
+        tokens = ()
+        if command.operation == "forward":
+            forwards += 1
+            if rank == 1 and forwards == 2:
+                if failure == "exit":
+                    return
+                if failure == "stall":
+                    threading.Event().wait()
+            value = torch.tensor([row.tokens[-1] + rank for row in command.rows])
+            distributed.all_reduce(value)
+            tokens = tuple(value.tolist())
+        elif command.operation == "close":
+            distributed.destroy_process_group()
+        else:
+            distributed.barrier()
+        command_id = command.command_id
+        if rank == 1 and forwards == 2 and failure == "reply":
+            command_id += 1
+        channel.send(
+            TPReply(command_id, rank, command.operation, tokens=tokens),
+            time.monotonic() + 30,
+        )
+        if command.operation == "close":
+            return
+
+
+@pytest.mark.parametrize("failure", [None, "exit", "stall", "reply"])
+def test_draft_tp_process_group_collectives_and_failure_retirement(tmp_path, failure):
+    """All-rank completion is required; an uncertain group cannot be reused."""
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenForwardRow
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=((tmp_path / "gloo-store").as_uri(), failure),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    rows = tuple(
+        TokenForwardRow(SequenceKey("gloo", index, 0), index, 0, (token,), (1,), True)
+        for index, token in enumerate((3, 5))
+    )
+    try:
+        assert [reply.rank for reply in group.ready] == [0, 1]
+        group.execute("warmup")
+        replies = group.execute("forward", rows=rows)
+        assert [reply.command_id for reply in replies] == [2, 2]
+        assert [reply.tokens for reply in replies] == [(7, 11), (7, 11)]
+        if failure is None:
+            group.execute("release", keys=tuple(row.key for row in rows))
+        else:
+            with pytest.raises(CompletionUnknownError, match="command failed"):
+                group.execute("forward", rows=rows)
+            with pytest.raises(CompletionUnknownError, match="unavailable"):
+                group.execute("warmup")
+    finally:
+        group.close()
+    receipt = group.worker_status()
+    assert len(receipt) == 2 and all(not worker["alive"] for worker in receipt)
+    if failure is None:
+        assert all(worker["exitcode"] == 0 for worker in receipt)
+
+
+def _draft_tp_sigint_owner(connection, init_method):
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    os.setsid()
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=(init_method, None),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    try:
+        group.execute("warmup")
+        try:
+            connection.send(("ready", group.worker_status()))
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+    finally:
+        group.close()
+    connection.send(("closed", group.worker_status()))
+    connection.close()
+
+
+def test_draft_tp_process_group_sigint_closes_through_owner(tmp_path, record_property):
+    """Group SIGINT must leave ranks available for the owner's typed close."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_draft_tp_sigint_owner,
+        args=(child, (tmp_path / "gloo-store").as_uri()),
+    )
+    try:
+        process.start()
+        child.close()
+        assert parent.poll(60), "draft TP owner did not become ready"
+        state, workers = parent.recv()
+        assert state == "ready"
+        assert len(workers) == 2
+        assert all(os.getpgid(worker["pid"]) == process.pid for worker in workers)
+        record_property("draft_tp_sigint_owner_pid", process.pid)
+        os.killpg(process.pid, signal.SIGINT)
+        assert parent.poll(15), "draft TP owner did not finish shutdown"
+        state, workers = parent.recv()
+        assert state == "closed"
+        process.join(timeout=5)
+        assert process.exitcode == 0
+        assert all(
+            not worker["alive"] and worker["exitcode"] == 0 for worker in workers
+        )
+        record_property("draft_tp_sigint_closed_workers", json.dumps(workers))
+    finally:
+        try:
+            if process.pid is not None:
+                if process.is_alive():
+                    if os.getpgid(process.pid) == process.pid:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                process.join(timeout=5)
+                assert not process.is_alive()
+                process.close()
+        finally:
+            parent.close()
+            child.close()
 
 
 def ipc_descriptor(**overrides):

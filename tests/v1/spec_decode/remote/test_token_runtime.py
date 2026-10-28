@@ -1978,19 +1978,22 @@ def token_config(
             },
         }.get(family, {})
         hf = hf_class(
-            architectures=[architecture],
-            hidden_size=hidden_size,
-            head_dim=8,
-            intermediate_size=hidden_size * 2,
-            num_hidden_layers=2,
-            num_attention_heads=hidden_size // 8,
-            num_key_value_heads=2,
-            vocab_size=128,
-            max_position_embeddings=64,
-            bos_token_id=0,
-            eos_token_id=1,
-            pad_token_id=2,
-            **(family_options | options),
+            **dict(
+                architectures=[architecture],
+                hidden_size=hidden_size,
+                head_dim=8,
+                intermediate_size=hidden_size * 2,
+                num_hidden_layers=2,
+                num_attention_heads=hidden_size // 8,
+                num_key_value_heads=2,
+                vocab_size=128,
+                max_position_embeddings=64,
+                bos_token_id=0,
+                eos_token_id=1,
+                pad_token_id=2,
+            )
+            | family_options
+            | options
         )
         with torch.random.fork_rng():
             torch.manual_seed(0)
@@ -2428,7 +2431,15 @@ def test_socket_prefill_chunks_keep_offsets_and_only_finalize_last(tmp_path, fin
         server.stop()
 
 
-def prefix_replay_config(tmp_path, endpoint, *, family="qwen3", failure_policy="error"):
+def prefix_replay_config(
+    tmp_path,
+    endpoint,
+    *,
+    family="qwen3",
+    draft_tp=1,
+    prefix_caching=True,
+    failure_policy="error",
+):
     from vllm.engine.arg_utils import EngineArgs
 
     assets = token_config(
@@ -2445,7 +2456,7 @@ def prefix_replay_config(tmp_path, endpoint, *, family="qwen3", failure_policy="
         max_num_seqs=4,
         max_num_batched_tokens=4,
         enable_chunked_prefill=True,
-        enable_prefix_caching=True,
+        enable_prefix_caching=prefix_caching,
         async_scheduling=False,
         enforce_eager=True,
         block_size=16,
@@ -2453,7 +2464,7 @@ def prefix_replay_config(tmp_path, endpoint, *, family="qwen3", failure_policy="
             "method": "draft_model",
             "model": assets.speculative_config.draft_model_config.model,
             "num_speculative_tokens": 3,
-            "draft_tensor_parallel_size": 1,
+            "draft_tensor_parallel_size": draft_tp,
             "draft_sample_method": "greedy",
             "execution": {
                 "placement": "remote",
@@ -2773,3 +2784,196 @@ def test_prefix_allocation_failure_isolates_request_until_finish(
             worker.close()
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("family", ["qwen3", "llama", "mistral"])
+def test_public_engine_args_distinguish_dense_draft_tp_identity(tmp_path, family):
+    """Separate draft ranks are an explicit contract, not target TP inheritance."""
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+        supports_token_async_scheduling,
+        supports_token_prefix_replay,
+    )
+
+    tp2 = prefix_replay_config(
+        tmp_path,
+        "unix:///tmp/draft-tp.sock",
+        family=family,
+        draft_tp=2,
+        prefix_caching=False,
+    )
+    assert tp2.parallel_config.tensor_parallel_size == 1
+    assert tp2.speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert not supports_token_prefix_replay(tp2)
+    assert not supports_token_async_scheduling(tp2)
+    contract = create_token_runtime_contract(tp2)
+    tp1 = prefix_replay_config(
+        tmp_path, "unix:///tmp/draft-tp.sock", family=family, prefix_caching=False
+    )
+    reference = create_token_runtime_contract(tp1)
+    assert contract.schema == reference.schema
+    assert contract.target_fingerprint == reference.target_fingerprint
+    assert contract.tokenizer_fingerprint == reference.tokenizer_fingerprint
+    assert contract.draft_fingerprint != reference.draft_fingerprint
+
+    with pytest.raises(ValueError, match="draft_tensor_parallel_size=3 cannot be"):
+        prefix_replay_config(
+            tmp_path,
+            "unix:///tmp/draft-tp.sock",
+            family=family,
+            draft_tp=3,
+            prefix_caching=False,
+        )
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_dense_draft_tp_contract_permits_native_kv_replication_and_sharding(
+    tmp_path, kv_heads
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        enforce_eager=True,
+        num_key_value_heads=kv_heads,
+        spec_options={
+            "draft_tensor_parallel_size": 2,
+            "execution": {
+                "placement": "remote",
+                "endpoints": ["unix:///tmp/draft-tp.sock"],
+                "transport": "inline",
+            },
+        },
+    )
+    spec = config.speculative_config
+    assert spec.draft_model_config.get_num_kv_heads(spec.draft_parallel_config) == 1
+    assert create_token_runtime_contract(config).schema.slots == (
+        FeatureSlot("token_ids", "int32", ()),
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_dense_draft_tp_worker_config_preserves_independent_geometry_and_rank(
+    tmp_path, rank
+):
+    import torch
+
+    from vllm.v1.spec_decode.remote.runtime.gpu import StandaloneParallelContext
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+
+    config = prefix_replay_config(
+        tmp_path, "unix:///tmp/draft-tp.sock", draft_tp=2, prefix_caching=False
+    )
+    cuda_initialized = torch.cuda.is_initialized()
+    resource = create_token_executor_config(
+        config,
+        parallel_context=StandaloneParallelContext(
+            rank=rank,
+            world_size=2,
+            init_method=(tmp_path / "unused-rendezvous").as_uri(),
+            timeout_s=30,
+        ),
+    )
+    assert config.parallel_config.tensor_parallel_size == 1
+    assert config.parallel_config.rank == 0
+    assert config.model_config.get_hidden_size() == 32
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert resource.model_config.get_hidden_size() == 16
+    assert resource.parallel_config.tensor_parallel_size == 2
+    assert resource.parallel_config.world_size == 2
+    assert resource.parallel_config.rank == rank
+    assert resource.speculative_config is not None
+    assert resource.speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert config.speculative_config.draft_parallel_config.rank == 0
+    assert torch.cuda.is_initialized() == cuda_initialized
+
+
+@pytest.mark.parametrize(
+    "options,reason",
+    [
+        ({"dtype": "float32"}, "unquantized bfloat16"),
+        ({"enforce_eager": False}, "eager synchronous"),
+        ({"target_tp": 2}, "target TP1"),
+        (
+            {"draft_type": "mistral", "sliding_window": 16},
+            "dense full-attention",
+        ),
+        (
+            {"target_type": "qwen3_next"},
+            "dense full-attention",
+        ),
+        (
+            {"cache_options": {"enable_prefix_caching": True}},
+            "prefix caching requires",
+        ),
+        ({"cache_options": {"cache_dtype": "fp8"}}, "bfloat16 KV"),
+        ({"intermediate_size": 33}, "intermediate size must be divisible"),
+        ({"num_attention_heads": 3}, "attention heads.*divisible"),
+        (
+            {"num_attention_heads": 6, "num_key_value_heads": 3},
+            "KV heads must shard or replicate evenly",
+        ),
+    ],
+)
+def test_dense_draft_tp_rejects_unvalidated_public_configuration(
+    tmp_path, options, reason
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    with pytest.raises(ValueError, match=reason):
+        config = token_config(
+            tmp_path,
+            **(
+                {
+                    "dtype": "bfloat16",
+                    "enforce_eager": True,
+                    "spec_options": {
+                        "draft_tensor_parallel_size": 2,
+                        "execution": {
+                            "placement": "remote",
+                            "policy": "on_demand",
+                            "endpoints": ["unix:///tmp/draft-tp.sock"],
+                            "transport": "inline",
+                        },
+                    },
+                }
+                | options
+            ),
+        )
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--draft-tensor-parallel-size", "2"],
+        ["--devices", "cuda:0", "cuda:1"],
+        ["--draft-tensor-parallel-size", "2", "--devices", "cuda:0"],
+        ["--draft-tensor-parallel-size", "2", "--devices", "cuda:0", "cuda:0"],
+        ["--draft-tensor-parallel-size", "2", "--devices", "cuda", "cuda:1"],
+        ["--draft-tensor-parallel-size", "2", "--devices", "cpu", "cuda:1"],
+    ],
+)
+def test_token_cli_rejects_ambiguous_draft_rank_devices(arguments):
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+
+    args = parser().parse_args(
+        [
+            "--endpoint",
+            "unix:///tmp/draft-tp.sock",
+            "--target-model",
+            "not-loaded",
+            "--draft-model",
+            "not-loaded",
+            *arguments,
+        ]
+    )
+    with pytest.raises(ValueError, match="draft TP2|draft TP2 requires"):
+        create_adapter(args)

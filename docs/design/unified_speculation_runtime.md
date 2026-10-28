@@ -128,7 +128,7 @@ tail KV cannot be treated as committed state.
 A standalone loader and forward path reuse native model execution without a
 target shell or a second inference engine. The supported mode is greedy,
 text-only native decoder models with homogeneous causal full attention,
-same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
+same-host inline, target TP1 and draft TP1 by default, with no heterogeneous vocabulary or
 parallel drafting. Qwen3, Llama and Mistral configured with `sliding_window=null`
 are examples; the runtime checks model capabilities and the loaded draft's
 actual KV specification rather than requiring a model-type name. Loaded drafts
@@ -260,3 +260,16 @@ is a design reference for the backend boundary and token-state contracts.
 motivates outcome precomputation. Appendix E's feature-dependency discussion is
 why target-conditioned shadow prediction remains separate from exact on-demand
 state. Token agreement alone cannot promote approximate KV into exact live KV.
+
+## Tensor-parallel draft ownership
+
+For draft TP2, set `draft_tensor_parallel_size=2` in the verifier's speculative
+configuration, and pass `--draft-tensor-parallel-size 2 --devices cuda:0 cuda:1`
+to the token-only server. The ordered device list uses the server process's
+logical `CUDA_VISIBLE_DEVICES` mapping and requires two distinct visible GPUs.
+`--device` remains the TP1 option and cannot be combined with `--devices`.
+`--draft-kv-cache-gib` is a per-rank budget. A dedicated target GPU plus two draft
+ranks uses three GPUs; a single-GPU correctness run does not validate TP2 or its
+collectives.
+
+Draft TP2 requires dense full attention, unquantized BF16 weights/KV, eager synchronous execution and no prefix caching. The CPU owner sends identical commands to two native ranks, uses their common KV capacity and retires the whole group after uncertain completion.

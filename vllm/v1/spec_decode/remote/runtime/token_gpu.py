@@ -3,17 +3,18 @@
 """Token-only native model/attention execution, without a target shell or engine."""
 
 import inspect
-from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.gpu import (
     GPUDraftStepExecutor,
+    StandaloneParallelContext,
     make_input_batch,
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
@@ -33,6 +34,9 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenStepExecutor,
 )
 
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TokenTPExecutor
+
 
 def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> None:
     """Fail closed when a native model needs inputs or state we do not supply."""
@@ -49,36 +53,67 @@ def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> N
         raise ValueError("token-only draft requires the default decoder model state")
 
 
+def create_token_executor_config(
+    config: VllmConfig, *, parallel_context: StandaloneParallelContext | None = None
+) -> VllmConfig:
+    """Give the standalone model its own geometry and rank-specific topology."""
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    resource = replace(
+        config,
+        model_config=spec.draft_model_config,
+        parallel_config=spec.draft_parallel_config,
+        quant_config=None,
+        cache_config=(
+            replace(config.cache_config, cache_dtype=spec.kv_cache_dtype)
+            if spec.kv_cache_dtype is not None
+            else config.cache_config
+        ),
+    )
+    resource = spec.apply_draft_overrides(resource)
+    if parallel_context is not None:
+        resource = replace(
+            resource,
+            parallel_config=replace(
+                resource.parallel_config, rank=parallel_context.rank
+            ),
+        )
+    return resource
+
+
 class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
     def __init__(
-        self, config: VllmConfig, *, device: torch.device, kv_cache_bytes: int
+        self,
+        config: VllmConfig,
+        *,
+        device: torch.device,
+        kv_cache_bytes: int,
+        parallel_context: StandaloneParallelContext | None = None,
     ):
         self._token_contract = create_token_runtime_contract(config)
         spec = config.speculative_config
         assert spec is not None and spec.draft_model_config is not None
         if (
             config.parallel_config.tensor_parallel_size != 1
-            or spec.draft_parallel_config.tensor_parallel_size != 1
+            or spec.draft_parallel_config.tensor_parallel_size
+            != (1 if parallel_context is None else parallel_context.world_size)
         ):
-            raise ValueError("token-only runtime requires target TP1 and draft TP1")
+            raise ValueError(
+                "token-only runtime topology differs from its worker group"
+            )
         if spec.draft_model_config.quantization is not None:
             raise ValueError(
                 "token-only first runtime requires unquantized draft weights"
             )
-        # Allocate attention/KV from the independent draft's dimensions. No
-        # target modules, embeddings or output head are constructed here.
-        resource = replace(
-            config,
-            model_config=spec.draft_model_config,
-            parallel_config=spec.draft_parallel_config,
-            quant_config=None,
-            cache_config=(
-                replace(config.cache_config, cache_dtype=spec.kv_cache_dtype)
-                if spec.kv_cache_dtype is not None
-                else config.cache_config
-            ),
+        resource = create_token_executor_config(
+            config, parallel_context=parallel_context
         )
-        super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
+        super().__init__(
+            resource,
+            device=device,
+            kv_cache_bytes=kv_cache_bytes,
+            parallel_context=parallel_context,
+        )
 
     def _create_contract(self, config):
         return self._token_contract
@@ -107,6 +142,9 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
     @property
     def max_num_reqs(self) -> int:
         return self.input_buffers.max_num_reqs
+
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        """TokenStateMachine owns the dense executor's request KV and slots."""
 
     def forward(self, key, req_index, start, tokens, blocks, *, sample):
         return self.forward_batch(
@@ -273,19 +311,44 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
 
 
 def make_token_gpu_adapter(
-    config: VllmConfig, *, device: torch.device, kv_cache_bytes: int
+    config: VllmConfig,
+    *,
+    device: torch.device,
+    kv_cache_bytes: int,
+    devices: tuple[torch.device, ...] | None = None,
 ) -> TokenOnlyDraftAdapter:
-    executor = TokenGPUStepExecutor(
-        config, device=device, kv_cache_bytes=kv_cache_bytes
-    )
     spec = config.speculative_config
     assert spec is not None
-    state = TokenStateMachine(
-        executor,
-        DraftBlockPool(executor.num_blocks, executor.block_size),
-        max_num_reqs=config.scheduler_config.max_num_seqs,
-        max_model_len=config.model_config.max_model_len,
-        vocab_size=config.model_config.get_vocab_size(),
-        max_k=spec.num_speculative_tokens,
-    )
+    draft = spec.draft_model_config
+    assert draft is not None
+    executor: TokenGPUStepExecutor | TokenTPExecutor
+    if spec.draft_parallel_config.tensor_parallel_size > 1:
+        from vllm.v1.spec_decode.remote.runtime.tp_executor import (
+            TokenTPExecutor as TPExecutor,
+        )
+
+        if devices is None:
+            raise ValueError("draft TP2 requires two explicit CUDA devices")
+        executor = TPExecutor(config, devices=devices, kv_cache_bytes=kv_cache_bytes)
+    elif devices is not None:
+        raise ValueError("multiple draft devices require draft TP2")
+    else:
+        executor = TokenGPUStepExecutor(
+            config, device=device, kv_cache_bytes=kv_cache_bytes
+        )
+    try:
+        state = TokenStateMachine(
+            executor,
+            DraftBlockPool(executor.num_blocks, executor.block_size),
+            max_num_reqs=config.scheduler_config.max_num_seqs,
+            max_model_len=config.model_config.max_model_len,
+            vocab_size=config.model_config.get_vocab_size(),
+            max_k=spec.num_speculative_tokens,
+        )
+    except BaseException as error:
+        try:
+            executor.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"token executor cleanup failed: {cleanup_error}")
+        raise
     return TokenOnlyDraftAdapter(state, executor.contract)

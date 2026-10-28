@@ -197,7 +197,21 @@ steps:
     - vllm/v1/worker/gpu/
     - tests/v1/e2e/spec_decode/remote/
   commands:
-    - pytest -v -s v1/e2e/spec_decode/remote/
+    - pytest -v -s -m 'not distributed' v1/e2e/spec_decode/remote/
+
+- label: ":nvidia: (2xH100) Remote Token Draft TP2"
+  key: spec-decode-remote-draft-tp2
+  timeout_in_minutes: 30
+  device: h100
+  num_devices: 2
+  source_file_dependencies:
+    - vllm/config/speculative.py
+    - vllm/distributed/
+    - vllm/v1/spec_decode/remote/
+    - vllm/v1/worker/gpu/
+    - tests/v1/e2e/spec_decode/remote/
+  commands:
+    - pytest -v -s v1/e2e/spec_decode/remote/test_remote_mtp.py::test_remote_token_draft_tp_matches_target_and_uses_drafts
 
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode MTP DeepSeek + MiMo"
   key: spec-decode-mtp-deepseek-mimo
