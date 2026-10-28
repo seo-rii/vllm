@@ -1058,7 +1058,15 @@ class RemoteDraftServer:
                             except RuntimeError as error:
                                 failure = error
                 if reject or failure is not None:
-                    conn.close()
+                    try:
+                        conn.close()
+                    except BaseException as cleanup_error:
+                        if failure is None:
+                            raise
+                        raise BaseExceptionGroup(
+                            "session thread startup and connection cleanup failures",
+                            [failure, cleanup_error],
+                        ) from None
                 if failure is not None:
                     with self._connections_lock:
                         if worker is None or worker.ident is None:
