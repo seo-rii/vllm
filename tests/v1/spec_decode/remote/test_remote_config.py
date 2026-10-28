@@ -27,6 +27,38 @@ def test_inline_transport_is_explicitly_supported():
     assert config.transport == "inline"
 
 
+def test_cross_node_configuration_is_explicit_and_token_transport_only():
+    execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("tcp://192.0.2.1:5001",),
+        allow_cross_node=True,
+    )
+    assert execution.remote_config().allow_cross_node
+    for endpoint, transport in (
+        ("unix:///draft.sock", "inline"),
+        ("tcp://192.0.2.1:5001", "cuda_ipc"),
+    ):
+        with pytest.raises(ValidationError, match="cross-node"):
+            RemoteDraftConfig(
+                endpoint=endpoint, transport=transport, allow_cross_node=True
+            )
+    with pytest.raises(ValidationError, match="local execution"):
+        SpeculativeExecutionConfig(allow_cross_node=True)
+    with pytest.raises(
+        ValidationError, match="cross-node placement requires token-only"
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=3,
+            prompt_lookup_max=3,
+            execution={
+                "placement": "remote",
+                "endpoints": ["tcp://192.0.2.1:5001"],
+                "allow_cross_node": True,
+            },
+        )
+
+
 def test_endpoint_is_required():
     with pytest.raises(ValidationError):
         RemoteDraftConfig()
