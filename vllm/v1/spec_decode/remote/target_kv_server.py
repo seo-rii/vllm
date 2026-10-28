@@ -203,16 +203,8 @@ class TargetKVDraftServer(RemoteDraftServer):
             torch.accelerator.synchronize(device)
         self.adapter.warmup()
 
-    def stop(self) -> None:
-        deadline = time.monotonic() + self.shutdown_timeout_s
-        try:
-            super().stop()
-        finally:
-            try:
-                self.work_queue.stop(deadline)
-            except ServerShutdownTimeout:
-                self._shutdown_failed = True
-                raise
+    def stop(self, *, deadline: float | None = None) -> None:
+        self._stop_with_owner(self.work_queue.stop, deadline=deadline)
 
     def _failed_job(self, job: DraftWork, status, detail: str) -> None:
         item = job.payload
