@@ -370,24 +370,27 @@ class TargetKVDraftServer(RemoteDraftServer):
             self._adapter_failed(error)
             logger.warning("Target-KV session failed: %s", error)
         finally:
-            conn.close()
             try:
-                if session is not None and not self._shutdown_failed:
-                    session.cleanup()
-            except ServerShutdownTimeout:
-                self._shutdown_failed = True
-            finally:
                 conn.close()
-                with self._connections_lock:
-                    self._connections.discard(conn)
-                    self._handshaking.discard(conn)
-                if session is not None:
-                    with self._admission_lock:
-                        if (
-                            self._verifiers.get(session.verifier_id)
-                            == session.session_id
-                        ):
-                            del self._verifiers[session.verifier_id]
+            except OSError as error:
+                logger.warning("Target-KV connection cleanup failed: %s", error)
+            finally:
+                try:
+                    if session is not None and not self._shutdown_failed:
+                        session.cleanup()
+                except ServerShutdownTimeout:
+                    self._shutdown_failed = True
+                finally:
+                    with self._connections_lock:
+                        self._connections.discard(conn)
+                        self._handshaking.discard(conn)
+                    if session is not None:
+                        with self._admission_lock:
+                            if (
+                                self._verifiers.get(session.verifier_id)
+                                == session.session_id
+                            ):
+                                del self._verifiers[session.verifier_id]
 
 
 class _TargetKVServerSession:
