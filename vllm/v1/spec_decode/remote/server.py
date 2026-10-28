@@ -837,13 +837,43 @@ class RemoteDraftServer:
             self._start_thread(self._acceptor)
             return self._listener.endpoint
         except BaseException as error:
-            try:
-                self.stop()
-            except BaseException as cleanup_error:
-                raise error from BaseExceptionGroup(
-                    "server startup rollback failed", [cleanup_error]
+            self._rollback_start(error)
+            raise
+
+    def _rollback_start(self, error: BaseException) -> None:
+        try:
+            self.stop()
+        except BaseException as cleanup_error:
+            raise error from BaseExceptionGroup(
+                "server startup rollback failed", [cleanup_error]
+            )
+
+    def _stop_with_owner(
+        self,
+        stop_owner: Callable[[float], None],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + self.shutdown_timeout_s
+        failure = None
+        try:
+            RemoteDraftServer.stop(self, deadline=deadline)
+        except BaseException as error:
+            failure = error
+        try:
+            stop_owner(deadline)
+        except BaseException as error:
+            self._lifecycle_failed(error)
+            if failure is not None:
+                raise ServerShutdownTimeout(
+                    "socket and GPU owner shutdown failed; process restart required"
+                ) from BaseExceptionGroup(
+                    "remote draft shutdown failures", [failure, error]
                 )
             raise
+        if failure is not None:
+            raise failure
 
     def start(self, endpoint: str) -> str:
         """Warm up, bind, and serve in the background.

@@ -143,6 +143,91 @@ def proposal(client, key, *, token=2, k=3, batch_id=0):
     )
 
 
+@pytest.mark.parametrize("kind", ["token", "conditioned"])
+def test_pool_shutdown_preserves_socket_and_owner_failures(tmp_path, monkeypatch, kind):
+    import errno
+    import socket
+
+    from tests.v1.spec_decode.remote.test_conditioned_pool_server import (
+        runtime as conditioned_runtime,
+    )
+
+    fail_close = False
+    socket_error = OSError(errno.EIO, "injected listener cleanup failure")
+
+    class FailingSocket(socket.socket):
+        listening = False
+
+        def listen(self, *args):
+            self.listening = True
+            return super().listen(*args)
+
+        def close(self):
+            nonlocal fail_close
+            super().close()
+            if self.listening and fail_close:
+                fail_close = False
+                raise socket_error
+
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    factory = runtime if kind == "token" else conditioned_runtime
+    with factory(tmp_path, shutdown_timeout_s=0.1) as values:
+        server = values[2] if kind == "token" else values[0]
+        entered, release = threading.Event(), threading.Event()
+
+        def hold():
+            entered.set()
+            assert release.wait(3)
+
+        work = server.work_queue.submit(DraftWork("held", hold))
+        try:
+            assert entered.wait(2)
+            fail_close = True
+            with pytest.raises(ServerShutdownTimeout) as caught:
+                server.stop()
+            failures = caught.value.__cause__.exceptions
+            assert len(failures) == 2
+            assert socket_error in failures[0].__cause__.exceptions
+            assert isinstance(failures[1], ServerShutdownTimeout)
+            assert not server.healthy
+        finally:
+            release.set()
+            work.wait()
+
+
+@pytest.mark.parametrize("kind", ["token", "conditioned"])
+@pytest.mark.parametrize("started", [False, True])
+def test_pool_start_rollback_joins_gpu_owner(tmp_path, monkeypatch, kind, started):
+    from tests.v1.spec_decode.remote.test_conditioned_pool_server import (
+        runtime as conditioned_runtime,
+    )
+
+    factory = runtime if kind == "token" else conditioned_runtime
+    with factory(tmp_path) as values:
+        server = values[2] if kind == "token" else values[0]
+        server.stop()
+        path = tmp_path / "retry.sock"
+        endpoint = f"unix://{path}"
+
+        class FailingThread(threading.Thread):
+            def start(self):
+                if self.name.endswith("acceptor"):
+                    if started:
+                        super().start()
+                    raise RuntimeError("injected acceptor startup failure")
+                return super().start()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "Thread", FailingThread)
+            with pytest.raises(RuntimeError, match="injected acceptor"):
+                server.start(endpoint)
+        assert not path.exists()
+        assert server.endpoint is None
+        assert not server.work_queue._thread.is_alive()
+        assert server.healthy
+        server.start(endpoint)
+
+
 @pytest.mark.parametrize("previous", ["warmup", "bind", "stop", "fatal"])
 def test_token_server_restarts_only_after_a_recoverable_completed_owner(previous):
     from vllm.v1.spec_decode.remote.errors import CudaRuntimeError
