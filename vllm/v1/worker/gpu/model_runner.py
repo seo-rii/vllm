@@ -1276,6 +1276,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            if new_req_data.trace_headers and self.speculator is not None:
+                self.speculator.register_trace_context(
+                    req_id, new_req_data.trace_headers
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 

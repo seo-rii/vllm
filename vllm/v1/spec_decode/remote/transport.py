@@ -292,6 +292,8 @@ class FramedConnection:
     def __init__(self, sock: socket.socket) -> None:
         sock.settimeout(None)
         self._sock = sock
+        self.sent_bytes = 0
+        self.received_bytes = 0
         self._buffer = bytearray()
         self._closed = False
         self._max_control_bytes = MAX_CONTROL_FRAME_BYTES
@@ -382,6 +384,7 @@ class FramedConnection:
         return min(maximum, boundary - len(self._buffer), capacity)
 
     def _append_received(self, chunk: bytes) -> None:
+        self.received_bytes += len(chunk)
         if self._partial_started is None:
             self._partial_started = time.monotonic()
         self._buffer.extend(chunk)
@@ -460,6 +463,7 @@ class FramedConnection:
                         raise TimeoutError
                 self._sock.settimeout(remaining)
                 self._sock.sendall(part)
+                self.sent_bytes += len(part)
         except MemoryError:
             # A write or duplex read may already have consumed stream bytes.
             with contextlib.suppress(OSError):
@@ -525,6 +529,7 @@ class FramedConnection:
                                 continue
                             if not sent:
                                 raise OSError("peer closed the connection")
+                            self.sent_bytes += sent
                             pending = pending[sent:]
 
     def recv(

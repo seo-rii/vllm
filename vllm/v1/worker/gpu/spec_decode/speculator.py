@@ -64,6 +64,10 @@ class BaseSpeculator(ABC):
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
 
+    def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
+        """Retain optional request context for a distributed draft backend."""
+        return None
+
     def close_requests(self, req_ids: Collection[str]) -> None:
         """Release per-request draft state on finish, cancellation or preemption."""
         return None

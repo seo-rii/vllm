@@ -33,6 +33,11 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcReceiver
 from vllm.v1.spec_decode.remote.errors import runtime_unusable
+from vllm.v1.spec_decode.remote.observability import (
+    current_server_observation,
+    init_remote_tracing,
+    server_observation,
+)
 from vllm.v1.spec_decode.remote.protocol import (
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
@@ -49,6 +54,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     PrefillChunk,
     ProposalResponse,
     ProtocolError,
+    RemoteObservation,
     RemoteServerLimits,
     SequenceAck,
     SequenceKey,
@@ -196,6 +202,10 @@ class StandaloneDraftAdapter(ABC):
 
     def cuda_ipc_device(self) -> "torch.device | None":
         """Opt into CUDA feature imports on this adapter's device."""
+        return None
+
+    def kv_statistics(self) -> tuple[int, int] | None:
+        """Host-side (used, usable capacity) block counts, when available."""
         return None
 
     def warmup(self) -> None:  # noqa: B027
@@ -712,6 +722,8 @@ class RemoteDraftServer:
                 raise AdapterQueueFull("remote adapter queue is full")
             self._queue_depth += 1
         acquired = False
+        observation = current_server_observation()
+        queued_at = time.monotonic() if observation is not None else 0.0
         try:
             while not acquired:
                 if self._shutdown_failed:
@@ -728,7 +740,12 @@ class RemoteDraftServer:
             if not cleanup and self._draining:
                 raise ConnectionClosed("remote draft server is stopping")
             try:
-                yield
+                if observation is None:
+                    yield
+                else:
+                    observation.queue_seconds += time.monotonic() - queued_at
+                    with observation.turn():
+                        yield
             except Exception as error:
                 self._adapter_failed(error)
                 raise
@@ -765,6 +782,7 @@ class RemoteDraftServer:
         Returns the resolved endpoint. The endpoint does not accept
         connections until the adapter has finished warming up.
         """
+        init_remote_tracing()
         if self._shutdown_failed:
             raise ServerShutdownTimeout("runtime requires process restart")
         if self._cleanup_failed:
@@ -943,6 +961,7 @@ class _ServerSession:
         self.ipc_receiver: CudaIpcReceiver | None = None
         self._ipc_buffers: set[tuple[str, int]] = set()
         self._ipc_ranges: dict[tuple[str, bytes], list[tuple[int, int]]] = {}
+        self.observability = False
 
     def run(self) -> None:
         if not self._handshake():
@@ -1108,6 +1127,7 @@ class _ServerSession:
         self.session_epoch = self.server.next_epoch()
         self.verifier_instance_id = message.verifier_instance_id
         self.num_speculative_tokens = message.num_speculative_tokens
+        self.observability = message.observability and envelope.protocol_minor >= 3
         adapter = self.server.adapter
         self.max_pending_frames = _MAX_INPUT_FRAMES + len(
             adapter.feature_schema().slots
@@ -1128,6 +1148,7 @@ class _ServerSession:
                 capabilities=adapter.capabilities(),
                 feature_schema=adapter.feature_schema(),
                 limits=self.server.limits,
+                observability=self.observability,
             ),
             envelope.request_id,
             deadline=deadline,
@@ -1221,9 +1242,23 @@ class _ServerSession:
         try:
             for frame in frames or ():
                 self.conn.send_data(frame, deadline=deadline)
+            observation = current_server_observation()
+            snapshot = None
+            if self.observability:
+                blocks = self.server.adapter.kv_statistics()
+                snapshot = RemoteObservation(
+                    0.0 if observation is None else observation.queue_seconds,
+                    0.0 if observation is None else observation.execute_seconds,
+                    self.server.registry.count(self.verifier_instance_id),
+                    None if blocks is None else blocks[0],
+                    None if blocks is None else blocks[1],
+                )
             self.conn.send_control(
                 encode_message(
-                    message, session_id=self.session_id, request_id=request_id
+                    message,
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    observation=snapshot,
                 ),
                 deadline=deadline,
             )
@@ -1252,9 +1287,21 @@ class _ServerSession:
         if isinstance(message, OpenSequence):
             self._open(message, request_id)
         elif isinstance(message, PrefillChunk):
-            self._prefill(message, request_id)
+            with server_observation(
+                "conditioned",
+                "prefill",
+                envelope.trace_context if self.observability else None,
+                enabled=self.observability,
+            ):
+                self._prefill(message, request_id)
         elif isinstance(message, AdvanceAndPropose):
-            self._propose(message, request_id)
+            with server_observation(
+                "conditioned",
+                "proposal",
+                envelope.trace_context if self.observability else None,
+                enabled=self.observability,
+            ):
+                self._propose(message, request_id)
         elif isinstance(message, CloseSequence):
             self._close(message, request_id)
         elif isinstance(message, CancelBatch):

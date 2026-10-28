@@ -4,7 +4,7 @@
 
 import itertools
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -179,9 +179,15 @@ class RemoteSpeculator(BaseSpeculator):
     def capture(self) -> None:
         pass
 
+    def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
+        if self._session is not None:
+            self._session.observation.register(req_id, headers)
+
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:
             return
+        if self._session is not None:
+            self._session.observation.forget(tuple(req_ids))
         self._terminal_requests.difference_update(req_ids)
         error = None
         pending = self._pending
@@ -313,6 +319,7 @@ class RemoteSpeculator(BaseSpeculator):
             self._stats["proposal_calls"] += 1
             try:
                 assert self._session is not None
+                self._session.observation.select(step.request_ids)
                 handle.preparation_deadline = self._session.preparation_deadline()
                 if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real model coverage of process-separated MTP on one NVIDIA GPU."""
 
+import json
 import os
 import signal
 import socket
@@ -12,6 +13,7 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +27,225 @@ pytestmark = pytest.mark.usefixtures("enable_pickle")
 
 MODEL = "XiaomiMiMo/MiMo-7B-RL"
 REVISION = "6299b5a2c45daf0c429285c92b8e61a5bd011c0d"
+
+
+@contextmanager
+def otlp_collector():
+    """Collect actual HTTP/protobuf exports from target and draft processes."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+        ExportTraceServiceRequest,
+    )
+
+    spans: list[Any] = []
+    changed = threading.Condition()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            payload = ExportTraceServiceRequest.FromString(
+                self.rfile.read(int(self.headers["Content-Length"]))
+            )
+            with changed:
+                spans.extend(
+                    span
+                    for resource in payload.resource_spans
+                    for scope in resource.scope_spans
+                    for span in scope.spans
+                )
+                changed.notify_all()
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1/traces", spans, changed
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("tracing", [False, True], ids=["tracing-off", "tracing-on"])
+def test_remote_mtp_observability_through_openai_server(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    tiny_ernie_mtp_model,
+    tracing,
+):
+    """Public serving metrics and OTLP spans preserve the target's exact tokens."""
+    import requests
+    from prometheus_client.parser import text_string_to_metric_families
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import TokenizersBackend
+
+    from tests.utils import RemoteOpenAIServer
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    model = tiny_ernie_mtp_model
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(
+            WordLevel({f"t{i}": i for i in range(128)}, unk_token="t0")
+        ),
+        unk_token="t0",
+        bos_token="t1",
+        eos_token="t2",
+        pad_token="t0",
+    )
+    tokenizer.save_pretrained(model)
+    prompt = [3 + (7 * i) % 125 for i in range(17)]
+    options = dict(
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        disable_log_stats=False,
+    )
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+    with vllm_runner(model, **options) as baseline:
+        expected = (
+            baseline.llm.generate(
+                {"prompt_token_ids": prompt}, sampling, use_tqdm=False
+            )[0]
+            .outputs[0]
+            .token_ids
+        )
+    with otlp_collector() as (collector, spans, changed):
+        if tracing:
+            monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", collector)
+            monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")
+        with draft_server(
+            model,
+            tmp_path / "observability-draft.log",
+            revision=None,
+            attention_backend="TRITON_ATTN",
+            draft_kv_cache_gib=0.03125,
+            max_feature_tokens=32,
+            trust_remote_code=False,
+            moe_backend="triton",
+        ) as endpoint:
+            spec = dict(
+                method="mtp",
+                model=model,
+                num_speculative_tokens=1,
+                draft_tensor_parallel_size=1,
+                attention_backend="TRITON_ATTN",
+                remote_draft=dict(
+                    endpoint=endpoint,
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                ),
+            )
+            args = [
+                "--dtype",
+                "bfloat16",
+                "--max-model-len",
+                "128",
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "32",
+                "--no-enable-prefix-caching",
+                "--no-async-scheduling",
+                "--enforce-eager",
+                "--block-size",
+                "16",
+                "--kv-cache-memory-bytes",
+                str(32 << 20),
+                "--attention-config",
+                '{"backend":"TRITON_ATTN"}',
+                "--moe-backend",
+                "triton",
+                "--speculative-config",
+                json.dumps(spec),
+            ]
+            if tracing:
+                args += ["--otlp-traces-endpoint", collector]
+            with RemoteOpenAIServer(model, args) as api:
+                trace_id = "1234567890abcdef1234567890abcdef"
+                response = requests.post(
+                    api.url_for("v1/completions"),
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "temperature": 0,
+                        "max_tokens": 8,
+                        "ignore_eos": True,
+                        "logprobs": 1,
+                        "return_tokens_as_token_ids": True,
+                    },
+                    headers={"traceparent": f"00-{trace_id}-1234567890abcdef-01"},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                actual = response.json()["choices"][0]["logprobs"]["tokens"]
+                assert [
+                    int(token.removeprefix("token_id:")) for token in actual
+                ] == list(expected)
+                metrics = requests.get(api.url_for("metrics"), timeout=5)
+                metrics.raise_for_status()
+                samples = [
+                    sample
+                    for metric in text_string_to_metric_families(metrics.text)
+                    for sample in metric.samples
+                ]
+                for name in (
+                    "vllm:remote_draft_rpc_seconds_count",
+                    "vllm:remote_draft_server_seconds_count",
+                    "vllm:remote_draft_bytes_total",
+                    "vllm:spec_decode_num_draft_tokens_total",
+                ):
+                    assert (
+                        sum(sample.value for sample in samples if sample.name == name)
+                        > 0
+                    )
+                if tracing:
+                    with changed:
+                        assert changed.wait_for(
+                            lambda: any(
+                                s.name == "remote_draft.proposal" for s in spans
+                            )
+                            and any(
+                                s.name == "remote_draft.server.proposal" for s in spans
+                            ),
+                            timeout=30,
+                        ), "target and standalone draft did not export their spans"
+                    clients = {
+                        s.span_id: s for s in spans if s.name == "remote_draft.proposal"
+                    }
+                    assert all(s.trace_id.hex() == trace_id for s in clients.values())
+                    assert any(
+                        s.parent_span_id in clients
+                        for s in spans
+                        if s.name == "remote_draft.server.proposal"
+                    )
+                else:
+                    assert not spans
 
 
 @contextmanager

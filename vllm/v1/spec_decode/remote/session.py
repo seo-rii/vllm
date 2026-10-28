@@ -36,6 +36,7 @@ from vllm.v1.spec_decode.remote.capabilities import (
 )
 from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcDescriptor, CudaIpcExporter
 from vllm.v1.spec_decode.remote.errors import cuda_context_fatal, runtime_unusable
+from vllm.v1.spec_decode.remote.observability import RemoteClientObservation
 from vllm.v1.spec_decode.remote.protocol import (
     AdvanceAndPropose,
     CloseSequence,
@@ -251,6 +252,8 @@ class RemoteDraftSession:
         self._request_timeout_s = request_timeout_ms / 1000.0
         self._startup_timeout_s = startup_timeout_ms / 1000.0
         self._clock = clock
+        self.observation = RemoteClientObservation("conditioned")
+        self._observability = False
         self._reconnect_at = -math.inf
         self._reconnect_backoff_s = _RECONNECT_BACKOFF_S
 
@@ -473,6 +476,7 @@ class RemoteDraftSession:
         self._session_id = ack.session_id
         self._session_epoch = ack.session_epoch
         self._peer_protocol_minor = envelope.protocol_minor
+        self._observability = ack.observability and envelope.protocol_minor >= 3
         self._capabilities = ack.capabilities
         self._feature_schema = ack.feature_schema
         self._limits = ack.limits
@@ -568,6 +572,7 @@ class RemoteDraftSession:
             max_num_seqs=identity.max_num_seqs,
             max_num_batched_tokens=identity.max_num_batched_tokens,
             max_model_len=identity.max_model_len,
+            observability=True,
         )
 
     def _handshake_rejections(self, hello: Hello, ack: HelloAck) -> list[str]:
@@ -1120,6 +1125,7 @@ class RemoteDraftSession:
                 self._invalidate("CUDA IPC proposal timed out")
             outcome = HandleState.TIMED_OUT
             statuses = self._fail_rows(handle, SpeculatorStatusCode.TIMEOUT)
+            self.observation.finish(handle.request_id, reason="timeout")
         except TransportError as e:
             self._invalidate(
                 f"connection lost while collecting batch {handle.batch_id}: {e}"
@@ -1167,6 +1173,8 @@ class RemoteDraftSession:
             if status is not SpeculatorStatusCode.OK
         )
         if failed:
+            for _, reason in failed:
+                self.observation.metrics.rows.labels("conditioned", reason).inc()
             self._raise_if_strict(f"batch {handle.batch_id} has failed rows: {failed}")
         return result
 
@@ -1354,6 +1362,13 @@ class RemoteDraftSession:
         request_id = self._next_request_id
         self._next_request_id += 1
         sent_frames = False
+        trace_context = None
+        if isinstance(message, (PrefillChunk, AdvanceAndPropose)):
+            trace_context = self.observation.start(
+                request_id,
+                "prefill" if isinstance(message, PrefillChunk) else "proposal",
+                trace_enabled=self._observability,
+            )
         try:
             for frame in frames:
                 conn.send_data(frame, deadline=wire_deadline, drain_incoming=True)
@@ -1364,11 +1379,15 @@ class RemoteDraftSession:
                 )
             conn.send_control(
                 encode_message(
-                    message, session_id=self._session_id, request_id=request_id
+                    message,
+                    session_id=self._session_id,
+                    request_id=request_id,
+                    trace_context=trace_context,
                 ),
                 deadline=wire_deadline,
                 drain_incoming=True,
             )
+            self.observation.record_bytes(conn)
         except TransportTimeout:
             # Completed data frames also need their final control message;
             # without it, the peer cannot discard the unfinished request.
@@ -1480,6 +1499,11 @@ class RemoteDraftSession:
                 message
             ):
                 continue
+            self.observation.record_bytes(conn)
+            self.observation.finish(
+                envelope.request_id,
+                envelope.observation if self._observability else None,
+            )
             return envelope, message
 
     def _accept_response(self, response: ProposalResponse) -> bool:
@@ -1861,6 +1885,10 @@ class RemoteDraftSession:
 
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
+        if conn is not None:
+            self.observation.record_bytes(conn)
+        self.observation.fail("connection")
+        self._observability = False
         exporter, self._ipc_exporter = self._ipc_exporter, None
         if exporter is not None:
             # A socket close does not prove the peer closed its CUDA mappings.

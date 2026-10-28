@@ -7,8 +7,14 @@ import math
 import time
 from dataclasses import dataclass
 
+import msgspec
+
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
+from vllm.v1.spec_decode.remote.observability import (
+    RemoteClientObservation,
+    failure_reason,
+)
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     ErrorReply,
@@ -115,12 +121,18 @@ class TokenOnlyRemoteSession:
         self._deferred_closes: set[SequenceKey] = set()
         self._closed = False
         self._last_batch = -1
+        self.observation = RemoteClientObservation("token")
+        self._observability = False
+        self._peer_protocol_minor = 0
 
     def deadline(self) -> float:
         return self.clock() + self.request_timeout_s
 
     def _invalidate(self) -> None:
         connection, self._conn = self._conn, None
+        if connection is not None:
+            self.observation.record_bytes(connection)
+        self.observation.fail("connection")
         for state in self.records.values():
             state.terminal = True
         for key in self._deferred_closes:
@@ -139,14 +151,27 @@ class TokenOnlyRemoteSession:
 
     def _send(self, message, request_id, deadline, frames=()) -> None:
         assert self._conn is not None
+        trace_context = None
+        if isinstance(message, (TokenPrefill, TokenAdvance)):
+            trace_context = self.observation.start(
+                request_id,
+                "prefill" if isinstance(message, TokenPrefill) else "proposal",
+                trace_enabled=self._observability,
+            )
         for frame in frames:
             self._conn.send_data(frame, deadline=deadline)
         if isinstance(message, (TokenPrefill, TokenAdvance)):
             message.execution_timeout_ms = max(0, int((deadline - self.clock()) * 1000))
         self._conn.send_control(
-            encode_token_message(message, session_id=self._sid, request_id=request_id),
+            encode_token_message(
+                message,
+                session_id=self._sid,
+                request_id=request_id,
+                trace_context=trace_context,
+            ),
             deadline=deadline,
         )
+        self.observation.record_bytes(self._conn)
 
     def _recv(self, request_id, deadline, *, handshake=False):
         assert self._conn is not None
@@ -198,6 +223,12 @@ class TokenOnlyRemoteSession:
                 )
             ):
                 raise ProtocolError("token hello session identity mismatch")
+            self.observation.record_bytes(self._conn)
+            if handshake:
+                self._peer_protocol_minor = envelope.protocol_minor
+            self.observation.finish(
+                request_id, envelope.observation if self._observability else None
+            )
             return message, frames
 
     def connect(self, *, deadline=None) -> None:
@@ -211,9 +242,14 @@ class TokenOnlyRemoteSession:
             deadline = self.clock() + self.startup_timeout_s
         try:
             self._conn = connect(self.endpoint, timeout=max(0, deadline - self.clock()))
+            self._observability = False
             self._sid = ""
             request_id = next(self._ids)
-            self._send(self.hello, request_id, deadline)
+            self._send(
+                msgspec.structs.replace(self.hello, observability=True),
+                request_id,
+                deadline,
+            )
             ack, frames = self._recv(request_id, deadline, handshake=True)
             if (
                 not isinstance(ack, TokenHelloAck)
@@ -228,6 +264,7 @@ class TokenOnlyRemoteSession:
             ):
                 raise ProtocolError("token server limits are too small")
             self._sid, self._epoch = ack.session_id, ack.session_epoch
+            self._observability = ack.observability and self._peer_protocol_minor >= 2
             self._reconnect.succeeded()
         except Exception:
             self._reconnect.failed()
@@ -287,6 +324,7 @@ class TokenOnlyRemoteSession:
             if not state.terminal:
                 state.committed += len(tokens)
         except Exception as error:
+            self.observation.fail(failure_reason(error))
             self.fail(f"token prefill failed: {error}")
 
     def dispatch(
@@ -341,6 +379,7 @@ class TokenOnlyRemoteSession:
                 frames,
             )
         except Exception as error:
+            self.observation.fail(failure_reason(error))
             try:
                 self.fail(f"token dispatch failed: {error}")
             except BaseException:
@@ -397,6 +436,7 @@ class TokenOnlyRemoteSession:
                 ):
                     raise ProtocolError("invalid token proposal values")
                 if status is not OK:
+                    self.observation.metrics.rows.labels("token", status.name).inc()
                     state.terminal = True
                     valid[i] = 0
                     if self.failure_policy == "error":
@@ -413,6 +453,15 @@ class TokenOnlyRemoteSession:
                 output.append(row_tokens)
             return TokenBatchResult(tuple(output), tuple(valid))
         except Exception as error:
+            reason = failure_reason(error)
+            if handle.request_id not in self.observation.pending:
+                self.observation.metrics.failures.labels(
+                    "token", "proposal", reason
+                ).inc()
+            self.observation.finish(
+                handle.request_id,
+                reason=reason,
+            )
             self.fail(f"token collect failed: {error}")
             if empty is None:
                 raise
@@ -434,6 +483,7 @@ class TokenOnlyRemoteSession:
             raise RuntimeError("cannot cancel a stale token handle")
         handle.active = False
         self._pending = None
+        self.observation.fail("cancelled")
         self._invalidate()
 
     def close_sequences(

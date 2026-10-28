@@ -4,6 +4,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -412,8 +413,7 @@ def test_token_open_metadata_oom_preserves_all_slots(monkeypatch, failure):
     assert {state.sequences[key].req_index for key in keys} == {0, 1, 2, 3}
 
 
-@pytest.fixture
-def socket_runtime(tmp_path, request):
+def _socket_runtime(tmp_path, max_connections=16):
     state, oracle = machine(executor=BatchedKVOracle())
     contract = RuntimeContract(
         TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
@@ -429,19 +429,318 @@ def socket_runtime(tmp_path, request):
     server = TokenDraftServer(
         TokenOnlyDraftAdapter(state, contract),
         limits=RemoteServerLimits(4, 64, 4, 64),
-        max_connections=getattr(request, "param", 16),
+        max_connections=max_connections,
     )
     endpoint = server.start(f"unix://{tmp_path}/t.sock")
     hello = TokenHello("verifier", "target", "draft", "tokenizer", 3, 128, 4, 64, 64)
     session = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
+    session.connect()
+    return state, oracle, server, session
+
+
+@pytest.fixture
+def socket_runtime(tmp_path, request):
+    state, oracle, server, session = _socket_runtime(
+        tmp_path, getattr(request, "param", 16)
+    )
     try:
-        session.connect()
         yield state, oracle, server, session
     finally:
         session.close()
         server.stop()
         assert not state.sequences
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+
+
+@pytest.mark.parametrize("reset_collectors", [False, True])
+def test_token_rpc_metrics_include_server_resources_and_cleanup(
+    socket_runtime, reset_collectors
+):
+    """A real client exposes server execution and returns its reported KV credit."""
+    import urllib.request
+
+    from prometheus_client import start_http_server
+    from prometheus_client.parser import text_string_to_metric_families
+
+    state, _, _, session = socket_runtime
+    if reset_collectors:
+        from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+
+        unregister_vllm_metrics()
+    httpd, thread = start_http_server(0, addr="127.0.0.1")
+
+    def values():
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{httpd.server_port}/metrics", timeout=5
+        ) as response:
+            return [
+                sample
+                for metric in text_string_to_metric_families(response.read().decode())
+                if metric.name.startswith("vllm:remote_draft_")
+                for sample in metric.samples
+            ]
+
+    def value(name, **labels):
+        return sum(
+            sample.value
+            for sample in values()
+            if sample.name == name
+            and all(sample.labels.get(key) == val for key, val in labels.items())
+        )
+
+    before = value(
+        "vllm:remote_draft_rpc_seconds_count", backend="token", operation="proposal"
+    )
+    try:
+        key = session.open_sequence(71, deadline=session.deadline())
+        session.prefill(key, (1, 2), is_final=True, deadline=session.deadline())
+        result = session.collect(
+            session.dispatch(
+                0,
+                (TokenAdvanceRow(key, 2, None, 0, 0, (3,)),),
+                2,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (2,)
+        assert (
+            value(
+                "vllm:remote_draft_rpc_seconds_count",
+                backend="token",
+                operation="proposal",
+            )
+            == before + 1
+        )
+        for stage in ("queue", "execute"):
+            assert (
+                value(
+                    "vllm:remote_draft_server_seconds_count",
+                    backend="token",
+                    operation="proposal",
+                    stage=stage,
+                )
+                > 0
+            )
+        assert (
+            value(
+                "vllm:remote_draft_server_resources",
+                backend="token",
+                resource="kv_used_blocks",
+            )
+            > 0
+        )
+        for direction in ("sent", "received"):
+            assert (
+                value(
+                    "vllm:remote_draft_bytes_total",
+                    backend="token",
+                    direction=direction,
+                )
+                > 0
+            )
+        assert all(
+            set(sample.labels)
+            <= {
+                "backend",
+                "operation",
+                "stage",
+                "direction",
+                "reason",
+                "resource",
+                "le",
+            }
+            for sample in values()
+        )
+        session.close_sequences((key,))
+        assert (
+            value(
+                "vllm:remote_draft_server_resources",
+                backend="token",
+                resource="kv_used_blocks",
+            )
+            == 0
+        )
+        assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def _check_token_otlp_trace_links(directory):
+    import os
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from pathlib import Path
+
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+        ExportTraceServiceRequest,
+    )
+
+    from vllm.tracing import init_tracer
+
+    received: list[Any] = []
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            payload = ExportTraceServiceRequest.FromString(
+                self.rfile.read(int(self.headers["Content-Length"]))
+            )
+            received.extend(
+                span
+                for resource in payload.resource_spans
+                for scope in resource.scope_spans
+                for span in scope.spans
+            )
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    collector = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    collector_thread = threading.Thread(target=collector.serve_forever, daemon=True)
+    collector_thread.start()
+    os.environ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] = "http/protobuf"
+    tracer = init_tracer(
+        "test.remote_draft", f"http://127.0.0.1:{collector.server_port}/v1/traces"
+    )
+    state, _, server, session = _socket_runtime(Path(directory))
+    try:
+        request_spans = []
+        keys = []
+        for i in range(2):
+            with tracer.start_as_current_span(f"request.{i}") as span:
+                carrier: dict[str, str] = {}
+                inject(carrier)
+                carrier["tracestate"] = "vendor=test"
+                session.observation.register(str(i), carrier)
+                request_spans.append(span.get_span_context())
+            session.observation.select((str(i),))
+            key = session.open_sequence(i, deadline=session.deadline())
+            keys.append(key)
+            session.prefill(key, (i + 1,), is_final=True, deadline=session.deadline())
+        session.observation.select(("0", "1"))
+        result = session.collect(
+            session.dispatch(
+                0,
+                tuple(
+                    TokenAdvanceRow(key, 1, None, 0, 0, (i + 3,))
+                    for i, key in enumerate(keys)
+                ),
+                2,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (2, 2)
+        session.close_sequences(tuple(keys))
+        assert trace.get_tracer_provider().force_flush(timeout_millis=5000)
+        clients = [s for s in received if s.name == "remote_draft.proposal"]
+        servers = [s for s in received if s.name == "remote_draft.server.proposal"]
+        assert len(clients) == len(servers) == 1
+        client, remote = clients[0], servers[0]
+        assert remote.parent_span_id == client.span_id
+        assert remote.trace_id == client.trace_id
+        assert {
+            (int.from_bytes(link.trace_id), int.from_bytes(link.span_id))
+            for link in client.links
+        } == {(context.trace_id, context.span_id) for context in request_spans}
+        prefills = [s for s in received if s.name == "remote_draft.prefill"]
+        assert {int.from_bytes(s.parent_span_id) for s in prefills} == {
+            context.span_id for context in request_spans
+        }
+        assert all("vendor=test" in span.trace_state for span in prefills)
+        attributes = {
+            attribute.key: attribute.value.double_value
+            for attribute in remote.attributes
+        }
+        assert attributes["vllm.remote.queue_seconds"] >= 0
+        assert attributes["vllm.remote.execute_seconds"] > 0
+        assert not session.observation.pending
+    finally:
+        session.close()
+        server.stop()
+        trace.get_tracer_provider().shutdown()
+        collector.shutdown()
+        collector.server_close()
+        collector_thread.join(timeout=5)
+        assert not state.sequences
+
+
+def test_token_otlp_context_links_across_real_socket(tmp_path):
+    """A real HTTP OTLP exporter sees linked requests and child server spans."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "from tests.v1.spec_decode.remote.test_token_runtime import "
+            "_check_token_otlp_trace_links; import sys; "
+            "_check_token_otlp_trace_links(sys.argv[1])",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime):
+    import msgspec
+
+    state, _, _, original = socket_runtime
+    session = TokenOnlyRemoteSession(
+        original.endpoint,
+        msgspec.structs.replace(original.hello, verifier_instance_id="metrics-client"),
+        failure_policy="target_only",
+        request_timeout_ms=5000,
+    )
+    rows = session.observation.metrics.rows.labels("token", "SEQUENCE_DESYNC")
+
+    def failures():
+        return next(
+            sample.value
+            for metric in rows.collect()
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        )
+
+    before = failures()
+    try:
+        key = session.open_sequence(0, deadline=session.deadline())
+        session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+        result = session.collect(
+            session.dispatch(
+                0,
+                (TokenAdvanceRow(key, 1, None, 1, 1, (2,)),),
+                1,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (0,)
+        assert failures() == before + 1
+        assert not session.active(key)
+        result = session.collect(
+            session.dispatch(
+                1,
+                (TokenAdvanceRow(key, 1, None, 1, 1, (2,)),),
+                1,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (0,)
+        assert failures() == before + 1
+        session.close_sequences((key,))
+        assert not state.sequences
+    finally:
+        session.close()
 
 
 @pytest.mark.parametrize("socket_runtime", [1], indirect=True)
@@ -605,7 +904,7 @@ def test_protocol_majors_are_explicit_and_v2_unchanged():
     v3 = encode_token_message(Ping(1))
     assert decode_envelope(v2).protocol_major == 2
     assert decode_token_message(v3)[0].protocol_major == 3
-    assert decode_token_message(v3)[0].protocol_minor == 1
+    assert decode_token_message(v3)[0].protocol_minor == 2
     with pytest.raises(ProtocolVersionError):
         decode_token_message(v2)
     with pytest.raises(ProtocolVersionError):

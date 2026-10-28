@@ -4,7 +4,7 @@
 
 import itertools
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -110,6 +110,10 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def capture(self) -> None:
         pass
 
+    def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
+        if self._session is not None:
+            self._session.observation.register(req_id, headers)
+
     def _empty(self, n, *, device="cpu") -> SpeculatorOutput:
         return SpeculatorOutput(
             torch.zeros(
@@ -145,6 +149,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             return handle
         if self._tp.rank_in_group == 0:
             try:
+                assert self._session is not None
+                if step.request_ids:
+                    self._session.observation.select(step.request_ids)
                 handle.output = self._empty(len(step.request_ids))
                 if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(
@@ -384,6 +391,8 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:
             return
+        if self._session is not None:
+            self._session.observation.forget(tuple(req_ids))
         self._terminal_requests.difference_update(req_ids)
         if self._pending is not None and set(req_ids).intersection(
             self._pending.step.request_ids

@@ -28,11 +28,13 @@ from vllm.v1.spec_decode.remote.protocol import (
     ProposalResponse,
     ProtocolError,
     ProtocolVersionError,
+    RemoteObservation,
     RemoteServerLimits,
     SequenceAck,
     SequenceKey,
     SpeculatorStatusCode,
     TargetFeatureSchema,
+    TraceContext,
     decode_envelope,
     decode_payload,
     encode_message,
@@ -62,6 +64,36 @@ SCHEMA = TargetFeatureSchema(
         ),
     ),
 )
+
+
+def test_optional_observability_envelope_is_bounded_and_legacy_shape_is_preserved():
+    ordinary = msgspec.msgpack.decode(encode_message(Ping(1)))
+    assert set(ordinary) == {
+        "protocol_major",
+        "protocol_minor",
+        "message_type",
+        "session_id",
+        "request_id",
+        "payload",
+    }
+    context = TraceContext("00-" + "1" * 32 + "-" + "2" * 16 + "-01", "vendor=x")
+    observed = decode_envelope(
+        encode_message(
+            Ping(1),
+            trace_context=context,
+            observation=RemoteObservation(0.001, 0.002, 1, 2, 32),
+        )
+    )
+    assert observed.trace_context == context
+    assert observed.observation == RemoteObservation(0.001, 0.002, 1, 2, 32)
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(observed))
+    wire["trace_context"]["tracestate"] = "x" * 513
+    with pytest.raises(ProtocolError, match="tracestate"):
+        decode_envelope(msgspec.msgpack.encode(wire))
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(observed))
+    wire["observation"]["queue_seconds"] = -1.0
+    with pytest.raises(ProtocolError, match="queue_seconds"):
+        decode_envelope(msgspec.msgpack.encode(wire))
 
 
 @pytest.mark.parametrize(
