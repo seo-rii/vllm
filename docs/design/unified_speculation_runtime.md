@@ -296,6 +296,25 @@ include prefix upload, accepted tokens, queueing, target/draft memory and tail
 latency. A loopback TCP model test proves integration, not a two-host serving
 speedup.
 
+### Token-only RPC cost experiment
+
+Export a bounded JSON manifest from the real draft adapter using schema_version1, a matching TokenHello contract, string model/revision/content identities, and exact server source/native IDs. The server must opt in with `--allow-cross-node`. Keep its TCP listener on loopback when reaching it through an SSH tunnel.
+
+Run the same immutable client/server source and model artifacts over each path:
+
+```bash
+.venv/bin/python benchmarks/spec_decode/benchmark_remote_token_rpc.py \
+  --endpoint tcp://127.0.0.1:<port> --allow-cross-node \
+  --transport-label loopback --manifest /path/to/manifest.json \
+  --output-json /path/to/loopback-result.json \
+  --requests 8 --rounds-per-request 12 --warmup-requests 1 \
+  --accepted-prefix all --target-token-ms 1 5 10 20
+```
+
+For an owned trusted SSH forward, run the client on the second host against the forwarded local port with `--transport-label ssh-tunnel`. Record the physical hosts and tunnel configuration privately; public results should identify the path type and hardware without machine aliases. Repeat with `--accepted-prefix 0` to measure rejection/correction state updates. Defaults require enough context for16prompt tokens, twelve rounds and the requested rollout (K3 needs64 positions).
+
+The client runs open/prefill/advance/close through real sockets and the native drafter. It reports RPC/open/prefill/close distributions, raw valid proposals, tensor payload bytes, library/source/model identities and hypothetical break-even bounds. It does not execute a target model: accepted/emitted counts are explicitly synthetic and `target_verified_tokens` is null. RPC time combines serialization, transport, queue delay and native draft computation; it is not isolated network RTT. Payload bytes exclude control metadata, frame headers, TCP and SSH overhead. Break-even bounds exclude setup and assume serial draft RPC plus target verification. Positive remaining verification budget is necessary, not sufficient, for a serving speedup.
+
 ## Related work
 
 [RFC #42109](https://github.com/vllm-project/vllm/issues/42109) proposes standalone
