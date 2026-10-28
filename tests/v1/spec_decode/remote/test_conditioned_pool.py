@@ -343,3 +343,115 @@ def test_blocked_prefill_cannot_prevent_healthy_endpoint_from_proposing(
         )
     finally:
         release.set()
+
+
+def test_inline_cuda_features_wait_for_producer_in_driver_threads(
+    conditioned_pool_runtime, monkeypatch
+):
+    """A delayed accelerator double refuses D2H before its producer event."""
+    producer_thread = threading.get_ident()
+    waited = set()
+    records = []
+
+    class Stream:
+        device = torch.device("cuda:0")
+
+        def wait_event(self, event):
+            assert event.recorded
+            assert threading.get_ident() != producer_thread
+            waited.add(threading.get_ident())
+
+    class Event:
+        recorded = False
+
+        def record(self, stream):
+            assert threading.get_ident() == producer_thread
+            self.recorded = True
+            records.append(self)
+
+    class CudaTensor(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+        @property
+        def device(self):
+            return torch.device("cuda:0")
+
+        def record_stream(self, stream):
+            assert threading.get_ident() in waited
+
+        def cpu(self):
+            assert threading.get_ident() in waited, "D2H raced the producer"
+            return self.as_subclass(torch.Tensor)
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: Stream())
+    client, _, _, _ = conditioned_pool_runtime
+    pool = client()
+    keys = pool.reserve_sequences((0, 1))
+    chunks = tuple(
+        (
+            key,
+            FeatureBatch(
+                POOL_SCHEMA.schema_id,
+                tuple(
+                    slot.as_subclass(CudaTensor) if slot is not None else None
+                    for slot in features(prompt).slots
+                ),
+            ),
+            True,
+        )
+        for key, prompt in zip(keys, ((1, 2), (7, 8, 9)))
+    )
+    result = run(pool, proposal(0, keys, [0, 0], [], [0, 0], [30, 40]), chunks)
+    assert result.output.token_ids.tolist() == [
+        digest_row([1, 2], 30),
+        digest_row([7, 8, 9], 40),
+    ]
+    assert len(records) == 1 and len(waited) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_inline_cuda_nondefault_stream_preserves_ragged_features(
+    conditioned_pool_runtime,
+):
+    """Real D2H/partition copies must observe the delayed producer's values."""
+    client, _, _, _ = conditioned_pool_runtime
+    pool = client()
+    keys, drafts = start_prompts(pool)
+    (new_key,) = pool.reserve_sequences((2,))
+    batch = proposal(
+        1,
+        [keys[1], new_key, keys[0]],
+        [4, 0, 2],
+        [30, *drafts[1], 30, drafts[0][0]],
+        [1, 0, 0],
+        [40, 50, 60],
+    )
+    chunk = features([11, 12, 13])
+    producer = torch.cuda.Stream()
+    pinned = []
+
+    def delayed(source):
+        slots = []
+        for slot in source.slots:
+            if slot is None:
+                slots.append(None)
+                continue
+            host = slot.pin_memory()
+            pinned.append(host)
+            target = torch.empty_like(host, device=producer.device)
+            target.copy_(host, non_blocking=True)
+            slots.append(target)
+        return FeatureBatch(source.schema_id, tuple(slots))
+
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(10_000_000)
+        batch = replace(batch, features=delayed(batch.features))
+        result = run(pool, batch, ((new_key, delayed(chunk), True),))
+    assert result.output.token_ids.tolist() == [
+        digest_row([7, 8, 30, drafts[1][0]], 40),
+        digest_row([11, 12, 13], 50),
+        digest_row([1, 2, 30], 60),
+    ]
