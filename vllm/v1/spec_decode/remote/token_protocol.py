@@ -106,8 +106,8 @@ def encode_token_message(
     payload = msgspec.msgpack.encode(message)
     if isinstance(message, (TokenHello, TokenHelloAck)) and not message.cross_node:
         fields = msgspec.to_builtins(message)
-        fields.pop("cross_node")
-        fields.pop("byte_order")
+        fields.pop("cross_node", None)
+        fields.pop("byte_order", None)
         payload = msgspec.msgpack.encode(fields)
     return msgspec.msgpack.encode(
         MessageEnvelope(
