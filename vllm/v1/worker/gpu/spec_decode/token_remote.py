@@ -231,8 +231,6 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 "token backend is closed or still has a pending proposal"
             )
         handle = _TokenHandle(self._owner, next(self._rounds), step, context)
-        if self._cost is not None:
-            handle.started_at = time.monotonic()
         self._pending = handle
         if context.dummy_run or context.is_profile:
             handle.output = self._empty(len(step.request_ids), device=self.device)
@@ -287,6 +285,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         sampled = context.num_sampled.cpu().tolist()
         rejected = context.num_rejected.cpu().tolist()
         recovery = context.last_sampled[batch.idx_mapping].reshape(-1).cpu().tolist()
+        if self._cost is not None:
+            # These existing copies also fence the preceding asynchronous target.
+            handle.started_at = time.monotonic()
         rows, indices = [], []
         for i, req_id in enumerate(handle.step.request_ids):
             if req_id in self._terminal_requests:
@@ -398,7 +399,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     and decoding
                     and complete
                     and previous.request_ids == handle.step.request_ids
-                    and all(q == previous.k + 1 for q in handle.step.query_lens)
+                    and all(row.offered == previous.k for row in rows)
                 ):
                     self._cost.observe(
                         batch_size=len(rows),

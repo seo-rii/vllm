@@ -2097,18 +2097,18 @@ def test_remote_token_cost_policy_retires_without_changing_target_tokens(
             reports = runner.llm.collective_rpc(
                 lambda worker: worker.model_runner.speculator.get_cost_stats()
             )
-    assert actual_tokens == expected_tokens and len(actual_tokens) == 96
-    assert accepted > 0
     assert len(reports) == 1
     stats = reports[0]
-    assert stats["observations"] >= 4
-    assert stats["target_only_transitions"] == 1
-    assert all(count > 0 for count in stats["chosen_k_counts"])
-    assert sum(stats["chosen_k_counts"]) < 32
     record_property("remote_cost.async_scheduling", async_scheduling)
     record_property("remote_cost.stats", stats)
     record_property("remote_cost.accepted_tokens", accepted)
     record_property("remote_cost.output_token_ids", actual_tokens)
+    assert actual_tokens == expected_tokens and len(actual_tokens) == 96
+    assert accepted > 0
+    assert stats["observations"] >= 4
+    assert stats["target_only_transitions"] == 1
+    assert all(count > 0 for count in stats["chosen_k_counts"])
+    assert sum(stats["chosen_k_counts"]) < 32
 
 
 def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) -> None:

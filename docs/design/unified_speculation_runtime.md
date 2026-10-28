@@ -279,8 +279,13 @@ compares emitted tokens per measured round. Positive-K costs include client
 preparation, the RPC (including server queue and draft work), and the following
 target verification interval. The K=0 target interval provides the target-only
 baseline; K=0 still updates the remote context during calibration. Prefill,
-request reordering, incomplete proposals and changed physical query widths do
+request reordering, incomplete proposals and clipped logical proposals do
 not contribute timing samples.
+Timing boundaries follow the existing host metadata copies so their completion
+wait includes preceding asynchronous target work. Physical async placeholder
+slots do not count as logical proposals. The zero-proposal baseline retains the
+runtime's existing target query shape and host observation overhead; it is not
+a separate no-speculation GPU benchmark.
 
 Moving averages and a switching margin reduce sensitivity to individual noisy
 rounds. Periodic probes refresh the alternatives. If no tested positive K meets
