@@ -88,11 +88,14 @@ VLLM_USE_V2_MODEL_RUNNER=1 .venv/bin/python -m vllm.v1.spec_decode.remote.runtim
   --draft-kv-cache-gib 0.25 --max-model-len 256 --max-feature-tokens 256
 ```
 
-The cache budget is a cap within the draft KV arena. Branch slots and native
-copy scratch are initialized before serving. Executor buffers include the extra
-branch slots; `--max-batch-size` and `--max-feature-tokens` continue to bound
-foreground admission. The cache copies whole source pages and predicts one
-all-accepted continuation; longer contexts therefore cost more memory and copying.
+The cache budget caps additional physical branch pages within the draft KV
+arena. Branch slots and native copy scratch are initialized before serving.
+Executor buffers include the extra branch slots; `--max-batch-size` and
+`--max-feature-tokens` continue to bound foreground admission. The cache shares
+whole immutable committed prefix pages and copies only the mutable tail before
+predicting one all-accepted continuation. Shared pages remain reserved in the
+physical arena until both the live and branch leases release them; sharing does
+not expand the arena or reuse another request's KV.
 Foreground work has priority, and an unfinished or wrong prediction falls back
 to ordinary on-demand drafting for that round.
 

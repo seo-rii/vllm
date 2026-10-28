@@ -3002,10 +3002,11 @@ class BlockKVOracle(TokenStepExecutor):
         return KVOracle.predict(prefix) if sample else None
 
 
-def outcome_machine(num_blocks=33):
+def outcome_machine(num_blocks=33, max_branch_blocks=None, executor=None):
     from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
 
-    executor = BlockKVOracle(num_blocks=num_blocks)
+    if executor is None:
+        executor = BlockKVOracle(num_blocks=num_blocks)
     state = TokenStateMachine(
         executor,
         DraftBlockPool(num_blocks, 4),
@@ -3018,11 +3019,56 @@ def outcome_machine(num_blocks=33):
         state,
         live_slots=2,
         max_branches=2,
-        max_branch_blocks=min(16, num_blocks - 1),
+        max_branch_blocks=(
+            min(16, num_blocks - 1) if max_branch_blocks is None else max_branch_blocks
+        ),
         copy_chunk_blocks=1,
         contract_id=("target", "draft", "tokenizer", "greedy"),
     )
     return state, executor, cache
+
+
+@pytest.mark.parametrize(
+    "committed,k,copied,shared,private",
+    [
+        (4, 1, 0, 1, 1),
+        (7, 1, 1, 1, 2),
+        (8, 1, 0, 2, 1),
+        (4, 3, 1, 1, 2),
+        (7, 3, 2, 1, 3),
+        (8, 3, 1, 2, 2),
+        (16, 3, 1, 4, 2),
+        (32, 3, 1, 8, 2),
+    ],
+)
+def test_outcome_cache_copies_only_mutable_tail_and_charges_physical_pages(
+    committed, k, copied, shared, private
+):
+    state, executor, cache = outcome_machine(max_branch_blocks=private)
+    key = SequenceKey("prefix", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, tuple(range(1, committed)), is_final=True)
+    cache.bind_epoch(key, 1)
+    result = cache.advance_many(
+        ((7, TokenAdvanceRow(key, committed - 1, None, 0, 0, (3,)), k),)
+    )[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    before = state.block_pool.num_free_blocks
+    storage_before = executor.storage.clone()
+    for _ in range(16):
+        if not cache.step(result.prediction):
+            break
+    assert cache.counters["ready"] == 1
+    assert cache.counters["copied_blocks"] == copied
+    assert cache.counters["shared_blocks"] == shared
+    assert cache.branch_blocks == private
+    assert state.block_pool.num_free_blocks == before - private
+    for page in result.prediction.source_blocks:
+        assert executor.storage[page].equal(storage_before[page])
+    cache.close((key,))
+    assert state.block_pool.num_free_blocks == before
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
 
 
 def token_oracle_contract():
@@ -3175,7 +3221,7 @@ def test_outcome_cache_client_rejects_legacy_policy_ack_before_sending_data(tmp_
 
 
 @pytest.mark.parametrize("outcome", ["hit", "reject", "bonus", "short", "k0", "k1"])
-def test_outcome_cache_full_copy_consumption_matches_live_token_state(outcome):
+def test_outcome_cache_consumption_matches_live_token_state(outcome):
     cached, executor, cache = outcome_machine()
     reference, _, _ = outcome_machine()
     key = SequenceKey("cache", 1, 0)
@@ -3268,7 +3314,7 @@ def test_outcome_cache_evicts_prediction_before_feasible_live_allocation():
     for _ in range(16):
         if not cache.step(source.prediction):
             break
-    assert cache.branch_blocks == 3
+    assert cache.branch_blocks == 2
     state.open(other)
     state.prefill(other, 0, (2, 3, 4, 5), is_final=True)
     row = TokenAdvanceRow(other, 4, None, 0, 0, (6,) * 16)
@@ -3297,13 +3343,88 @@ def test_outcome_cache_evicts_prediction_before_feasible_live_prefill():
     for _ in range(16):
         if not cache.step(source.prediction):
             break
-    assert cache.branch_blocks == 3 and state.block_pool.num_free_blocks == 2
+    assert cache.branch_blocks == 2 and state.block_pool.num_free_blocks == 3
     adapter.open_sequence(other)
     adapter.prefill(other, PrefillInputs(0, 16, True, (ints_to_frame(0, (2,) * 16),)))
     assert state.sequences[other].committed == 16 and state.sequences[other].ready
     assert cache.branch_blocks == 0 and state.block_pool.num_free_blocks == 1
     adapter.close_sequences((key, other))
     assert state.block_pool.num_free_blocks == 7
+
+
+@pytest.mark.parametrize("failure", ["copy", "forward"])
+def test_outcome_cache_failed_tail_work_returns_private_pages_and_prefix_refs(failure):
+    class FaultingOracle(BlockKVOracle):
+        def copy_blocks(self, copies):
+            super().copy_blocks(copies)
+            if failure == "copy":
+                raise MemoryError("tail copy failed")
+
+        def forward(self, key, req_index, start, tokens, blocks, *, sample):
+            token = super().forward(
+                key, req_index, start, tokens, blocks, sample=sample
+            )
+            if failure == "forward" and req_index >= 2:
+                raise MemoryError("branch forward failed")
+            return token
+
+    state, executor, cache = outcome_machine(executor=FaultingOracle())
+    key = SequenceKey("failed-tail", 0, 0)
+    state.open(key)
+    prefix = tuple(range(1, 32))
+    state.prefill(key, 0, prefix, is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 31, None, 0, 0, (3,)), 3),))[
+        0
+    ]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    before = state.block_pool.num_free_blocks
+    storage_before = executor.storage.clone()
+    for _ in range(8):
+        if not cache.step(source.prediction):
+            break
+    assert cache.counters["failed"] == 1 and cache.branch_blocks == 0
+    assert state.block_pool.num_free_blocks == before
+    for page in source.prediction.source_blocks:
+        assert executor.storage[page].equal(storage_before[page])
+    bonus = KVOracle.predict(prefix + (3,) + source.token_ids)
+    result = cache.advance_many(
+        ((19, TokenAdvanceRow(key, 32, 7, 3, 3, source.token_ids + (bonus,)), 3),)
+    )[0]
+    assert not isinstance(result, Exception) and result.origin == "on_demand"
+    assert result.token_ids[0] == KVOracle.predict(
+        prefix + (3,) + source.token_ids + (bonus,)
+    )
+    cache.close((key,))
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
+
+
+def test_outcome_cache_shared_prefix_stays_reserved_after_live_lease_closes():
+    state, _, cache = outcome_machine(max_branch_blocks=2)
+    key, other = SequenceKey("borrowed", 0, 0), SequenceKey("other", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, tuple(range(1, 32)), is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 31, None, 0, 0, (3,)), 3),))[
+        0
+    ]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    for _ in range(8):
+        if not cache.step(source.prediction):
+            break
+    assert cache.counters["ready"] == 1 and cache.branch_blocks == 2
+    shared = source.prediction.source_blocks[:8]
+    state.close((key,))
+    assert cache.branch_blocks == 10
+    state.open(other)
+    state.prefill(other, 0, (4,) * 64, is_final=True)
+    assert set(shared).isdisjoint(
+        state.block_pool.blocks(state.sequences[other].req_index)
+    )
+    cache.close((key,))
+    state.close((other,))
+    assert state.block_pool.num_free_blocks == 32
 
 
 @pytest.mark.parametrize("fp8_source", ["target", "draft"])

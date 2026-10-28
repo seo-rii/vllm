@@ -2567,6 +2567,10 @@ def _run_token_outcome_cache_oracle(model, result_path):
         branch_slots=2,
     )
     pool = DraftBlockPool(executor.num_blocks, executor.block_size)
+    page_bytes = sum(
+        group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+        for group in executor.kv_config.kv_cache_groups
+    )
     state_options = dict(max_model_len=128, vocab_size=128, max_k=4, max_num_reqs=1)
     state = TokenStateMachine(executor, pool, **state_options)
     reference = TokenStateMachine(executor, pool, req_index_offset=2, **state_options)
@@ -2640,6 +2644,7 @@ def _run_token_outcome_cache_oracle(model, result_path):
                 poll.wait(0.001)
             assert cache.counters["ready"] == 1
             before = dict(cache.counters)
+            before["branch_blocks"] = cache.branch_blocks
             actual = client.collect(
                 client.dispatch(
                     19,
@@ -2659,7 +2664,10 @@ def _run_token_outcome_cache_oracle(model, result_path):
             assert actual.origins == ("cache",)
             assert actual.token_ids[0][:3] == expected.token_ids
             assert actual.valid_lengths == (3,) and client.cache_hits == 1
-            assert cache.counters["hits"] == 1 and cache.counters["copied_blocks"] > 0
+            assert cache.counters["hits"] == 1
+            assert before["copied_blocks"] == before["shared_blocks"] == 1
+            assert before["branch_blocks"] == 1
+            assert before["ready_latency_ns"] > 0
             client.close_sequences((key,))
             server.work_queue.call("reference", lambda: reference.close((ref_key,)))
         finally:
@@ -2680,6 +2688,10 @@ def _run_token_outcome_cache_oracle(model, result_path):
                 valid_lengths=actual.valid_lengths,
                 client_cache_hits=client.cache_hits,
                 ready_before_hit=before["ready"],
+                first_build=before,
+                page_bytes=page_bytes,
+                first_build_copied_bytes=before["copied_blocks"] * page_bytes,
+                first_build_additional_kv_bytes=before["branch_blocks"] * page_bytes,
                 counters=cache.counters,
                 num_blocks=pool.num_blocks,
                 free_blocks=pool.num_free_blocks,

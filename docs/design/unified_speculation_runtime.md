@@ -125,11 +125,19 @@ sampling or local caching.
 
 After a proposal response is sent successfully, the existing draft owner may
 build one candidate for the outcome where every offered draft is accepted and
-the draft's next greedy token matches the target's bonus token. Each branch
-owns a full copy of the source KV pages. Reserved internal request slots,
-branch count, branch KV blocks and copy chunk size are bounded at startup.
-Cache KV uses the existing physical draft arena; it is not a second allocator.
-Copy scratch is warmed before the listener becomes ready.
+the draft's next greedy token matches the target's bonus token. A branch shares
+whole pages of the immutable committed prefix. It allocates private pages for
+the partial committed page and the speculative/write tail, copying only written
+tail pages before starting a forward. Shared pages are reference counted and
+remain reserved until both leases close. Neither live nor predicted execution
+writes the shared prefix.
+
+Reserved internal request slots, branch count, additional physical branch KV
+pages and copy chunk size are bounded at startup. Shared prefix references do
+not consume the branch's additional-page budget; they remain charged once in
+the existing physical draft arena. Copy scratch is warmed before the listener
+becomes ready. Ready logs include shared/copied page counts, extra forwards and
+elapsed build-readiness time; the latter includes queue gaps between phases.
 
 Background work runs only when foreground/cleanup queues are empty and yields
 after one copy chunk or forward. The cache key includes sequence generation,
@@ -145,7 +153,7 @@ prediction must not cause an otherwise feasible live request to fail. Fatal or
 completion-unknown errors retain uncertain resources and require process
 replacement under the existing failure policy.
 
-Full-context copying and extra forwards consume memory and compute. Same-GPU
+Private tail copying and extra forwards consume memory and compute. Same-GPU
 correctness does not establish overlap or throughput gains; the policy is
 experimental and disabled by default. See the
 [configuration example](../features/speculative_decoding/remote_draft.md#all-accepted-outcome-cache).

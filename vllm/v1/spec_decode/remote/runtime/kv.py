@@ -21,7 +21,7 @@ class DraftKVExhausted(Exception):
 
 
 class DraftBlockPool:
-    """Fixed pool of KV blocks keyed by request slot."""
+    """Fixed pool of page leases, with shared immutable prefix blocks."""
 
     def __init__(self, num_blocks: int, block_size: int) -> None:
         if num_blocks < 2:
@@ -35,6 +35,7 @@ class DraftBlockPool:
         self._free = list(range(num_blocks - 1, NULL_BLOCK_ID, -1))
         self._num_free = len(self._free)
         self._owned: dict[int, list[int]] = {}
+        self._references = [0] * num_blocks
 
     @property
     def num_free_blocks(self) -> int:
@@ -42,6 +43,11 @@ class DraftBlockPool:
 
     def blocks(self, req_index: int) -> tuple[int, ...]:
         return tuple(self._owned.get(req_index, ()))
+
+    def exclusive_blocks(self, req_index: int) -> int:
+        return sum(
+            self._references[block] == 1 for block in self._owned.get(req_index, ())
+        )
 
     def ensure(self, req_index: int, num_positions: int) -> list[int]:
         """Grow ``req_index`` to cover positions ``[0, num_positions)``.
@@ -60,23 +66,70 @@ class DraftBlockPool:
         # Prepare allocation-backed metadata before consuming free capacity.
         remaining = self._num_free - missing
         new_blocks = self._free[remaining : self._num_free][::-1]
+        references = iter(new_blocks)
         self._owned[req_index] = owned + new_blocks
+        for block in references:
+            self._references[block] = 1
         self._num_free = remaining
         return new_blocks
+
+    def fork_prefix(
+        self,
+        source: int,
+        destination: int,
+        shared_blocks: int,
+        num_positions: int,
+    ) -> list[int]:
+        """Share immutable whole prefix pages and reserve a private writable tail.
+
+        The caller must never write the shared prefix through either lease.
+        Metadata and free capacity are unchanged if preparation fails.
+        """
+        owned = self._owned[source]
+        count = cdiv(num_positions, self.block_size)
+        if (
+            source == destination
+            or destination in self._owned
+            or not 0 <= shared_blocks <= min(len(owned), count)
+        ):
+            raise ValueError("invalid draft KV prefix fork")
+        missing = count - shared_blocks
+        if missing > self._num_free:
+            raise DraftKVExhausted(
+                f"need {missing} private draft KV blocks, {self._num_free} free"
+            )
+        remaining = self._num_free - missing
+        private = self._free[remaining : self._num_free][::-1]
+        prefix = owned[:shared_blocks]
+        references = iter(
+            [(block, self._references[block] + 1) for block in prefix]
+            + [(block, 1) for block in private]
+        )
+        self._owned[destination] = prefix + private
+        for block, count in references:
+            self._references[block] = count
+        self._num_free = remaining
+        return private
 
     def release(self, req_index: int) -> None:
         owned = self._owned.get(req_index)
         if owned is None:
             return
-        returned = self._num_free + len(owned)
-        for index, block_id in enumerate(reversed(owned), self._num_free):
-            self._free[index] = block_id
+        references = [(block, self._references[block] - 1) for block in owned]
+        commit_references = iter(references)
+        returned = self._num_free
+        for block_id, count in reversed(references):
+            if count == 0:
+                self._free[returned] = block_id
+                returned += 1
         # Until all writes succeed these cells are outside the free prefix.
+        for block_id, count in commit_references:
+            self._references[block_id] = count
         del self._owned[req_index]
         self._num_free = returned
 
     def swap(self, first: int, second: int) -> None:
-        """Transfer two complete writable page leases without copying their KV."""
+        """Exchange complete page leases without changing their reference counts."""
         if first == second:
             raise ValueError("draft KV lease swap requires distinct slots")
         left, right = self._owned[first], self._owned[second]
