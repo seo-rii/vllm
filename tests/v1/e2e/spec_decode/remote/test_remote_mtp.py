@@ -1413,6 +1413,303 @@ def tiny_ernie_mtp_model(tmp_path):
     return _save_mtp_checkpoint(tmp_path / "ernie", config, weights)
 
 
+def _save_eagle3_models(directory: str, target_family: str) -> None:
+    """Export real native EAGLE weights; amplify two head rows for acceptance coverage.
+
+    Attention, MLP and feature projection stay seeded, nontrivial native layers.
+    This controlled checkpoint measures state/placement correctness, not quality.
+    """
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        LlamaConfig,
+        LlamaForCausalLM,
+        MistralConfig,
+        MistralForCausalLM,
+        Qwen2Config,
+        Qwen2ForCausalLM,
+        Qwen3Config,
+        Qwen3ForCausalLM,
+        TokenizersBackend,
+    )
+
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        SpeculativeConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.model_loader import get_model
+    from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+    from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+    assert current_platform.is_cpu() and not torch.cuda.is_initialized()
+    torch.set_num_threads(1)
+    root = Path(directory)
+    target_path, draft_path = root / "target", root / "draft"
+    common = dict(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        mlp_bias=False,
+    )
+    assert target_family in ("llama", "qwen3", "qwen2", "mistral")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261025)
+        if target_family == "llama":
+            target = LlamaForCausalLM(LlamaConfig(num_hidden_layers=4, **common))
+        elif target_family == "qwen3":
+            target = Qwen3ForCausalLM(
+                Qwen3Config(
+                    num_hidden_layers=4,
+                    layer_types=["full_attention"] * 4,
+                    **common,
+                )
+            )
+        elif target_family == "qwen2":
+            target = Qwen2ForCausalLM(
+                Qwen2Config(
+                    num_hidden_layers=4,
+                    use_sliding_window=False,
+                    layer_types=["full_attention"] * 4,
+                    **common,
+                )
+            )
+        else:
+            target = MistralForCausalLM(
+                MistralConfig(num_hidden_layers=4, sliding_window=None, **common)
+            )
+        target = target.to(dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            target.lm_head.weight[3].mul_(32)
+            target.lm_head.weight[4].copy_(-target.lm_head.weight[3])
+    target.save_pretrained(target_path)
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        num_hidden_layers=1,
+        draft_vocab_size=128,
+        target_hidden_size=128,
+        num_aux_hidden_states=3,
+        eagle_aux_hidden_state_layer_ids=[1, 2, 4],
+        eagle_config={"use_aux_hidden_state": True},
+        **common,
+    ).save_pretrained(draft_path)
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token1",
+        eos_token="token2",
+        pad_token="token0",
+    )
+    for path in (target_path, draft_path):
+        tokenizer.save_pretrained(path)
+
+    def make_config():
+        model = ModelConfig(
+            model=str(target_path),
+            dtype="bfloat16",
+            max_model_len=128,
+            enforce_eager=True,
+            skip_tokenizer_init=True,
+        )
+        parallel = ParallelConfig()
+        return VllmConfig(
+            model_config=model,
+            parallel_config=parallel,
+            speculative_config=SpeculativeConfig(
+                model=str(draft_path),
+                method="eagle3",
+                num_speculative_tokens=3,
+                target_model_config=model,
+                target_parallel_config=parallel,
+                draft_sample_method="greedy",
+                draft_tensor_parallel_size=1,
+            ),
+            device_config=DeviceConfig("cpu"),
+            cache_config=CacheConfig(block_size=32, enable_prefix_caching=False),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=32,
+                max_model_len=128,
+                async_scheduling=False,
+                is_encoder_decoder=False,
+            ),
+        )
+
+    config = make_config()
+    try:
+        with set_current_vllm_config(config):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=(root / "rendezvous").as_uri(),
+                backend="gloo",
+            )
+            initialize_model_parallel(backend="gloo")
+        with (
+            set_current_vllm_config(config),
+            set_default_torch_dtype(torch.bfloat16),
+            torch.device("cpu"),
+            torch.random.fork_rng(devices=[]),
+            torch.no_grad(),
+        ):
+            torch.manual_seed(20261026)
+            draft = Eagle3LlamaForCausalLM(vllm_config=config)
+            for value in draft.parameters():
+                value.fill_(1) if value.ndim == 1 else value.normal_(mean=0, std=0.02)
+            draft.model.embed_tokens.weight.copy_(target.model.embed_tokens.weight)
+            draft.lm_head.weight.copy_(target.lm_head.weight)
+        expected = {
+            name: value.detach().clone() for name, value in draft.named_parameters()
+        }
+        save_file(
+            {
+                name.removeprefix("model."): value.contiguous()
+                for name, value in expected.items()
+            },
+            draft_path / "model.safetensors",
+        )
+        loaded_config = make_config()
+        with set_current_vllm_config(loaded_config):
+            native_target = get_model(vllm_config=loaded_config)
+            loaded = load_eagle_model(native_target, loaded_config)
+        actual = dict(loaded.named_parameters())
+        assert actual.keys() == expected.keys()
+        assert all(torch.equal(actual[name], value) for name, value in expected.items())
+        assert loaded.model.embed_tokens is native_target.model.embed_tokens
+        assert loaded.lm_head is native_target.lm_head
+        assert loaded.model.layers[0].self_attn.qkv_proj.weight.shape == (256, 256)
+        captured = {}
+
+        def capture(index):
+            def hook(module, args, output):
+                captured[index] = (
+                    output[0] if isinstance(output, tuple) else output
+                ).detach()
+
+            return hook
+
+        handles = [
+            target.model.layers[index - 1].register_forward_hook(capture(index))
+            for index in (1, 2, 4)
+        ]
+        try:
+            with set_current_vllm_config(loaded_config), torch.inference_mode():
+                output = target(
+                    torch.tensor([[3 + (i * 7) % 125 for i in range(17)]]),
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+                assert tuple(captured) == (1, 2, 4)
+                assert torch.equal(captured[1], output.hidden_states[1])
+                assert torch.equal(captured[2], output.hidden_states[2])
+                assert not torch.equal(captured[4], output.hidden_states[-1])
+                features = torch.cat([captured[i] for i in (1, 2, 4)], dim=-1)[0]
+                combined = loaded.combine_hidden_states(features)
+                assert features.shape == (17, 384) and combined.shape == (17, 128)
+                assert torch.equal(
+                    combined,
+                    torch.nn.functional.linear(features, loaded.model.fc.weight),
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+    finally:
+        try:
+            destroy_model_parallel()
+        finally:
+            destroy_distributed_environment()
+    assert not torch.cuda.is_initialized()
+    (root / "fixture.json").write_text(
+        json.dumps(
+            dict(
+                model=type(loaded).__name__,
+                target_family=target_family,
+                target_model=type(native_target).__name__,
+                parameters=len(expected),
+                exact_parameter_roundtrip=True,
+                shared_embedding_and_head=True,
+                capture_ids=[1, 2, 4],
+                final_capture_prenorm=True,
+                feature_shape=list(features.shape),
+                combined_shape=list(combined.shape),
+                cuda_initialized=False,
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+            )
+        )
+        + "\n"
+    )
+
+
+def _tiny_eagle3_models(tmp_path, target_family):
+    """Keep CPU constructor/TP setup isolated from the serving worker's platform."""
+    root = (tmp_path / f"{target_family}-eagle3").resolve()
+    root.mkdir()
+    source = Path(__file__).resolve().parents[5]
+    command = [
+        sys.executable,
+        "-c",
+        "import pathlib,sys; import vllm; "
+        "assert pathlib.Path(vllm.__file__).resolve().is_relative_to(sys.argv[1]); "
+        "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_eagle3_models; _save_eagle3_models(*sys.argv[2:])",
+        str(source),
+        str(root),
+        target_family,
+    ]
+    log_path = root / "fixture.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(source),
+                CUDA_VISIBLE_DEVICES="",
+                VLLM_TARGET_DEVICE="cpu",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            assert process.wait(timeout=210) == 0, f"EAGLE fixture failed: {log_path}"
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    return str(root / "target"), str(root / "draft")
+
+
+@pytest.fixture
+def tiny_eagle3_models(tmp_path, eagle_target):
+    return _tiny_eagle3_models(tmp_path, eagle_target)
+
+
 @pytest.fixture
 def tiny_independent_qwen3_models(tmp_path, request, mtp_family):
     target_path = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
@@ -1836,6 +2133,39 @@ def test_remote_independent_mla_draft_preserves_target(
         independent_draft=draft,
         independent_draft_kind="deepseek_v2",
         native_control=False,
+    )
+
+
+@pytest.mark.parametrize("eagle_target", ["llama", "qwen3", "qwen2", "mistral"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_eagle3_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    eagle_target,
+    k,
+    tiny_eagle3_models,
+    record_property,
+):
+    """Preserve real captured features and shared weights across draft placement."""
+    import json
+
+    target, draft = tiny_eagle3_models
+    record_property(
+        "fixture", json.loads((Path(draft).parent / "fixture.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        eagle_target,
+        None,
+        k,
+        record_property,
+        target_model=target,
+        eagle3_draft=draft,
     )
 
 
