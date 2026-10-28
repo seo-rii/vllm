@@ -3800,3 +3800,60 @@ def test_token_owner_failure_marks_server_unhealthy_and_wakes_stop(
     assert server.queue_depth == 0
     with pytest.raises(ServerShutdownTimeout, match="restart required"):
         server.stop()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_queue_rejects_admission_until_initializer_completes(fails):
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+        max_background_jobs=1,
+        max_background_bytes=8,
+    )
+
+    def initialize():
+        entered.set()
+        assert release.wait(3)
+        if fails:
+            raise MemoryError("initialization")
+
+    def start():
+        try:
+            queue.start(initialize)
+        except BaseException as error:
+            errors.append(error)
+
+    startup = threading.Thread(target=start)
+    startup.start()
+    try:
+        assert entered.wait(3)
+        with pytest.raises(ServerShutdownTimeout):
+            queue.submit(DraftWork("a", lambda: 7, num_bytes=8))
+        assert not queue.submit_background(
+            DraftWork("a", lambda: False, background=True, num_bytes=8)
+        )
+        assert queue.depth == queue.pending_bytes == 0
+    finally:
+        release.set()
+        startup.join(3)
+        assert not startup.is_alive()
+    assert len(errors) == int(fails)
+    if fails:
+        assert isinstance(errors[0], MemoryError)
+        queue.start(lambda: None)
+    assert queue.call("a", lambda: 7) == 7
+    queue.stop(time.monotonic() + 3)
