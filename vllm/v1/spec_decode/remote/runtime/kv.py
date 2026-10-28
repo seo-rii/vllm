@@ -115,13 +115,16 @@ class DraftBlockPool:
         owned = self._owned.get(req_index)
         if owned is None:
             return
+        references = [(block, self._references[block] - 1) for block in owned]
+        commit_references = iter(references)
         returned = self._num_free
-        for block_id in reversed(owned):
-            self._references[block_id] -= 1
-            if self._references[block_id] == 0:
+        for block_id, count in reversed(references):
+            if count == 0:
                 self._free[returned] = block_id
                 returned += 1
         # Until all writes succeed these cells are outside the free prefix.
+        for block_id, count in commit_references:
+            self._references[block_id] = count
         del self._owned[req_index]
         self._num_free = returned
 
