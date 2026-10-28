@@ -116,6 +116,8 @@ class RemoteDraftConfig:
     """
     startup_timeout_ms: int = Field(default=30_000, gt=0)
     """Deadline for the initial connection and HELLO handshake."""
+    allow_cross_node: bool = False
+    """Explicitly permit token-only inline TCP placement on a trusted network."""
 
     @model_validator(mode="after")
     def _validate_endpoint(self) -> Self:
@@ -124,6 +126,11 @@ class RemoteDraftConfig:
         if not self.endpoint.strip():
             raise ValueError("remote_draft.endpoint must not be empty")
         parse_endpoint(self.endpoint)
+        if self.allow_cross_node and (
+            not self.endpoint.startswith("tcp://")
+            or self.transport not in ("auto", "inline")
+        ):
+            raise ValueError("cross-node token-only drafting requires inline TCP")
         if self.transport == "cuda_ipc" and not self.endpoint.startswith("unix://"):
             raise ValueError("remote_draft cuda_ipc requires a UNIX socket")
         return self
@@ -147,17 +154,23 @@ class SpeculativeExecutionConfig:
     """Remote proposal deadline override; defaults to 100 milliseconds."""
     startup_timeout_ms: int | None = Field(default=None, gt=0)
     """Remote handshake deadline override; defaults to 30 seconds."""
+    allow_cross_node: bool = False
+    """Opt in to the experimental token-only TCP cross-node contract."""
 
     @model_validator(mode="after")
     def _validate_placement(self) -> Self:
         if self.placement == "local":
-            if self.endpoints or any(
-                value is not None
-                for value in (
-                    self.transport,
-                    self.failure_policy,
-                    self.request_timeout_ms,
-                    self.startup_timeout_ms,
+            if (
+                self.endpoints
+                or self.allow_cross_node
+                or any(
+                    value is not None
+                    for value in (
+                        self.transport,
+                        self.failure_policy,
+                        self.request_timeout_ms,
+                        self.startup_timeout_ms,
+                    )
                 )
             ):
                 raise ValueError("local execution cannot specify remote options")
@@ -178,6 +191,7 @@ class SpeculativeExecutionConfig:
             startup_timeout_ms=(
                 30_000 if self.startup_timeout_ms is None else self.startup_timeout_ms
             ),
+            allow_cross_node=self.allow_cross_node,
         )
 
 
@@ -1750,6 +1764,15 @@ class SpeculativeConfig:
         from vllm.v1.spec_decode.remote.capabilities import (
             remote_draft_config_incompatibilities,
         )
+
+        remote = self.get_remote_draft_config()
+        assert remote is not None
+        if remote.allow_cross_node and (
+            self.method != "draft_model" or self.execution is None
+        ):
+            raise ValueError(
+                "cross-node placement requires token-only remote execution"
+            )
 
         if self.method == "draft_model" and self.execution is not None:
             remote = self.get_remote_draft_config()

@@ -609,7 +609,7 @@ def test_protocol_majors_are_explicit_and_v2_unchanged():
     v3 = encode_token_message(Ping(1))
     assert decode_envelope(v2).protocol_major == 2
     assert decode_token_message(v3)[0].protocol_major == 3
-    assert decode_token_message(v3)[0].protocol_minor == 1
+    assert decode_token_message(v3)[0].protocol_minor == 2
     with pytest.raises(ProtocolVersionError):
         decode_token_message(v2)
     with pytest.raises(ProtocolVersionError):
@@ -915,6 +915,103 @@ def test_actual_socket_prefill_full_acceptance_k0_and_close(socket_runtime):
     session.close_sequences((key,))
     assert not state.sequences
     assert len(server.registry) == 0
+
+
+def test_cross_node_tcp_negotiates_before_frames_and_returns_all_credits(
+    socket_runtime,
+):
+    import sys
+
+    _, _, original, prior = socket_runtime
+    state, oracle = machine(executor=BatchedKVOracle())
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, original.adapter.contract),
+        limits=original.limits,
+        allow_remote_connections=True,
+    )
+    endpoint = server.start("tcp://0.0.0.0:0")
+    with pytest.raises(ValueError, match="same-host"):
+        TokenOnlyRemoteSession(endpoint, prior.hello)
+    endpoint = endpoint.replace("0.0.0.0", "127.0.0.1")
+    session = TokenOnlyRemoteSession(
+        endpoint,
+        prior.hello,
+        allow_cross_node=True,
+        request_timeout_ms=5000,
+    )
+    try:
+        session.connect()
+        assert session.hello.cross_node and session.hello.byte_order == sys.byteorder
+        key = session.open_sequence(42, deadline=session.deadline())
+        session.prefill(key, (1, 2, 3), is_final=True, deadline=session.deadline())
+        result = session.collect(
+            session.dispatch(
+                0,
+                (TokenAdvanceRow(key, 3, None, 0, 0, (7,)),),
+                3,
+                deadline=session.deadline(),
+            )
+        )
+        assert result.valid_lengths == (3,)
+        assert len(result.token_ids[0]) == 3
+        assert oracle.calls
+        session.close_sequences((key,))
+        assert not state.sequences and len(server.registry) == 0
+        assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+    finally:
+        session.close()
+        server.stop()
+
+
+def test_cross_node_tcp_rejects_server_without_opt_in(socket_runtime):
+    _, _, original, prior = socket_runtime
+    state, _ = machine(executor=BatchedKVOracle())
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, original.adapter.contract),
+        limits=original.limits,
+    )
+    endpoint = server.start("tcp://127.0.0.1:0")
+    session = TokenOnlyRemoteSession(endpoint, prior.hello, allow_cross_node=True)
+    try:
+        with pytest.raises(RemoteDraftError, match="cross-node.*opt-in"):
+            session.connect()
+        assert not state.sequences and len(server.registry) == 0
+    finally:
+        session.close()
+        server.stop()
+
+
+def test_cross_node_rejects_byte_order_mismatch_before_any_forward(socket_runtime):
+    import sys
+
+    import msgspec
+
+    from vllm.v1.spec_decode.remote.protocol import ErrorReply
+    from vllm.v1.spec_decode.remote.transport import connect
+
+    _, _, original, prior = socket_runtime
+    state, oracle = machine(executor=BatchedKVOracle())
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, original.adapter.contract),
+        limits=original.limits,
+        allow_remote_connections=True,
+    )
+    endpoint = server.start("tcp://127.0.0.1:0")
+    peer = connect(endpoint, timeout=5)
+    try:
+        hello = msgspec.structs.replace(
+            prior.hello,
+            cross_node=True,
+            byte_order="big" if sys.byteorder == "little" else "little",
+        )
+        peer.send_control(encode_token_message(hello, request_id=1))
+        _, reply = decode_token_message(peer.recv(timeout=5).body)
+        assert isinstance(reply, ErrorReply)
+        assert "byte order" in reply.detail
+        assert not oracle.calls and not state.sequences
+    finally:
+        peer.close()
+        server.stop()
 
 
 def test_actual_socket_stale_proposal_terminal_and_sibling_survives(socket_runtime):

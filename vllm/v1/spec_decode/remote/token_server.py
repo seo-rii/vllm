@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Same-host v3 token server using the existing framed transport/lifecycle."""
+"""Opt-in token-only TCP placement using the framed transport/lifecycle."""
 
+import sys
 import threading
 import time
 import uuid
@@ -63,7 +64,7 @@ class TokenDraftServer(RemoteDraftServer):
     def start(self, endpoint: str) -> str:
         if self._listener is not None or not self.healthy:
             raise RuntimeError("token runtime is already started or unhealthy")
-        if not is_local_endpoint(endpoint):
+        if not is_local_endpoint(endpoint) and not self.allow_remote_connections:
             raise ValueError("token-only placement currently requires the same host")
         try:
             self.adapter.warmup()
@@ -148,6 +149,13 @@ class _TokenServerSession(_ServerSession):
             contract = self.server.adapter.contract
             state = self.server.adapter.state
             reasons = limit_shortfalls(hello, self.server.limits)
+            if hello.cross_node and (
+                not self.server.allow_remote_connections
+                or hello.byte_order != sys.byteorder
+            ):
+                reasons.append(
+                    "cross-node placement requires opt-in and matching byte order"
+                )
             if (
                 hello.method != "draft_model"
                 or hello.transport != "inline"
@@ -193,6 +201,8 @@ class _TokenServerSession(_ServerSession):
                 self.session_epoch,
                 contract.tokenizer_fingerprint,
                 self.server.limits,
+                cross_node=hello.cross_node,
+                byte_order=sys.byteorder if hello.cross_node else "",
             ),
             envelope.request_id,
             deadline=deadline,

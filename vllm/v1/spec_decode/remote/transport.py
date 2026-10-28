@@ -10,8 +10,8 @@ of tensor bytes. Integer metadata and results remain inline. Wire framing
 and validation need only the standard library and msgspec.
 
 Frame layout: ``kind:u8 | length:u32 big-endian | body``. Data-plane
-payloads are in native byte order, which is acceptable because remote
-placement is same-host only.
+payloads are in native byte order. Cross-node token-only peers explicitly
+negotiate matching byte order before exchanging data frames.
 """
 
 import array
