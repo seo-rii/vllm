@@ -198,7 +198,11 @@ steps:
     - vllm/v1/spec_decode/remote/
     - vllm/v1/worker/gpu/
     - tests/v1/e2e/spec_decode/remote/
+    - tests/v1/spec_decode/remote/test_token_gpu.py
+    - tests/v1/spec_decode/remote/test_token_runtime.py
   commands:
+    - pytest -v --noconftest v1/spec_decode/remote/test_token_gpu.py::test_recurrent_startup_reads_each_checkpoint_once_and_rechecks_changes
+    - pytest -v --noconftest v1/spec_decode/remote/test_token_runtime.py -k 'validates_effective_public_ssm_dtype or rejects_resolved_bfloat16_ssm_dtype'
     - pytest -v -s v1/e2e/spec_decode/remote/
 
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode MTP DeepSeek + MiMo"
