@@ -286,6 +286,11 @@ wait includes preceding asynchronous target work. Physical async placeholder
 slots do not count as logical proposals. The zero-proposal baseline retains the
 runtime's existing target query shape and host observation overhead; it is not
 a separate no-speculation GPU benchmark.
+`min_speedup` applies to this estimate. Host observation and the active
+speculative runtime can overestimate the cost of a standalone target-only
+engine, so a positive estimate does not establish an end-to-end speedup.
+Compare complete generation against both fixed K and target-only execution
+before enabling the policy for a workload.
 
 Moving averages and a switching margin reduce sensitivity to individual noisy
 rounds. Periodic probes refresh the alternatives. If no tested positive K meets

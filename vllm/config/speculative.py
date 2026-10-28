@@ -95,7 +95,7 @@ class RemoteDraftCostConfig:
     ema_alpha: float = Field(default=0.25, gt=0, le=1, allow_inf_nan=False)
     """Weight of a new observation in the per-batch-size moving averages."""
     min_speedup: float = Field(default=1.05, ge=1, allow_inf_nan=False)
-    """Required goodput relative to measured target-only decoding."""
+    """Required goodput relative to the measured zero-proposal baseline estimate."""
     switch_margin: float = Field(default=0.05, ge=0, allow_inf_nan=False)
     """Relative goodput improvement required to switch between positive K."""
     probe_interval: int = Field(default=16, ge=1)
