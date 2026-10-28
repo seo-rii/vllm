@@ -15,6 +15,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -356,39 +357,68 @@ class TPProcessGroup:
         with self._reap_lock:
             if self._closed.is_set():
                 return
+            failure: BaseException | None = None
+
+            def attempt(action: Callable[[], None]) -> bool:
+                nonlocal failure
+                try:
+                    action()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.add_note(f"draft TP cleanup also failed: {error}")
+                    return False
+                return True
+
             for rank in self._ranks:
-                rank.channel.close()
+                attempt(rank.channel.close)
             if graceful:
                 deadline = time.monotonic() + min(self.timeout_s, 5)
                 for rank in self._ranks:
                     if rank.pid is not None and not rank.closed:
-                        rank.process.join(max(0.0, deadline - time.monotonic()))
+                        attempt(
+                            partial(
+                                rank.process.join,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                        )
             for rank in self._ranks:
-                rank.death.close()
+                attempt(rank.death.close)
             for rank in self._ranks:
                 if rank.alive():
-                    rank.process.terminate()
+                    attempt(rank.process.terminate)
             deadline = time.monotonic() + min(self.timeout_s, 2)
             for rank in self._ranks:
                 if rank.pid is not None and not rank.closed:
-                    rank.process.join(max(0.0, deadline - time.monotonic()))
+                    attempt(
+                        partial(
+                            rank.process.join, max(0.0, deadline - time.monotonic())
+                        )
+                    )
             for rank in self._ranks:
                 if rank.alive():
-                    rank.process.kill()
+                    attempt(rank.process.kill)
             deadline = time.monotonic() + min(self.timeout_s, 2)
             for rank in self._ranks:
                 if rank.pid is not None and not rank.closed:
-                    rank.process.join(max(0.0, deadline - time.monotonic()))
+                    attempt(
+                        partial(
+                            rank.process.join, max(0.0, deadline - time.monotonic())
+                        )
+                    )
                     if not rank.alive():
                         rank.exit_code = rank.process.exitcode
-                        rank.process.close()
-                        rank.closed = True
+                        if attempt(rank.process.close):
+                            rank.closed = True
             if any(rank.alive() for rank in self._ranks):
                 raise CompletionUnknownError(
                     "draft TP rank did not exit after termination; "
                     "its owner must be replaced"
-                )
+                ) from failure
             self._closed.set()
+            if failure is not None:
+                raise failure
 
     def _abort(self) -> None:
         self._failed.set()

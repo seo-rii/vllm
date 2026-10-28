@@ -47,7 +47,11 @@ def _draft_tp_gloo_worker(channel, rank, init_method, failure):
     import torch
     import torch.distributed as distributed
 
-    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPGeometry, TPReply
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import (
+        TPFailure,
+        TPGeometry,
+        TPReply,
+    )
 
     torch.set_num_threads(1)
     distributed.init_process_group(
@@ -74,6 +78,19 @@ def _draft_tp_gloo_worker(channel, rank, init_method, failure):
                 if failure == "exit":
                     return
                 if failure == "stall":
+                    threading.Event().wait()
+                if failure == "error":
+                    channel.send(
+                        TPReply(
+                            command.command_id,
+                            rank,
+                            command.operation,
+                            error=TPFailure(
+                                "RuntimeError", "injected ordinary rank failure", ""
+                            ),
+                        ),
+                        time.monotonic() + 30,
+                    )
                     threading.Event().wait()
             value = torch.tensor([row.tokens[-1] + rank for row in command.rows])
             distributed.all_reduce(value)
@@ -131,6 +148,75 @@ def test_draft_tp_process_group_collectives_and_failure_retirement(tmp_path, fai
     assert len(receipt) == 2 and all(not worker["alive"] for worker in receipt)
     if failure is None:
         assert all(worker["exitcode"] == 0 for worker in receipt)
+
+
+@pytest.mark.parametrize("operation", ["abort", "forward"])
+def test_draft_tp_socket_cleanup_failure_still_reaps_every_rank(
+    tmp_path, monkeypatch, operation
+):
+    """A failed channel close cannot defer rank retirement to another caller."""
+    import errno
+
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenForwardRow
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    class CleanupErrorSocket(socket.socket):
+        fail_close = False
+
+        def close(self):
+            super().close()
+            if self.fail_close:
+                self.fail_close = False
+                raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    socketpair = socket.socketpair
+    parents = []
+
+    def channels(*args, **kwargs):
+        parent, child = socketpair(*args, **kwargs)
+        parent = CleanupErrorSocket(fileno=parent.detach())
+        parents.append(parent)
+        return parent, child
+
+    monkeypatch.setattr(socket, "socketpair", channels)
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=((tmp_path / "gloo-store").as_uri(), "error"),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    rows = (TokenForwardRow(SequenceKey("cleanup", 0, 0), 0, 0, (3,), (1,), True),)
+    try:
+        group.execute("warmup")
+        group.execute("forward", rows=rows)
+        parents[0].fail_close = True
+        failure = None
+        try:
+            if operation == "abort":
+                group.abort()
+            else:
+                group.execute("forward", rows=rows)
+        except BaseException as error:
+            failure = error
+        receipt = group.worker_status()
+        assert len(receipt) == 2 and all(not worker["alive"] for worker in receipt)
+        assert all(worker["exitcode"] is not None for worker in receipt)
+        if operation == "abort":
+            assert isinstance(failure, OSError)
+            assert "injected socket cleanup failure" in str(failure)
+        else:
+            assert isinstance(failure, CompletionUnknownError)
+            assert isinstance(failure.__cause__, RuntimeError)
+            assert "injected ordinary rank failure" in str(failure.__cause__)
+            assert any(
+                "injected socket cleanup failure" in note
+                for note in failure.__cause__.__notes__
+            )
+    finally:
+        group.close()
 
 
 def _draft_tp_sigint_owner(connection, init_method):
