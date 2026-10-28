@@ -149,6 +149,8 @@ Step3.5 shares the target embedding and loads each MTP module's own LM head
 from its checkpoint. The standalone process does not load or allocate the
 unused target LM head. Missing MTP head weights fail native checkpoint
 completeness validation; the target head is not a replacement.
+Split attention checkpoints must also provide every Q/K/V projection weight;
+fused `qkv_proj.weight` checkpoints are supported.
 
 This contract requires native unquantized BF16 target/draft weights and KV,
 target TP1, draft TP1, one inline endpoint, GQA and dense MTP feed-forward
