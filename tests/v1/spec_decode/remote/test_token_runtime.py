@@ -45,6 +45,160 @@ from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
 
 
+def test_measured_remote_cost_selects_goodput_and_respects_runner_budget():
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 3)
+    measurements = (
+        (0, 0.010, 0.100, 1),
+        (1, 0.012, 0.003, 2),
+        (2, 0.014, 0.004, 2),
+        (3, 0.016, 0.006, 4),
+    )
+    for k, target_seconds, rpc_seconds, emitted in measurements:
+        assert policy.choose(1, 3) == k
+        policy.observe(
+            batch_size=1,
+            k=k,
+            target_seconds=target_seconds,
+            rpc_seconds=rpc_seconds,
+            emitted_tokens=emitted,
+        )
+    assert policy.choose(1, 3) == 3
+    assert policy.choose(1, 1) == 1
+    assert policy.choose(2, 3) == 0
+    assert policy.snapshot()["observations"] == 4
+
+
+def test_measured_remote_cost_accounts_for_rpc_and_retires_unprofitable_work():
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 1)
+    policy.observe(
+        batch_size=2, k=0, target_seconds=0.010, rpc_seconds=0.100, emitted_tokens=2
+    )
+    policy.observe(
+        batch_size=2, k=1, target_seconds=0.012, rpc_seconds=0.020, emitted_tokens=4
+    )
+    assert policy.choose(2, 1) is None
+    assert policy.snapshot()["target_only_transitions"] == 2
+    # Another batch size must establish its own target-only baseline first.
+    assert policy.choose(1, 1) == 0
+    policy.reset_estimates()
+    assert policy.choose(2, 1) == 0
+    assert policy.snapshot()["observations"] == 2
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("inf"), float("nan")])
+def test_measured_remote_cost_ignores_invalid_timing(seconds):
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 1)
+    policy.observe(
+        batch_size=1, k=0, target_seconds=seconds, rpc_seconds=0.001, emitted_tokens=1
+    )
+    assert policy.snapshot()["observations"] == 0
+    assert policy.choose(1, 1) == 0
+
+
+@pytest.mark.usefixtures("cpu_parallel_state")
+def test_measured_remote_cost_calibrates_padded_k0_before_exploring_positive_k(
+    tmp_path,
+):
+    """Physical async placeholders must not hide a valid zero-draft observation."""
+    import torch
+
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    endpoint = f"unix://{tmp_path}/cost.sock"
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        enforce_eager=True,
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "endpoints": [endpoint],
+                "failure_policy": "error",
+                "request_timeout_ms": 5000,
+                "cost_aware": {"min_samples": 1},
+            }
+        },
+    )
+    state, oracle = machine(executor=BatchedKVOracle())
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, create_token_runtime_contract(config)),
+        limits=RemoteServerLimits(4, 64, 4, 64),
+    )
+    server.start(endpoint)
+    try:
+        with set_current_vllm_config(config):
+            worker = TokenOnlyRemoteSpeculator(config, torch.device("cpu"))
+        try:
+
+            def propose(token_ids, start, recovery, *, prefilling=False):
+                batch = InputBatch.make_dummy(
+                    1,
+                    len(token_ids),
+                    InputBuffers(4, 64, torch.device("cpu")),
+                    is_padding=False,
+                )
+                batch.req_ids = ["padded"]
+                batch.input_ids.copy_(torch.tensor(token_ids, dtype=torch.int32))
+                batch.positions.copy_(torch.arange(start, start + len(token_ids)))
+                batch.prefill_len_np[0] = 2
+                batch.num_computed_tokens_np[0] = start
+                batch.num_computed_prefill_tokens_np[0] = 0 if prefilling else 2
+                batch.is_prefilling_np[0] = prefilling
+                batch.has_prefill = prefilling
+                batch.seq_lens.fill_(start + len(token_ids))
+                batch.seq_lens_cpu_upper_bound.fill_(start + len(token_ids))
+                context = LocalExecutionContext(
+                    batch,
+                    None,
+                    None,
+                    None,
+                    None,
+                    torch.tensor([1]),
+                    torch.tensor([len(token_ids) - (2 if prefilling else 1)]),
+                    torch.tensor([recovery, 0, 0, 0]),
+                    torch.empty((1, 64), dtype=torch.int32),
+                    torch.zeros(4),
+                    torch.zeros(4, dtype=torch.int64),
+                )
+                return worker.collect(
+                    worker.dispatch(DraftStep.from_batch(batch, 3), context)
+                )
+
+            assert propose((1, 2), 0, 3, prefilling=True).valid_lengths.tolist() == [0]
+            assert propose((3, -1, -1, -1), 2, 4).valid_lengths.tolist() == [0]
+            result = propose((4, -1, -1, -1), 3, 5)
+            assert result.valid_lengths.tolist() == [1]
+            assert result.token_ids[0, 0].item() == KVOracle.predict([1, 2, 3, 4, 5])
+            stats = worker.get_cost_stats()
+            assert stats["observations"] == 1
+            counts = stats["chosen_k_counts"]
+            assert isinstance(counts, tuple)
+            assert counts[0] > 0 and counts[1] == 1
+            assert oracle.calls
+            worker.close_requests(("padded",))
+            assert not state.sequences and len(server.registry) == 0
+            assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+        finally:
+            worker.close()
+    finally:
+        server.stop()
+
+
 @pytest.mark.parametrize("handshake", [False, True])
 def test_token_client_rejects_oversized_header_before_waiting_for_body(
     socket_runtime, handshake

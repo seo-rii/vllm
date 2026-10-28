@@ -249,6 +249,63 @@ Performance comparisons include TTFT, TPOT, tail latency, throughput, target
 and draft memory, and additional GPU cost. Dispatch/collect separation alone
 does not demonstrate compute overlap.
 
+## Measured remote draft costs
+
+Independent full-attention token-only placement can opt into a host-side cost
+policy without enabling telemetry export:
+
+```json
+{
+  "method": "draft_model",
+  "model": "<draft-checkpoint>",
+  "num_speculative_tokens": 3,
+  "execution": {
+    "placement": "remote",
+    "endpoints": ["unix:///run/vllm/draft.sock"],
+    "cost_aware": {
+      "min_samples": 2,
+      "min_speedup": 1.05,
+      "ema_alpha": 0.25,
+      "switch_margin": 0.05,
+      "probe_interval": 16
+    }
+  }
+}
+```
+
+The policy measures stable consecutive decode batches separately by batch size.
+It calibrates K=0, explores positive K within the runner's existing budget, and
+compares emitted tokens per measured round. Positive-K costs include client
+preparation, the RPC (including server queue and draft work), and the following
+target verification interval. The K=0 target interval provides the target-only
+baseline; K=0 still updates the remote context during calibration. Prefill,
+request reordering, incomplete proposals and clipped logical proposals do
+not contribute timing samples.
+Timing boundaries follow the existing host metadata copies so their completion
+wait includes preceding asynchronous target work. Physical async placeholder
+slots do not count as logical proposals. The zero-proposal baseline retains the
+runtime's existing target query shape and host observation overhead; it is not
+a separate no-speculation GPU benchmark.
+`min_speedup` applies to this estimate. Host observation and the active
+speculative runtime can overestimate the cost of a standalone target-only
+engine, so a positive estimate does not establish an end-to-end speedup.
+Compare complete generation against both fixed K and target-only execution
+before enabling the policy for a workload.
+
+Moving averages and a switching margin reduce sensitivity to individual noisy
+rounds. Periodic probes refresh the alternatives. If no tested positive K meets
+the requested speedup, affected sequences are closed and those requests remain
+target-only until completion; subsequent steps send no draft RPC. New requests
+can still establish their own remote state. Existing failure policies apply to
+transport errors independently of this optimization decision.
+
+This experimental policy is disabled by default. It supports one inline
+endpoint, target/draft TP1, greedy full-attention token-only models, including
+the existing prefix replay and eager async contracts. Observations include
+scheduling and host contention and are not precise GPU kernel timings. Short
+requests or constantly changing batches may finish before calibration. No
+additional device synchronization, OTel collector or metrics scrape is needed.
+
 ## Related work
 
 [RFC #42109](https://github.com/vllm-project/vllm/issues/42109) proposes standalone

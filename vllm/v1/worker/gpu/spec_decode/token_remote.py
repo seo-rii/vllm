@@ -3,6 +3,7 @@
 """Same-step independent AR backend: authoritative token deltas over v3."""
 
 import itertools
+import time
 import uuid
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.proposal import ProposalHandle, SpeculatorOutput
+from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
 from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
     host_allocation_failure,
@@ -52,6 +54,17 @@ class _TokenHandle(ProposalHandle):
     rows: tuple[int, ...] = ()
     output: SpeculatorOutput | None = None
     error: str | None = None
+    started_at: float = 0
+    effective_k: int = 0
+    cost_eligible: bool = False
+
+
+@dataclass(frozen=True)
+class _CostRound:
+    request_ids: tuple[str, ...]
+    k: int
+    rpc_seconds: float
+    collected_at: float
 
 
 class TokenOnlyRemoteSpeculator(BaseSpeculator):
@@ -70,6 +83,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             raise ValueError("token-only remote drafting requires inline transport")
         self.device = device
         self.num_speculative_steps = spec.num_speculative_tokens
+        self._cost = (
+            RemoteDraftCostController(remote.cost_aware, self.num_speculative_steps)
+            if remote.cost_aware is not None
+            else None
+        )
+        self._cost_round: _CostRound | None = None
         self._tp = get_tp_group()
         self._owner = object()
         self._rounds = itertools.count()
@@ -122,6 +141,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
 
     def capture(self) -> None:
         pass
+
+    def get_cost_stats(self) -> dict[str, int | tuple[int, ...]]:
+        return {} if self._cost is None else self._cost.snapshot()
 
     def register_cached_prefix(
         self,
@@ -263,6 +285,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         sampled = context.num_sampled.cpu().tolist()
         rejected = context.num_rejected.cpu().tolist()
         recovery = context.last_sampled[batch.idx_mapping].reshape(-1).cpu().tolist()
+        if self._cost is not None:
+            # These existing copies also fence the preceding asynchronous target.
+            handle.started_at = time.monotonic()
         rows, indices = [], []
         for i, req_id in enumerate(handle.step.request_ids):
             if req_id in self._terminal_requests:
@@ -364,10 +389,40 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             indices.append(i)
         handle.rows = tuple(indices)
         if rows:
+            k = handle.step.num_speculative_tokens
+            if self._cost is not None:
+                previous, self._cost_round = self._cost_round, None
+                decoding = not any(handle.step.is_prefilling)
+                complete = len(rows) == len(handle.step.request_ids)
+                if (
+                    previous is not None
+                    and decoding
+                    and complete
+                    and previous.request_ids == handle.step.request_ids
+                    and all(row.offered == previous.k for row in rows)
+                ):
+                    self._cost.observe(
+                        batch_size=len(rows),
+                        k=previous.k,
+                        target_seconds=handle.started_at - previous.collected_at,
+                        rpc_seconds=previous.rpc_seconds,
+                        emitted_tokens=sum(int(sampled[i]) for i in indices),
+                    )
+                selected = self._cost.choose(len(rows), k if decoding else 0)
+                if selected is None:
+                    req_ids = tuple(handle.step.request_ids[i] for i in indices)
+                    self._terminal_requests.update(req_ids)
+                    keys = tuple(self._requests.pop(req_id).key for req_id in req_ids)
+                    session.close_sequences(keys, deadline=deadline)
+                    handle.rows = ()
+                    return
+                k = selected
+                handle.effective_k = k
+                handle.cost_eligible = decoding and complete
             handle.rpc = session.dispatch(
                 handle.round_id,
                 tuple(rows),
-                handle.step.num_speculative_tokens,
+                k,
                 deadline=deadline,
             )
 
@@ -435,12 +490,25 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             error, tokens, lengths = self._tp.broadcast_object(payload, src=0)
             if error is not None:
                 raise RuntimeError(f"token drafter proposal failed: {error}")
-            return SpeculatorOutput(
+            output = SpeculatorOutput(
                 torch.tensor(tokens, dtype=torch.int64, device=self.device).reshape(
                     len(handle.step.request_ids), self.num_speculative_steps
                 ),
                 torch.tensor(lengths, dtype=torch.int32, device=self.device),
             )
+            if self._cost is not None:
+                self._cost_round = None
+                if handle.cost_eligible and all(
+                    length == handle.effective_k for length in lengths
+                ):
+                    now = time.monotonic()
+                    self._cost_round = _CostRound(
+                        handle.step.request_ids,
+                        handle.effective_k,
+                        now - handle.started_at,
+                        now,
+                    )
+            return output
         finally:
             if not context.dummy_run and not context.is_profile:
                 for req_id in handle.step.request_ids:
@@ -449,6 +517,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
 
     def cancel(self, handle: ProposalHandle, reason: str) -> None:
         handle = self._owned(handle)
+        self._cost_round = None
         error = None
         try:
             if self._session is not None:
@@ -470,6 +539,10 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:
             return
+        if self._cost_round is not None and set(req_ids).intersection(
+            self._cost_round.request_ids
+        ):
+            self._cost_round = None
         self._terminal_requests.difference_update(req_ids)
         for req_id in req_ids:
             self._cached_prefixes.pop(req_id, None)
@@ -491,9 +564,17 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         error = self._tp.broadcast_object(error, src=0)
         if error is not None:
             raise RuntimeError(f"token request cleanup failed: {error}")
+        if (
+            self._cost is not None
+            and not self._requests
+            and not self._cached_prefixes
+            and not self._terminal_requests
+        ):
+            self._cost.reset_estimates()
 
     def close(self) -> None:
         self._closed = True
+        self._cost_round = None
         if self._session is not None:
             self._session.close()
             self._session = None
