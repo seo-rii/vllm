@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -809,6 +809,33 @@ class RemoteDraftServer:
                     "server startup rollback failed", [cleanup_error]
                 )
             raise
+
+    def _stop_with_owner(
+        self,
+        stop_owner: Callable[[float], None],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + self.shutdown_timeout_s
+        failure = None
+        try:
+            RemoteDraftServer.stop(self, deadline=deadline)
+        except BaseException as error:
+            failure = error
+        try:
+            stop_owner(deadline)
+        except BaseException as error:
+            self._lifecycle_failed(error)
+            if failure is not None:
+                raise ServerShutdownTimeout(
+                    "socket and GPU owner shutdown failed; process restart required"
+                ) from BaseExceptionGroup(
+                    "remote draft shutdown failures", [failure, error]
+                )
+            raise
+        if failure is not None:
+            raise failure
 
     def start(self, endpoint: str) -> str:
         """Warm up, bind, and serve in the background.

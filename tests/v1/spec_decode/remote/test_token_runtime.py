@@ -45,6 +45,94 @@ from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_cached_token_acceptor_start_rolls_back_gpu_owner(
+    tmp_path, monkeypatch, started
+):
+    import threading
+
+    state, _, cache = outcome_machine()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, token_oracle_contract(), cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+    )
+    path = tmp_path / "cache.sock"
+    endpoint = f"unix://{path}"
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            if self.name == "token-draft-acceptor":
+                if started:
+                    super().start()
+                raise RuntimeError("injected cached acceptor startup failure")
+            return super().start()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "Thread", FailingThread)
+            with pytest.raises(RuntimeError, match="injected cached acceptor"):
+                server.start(endpoint)
+        assert not path.exists()
+        assert not server.work_queue._thread.is_alive()
+        assert server.healthy
+        server.start(endpoint)
+        assert server.work_queue.call("check", lambda: 7) == 7
+    finally:
+        server.stop()
+
+
+def test_cached_token_shutdown_preserves_socket_and_owner_failures(
+    tmp_path, monkeypatch
+):
+    import errno
+    import socket
+    import threading
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    fail_close = False
+    socket_error = OSError(errno.EIO, "injected cache listener cleanup failure")
+
+    class FailingSocket(socket.socket):
+        def close(self):
+            nonlocal fail_close
+            super().close()
+            if fail_close:
+                fail_close = False
+                raise socket_error
+
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    state, _, cache = outcome_machine()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, token_oracle_contract(), cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+        shutdown_timeout_s=0.1,
+    )
+    server.start(f"unix://{tmp_path}/cache.sock")
+    entered, release = threading.Event(), threading.Event()
+
+    def hold():
+        entered.set()
+        assert release.wait(3)
+
+    work = server.work_queue.submit(DraftWork("held", hold))
+    try:
+        assert entered.wait(2)
+        fail_close = True
+        with pytest.raises(ServerShutdownTimeout) as caught:
+            server.stop()
+        failures = caught.value.__cause__.exceptions
+        assert len(failures) == 2
+        assert socket_error in failures[0].__cause__.exceptions
+        assert isinstance(failures[1], ServerShutdownTimeout)
+        assert not server.healthy
+    finally:
+        release.set()
+        work.wait()
+        server.stop()
+
+
 @pytest.mark.parametrize("handshake", [False, True])
 def test_token_client_rejects_oversized_header_before_waiting_for_body(
     socket_runtime, handshake

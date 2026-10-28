@@ -132,16 +132,8 @@ class TokenDraftServer(RemoteDraftServer):
                 torch.accelerator.synchronize(device)
         self.adapter.warmup()
 
-    def stop(self) -> None:
-        deadline = time.monotonic() + self.shutdown_timeout_s
-        try:
-            super().stop()
-        finally:
-            try:
-                self.work_queue.stop(deadline)
-            except ServerShutdownTimeout:
-                self._shutdown_failed = True
-                raise
+    def stop(self, *, deadline: float | None = None) -> None:
+        self._stop_with_owner(self.work_queue.stop, deadline=deadline)
 
     def _execute_advances(self, work: tuple[DraftWork, ...]) -> None:
         with self.adapter_turn():
