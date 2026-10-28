@@ -38,9 +38,11 @@ def draft_server(
     target_kv: bool = False,
     token_only_draft: str | None = None,
     max_num_seqs: int = 4,
+    eagle3_draft: str | None = None,
     revision: str | None = REVISION,
     num_speculative_tokens: int = 1,
     attention_backend: str = "FLASH_ATTN",
+    target_attention_backend: str | None = None,
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
     trust_remote_code: bool = True,
@@ -60,9 +62,9 @@ def draft_server(
             "--target-model",
             model,
             "--draft-model",
-            model,
+            eagle3_draft or model,
             "--method",
-            "mtp",
+            "eagle3" if eagle3_draft is not None else "mtp",
             "--num-speculative-tokens",
             str(num_speculative_tokens),
             "--device",
@@ -82,7 +84,7 @@ def draft_server(
             "--attention-backend",
             attention_backend,
             "--target-attention-backend",
-            attention_backend,
+            target_attention_backend or attention_backend,
         ]
         if trust_remote_code:
             command.append("--trust-remote-code")
@@ -131,19 +133,19 @@ def draft_server(
                 "--draft-model",
                 token_only_draft,
                 "--num-speculative-tokens",
-                "3",
+                str(num_speculative_tokens),
                 "--max-batch-size",
                 "4",
                 "--max-model-len",
                 "128",
                 "--max-feature-tokens",
-                "64",
+                str(max_feature_tokens),
                 "--draft-kv-cache-gib",
-                "0.03125",
+                str(draft_kv_cache_gib),
                 "--attention-backend",
-                "TRITON_ATTN",
+                attention_backend,
                 "--target-attention-backend",
-                "TRITON_ATTN",
+                target_attention_backend or attention_backend,
             ]
         with log_path.open("w") as log:
             process = subprocess.Popen(
@@ -551,6 +553,9 @@ def test_remote_sliding_window_draft_matches_native_and_target(
                         target,
                         tmp_path / f"token-{num_workers}-{i}.log",
                         token_only_draft=draft,
+                        num_speculative_tokens=3,
+                        attention_backend="TRITON_ATTN",
+                        draft_kv_cache_gib=0.03125,
                     )
                 )
                 for i in range(num_workers)
@@ -1408,6 +1413,322 @@ def tiny_ernie_mtp_model(tmp_path):
     return _save_mtp_checkpoint(tmp_path / "ernie", config, weights)
 
 
+@pytest.fixture
+def tiny_independent_qwen3_models(tmp_path, request, mtp_family):
+    target_path = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    return _tiny_independent_qwen3_models(tmp_path, target_path)
+
+
+def _two_candidate_head(weight):
+    import torch
+
+    with torch.no_grad():
+        weight[3].mul_(32)
+        weight[4].copy_(-weight[3])
+
+
+def _tiny_independent_qwen3_models(tmp_path, target_path):
+    """Exercise accepted states with real models and two amplified output rows.
+
+    Keep every target attention/recurrent weight and the original fixture intact.
+    The independent draft has its own head geometry; this is not a quality test.
+    """
+    import hashlib
+    import json
+    import shutil
+
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoConfig
+
+    def digests(path):
+        return {
+            str(file.relative_to(path)): hashlib.sha256(file.read_bytes()).hexdigest()
+            for file in sorted(path.rglob("*"))
+            if file.is_file()
+        }
+
+    source = Path(target_path)
+    original = digests(source)
+    config = AutoConfig.from_pretrained(source)
+    assert not config.tie_word_embeddings
+    target = tmp_path / "controlled-target"
+    shutil.copytree(source, target)
+    checkpoint = target / "model.safetensors"
+    with safe_open(checkpoint, framework="pt", device="cpu") as reader:
+        metadata = reader.metadata()
+    weights = load_file(checkpoint)
+    original_head = weights["lm_head.weight"].clone()
+    _two_candidate_head(weights["lm_head.weight"])
+    assert torch.equal(weights["lm_head.weight"][:3], original_head[:3])
+    assert torch.equal(weights["lm_head.weight"][5:], original_head[5:])
+    replacement = target / "controlled.safetensors"
+    save_file(weights, replacement, metadata=metadata)
+    replacement.replace(checkpoint)
+    assert digests(source) == original
+    target_identity = digests(target)
+    assert all(
+        target_identity[name] == digest
+        for name, digest in original.items()
+        if name != "model.safetensors"
+    )
+    draft = _tiny_independent_qwen3_draft(tmp_path, target)
+    (tmp_path / "independent-control.json").write_text(
+        json.dumps(
+            dict(
+                original_target=original,
+                controlled_target=target_identity,
+                draft=digests(Path(draft)),
+                target_architecture=config.architectures,
+                target_hidden_size=config.hidden_size,
+                draft_hidden_size=64,
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+                original_target_unchanged=True,
+                changed_target_rows=[3, 4],
+            )
+        )
+        + "\n"
+    )
+    return str(target), draft
+
+
+def _tiny_independent_qwen3_draft(tmp_path, target_path):
+    """Load a separate dense LM with the target's exact tokenizer artifacts."""
+    import shutil
+
+    import torch
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    target_path = Path(target_path)
+    target = AutoConfig.from_pretrained(target_path)
+    assert (
+        target.vocab_size,
+        target.bos_token_id,
+        target.eos_token_id,
+        target.pad_token_id,
+    ) == (128, 1, 2, 0)
+    config = Qwen3Config(
+        vocab_size=target.vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=128,
+        layer_types=["full_attention"] * 2,
+        bos_token_id=target.bos_token_id,
+        eos_token_id=target.eos_token_id,
+        pad_token_id=target.pad_token_id,
+        tie_word_embeddings=False,
+    )
+    assert config.hidden_size != target.hidden_size
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261025)
+        draft = Qwen3ForCausalLM(config)
+    _two_candidate_head(draft.lm_head.weight)
+    path = tmp_path / "independent-qwen3"
+    draft.save_pretrained(path)
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "vocab.txt",
+        "merges.txt",
+        "tokenizer.model",
+    ):
+        if (target_path / name).is_file():
+            shutil.copyfile(target_path / name, path / name)
+            assert (path / name).read_bytes() == (target_path / name).read_bytes()
+    assert all(
+        (path / name).is_file() for name in ("tokenizer.json", "tokenizer_config.json")
+    )
+    return str(path)
+
+
+@pytest.fixture
+def tiny_independent_mla_models(tmp_path, request):
+    return _tiny_independent_mla_models(
+        tmp_path,
+        dense_ffn=getattr(request, "param", "moe") == "dense",
+    )
+
+
+def _tiny_independent_mla_models(tmp_path, *, dense_ffn=False):
+    """Real independent MLA weights; fixed heads exercise accepted-state paths."""
+    import hashlib
+    import json
+    import shutil
+
+    import torch
+    from transformers import (
+        DeepseekV2Config,
+        DeepseekV2ForCausalLM,
+        Qwen3Config,
+        Qwen3ForCausalLM,
+    )
+
+    common = dict(
+        vocab_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    target_config = Qwen3Config(
+        hidden_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["full_attention"] * 2,
+        **common,
+    )
+    draft_config = DeepseekV2Config(
+        architectures=["DeepseekV2ForCausalLM"],
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        n_routed_experts=0 if dense_ffn else 4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        first_k_dense_replace=2 if dense_ffn else 1,
+        n_group=1,
+        topk_group=1,
+        topk_method="greedy",
+        norm_topk_prob=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        attention_bias=False,
+        **common,
+    )
+    paths = []
+    for name, cls, config, seed in (
+        ("qwen3-target", Qwen3ForCausalLM, target_config, 20261024),
+        ("deepseek-v2-draft", DeepseekV2ForCausalLM, draft_config, 20261025),
+    ):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            model = cls(config)
+        _two_candidate_head(model.lm_head.weight)
+        # These are complete LM checkpoints, without synthesized MTP modules.
+        config.architectures = [cls.__name__]
+        paths.append(
+            _save_mtp_checkpoint(
+                tmp_path / name, config, _unpack_mtp_experts(model.state_dict())
+            )
+        )
+    target, draft = map(Path, paths)
+    for source in target.iterdir():
+        if source.name not in ("model.safetensors", "config.json"):
+            shutil.copyfile(source, draft / source.name)
+            assert source.read_bytes() == (draft / source.name).read_bytes()
+    (tmp_path / "mla-fixture.json").write_text(
+        json.dumps(
+            dict(
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+                seeds=[20261024, 20261025],
+                target_architecture="Qwen3ForCausalLM",
+                draft_architecture="DeepseekV2ForCausalLM",
+                independent_full_model=True,
+                ffn_layout="dense" if dense_ffn else "moe",
+                routed_experts=0 if dense_ffn else 4,
+                first_k_dense_replace=2 if dense_ffn else 1,
+                target_hidden_size=64,
+                draft_hidden_size=128,
+                latent_width=576,
+                models={
+                    role: {
+                        file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+                        for file in sorted(path.iterdir())
+                        if file.is_file()
+                    }
+                    for role, path in (("target", target), ("draft", draft))
+                },
+            )
+        )
+        + "\n"
+    )
+    return paths[0], paths[1]
+
+
+def _check_independent_mla_weights(model, model_path):
+    """Check the complete real checkpoint, including native packed projections."""
+    import torch
+    from safetensors.torch import load_file
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    weights = load_file(Path(model_path) / "model.safetensors")
+    checked = set()
+
+    def equal(actual, names):
+        # The native loader casts checkpoint tensors to each real parameter's
+        # dtype; the router checkpoint deliberately retains FP32 storage.
+        assert actual.dtype in (torch.bfloat16, torch.float32)
+        expected = torch.cat([weights[name] for name in names]).to(actual.dtype)
+        assert torch.equal(actual.detach().cpu(), expected), names
+        checked.update(names)
+
+    for name, parameter in model.named_parameters():
+        if name in weights:
+            equal(parameter, [name])
+    for index, layer in enumerate(model.model.layers):
+        prefix = f"model.layers.{index}"
+        equal(
+            layer.self_attn.fused_qkv_a_proj.weight,
+            [
+                f"{prefix}.self_attn.q_a_proj.weight",
+                f"{prefix}.self_attn.kv_a_proj_with_mqa.weight",
+            ],
+        )
+        experts = [
+            module
+            for module in layer.mlp.modules()
+            if isinstance(module, RoutedExperts)
+        ]
+        dense = (
+            [(layer.mlp.shared_experts, f"{prefix}.mlp.shared_experts")]
+            if experts
+            else [(layer.mlp, f"{prefix}.mlp")]
+        )
+        for mlp, name in dense:
+            equal(
+                mlp.gate_up_proj.weight,
+                [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"],
+            )
+        if experts:
+            assert len(experts) == 1
+            method = experts[0].quant_method
+            assert isinstance(method, UnquantizedFusedMoEMethod)
+            assert method.unquantized_backend.name == "TRITON"
+            for expert in range(4):
+                base = f"{prefix}.mlp.experts.{expert}"
+                equal(
+                    experts[0].w13_weight[expert],
+                    [f"{base}.gate_proj.weight", f"{base}.up_proj.weight"],
+                )
+                equal(experts[0].w2_weight[expert], [f"{base}.down_proj.weight"])
+    assert checked == weights.keys(), weights.keys() - checked
+    return sorted(checked)
+
+
 @pytest.mark.parametrize(
     "mtp_family,mtp_window,k",
     [
@@ -1440,13 +1761,119 @@ def test_remote_native_mtp_matches_native_and_target(
     record_property,
 ):
     """Compare native and standalone MTP across chunk/window boundaries and reuse."""
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        mtp_family,
+        mtp_window,
+        k,
+        record_property,
+    )
+
+
+@pytest.mark.parametrize("mtp_family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_independent_draft_with_hybrid_or_mla_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    mtp_family,
+    k,
+    tiny_independent_qwen3_models,
+    record_property,
+):
+    """Keep target state local while a distinct dense AR model drafts token deltas."""
+    import json
+
+    target, draft = tiny_independent_qwen3_models
+    record_property(
+        "fixture", json.loads((tmp_path / "independent-control.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        mtp_family,
+        None,
+        k,
+        record_property,
+        target_model=target,
+        independent_draft=draft,
+    )
+
+
+@pytest.mark.parametrize("tiny_independent_mla_models", ["dense", "moe"], indirect=True)
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_independent_mla_draft_preserves_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    k,
+    tiny_independent_mla_models,
+    record_property,
+):
+    """Check exact target output and accepted drafts for dense and routed MLA."""
+    import json
+
+    target, draft = tiny_independent_mla_models
+    fixture = json.loads((tmp_path / "mla-fixture.json").read_text())
+    record_property("fixture", fixture)
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        "qwen3",
+        None,
+        k,
+        record_property,
+        target_model=target,
+        independent_draft=draft,
+        independent_draft_kind="deepseek_v2",
+        native_control=False,
+    )
+
+
+def _compare_native_and_remote_draft(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    mtp_family,
+    mtp_window,
+    k,
+    record_property,
+    *,
+    independent_draft=None,
+    independent_draft_kind="qwen3",
+    target_model=None,
+    eagle3_draft=None,
+    native_control=True,
+):
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    independent = independent_draft is not None
+    mla_draft = independent and independent_draft_kind == "deepseek_v2"
+    if not native_control:
+        import json
+
+        assert mla_draft
+        assert mtp_family == "qwen3"
+        assert json.loads((Path(independent_draft) / "config.json").read_text())[
+            "n_routed_experts"
+        ] in (0, 4)
+    eagle3 = eagle3_draft is not None
+    detailed = independent or eagle3
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    model = request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
+    model = target_model or request.getfixturevalue(f"tiny_{mtp_family}_mtp_model")
     mtp_windows = {
         "exaone_two": (None, None),
         "exaone_three": (None, 16, 32),
@@ -1454,9 +1881,19 @@ def test_remote_native_mtp_matches_native_and_target(
     num_modules = len(mtp_windows)
     dense_mla = mtp_family == "glm4_moe_lite"
     attention_backend = "TRITON_MLA" if dense_mla else "TRITON_ATTN"
-    attention_config = {"backend": attention_backend}
-    if dense_mla:
+    attention_config: dict[str, Any] = {"backend": attention_backend}
+    if dense_mla or mla_draft:
         attention_config["mla_prefill_backend"] = "FLASH_ATTN"
+        if independent:
+            # Native AR uses the public per-kind map to give the MLA target and
+            # independent dense draft their actual attention implementations.
+            attention_config.update(
+                backend="TRITON_ATTN",
+                backend_per_kind={
+                    "mla_attention": "TRITON_MLA",
+                    "full_attention": "TRITON_ATTN",
+                },
+            )
     kwargs = dict(
         trust_remote_code=False,
         skip_tokenizer_init=True,
@@ -1474,7 +1911,11 @@ def test_remote_native_mtp_matches_native_and_target(
         attention_config=attention_config,
         disable_log_stats=False,
     )
-    moe_backend = None if mtp_family.startswith("exaone") else "triton"
+    if independent:
+        kwargs["tokenizer_mode"] = "hf"
+    moe_backend = (
+        None if mtp_family.startswith("exaone") or eagle3 or mla_draft else "triton"
+    )
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
     if hybrid_target:
@@ -1496,7 +1937,7 @@ def test_remote_native_mtp_matches_native_and_target(
         max_tokens=8,
         ignore_eos=True,
         detokenize=False,
-        logprobs=5 if hybrid_target or dense_mla else None,
+        logprobs=5 if hybrid_target or dense_mla or detailed else None,
     )
     # MLA prefill and absorbed decode use different floating-point operations.
     compare_target_logprobs = hybrid_target or dense_mla
@@ -1504,10 +1945,71 @@ def test_remote_native_mtp_matches_native_and_target(
         "target_comparison",
         "top5_logprobs" if compare_target_logprobs else "exact_tokens",
     )
-    record_property("placement_comparison", "exact_tokens")
+    record_property(
+        "placement_comparison",
+        "exact_tokens" if native_control else "remote_target_exact_tokens",
+    )
+    if not native_control:
+        record_property(
+            "native.unavailable",
+            "Native mixed Qwen3/MLA execution builds draft metadata with the "
+            "target head dimension; routed drafts also require an expert group "
+            "that the dense target does not initialize. No native placement "
+            "parity is claimed; standalone native proposal replay is separate.",
+        )
     record_property("batch_invariant", not hybrid_target)
 
-    def generate(runner):
+    def generate(runner, mode):
+        outputs = [
+            runner.llm.generate(batch, sampling, use_tqdm=False) for batch in batches
+        ]
+        if detailed:
+            record_property(
+                f"{mode}.outputs",
+                [
+                    [
+                        {
+                            "prompt_token_ids": prompt["prompt_token_ids"],
+                            "token_ids": list(output.outputs[0].token_ids),
+                            "text": output.outputs[0].text,
+                            "logprobs": [
+                                {
+                                    token: {
+                                        "logprob": value.logprob,
+                                        "rank": value.rank,
+                                        "decoded_token": value.decoded_token,
+                                    }
+                                    for token, value in step.items()
+                                }
+                                for step in output.outputs[0].logprobs
+                            ],
+                        }
+                        for prompt, output in zip(prompts, batch)
+                    ]
+                    for prompts, batch in zip(batches, outputs)
+                ],
+            )
+        if detailed and mode != "target":
+            observations = []
+            for batch in outputs:
+                for output in batch:
+                    metrics = output.outputs[0].spec_decode_metrics
+                    assert metrics is not None
+                    observation = metrics.to_dict()
+                    assert observation["num_spec_tokens"] == k
+                    assert len(metrics.histogram) == k + 1
+                    assert metrics.per_step_accepted
+                    assert len(metrics.per_step_accepted) == len(
+                        metrics.per_step_drafted
+                    )
+                    assert all(
+                        0 <= a <= d <= k
+                        for a, d in zip(
+                            metrics.per_step_accepted, metrics.per_step_drafted
+                        )
+                    )
+                    observations.append(observation)
+            record_property(f"{mode}.request_speculation", observations)
         return [
             [
                 (
@@ -1515,9 +2017,9 @@ def test_remote_native_mtp_matches_native_and_target(
                     output.outputs[0].text,
                     output.outputs[0].logprobs,
                 )
-                for output in runner.llm.generate(batch, sampling, use_tqdm=False)
+                for output in batch
             ]
-            for batch in batches
+            for batch in outputs
         ]
 
     def compare_outputs(actual, reference, mode):
@@ -1525,7 +2027,10 @@ def test_remote_native_mtp_matches_native_and_target(
 
         assert len(actual) == len(reference) == len(batches)
         mismatches = 0
-        for outputs, expected_outputs, prompts in zip(actual, reference, batches):
+        first_mismatch = None
+        for batch_index, (outputs, expected_outputs, prompts) in enumerate(
+            zip(actual, reference, batches)
+        ):
             assert len(outputs) == len(expected_outputs) == len(prompts)
             assert all(len(output[0]) == 8 for output in outputs)
             mismatches += sum(
@@ -1533,6 +2038,24 @@ def test_remote_native_mtp_matches_native_and_target(
                 for output, expected_output in zip(outputs, expected_outputs)
                 for token, expected_token in zip(output[0], expected_output[0])
             )
+            if detailed and first_mismatch is None:
+                for row, (output, expected_output) in enumerate(
+                    zip(outputs, expected_outputs)
+                ):
+                    for position, (token, expected_token) in enumerate(
+                        zip(output[0], expected_output[0])
+                    ):
+                        if token != expected_token:
+                            first_mismatch = {
+                                "batch": batch_index,
+                                "row": row,
+                                "position": position,
+                                "actual_prefix": output[0][: position + 1],
+                                "target_prefix": expected_output[0][: position + 1],
+                            }
+                            break
+                    if first_mismatch is not None:
+                        break
             if compare_target_logprobs:
                 assert all(
                     output[2] is not None and len(output[2]) == 8
@@ -1549,6 +2072,8 @@ def test_remote_native_mtp_matches_native_and_target(
                     output[0] for output in expected_outputs
                 ]
         record_property(f"{mode}.token_mismatches", mismatches)
+        if detailed:
+            record_property(f"{mode}.first_target_token_mismatch", first_mismatch)
 
     def speculation_counts(runner, mode):
         runner.llm.llm_engine.do_log_stats()
@@ -1565,7 +2090,7 @@ def test_remote_native_mtp_matches_native_and_target(
             record_property(f"{mode}.{label}", value)
         assert counts[0] > 0 and counts[1] > 0
         assert 0 <= counts[2] <= counts[1]
-        if num_modules == 3:
+        if detailed or num_modules == 3:
             assert counts[2] > 0, "this draft fixture must exercise actual acceptance"
         return counts
 
@@ -1637,6 +2162,8 @@ def test_remote_native_mtp_matches_native_and_target(
         return moe_backends(worker.model_runner.get_draft_model())
 
     def recurrent_policy(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
         from vllm.model_executor.layers.mamba.abstract import MambaBase
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             QwenGatedDeltaNetAttention,
@@ -1666,9 +2193,15 @@ def test_remote_native_mtp_matches_native_and_target(
                 {"type": layer.mamba_type.name, "shapes": shapes, "kernels": kernels}
             )
         return {
+            "model": type(runner.get_model()).__name__,
             "state": type(runner.model_state).__name__,
             "k": worker.vllm_config.num_speculative_tokens,
             "layers": layers,
+            "attention_backends": [
+                layer.get_attn_backend().get_name()
+                for layer in runner.get_model().modules()
+                if isinstance(layer, (Attention, MLAAttention))
+            ],
         }
 
     def check_recurrence(runner, mode):
@@ -1677,6 +2210,30 @@ def test_remote_native_mtp_matches_native_and_target(
         assert len(policies) == 1
         policy = policies[0]
         assert policy["k"] == (0 if mode == "target" else k)
+        if eagle3:
+            assert (
+                policy["model"]
+                == {
+                    "llama": "LlamaForCausalLM",
+                    "qwen3": "Qwen3ForCausalLM",
+                    "qwen2": "Qwen2ForCausalLM",
+                    "mistral": "MistralForCausalLM",
+                }[mtp_family]
+            )
+            assert policy["attention_backends"] == ["TRITON_ATTN"] * 4
+        if independent:
+            assert (
+                policy["model"]
+                == {
+                    "qwen3_next": "Qwen3NextForCausalLM",
+                    "nemotron_h": "NemotronHForCausalLM",
+                    "glm4_moe_lite": "Glm4MoeLiteForCausalLM",
+                    "qwen3": "Qwen3ForCausalLM",
+                }[mtp_family]
+            )
+            assert policy["attention_backends"] == [attention_backend] * (
+                1 if hybrid_target else 2
+            )
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
@@ -1752,18 +2309,200 @@ def test_remote_native_mtp_matches_native_and_target(
             )
         return policies
 
+    def independent_draft_identity(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.attention.backends.mla.triton_mla import TritonMLAMetadataBuilder
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionMetadataBuilder,
+        )
+        from vllm.v1.worker.gpu.model_states import resolve_model_state_cls
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+        from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
+            StandaloneARSpeculator,
+        )
+
+        runner = worker.model_runner
+        speculator = runner.speculator
+        assert isinstance(speculator, StandaloneARSpeculator)
+        draft = runner.get_draft_model()
+        assert type(draft).__name__ == (
+            "DeepseekV2ForCausalLM" if mla_draft else "Qwen3ForCausalLM"
+        )
+        config = speculator.attn_vllm_config
+        assert config.model_config.model == independent_draft
+        assert config.model_config.get_hidden_size() == (128 if mla_draft else 64)
+        assert config.model_config.get_num_kv_heads(config.parallel_config) == 1
+        assert config.model_config.get_head_size() == (576 if mla_draft else 32)
+        assert config.cache_config.cache_dtype == "auto"
+        assert worker.vllm_config.speculative_config.kv_cache_dtype == "auto"
+        assert resolve_model_state_cls(config, draft) is DefaultModelState
+        if mla_draft:
+            assert worker.vllm_config.speculative_config.method == "draft_model"
+            assert config.model_config.use_mla and not draft.use_mha
+            from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLP
+
+            assert draft.config.n_routed_experts == 0
+            assert draft.config.first_k_dense_replace == 2
+            assert len(draft.model.layers) == 2
+            assert all(
+                isinstance(layer.mlp, DeepseekV2MLP) for layer in draft.model.layers
+            )
+            assert mla_layout(draft) == [expected_mla_layout] * 2
+            for groups in speculator.attn_groups:
+                for group in groups:
+                    builder = group.get_metadata_builder()
+                    assert isinstance(builder, TritonMLAMetadataBuilder)
+                    assert builder.mla_dims.kv_lora_rank == 512
+            assert len([m for m in draft.modules() if isinstance(m, MLAAttention)]) == 2
+            return {
+                "speculator": type(speculator).__name__,
+                "model": type(draft).__name__,
+                "resolved_model_state": "DefaultModelState",
+                "hidden_size": 128,
+                "kv_heads": 1,
+                "head_size": 576,
+                "backend": "TRITON_MLA",
+                "metadata_builders": [
+                    type(group.get_metadata_builder()).__name__
+                    for groups in speculator.attn_groups
+                    for group in groups
+                ],
+                "kv_cache_dtype": config.cache_config.cache_dtype,
+                "dense_mlp_layers": 2,
+                "mla_layout": mla_layout(draft),
+                "checkpoint_weights": _check_independent_mla_weights(
+                    draft, independent_draft
+                ),
+            }
+        layers = [layer for layer in draft.modules() if isinstance(layer, Attention)]
+        assert len(layers) == 2
+        assert all(
+            layer.num_kv_heads == 1 and layer.head_size == 32 for layer in layers
+        )
+        assert all(layer.sliding_window is None for layer in layers)
+        assert all(
+            layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers
+        )
+        builders = []
+        for groups in speculator.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                assert isinstance(builder, TritonAttentionMetadataBuilder)
+                assert (builder.num_heads_q, builder.num_heads_kv, builder.headdim) == (
+                    2,
+                    1,
+                    32,
+                )
+                builders.append(type(builder).__name__)
+        assert builders
+        return {
+            "speculator": type(speculator).__name__,
+            "model": type(draft).__name__,
+            "resolved_model_state": "DefaultModelState",
+            "hidden_size": 64,
+            "kv_heads": 1,
+            "head_size": 32,
+            "backend": "TRITON_ATTN",
+            "metadata_builders": builders,
+            "kv_cache_dtype": config.cache_config.cache_dtype,
+        }
+
+    def token_remote_identity(worker):
+        from vllm.v1.worker.gpu.spec_decode.token_remote import (
+            TokenOnlyRemoteSpeculator,
+        )
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, TokenOnlyRemoteSpeculator)
+        assert runner.draft_backend is runner.speculator
+        assert runner.get_draft_model() is None
+        spec = worker.vllm_config.speculative_config
+        assert spec.method == "draft_model"
+        assert spec.draft_model_config.model == independent_draft
+        return type(runner.speculator).__name__
+
+    def eagle_identity(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+        from vllm.v1.worker.gpu.spec_decode.remote import RemoteSpeculator
+
+        runner = worker.model_runner
+        target = runner.get_model()
+        assert (
+            type(target).__name__
+            == {
+                "llama": "LlamaForCausalLM",
+                "qwen3": "Qwen3ForCausalLM",
+                "qwen2": "Qwen2ForCausalLM",
+                "mistral": "MistralForCausalLM",
+            }[mtp_family]
+        )
+        spec = worker.vllm_config.speculative_config
+        capture_ids = target.model.aux_hidden_state_layers
+        assert capture_ids == (() if spec is None else (1, 2, 4))
+        result = {"target": type(target).__name__, "capture_ids": capture_ids}
+        if spec is None:
+            return result
+        assert spec.method == "eagle3" and spec.draft_model_config.model == eagle3_draft
+        result["speculator"] = type(runner.speculator).__name__
+        if spec.use_remote_draft():
+            assert isinstance(runner.speculator, RemoteSpeculator)
+            assert runner.get_draft_model() is None
+        else:
+            assert isinstance(runner.speculator, EagleSpeculator)
+            draft = runner.get_draft_model()
+            assert isinstance(draft, Eagle3LlamaForCausalLM)
+            assert draft.model.use_aux_hidden_state
+            assert draft.model.num_aux_hidden_states == 3
+            assert draft.model.fc_input_size == 384
+            assert draft.model.fc.weight.shape == (128, 384)
+            assert draft.model.layers[0].self_attn.qkv_proj.weight.shape == (256, 256)
+            assert draft.model.embed_tokens is target.model.embed_tokens
+            assert draft.lm_head is target.lm_head
+            backends = [
+                layer.get_attn_backend().get_name()
+                for layer in draft.modules()
+                if isinstance(layer, Attention)
+            ]
+            assert backends == ["TRITON_ATTN"]
+            result.update(
+                draft=type(draft).__name__,
+                fc_shape=tuple(draft.model.fc.weight.shape),
+                shared_embedding_and_head=True,
+                attention_backends=backends,
+            )
+        return result
+
     config = dict(
-        method="mtp",
-        model=model,
+        method="draft_model" if independent else "eagle3" if eagle3 else "mtp",
+        model=independent_draft or eagle3_draft or model,
         num_speculative_tokens=k,
         draft_tensor_parallel_size=1,
         draft_sample_method="greedy",
-        attention_backend=attention_backend,
+        attention_backend=(
+            "TRITON_MLA"
+            if mla_draft
+            else "TRITON_ATTN"
+            if independent
+            else attention_backend
+        ),
     )
+    if independent:
+        # Public native control: select draft-owned metadata geometry while
+        # preserving the target's automatic BF16 cache precision.
+        config["kv_cache_dtype"] = "auto"
     with vllm_runner(model, **kwargs) as baseline:
         windows = baseline.llm.apply_model(target_windows)
-        assert windows == [[None] * (1 if hybrid_target else max(2, num_modules))]
+        assert windows == [
+            [None] * (4 if eagle3 else 1 if hybrid_target else max(2, num_modules))
+        ]
         record_property("target.attention_windows", windows)
+        if eagle3:
+            record_property(
+                "target.eagle3", baseline.llm.collective_rpc(eagle_identity)
+            )
         if dense_mla:
             layout = baseline.llm.apply_model(mla_layout)
             assert layout == [[expected_mla_layout] * 2]
@@ -1773,86 +2512,147 @@ def test_remote_native_mtp_matches_native_and_target(
         assert backends == [["TRITON"] * expected_moe_count]
         record_property("target.moe_backends", backends)
         check_recurrence(baseline, "target")
-        expected = generate(baseline)
+        expected = generate(baseline, "target")
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
-    with vllm_runner(model, speculative_config=config, **kwargs) as native:
-        policy = native.llm.collective_rpc(draft_kv_policy)
-        assert policy == [
-            [
-                (
-                    window,
-                    "MLAAttentionSpec"
-                    if dense_mla
-                    else "FullAttentionSpec"
-                    if window is None
-                    else "SlidingWindowSpec",
-                    window,
-                )
-                for window in mtp_windows
+    if native_control:
+        with vllm_runner(
+            model,
+            speculative_config=config,
+            per_request_spec_decode_metrics="detailed" if detailed else "none",
+            **kwargs,
+        ) as native:
+            policy = native.llm.collective_rpc(draft_kv_policy)
+            assert policy == [
+                [
+                    (
+                        window,
+                        "MLAAttentionSpec"
+                        if mla_draft or (dense_mla and not independent)
+                        else "FullAttentionSpec"
+                        if window is None
+                        else "SlidingWindowSpec",
+                        window,
+                    )
+                    for window in ((None, None) if independent else mtp_windows)
+                ]
             ]
-        ]
-        record_property("native.kv_policy", policy)
-        if num_modules > 1:
-            identity = native.llm.collective_rpc(draft_module_identity)
-            record_property("native.module_identity", identity)
-        if dense_mla:
-            layout = native.llm.collective_rpc(draft_mla_layout)
-            assert layout == [[expected_mla_layout]]
-            record_property("native.mla_layout", layout)
-        backends = native.llm.collective_rpc(draft_moe_backends)
-        draft_has_moe = not mtp_family.startswith("exaone") and mtp_family != "ernie"
-        assert backends == [["TRITON"] if draft_has_moe else []]
-        record_property("native.moe_backends", backends)
-        recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
-        assert recurrent_layers == [0]
-        record_property("native.recurrent_layers", recurrent_layers)
-        native_recurrence = check_recurrence(native, "native")
-        native_outputs = generate(native)
-        compare_outputs(native_outputs, expected, "native")
-        native_counts = speculation_counts(native, "native")
+            record_property("native.kv_policy", policy)
+            if num_modules > 1:
+                identity = native.llm.collective_rpc(draft_module_identity)
+                record_property("native.module_identity", identity)
+            if independent:
+                identity = native.llm.collective_rpc(independent_draft_identity)
+                record_property("native.independent_draft", identity)
+            if eagle3:
+                record_property(
+                    "native.eagle3", native.llm.collective_rpc(eagle_identity)
+                )
+            if dense_mla and not independent:
+                layout = native.llm.collective_rpc(draft_mla_layout)
+                assert layout == [[expected_mla_layout]]
+                record_property("native.mla_layout", layout)
+            backends = native.llm.collective_rpc(draft_moe_backends)
+            draft_has_moe = (
+                not independent
+                and not eagle3
+                and not mtp_family.startswith("exaone")
+                and mtp_family != "ernie"
+            )
+            assert backends == [["TRITON"] if draft_has_moe else []]
+            record_property("native.moe_backends", backends)
+            recurrent_layers = native.llm.collective_rpc(draft_recurrent_layers)
+            assert recurrent_layers == [0]
+            record_property("native.recurrent_layers", recurrent_layers)
+            native_recurrence = check_recurrence(native, "native")
+            native_outputs = generate(native, "native")
+            compare_outputs(native_outputs, expected, "native")
+            native_counts = speculation_counts(native, "native")
     server_log = tmp_path / f"{mtp_family}-draft.log"
     with draft_server(
         model,
         server_log,
+        token_only_draft=independent_draft,
+        eagle3_draft=eagle3_draft,
         revision=None,
         num_speculative_tokens=k,
-        attention_backend=attention_backend,
+        attention_backend=(
+            "TRITON_MLA"
+            if mla_draft
+            else "TRITON_ATTN"
+            if independent
+            else attention_backend
+        ),
+        target_attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=32,
         trust_remote_code=False,
         moe_backend=moe_backend,
     ) as endpoint:
-        for transport in ("inline", "cuda_ipc") if num_modules > 1 else ("inline",):
-            remote_config = dict(
-                config,
-                remote_draft=dict(
-                    endpoint=endpoint,
-                    transport=transport,
-                    failure_policy="error",
-                    request_timeout_ms=5000,
-                    startup_timeout_ms=600000,
-                ),
+        transports = ("inline", "cuda_ipc") if num_modules > 1 else ("inline",)
+        for transport in transports:
+            mode = "remote" if transport == "inline" else "remote_ipc"
+            remote_options = dict(
+                transport=transport,
+                failure_policy="error",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
             )
+            remote_config = dict(config)
+            if independent:
+                remote_config["execution"] = dict(
+                    placement="remote",
+                    policy="on_demand",
+                    endpoints=[endpoint],
+                    **remote_options,
+                )
+            else:
+                remote_config["remote_draft"] = dict(
+                    endpoint=endpoint, **remote_options
+                )
             with vllm_runner(
-                model, speculative_config=remote_config, **kwargs
+                model,
+                speculative_config=remote_config,
+                per_request_spec_decode_metrics="detailed" if detailed else "none",
+                **kwargs,
             ) as remote:
                 actual_config = remote.llm.llm_engine.vllm_config.speculative_config
                 assert actual_config.use_remote_draft()
                 assert actual_config.get_remote_draft_endpoints() == (endpoint,)
-                assert check_recurrence(remote, "remote") == native_recurrence
-                remote_outputs = generate(remote)
-                compare_outputs(remote_outputs, expected, "remote")
-                for actual_batch, native_batch in zip(remote_outputs, native_outputs):
-                    assert [output[0] for output in actual_batch] == [
-                        output[0] for output in native_batch
-                    ]
-                    if dense_mla:
-                        assert [output[2] for output in actual_batch] == [
-                            output[2] for output in native_batch
+                remote_recurrence = check_recurrence(remote, mode)
+                if native_control:
+                    assert remote_recurrence == native_recurrence
+                if independent:
+                    record_property(
+                        "remote.backend",
+                        remote.llm.collective_rpc(token_remote_identity),
+                    )
+                if eagle3:
+                    record_property(
+                        "remote.eagle3", remote.llm.collective_rpc(eagle_identity)
+                    )
+                remote_outputs = generate(remote, mode)
+                compare_outputs(remote_outputs, expected, mode)
+                if native_control:
+                    for actual_batch, native_batch in zip(
+                        remote_outputs, native_outputs
+                    ):
+                        assert [output[0] for output in actual_batch] == [
+                            output[0] for output in native_batch
                         ]
-                if dense_mla:
-                    record_property("placement.logprobs", "exact_returned_top5")
-                assert speculation_counts(remote, "remote") == native_counts
+                        if dense_mla or detailed:
+                            assert [output[2] for output in actual_batch] == [
+                                output[2] for output in native_batch
+                            ]
+                    if dense_mla or detailed:
+                        record_property("placement.logprobs", "exact_returned_top5")
+                remote_counts = speculation_counts(remote, mode)
+                if native_control:
+                    if detailed:
+                        record_property(
+                            "placement.speculation_counts_equal",
+                            remote_counts == native_counts,
+                        )
+                    assert remote_counts == native_counts
     if num_modules > 1:
         server_lines = server_log.read_text().splitlines()
         negotiated = [
@@ -1868,12 +2668,644 @@ def test_remote_native_mtp_matches_native_and_target(
         )
         assert sum(warmup in line for line in server_lines) == 1
         record_property("remote.device_replay_warmup", warmup)
-    if dense_mla:
+
+    if eagle3:
+        identity = (
+            "Standalone EAGLE3 features: model=Eagle3LlamaForCausalLM "
+            "target_layers=(1, 2, 4) input_width=384 output_width=128"
+        )
+        assert (
+            sum(identity in line for line in server_log.read_text().splitlines()) == 1
+        )
+        record_property("remote.eagle3_from_server_log", identity)
+    if independent:
+        import ast
+
+        identity_prefix = "Token-only draft loaded: "
+        identities = [
+            line.split(identity_prefix, 1)[1]
+            for line in server_log.read_text().splitlines()
+            if identity_prefix in line
+        ]
+        assert len(identities) == 1
+        identity, layout_text = identities[0].split(" kv_layouts=", 1)
+        expected_model = "DeepseekV2ForCausalLM" if mla_draft else "Qwen3ForCausalLM"
+        expected_backend = "TRITON_MLA" if mla_draft else "TRITON_ATTN"
+        assert identity == (
+            f"speculator=StandaloneARSpeculator model={expected_model} "
+            f"state=DefaultModelState attention_backends=['{expected_backend}']"
+        )
+        layouts = ast.literal_eval(layout_text)
+        assert layouts and sum(layout["layers"] for layout in layouts) == 2
+        assert all(
+            layout["kind"] == ("MLAAttentionSpec" if mla_draft else "FullAttentionSpec")
+            and layout["kv_heads"] == 1
+            and layout["head_size"] == (576 if mla_draft else 32)
+            and layout["window"] is None
+            and layout["dtype"] == "torch.bfloat16"
+            for layout in layouts
+        )
+        record_property(
+            "remote.loaded_draft", {"identity": identity, "kv_layouts": layouts}
+        )
+    if dense_mla and not independent:
         assert any(
             "Using " in line and "TRITON_MLA" in line and "backend." in line
             for line in server_log.read_text().splitlines()
         )
         record_property("remote.decode_backend_from_server_log", "TRITON_MLA")
+
+
+def _run_independent_mla_oracle(target_path, draft_path, result_path):
+    """Compare real latent KV with authoritative replay, including poisoned tails."""
+    import itertools
+    import json
+
+    import torch
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.forward_context import get_forward_context
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLAAttention,
+        MLACommonMetadata,
+    )
+    from vllm.v1.attention.backends.mla.triton_mla import TritonMLAMetadataBuilder
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        TokenGPUStepExecutor,
+        make_token_gpu_adapter,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_state import (
+        TokenAdvanceRow,
+        TokenForwardRow,
+        TokenStateMachine,
+    )
+    from vllm.v1.spec_decode.remote.server import AdapterError
+
+    torch.set_num_threads(1)
+    config = EngineArgs(
+        model=target_path,
+        tokenizer_mode="hf",
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=6,
+        max_num_batched_tokens=128,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        attention_config={
+            "backend": "TRITON_ATTN",
+            "backend_per_kind": {
+                "full_attention": "TRITON_ATTN",
+                "mla_attention": "TRITON_MLA",
+            },
+            "mla_prefill_backend": "FLASH_ATTN",
+        },
+        speculative_config={
+            "method": "draft_model",
+            "model": draft_path,
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": 1,
+            "kv_cache_dtype": "auto",
+            "attention_backend": "TRITON_MLA",
+        },
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    assert config.speculative_config.method == "draft_model"
+    adapter = make_token_gpu_adapter(
+        config, device=torch.device("cuda:0"), kv_cache_bytes=32 << 20
+    )
+    state, executor = adapter.state, adapter.state.executor
+    assert isinstance(executor, TokenGPUStepExecutor)
+    pool = state.block_pool
+    model = executor.speculator.model
+    assert type(model).__name__ == "DeepseekV2ForCausalLM" and not model.use_mha
+    assert type(executor.model_state).__name__ == "DefaultModelState"
+    thresholds = []
+    for groups in executor.attn_groups:
+        for group in groups:
+            builder = group.get_metadata_builder()
+            assert isinstance(builder, TritonMLAMetadataBuilder)
+            thresholds.append(builder.reorder_batch_threshold)
+    assert thresholds and len(set(thresholds)) == 1
+    decode_threshold = thresholds[0]
+    checked_weights = _check_independent_mla_weights(model, draft_path)
+    layers = [layer for layer in model.modules() if isinstance(layer, MLAAttention)]
+    assert len(layers) == 2
+    layout, ranges = [], []
+    for layer in layers:
+        spec = layer.get_kv_cache_spec(executor.vllm_config)
+        assert type(spec) is MLAAttentionSpec
+        assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
+        assert spec.block_size == 16 and spec.dtype == torch.bfloat16
+        assert layer.get_attn_backend().get_name() == "TRITON_MLA"
+        assert layer.prefill_backend is not None
+        assert layer.prefill_backend.get_name() == "FLASH_ATTN"
+        assert not layer.impl.is_sparse
+        cache = layer.kv_cache
+        assert tuple(cache.shape) == (executor.num_blocks, 16, 576)
+        size = (
+            1 + sum((n - 1) * s for n, s in zip(cache.shape, cache.stride()))
+        ) * cache.element_size()
+        ranges.append((cache.data_ptr(), cache.data_ptr() + size))
+        layout.append(
+            dict(
+                layer=layer.layer_name,
+                shape=list(cache.shape),
+                strides=list(cache.stride()),
+            )
+        )
+    assert all(
+        a1 <= b0 or b1 <= a0 for (a0, a1), (b0, b1) in itertools.combinations(ranges, 2)
+    )
+    metadata = []
+
+    def observe_attention(layer, inputs):
+        value = get_forward_context().attn_metadata[layer.layer_name]
+        assert isinstance(value, MLACommonMetadata)
+        metadata.append(
+            dict(
+                query_lens=torch.diff(value.query_start_loc).cpu().tolist(),
+                num_decodes=value.num_decodes,
+                num_prefills=value.num_prefills,
+            )
+        )
+
+    hook = layers[0].register_forward_pre_hook(observe_attention)
+    keys = [SequenceKey("mla-live", row, 0) for row in range(3)]
+    refs = [SequenceKey("mla-reference", row, 0) for row in range(3)]
+    transcripts = [
+        [3 + (i * 7 + row) % 125 for i in range(n)]
+        for row, n in enumerate((15, 16, 17))
+    ]
+    proposals: list[list[int]] = [[], [], []]
+    previous_ids: list[int | None] = [None, None, None]
+    checks, outcomes, orders, partitions, proposal_references = [], [], [], [], []
+
+    def blocks(key):
+        return pool.blocks(state.sequences[key].req_index)
+
+    def prefix(key, length):
+        indices = torch.tensor(blocks(key), dtype=torch.int64, device=executor.device)
+        return [
+            layer.kv_cache.index_select(0, indices).flatten(0, 1)[:length].cpu().clone()
+            for layer in layers
+        ]
+
+    def owns_distinct_blocks():
+        owned = [block for key in state.sequences for block in blocks(key)]
+        assert 0 not in owned and len(owned) == len(set(owned))
+        assert len(owned) + pool.num_free_blocks == pool.num_blocks - 1
+
+    def forward_reference(row, start, tokens, sample):
+        key = refs[row]
+        req_index = state.sequences[key].req_index
+        pool.ensure(req_index, start + len(tokens))
+        return TokenForwardRow(
+            key, req_index, start, tuple(tokens), blocks(key), sample
+        )
+
+    try:
+        for row, tokens in enumerate(transcripts):
+            for key in (keys[row], refs[row]):
+                state.open(key)
+                offset = 0
+                chunk_size = (1, 15, 16)[row]
+                while offset < len(tokens):
+                    end = min(offset + chunk_size, len(tokens))
+                    state.prefill(
+                        key,
+                        offset,
+                        tuple(tokens[offset:end]),
+                        is_final=end == len(tokens),
+                    )
+                    offset = end
+        # The reference calls the real executor directly. Its transcript and
+        # write positions do not come from TokenStateMachine's updated fields.
+        for step, k in enumerate((0, 3, 3, 0, 3, 3, 1, 3)):
+            order = (
+                (2, 0, 1),
+                (1, 2, 0),
+                (0, 1, 2),
+                (2, 0, 1),
+                (1, 0, 2),
+                (0, 2, 1),
+                (2, 1, 0),
+                (0, 1, 2),
+            )[step]
+            updates, corrections, expected_lengths = {}, {}, {}
+            old_lengths = list(map(len, transcripts))
+            for row in range(3):
+                old = len(transcripts[row])
+                previous = proposals[row]
+                offered = min(len(previous), 1) if step == 6 else len(previous)
+                accepted = (
+                    min(offered, (0, 3, 1)[row])
+                    if step == 2
+                    else min(offered, (2, 0, 3)[row])
+                )
+                delta = previous[:accepted] + [3 + (step * 11 + row * 13) % 125]
+                if not previous and step == 1:
+                    delta += [17 + row] * row
+                keep = old + min(accepted, max(len(previous) - 1, 0))
+                before = {
+                    other: prefix(keys[other], old_lengths[other]) for other in range(3)
+                }
+                # Poison only rejected/unwritten tail. Accepted latent rows
+                # and all sibling allocations must remain untouched.
+                with torch.inference_mode():
+                    for position in range(keep, len(blocks(keys[row])) * 16):
+                        for layer in layers:
+                            layer.kv_cache[
+                                blocks(keys[row])[position // 16], position % 16
+                            ].fill_(torch.nan)
+                for other in range(3):
+                    for a, b in zip(
+                        before[other], prefix(keys[other], old_lengths[other])
+                    ):
+                        assert torch.equal(a, b)
+                updates[row] = (
+                    step,
+                    TokenAdvanceRow(
+                        keys[row],
+                        old,
+                        previous_ids[row],
+                        offered,
+                        accepted,
+                        tuple(delta),
+                    ),
+                    k,
+                )
+                corrections[row] = forward_reference(
+                    row, keep, delta[keep - old :], k > 0
+                )
+                expected_lengths[row] = old + len(delta)
+                transcripts[row].extend(delta)
+                outcomes.append(
+                    dict(
+                        step=step,
+                        row=row,
+                        offered=offered,
+                        accepted=accepted,
+                        k=k,
+                        correction=len(corrections[row].tokens),
+                    )
+                )
+            orders.append(
+                dict(
+                    step=step,
+                    rows=list(order),
+                    query_lens=[len(corrections[row].tokens) for row in order],
+                )
+            )
+            start = len(metadata)
+            actual = state.advance_many(tuple(updates[row] for row in order))
+            actual_partitions = metadata[start:]
+            assert all(not isinstance(result, Exception) for result in actual), actual
+            # Canonical decode/short-extend/prefill order is the native contract.
+            # A noncanonical caller order must preserve row identity and state.
+            reference_order = sorted(
+                order, key=lambda row: len(corrections[row].tokens)
+            )
+            start = len(metadata)
+            first = executor.forward_batch(
+                tuple(corrections[row] for row in reference_order)
+            )
+            expected = {
+                row: ([] if k == 0 else [token])
+                for row, token in zip(reference_order, first)
+            }
+            for depth in range(1, k):
+                rows = [
+                    forward_reference(
+                        row,
+                        expected_lengths[row] + depth - 1,
+                        [expected[row][-1]],
+                        True,
+                    )
+                    for row in order
+                ]
+                for row, token in zip(order, executor.forward_batch(tuple(rows))):
+                    expected[row].append(token)
+            reference_partitions = metadata[start:]
+            # Check actual execution paths before comparing floating-point KV.
+            # The native MLA builder expects a uniform decode prefix; different
+            # prefill/absorbed-decode paths are not a bitwise state oracle.
+            assert len(actual_partitions) == max(k, 1)
+            assert actual_partitions == reference_partitions
+            for partition in actual_partitions:
+                query_lens = partition["query_lens"]
+                assert query_lens == sorted(query_lens)
+                decodes = (
+                    query_lens.count(query_lens[0])
+                    if query_lens[0] <= decode_threshold
+                    else 0
+                )
+                assert partition["num_decodes"] == decodes
+                assert partition["num_prefills"] == len(query_lens) - decodes
+            partitions.append(
+                dict(
+                    step=step, actual=actual_partitions, reference=reference_partitions
+                )
+            )
+            for row, result in zip(order, actual):
+                assert not isinstance(result, Exception)
+                assert list(result.token_ids) == expected[row], (
+                    step,
+                    row,
+                    result,
+                    expected[row],
+                )
+                progress = state.sequences[keys[row]]
+                committed = len(transcripts[row])
+                assert (
+                    result.committed
+                    == progress.committed
+                    == progress.materialized
+                    == committed
+                )
+                assert progress.speculative_written_end == committed + max(k - 1, 0)
+                assert progress.pending_last_token == (
+                    (committed + k - 1, expected[row][-1]) if k else None
+                )
+                assert progress.reserved_end >= progress.speculative_written_end
+                for a, b in zip(
+                    prefix(keys[row], committed), prefix(refs[row], committed)
+                ):
+                    assert torch.isfinite(a).all() and torch.equal(a, b), (
+                        step,
+                        row,
+                        committed,
+                    )
+                proposals[row] = list(result.token_ids)
+                previous_ids[row] = result.proposal_id
+                if result.token_ids:
+                    proposal_references.append(
+                        dict(
+                            step=step,
+                            row=row,
+                            committed_token_ids=list(transcripts[row]),
+                            token_ids=list(result.token_ids),
+                        )
+                    )
+                checks.append(
+                    dict(
+                        step=step, row=row, committed=committed, k=k, poisoned_tail=True
+                    )
+                )
+            owns_distinct_blocks()
+        state.close(tuple(keys + refs))
+        assert not state.sequences and pool.num_free_blocks == executor.num_blocks - 1
+        truncations = []
+        for row, length in enumerate((125, 126, 127)):
+            key = SequenceKey("mla-live", row, 1)
+            state.open(key)
+            state.prefill(key, 0, tuple([3] * length), is_final=True)
+            result = state.advance(
+                100 + row, TokenAdvanceRow(key, length, None, 0, 0, (4,)), 3
+            )
+            assert len(result.token_ids) == 127 - length
+            assert state.sequences[key].speculative_written_end <= 128
+            truncations.append(
+                dict(committed=result.committed, returned_k=len(result.token_ids))
+            )
+            state.close((key,))
+        assert pool.num_free_blocks == executor.num_blocks - 1
+        # Reuse the real allocation with a smaller logical budget only after
+        # every preceding owner has closed; there is never overlapping ownership.
+        small = TokenStateMachine(
+            executor,
+            DraftBlockPool(3, 16),
+            max_num_reqs=2,
+            max_model_len=128,
+            vocab_size=128,
+            max_k=3,
+        )
+        a, b = SequenceKey("capacity", 0, 0), SequenceKey("capacity", 1, 0)
+        for key in (a, b):
+            small.open(key)
+            small.prefill(key, 0, tuple([3] * 16), is_final=True)
+        previous_blocks = small.block_pool.blocks(small.sequences[a].req_index)
+        with pytest.raises(AdapterError) as raised:
+            small.advance(0, TokenAdvanceRow(a, 16, None, 0, 0, (4,)), 1)
+        assert raised.value.status == SpeculatorStatusCode.OUT_OF_MEMORY
+        assert small.block_pool.blocks(small.sequences[a].req_index) == previous_blocks
+        assert small.sequences[a].committed == 16 and small.sequences[a].ready
+        small.close((b,))
+        assert (
+            len(small.advance(0, TokenAdvanceRow(a, 16, None, 0, 0, (4,)), 1).token_ids)
+            == 1
+        )
+        small.close((a,))
+        assert not small.sequences and small.block_pool.num_free_blocks == 2
+        Path(result_path).write_text(
+            json.dumps(
+                dict(
+                    model=type(model).__name__,
+                    state=type(executor.model_state).__name__,
+                    layout=layout,
+                    checkpoint_weights=checked_weights,
+                    disjoint_layer_storage=True,
+                    checks=checks,
+                    outcomes=outcomes,
+                    orders=orders,
+                    metadata=metadata,
+                    same_path_partitions=partitions,
+                    proposal_references=proposal_references,
+                    decode_threshold=decode_threshold,
+                    truncations=truncations,
+                    generation_reuse=True,
+                    capacity_recovered=True,
+                    all_blocks_recovered=True,
+                )
+            )
+            + "\n"
+        )
+    finally:
+        hook.remove()
+        state.close(tuple(state.sequences))
+
+
+def test_remote_independent_mla_state_matches_authoritative_replay(
+    vllm_runner, monkeypatch, tmp_path, tiny_independent_mla_models, record_property
+):
+    """Check exact MLA state and standalone native proposals after corrections."""
+    import json
+    import math
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    target, draft = tiny_independent_mla_models
+    result, log_path = tmp_path / "mla-oracle.json", tmp_path / "mla-oracle.log"
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _run_independent_mla_oracle; "
+        "_run_independent_mla_oracle(*sys.argv[1:])",
+        target,
+        draft,
+        str(result),
+    ]
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            assert process.wait(timeout=300) == 0, (
+                f"independent MLA oracle failed: {log_path}"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    receipt = json.loads(result.read_text())
+    assert receipt["model"] == "DeepseekV2ForCausalLM"
+    assert len(receipt["checks"]) == 24
+    assert {entry["accepted"] for entry in receipt["outcomes"]} == {0, 1, 2, 3}
+    assert {entry["k"] for entry in receipt["checks"]} == {0, 1, 3}
+    assert {(1, 2, 1), (2, 1, 2)} <= {
+        tuple(entry["query_lens"]) for entry in receipt["orders"]
+    }
+    assert all(
+        receipt[field]
+        for field in (
+            "capacity_recovered",
+            "all_blocks_recovered",
+            "generation_reuse",
+            "disjoint_layer_storage",
+        )
+    )
+    record_property("native.mla_state_oracle", receipt)
+    cases = receipt["proposal_references"]
+    assert len(cases) == 18 and sum(len(case["token_ids"]) for case in cases) == 48
+
+    def native_identity(worker):
+        import torch
+
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.attention.backends.mla.triton_mla import (
+            TritonMLAMetadataBuilder,
+        )
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        config, runner = worker.vllm_config, worker.model_runner
+        model = runner.model
+        assert config.speculative_config is None
+        assert config.model_config.model == draft
+        assert config.model_config.use_mla and not model.use_mha
+        assert config.model_config.get_hidden_size() == 128
+        assert config.model_config.get_head_size() == 576
+        assert config.cache_config.cache_dtype == "auto"
+        assert type(model).__name__ == "DeepseekV2ForCausalLM"
+        assert type(runner.model_state).__name__ == "DefaultModelState"
+        layers = [m for m in model.modules() if isinstance(m, MLAAttention)]
+        assert len(layers) == 2
+        for layer in layers:
+            spec = layer.get_kv_cache_spec(config)
+            assert isinstance(spec, MLAAttentionSpec)
+            assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
+            assert spec.dtype == torch.bfloat16 and spec.block_size == 16
+            assert layer.get_attn_backend().get_name() == "TRITON_MLA"
+            assert layer.prefill_backend is not None
+            assert layer.prefill_backend.get_name() == "FLASH_ATTN"
+        builders = [
+            g.get_metadata_builder() for groups in runner.attn_groups for g in groups
+        ]
+        assert builders and all(
+            isinstance(b, TritonMLAMetadataBuilder) for b in builders
+        )
+        assert all(b.model_config is config.model_config for b in builders)
+        return dict(
+            model=type(model).__name__,
+            model_path=config.model_config.model,
+            head_size=config.model_config.get_head_size(),
+            backend="TRITON_MLA",
+            prefill_backend="FLASH_ATTN",
+            checkpoint_weights=_check_independent_mla_weights(model, draft),
+        )
+
+    # The executor child has exited. A real standalone LLM now owns the draft
+    # checkpoint and distributed state, without the mixed native runner's target
+    # metadata ownership. Cross-path token equality supplements same-path KV.
+    with vllm_runner(
+        draft,
+        tokenizer_mode="hf",
+        skip_tokenizer_init=True,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=6,
+        max_num_batched_tokens=128,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        kernel_config={"moe_backend": "triton", "enable_jit_warmup": False},
+        attention_config={"backend": "TRITON_MLA", "mla_prefill_backend": "FLASH_ATTN"},
+    ) as native:
+        identity = native.llm.collective_rpc(native_identity)
+        assert identity[0]["checkpoint_weights"] == receipt["checkpoint_weights"]
+        outputs = native.llm.generate(
+            [{"prompt_token_ids": case["committed_token_ids"]} for case in cases],
+            [
+                SamplingParams(
+                    temperature=0,
+                    max_tokens=len(case["token_ids"]),
+                    ignore_eos=True,
+                    detokenize=False,
+                    logprobs=5,
+                )
+                for case in cases
+            ],
+            use_tqdm=False,
+        )
+    observations = [
+        dict(
+            **case,
+            native_prompt_token_ids=output.prompt_token_ids,
+            native_token_ids=list(output.outputs[0].token_ids),
+            native_logprobs=[
+                {
+                    token: dict(logprob=value.logprob, rank=value.rank)
+                    for token, value in values.items()
+                }
+                for values in output.outputs[0].logprobs or []
+            ],
+        )
+        for case, output in zip(cases, outputs)
+    ]
+    record_property(
+        "native.mla_proposal_replay",
+        dict(
+            identity=identity,
+            comparison="exact_proposal_tokens_from_committed_prefix",
+            requests=len(observations),
+            tokens=sum(len(case["token_ids"]) for case in cases),
+            observations=observations,
+        ),
+    )
+    assert len(outputs) == len(cases)
+    for case, output in zip(cases, outputs):
+        assert output.prompt_token_ids == case["committed_token_ids"]
+        generated = output.outputs[0]
+        assert list(generated.token_ids) == case["token_ids"], case
+        assert generated.finish_reason == "length"
+        assert generated.logprobs is not None
+        assert len(generated.logprobs) == len(generated.token_ids)
+        for token, values in zip(generated.token_ids, generated.logprobs):
+            assert token in values and len(values) >= 5
+            assert all(math.isfinite(value.logprob) for value in values.values())
 
 
 def _multi_module_ipc_client(pipe, endpoint, identity) -> None:

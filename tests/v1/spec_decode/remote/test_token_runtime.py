@@ -4,6 +4,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 import pytest
 from huggingface_hub.errors import (
@@ -1920,6 +1921,10 @@ def token_config(
     target_type="qwen3",
     draft_type="qwen3",
     target_options=None,
+    spec_options=None,
+    attention_config=None,
+    dtype="float32",
+    target_tp=1,
     **draft_options,
 ):
     import torch
@@ -1927,13 +1932,18 @@ def token_config(
     from tokenizers.models import WordLevel
     from transformers import (
         AutoModelForCausalLM,
+        DeepseekV2Config,
+        Glm4MoeLiteConfig,
         LlamaConfig,
         MistralConfig,
+        NemotronHConfig,
         Qwen3Config,
+        Qwen3NextConfig,
         TokenizersBackend,
     )
 
     from vllm.config import (
+        AttentionConfig,
         CacheConfig,
         DeviceConfig,
         ModelConfig,
@@ -1947,6 +1957,10 @@ def token_config(
         "qwen3": (Qwen3Config, "Qwen3ForCausalLM"),
         "llama": (LlamaConfig, "LlamaForCausalLM"),
         "mistral": (MistralConfig, "MistralForCausalLM"),
+        "qwen3_next": (Qwen3NextConfig, "Qwen3NextForCausalLM"),
+        "nemotron_h": (NemotronHConfig, "NemotronHForCausalLM"),
+        "glm4_moe_lite": (Glm4MoeLiteConfig, "Glm4MoeLiteForCausalLM"),
+        "deepseek_v2": (DeepseekV2Config, "DeepseekV2ForCausalLM"),
     }
     tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
@@ -1957,6 +1971,56 @@ def token_config(
 
     def model(path, family, *, hidden_size, **options):
         hf_class, architecture = families[family]
+        family_options: dict[str, Any] = {
+            "mistral": {"sliding_window": None},
+            "qwen3_next": {
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32,
+            },
+            "nemotron_h": {
+                "layers_block_type": ["linear_attention", "full_attention"],
+                "mamba_num_heads": 2,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 8,
+                "n_groups": 1,
+                "conv_kernel": 4,
+                "chunk_size": 32,
+            },
+            "glm4_moe_lite": {
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "n_group": 1,
+                "topk_group": 1,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
+            "deepseek_v2": {
+                "kv_lora_rank": 512,
+                "q_lora_rank": 128,
+                "qk_rope_head_dim": 64,
+                "qk_nope_head_dim": 192,
+                "v_head_dim": 256,
+                "first_k_dense_replace": 1,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+            },
+        }.get(family, {})
         hf = hf_class(
             architectures=[architecture],
             hidden_size=hidden_size,
@@ -1970,7 +2034,7 @@ def token_config(
             bos_token_id=0,
             eos_token_id=1,
             pad_token_id=2,
-            **(({"sliding_window": None} if family == "mistral" else {}) | options),
+            **(family_options | options),
         )
         with torch.random.fork_rng():
             torch.manual_seed(0)
@@ -1979,7 +2043,7 @@ def token_config(
         return ModelConfig(
             model=str(path),
             tokenizer_mode="hf",
-            dtype="float32",
+            dtype=dtype,
             max_model_len=64,
             skip_tokenizer_init=True,
         )
@@ -1988,18 +2052,19 @@ def token_config(
         tmp_path / "target", target_type, hidden_size=32, **(target_options or {})
     )
     draft = model(tmp_path / "draft", draft_type, hidden_size=16, **draft_options)
-    parallel = ParallelConfig()
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
     spec = SpeculativeConfig(
         model=draft.model,
         method="draft_model",
-        num_speculative_tokens=3,
         target_model_config=target,
         target_parallel_config=parallel,
+        **({"num_speculative_tokens": 3} | (spec_options or {})),
     )
     return VllmConfig(
         model_config=target,
         parallel_config=parallel,
         speculative_config=spec,
+        attention_config=attention_config or AttentionConfig(),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=64,
@@ -2021,6 +2086,279 @@ def token_config(
         ),
         device_config=DeviceConfig("cpu"),
     )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("kv_dtype", [None, "auto", "bfloat16"])
+def test_token_mla_draft_keeps_independent_model_and_backend(tmp_path, k, kv_dtype):
+    from vllm.config import AttentionConfig
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        draft_type="deepseek_v2",
+        dtype="bfloat16",
+        attention_config=AttentionConfig(backend="TRITON_ATTN"),
+        spec_options={
+            "num_speculative_tokens": k,
+            "kv_cache_dtype": kv_dtype,
+            "attention_backend": "TRITON_MLA",
+        },
+    )
+    spec = config.speculative_config
+    assert spec.method == "draft_model"
+    assert spec.draft_model_config.architecture == "DeepseekV2ForCausalLM"
+    contract = create_token_runtime_contract(config)
+    resource = create_token_executor_config(config)
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.num_prefill_lookahead == 0
+    assert resource.model_config is spec.draft_model_config
+    assert resource.model_config.use_mla and not config.model_config.use_mla
+    assert resource.model_config.get_head_size() == 576
+    assert resource.model_config.get_num_kv_heads(resource.parallel_config) == 1
+    assert resource.attention_config.backend is not None
+    assert resource.attention_config.backend.name == "TRITON_MLA"
+    assert config.attention_config.backend.name == "TRITON_ATTN"
+    assert resource.attention_config is not config.attention_config
+    assert resource.cache_config is not config.cache_config
+    assert resource.cache_config.cache_dtype == (kv_dtype or "auto")
+    assert config.cache_config.cache_dtype == "auto"
+    assert resource.cache_config.sliding_window is None
+
+
+@pytest.mark.parametrize(
+    "options,reason",
+    [
+        (
+            {
+                "target_options": {
+                    "use_sliding_window": True,
+                    "max_window_layers": 0,
+                    "sliding_window": 16,
+                }
+            },
+            "MLA draft requires a dense Qwen3 target",
+        ),
+        ({"target_type": "qwen3_next"}, "MLA draft requires a dense Qwen3 target"),
+        ({"dtype": "float32"}, "MLA draft requires unquantized bfloat16"),
+        ({"index_topk": 8}, "dense MLA without an indexer"),
+        ({"sliding_window": 16}, "dense MLA without an indexer"),
+        ({"spec_options": {"kv_cache_dtype": "fp8"}}, "MLA draft requires bfloat16 KV"),
+        (
+            {"target_tp": 2, "spec_options": {"draft_tensor_parallel_size": 1}},
+            "MLA draft requires target TP1 and draft TP1",
+        ),
+        (
+            {
+                "spec_options": {
+                    "execution": {
+                        "placement": "remote",
+                        "endpoints": ["unix:///tmp/a.sock", "unix:///tmp/b.sock"],
+                    }
+                }
+            },
+            "MLA draft requires one inline endpoint",
+        ),
+        (
+            {
+                "spec_options": {
+                    "execution": {
+                        "placement": "remote",
+                        "endpoints": ["unix:///tmp/a.sock"],
+                        "transport": "cuda_ipc",
+                    }
+                }
+            },
+            # The public speculative config rejects this before runtime admission.
+            "token-only execution supports inline transport",
+        ),
+    ],
+)
+def test_token_mla_draft_rejects_unvalidated_combinations(tmp_path, options, reason):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    with pytest.raises(ValueError, match=reason):
+        config = token_config(
+            tmp_path, draft_type="deepseek_v2", **({"dtype": "bfloat16"} | options)
+        )
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        (None, None),
+        ({"head_size": 575}, "MLA KV geometry"),
+        ({"dtype": "float16"}, "MLA KV geometry"),
+        ({"topk_buffer_width": 8}, "dense MLA without an indexer"),
+        ({"is_index_group_leader": True}, "dense MLA without an indexer"),
+        ("full", "requires MLA KV"),
+        ("mixed", "cannot mix MLA and dense attention"),
+        ("missing", "one attention KV per model layer"),
+        ("duplicate", "indices must be unique and complete"),
+    ],
+)
+def test_token_mla_kv_checks_contract_geometry(tmp_path, change, reason):
+    """Real KV spec constructors exercise validation; GPU tests inspect loaded specs."""
+    import torch
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+        validate_token_model_kv_specs,
+    )
+
+    config = create_token_executor_config(
+        token_config(tmp_path, draft_type="deepseek_v2", dtype="bfloat16")
+    )
+    layout = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        max_tp_shards=1,
+    )
+    if isinstance(change, dict):
+        if "dtype" in change:
+            change = change | {"dtype": getattr(torch, change["dtype"])}
+        layout = replace(layout, **change)
+    full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+    )
+    # Reversed insertion order must remain valid; indices define layer identity.
+    specs = {f"draft.model.layers.{i}.self_attn.attn": layout for i in (1, 0)}
+    if change == "full":
+        specs = dict.fromkeys(specs, full)
+    elif change == "mixed":
+        specs["draft.model.layers.0.self_attn.attn"] = full
+    elif change == "missing":
+        del specs["draft.model.layers.0.self_attn.attn"]
+    elif change == "duplicate":
+        specs["draft.model.layers.1.other_attn.attn"] = specs.pop(
+            "draft.model.layers.0.self_attn.attn"
+        )
+    if reason is None:
+        validate_token_model_kv_specs(config, specs)
+        assert len(specs) == config.model_config.get_total_num_hidden_layers() == 2
+    else:
+        with pytest.raises(ValueError, match=reason):
+            validate_token_model_kv_specs(config, specs)
+
+
+@pytest.mark.parametrize("family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_token_contract_keeps_recurrent_and_mla_state_on_target(tmp_path, family, k):
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path, target_type=family, spec_options={"num_speculative_tokens": k}
+    )
+    contract = create_token_runtime_contract(config)
+    resource = create_token_executor_config(config)
+    assert config.model_config.is_hybrid == (family != "glm4_moe_lite")
+    assert config.model_config.use_mla == (family == "glm4_moe_lite")
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.num_prefill_lookahead == 0
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert resource.model_config.architecture == "Qwen3ForCausalLM"
+    assert not resource.model_config.is_hybrid and not resource.model_config.use_mla
+    assert not resource.model_config.has_inner_state
+
+
+@pytest.mark.parametrize("family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
+def test_token_contract_still_rejects_recurrent_and_mla_drafts(tmp_path, family):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import _validate_token_model
+
+    # SpeculativeConfig can reinterpret these checkpoints as MTP. Exercise the
+    # dense-draft gate on their real original ModelConfig, without that rewrite.
+    config = token_config(tmp_path, target_type=family)
+    with pytest.raises(
+        ValueError, match="token-only draft requires a native decoder-only"
+    ):
+        _validate_token_model(config.model_config, "draft")
+
+
+@pytest.mark.parametrize(
+    "family,options,reason",
+    [
+        ("glm4_moe_lite", {"index_topk": 8}, "dense MLA"),
+        ("qwen3_next", {"is_causal": False}, "native decoder-only causal"),
+        ("nemotron_h", {"attention_chunk_size": 16}, "chunked attention"),
+    ],
+)
+def test_token_target_extension_preserves_unsupported_state_checks(
+    tmp_path, family, options, reason
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(tmp_path, target_type=family, target_options=options)
+    with pytest.raises(ValueError, match=reason):
+        create_token_runtime_contract(config)
+
+
+def test_token_recurrent_target_requires_single_endpoint(tmp_path):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type="qwen3_next",
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/draft-a.sock", "unix:///tmp/draft-b.sock"],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="target requires a single remote endpoint"):
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize("kv_dtype", [None, "auto"])
+def test_token_executor_applies_draft_backends_without_mutating_target(
+    tmp_path, kv_dtype
+):
+    from vllm.config import AttentionConfig
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+
+    config = token_config(
+        tmp_path,
+        target_type="glm4_moe_lite",
+        attention_config=AttentionConfig(backend="TRITON_MLA"),
+        spec_options={"attention_backend": "TRITON_ATTN", "kv_cache_dtype": kv_dtype},
+    )
+    resource = create_token_executor_config(config)
+    assert resource.attention_config.backend is not None
+    assert resource.attention_config.backend.name == "TRITON_ATTN"
+    assert config.attention_config.backend.name == "TRITON_MLA"
+    assert resource.attention_config is not config.attention_config
+    assert (
+        resource.cache_config.cache_dtype == config.cache_config.cache_dtype == "auto"
+    )
+    assert resource.cache_config is not config.cache_config
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert resource.model_config.get_head_size() != config.model_config.get_head_size()
 
 
 @pytest.mark.parametrize(
