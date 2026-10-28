@@ -555,6 +555,52 @@ def test_queue_start_failure_retains_uncertain_thread_ownership(monkeypatch, fau
             queue.start(lambda: None)
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_queue_rejects_admission_until_initializer_completes(fails):
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+    )
+
+    def initialize():
+        entered.set()
+        assert release.wait(3)
+        if fails:
+            raise MemoryError("initialization")
+
+    def start():
+        try:
+            queue.start(initialize)
+        except BaseException as error:
+            errors.append(error)
+
+    startup = threading.Thread(target=start)
+    startup.start()
+    try:
+        assert entered.wait(3)
+        with pytest.raises(ServerShutdownTimeout):
+            queue.submit(DraftWork("a", lambda: 7, num_bytes=8))
+        assert queue.depth == queue.pending_bytes == 0
+    finally:
+        release.set()
+        startup.join(3)
+        assert not startup.is_alive()
+    assert len(errors) == int(fails)
+    if fails:
+        assert isinstance(errors[0], MemoryError)
+        queue.start(lambda: None)
+    assert queue.call("a", lambda: 7) == 7
+    queue.stop(time.monotonic() + 3)
+
+
 def test_expired_queued_client_skips_forward_and_healthy_client_progresses(tmp_path):
     with runtime(tmp_path, batch_wait_ms=0) as (state, oracle, server, client):
         a, b, blocker = (client(name) for name in ("a", "b", "blocker"))
