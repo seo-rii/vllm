@@ -196,8 +196,10 @@ steps:
     - vllm/v1/spec_decode/remote/
     - vllm/v1/worker/gpu/
     - tests/v1/e2e/spec_decode/remote/
+    - tests/v1/spec_decode/remote/test_token_gpu.py
   commands:
     - pytest -v -s -m 'not distributed' v1/e2e/spec_decode/remote/
+    - pytest -v -s --noconftest v1/spec_decode/remote/test_token_gpu.py::test_token_cuda_forward_failure_completes_before_native_kv_reuse
 
 - label: ":nvidia: (2xH100) Remote Token Draft TP2"
   key: spec-decode-remote-draft-tp2

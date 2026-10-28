@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native entrypoint/metadata CPU controls; model, attention and CUDA are doubles."""
 
-from contextlib import nullcontext
+import inspect
+import sys
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -485,3 +487,244 @@ def test_token_cache_executor_reserves_branch_slots_without_changing_live_budget
     assert scheduler.max_num_seqs == 4
     assert scheduler.max_num_batched_tokens == token_budget
     assert scheduler.max_num_scheduled_tokens == token_budget
+
+
+@contextmanager
+def _fail_token_forward_at(executor, boundary, failure, before_raise=None):
+    """Inject host failure around real model/logits/D2H submission boundaries."""
+    name, phase = boundary.split("_")
+    code = {
+        "model": inspect.unwrap(executor.speculator._run_model).__code__,
+        "logits": inspect.unwrap(executor.speculator.model.compute_logits).__code__,
+        "copy": inspect.unwrap(executor.forward_batch).__code__,
+    }.get(name)
+
+    def inject(frame, event, called):
+        if name == "copy":
+            matches = (
+                frame.f_code is code
+                and event == f"c_{phase}"
+                and getattr(called, "__name__", None) == "cpu"
+                and isinstance(getattr(called, "__self__", None), torch.Tensor)
+            )
+        else:
+            matches = frame.f_code is code and event == phase
+        if matches:
+            if before_raise is not None:
+                before_raise()
+            raise failure
+
+    previous = sys.getprofile()
+    sys.setprofile(inject)
+    try:
+        yield
+    finally:
+        sys.setprofile(previous)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "model_call",
+        "model_return",
+        "logits_call",
+        "logits_return",
+        "copy_call",
+        "copy_return",
+    ],
+)
+@pytest.mark.parametrize("completion_fails", [False, True])
+def test_token_forward_failure_waits_before_reusing_request_storage(
+    token_executor, monkeypatch, boundary, completion_fails
+):
+    from vllm.v1.spec_decode.remote.errors import (
+        CompletionUnknownError,
+        runtime_unusable,
+    )
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.token_state import (
+        TokenAdvanceRow,
+        TokenStateMachine,
+    )
+
+    executor, _, synced, _ = token_executor
+    pool = DraftBlockPool(9, 4)
+    state = TokenStateMachine(
+        executor, pool, max_num_reqs=1, max_model_len=16, vocab_size=128, max_k=1
+    )
+    old, new = SequenceKey("completion", 0, 0), SequenceKey("completion", 0, 1)
+    state.open(old)
+    state.prefill(old, 0, (1, 2), is_final=True)
+    slot = state.sequences[old].req_index
+    blocks = pool.blocks(slot)
+    synced.clear()
+    failure = MemoryError("injected host metadata allocation")
+    completion = RuntimeError("injected completion failure")
+
+    def synchronize(device):
+        synced.append(True)
+        if completion_fails:
+            raise completion
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    expected = CompletionUnknownError if completion_fails else MemoryError
+    with (
+        pytest.raises(expected) as raised,
+        _fail_token_forward_at(executor, boundary, failure),
+    ):
+        state.advance(0, TokenAdvanceRow(old, 2, None, 0, 0, (3,)), 1)
+    assert synced == [True]
+    assert not state.sequences[old].ready
+    if completion_fails:
+        assert runtime_unusable(raised.value)
+        assert raised.value.__cause__ is completion
+        assert completion.__context__ is failure
+        assert pool.blocks(slot) == blocks
+    else:
+        assert raised.value is failure
+        assert not runtime_unusable(failure)
+        state.close((old,))
+        assert pool.num_free_blocks == 8
+        state.open(new)
+        assert state.sequences[new].req_index == slot
+        state.prefill(new, 0, (7, 8), is_final=True)
+        assert state.advance(
+            1, TokenAdvanceRow(new, 2, None, 0, 0, (9,)), 1
+        ).token_ids == (1,)
+
+
+def test_token_forward_fatal_cuda_failure_does_not_submit_completion_work(
+    token_executor,
+):
+    from vllm.v1.spec_decode.remote.errors import CudaRuntimeError, runtime_unusable
+
+    executor, _, synced, _ = token_executor
+    failure = CudaRuntimeError("injected failed CUDA context", cuda_error_code=700)
+    with (
+        pytest.raises(CudaRuntimeError) as raised,
+        _fail_token_forward_at(executor, "model_return", failure),
+    ):
+        executor.forward(SequenceKey("fatal", 0, 0), 0, 0, (1,), (1,), sample=True)
+    assert raised.value is failure and runtime_unusable(raised.value)
+    assert not synced
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_token_cuda_forward_failure_completes_before_native_kv_reuse(tmp_path):
+    """Exercise all host failure boundaries with native weights, KV and kernels."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import Qwen3Config, Qwen3ForCausalLM, TokenizersBackend
+
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+
+    path = tmp_path / "qwen3"
+    config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=128,
+        head_dim=64,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=128,
+        max_position_embeddings=64,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        Qwen3ForCausalLM(config).save_pretrained(path)
+    TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    ).save_pretrained(path)
+    args = parser().parse_args(
+        [
+            "--endpoint",
+            f"unix://{tmp_path}/unused.sock",
+            "--target-model",
+            str(path),
+            "--draft-model",
+            str(path),
+            "--device",
+            "cuda:0",
+            "--dtype",
+            "bfloat16",
+            "--attention-backend",
+            "TRITON_ATTN",
+            "--target-attention-backend",
+            "TRITON_ATTN",
+            "--max-model-len",
+            "64",
+            "--max-feature-tokens",
+            "64",
+            "--max-batch-size",
+            "1",
+            "--num-speculative-tokens",
+            "1",
+            "--block-size",
+            "16",
+            "--draft-kv-cache-gib",
+            "0.01",
+        ]
+    )
+    try:
+        adapter = create_adapter(args)
+        adapter.warmup()
+        state = adapter.state
+        executor = state.executor
+        baseline = SequenceKey("cuda-completion", 0, 0)
+        state.open(baseline)
+        state.prefill(baseline, 0, (1, 2), is_final=True)
+        expected = state.advance(0, TokenAdvanceRow(baseline, 2, None, 0, 0, (3,)), 1)
+        state.close((baseline,))
+        for generation, boundary in enumerate(
+            (
+                "model_call",
+                "model_return",
+                "logits_call",
+                "logits_return",
+                "copy_call",
+                "copy_return",
+            ),
+            start=1,
+        ):
+            key = SequenceKey("cuda-completion", 0, generation)
+            state.open(key)
+            state.prefill(key, 0, (1, 2), is_final=True)
+            slot = state.sequences[key].req_index
+            blocks = state.block_pool.blocks(slot)
+            completion = torch.cuda.Event()
+
+            def submit_marker(completion=completion):
+                torch.cuda._sleep(100_000_000)
+                completion.record()
+
+            failure = MemoryError(f"injected {boundary} failure")
+            with (
+                pytest.raises(MemoryError) as raised,
+                _fail_token_forward_at(executor, boundary, failure, submit_marker),
+            ):
+                state.advance(0, TokenAdvanceRow(key, 2, None, 0, 0, (3,)), 1)
+            assert raised.value is failure
+            assert completion.query(), "failed forward returned with GPU work pending"
+            state.close((key,))
+            assert state.block_pool.num_free_blocks == executor.num_blocks - 1
+            replacement = SequenceKey("cuda-reuse", 0, generation)
+            state.open(replacement)
+            assert state.sequences[replacement].req_index == slot
+            state.prefill(replacement, 0, (1, 2), is_final=True)
+            assert state.block_pool.blocks(slot) == blocks
+            actual = state.advance(
+                0, TokenAdvanceRow(replacement, 2, None, 0, 0, (3,)), 1
+            )
+            assert actual.token_ids == expected.token_ids
+            state.close((replacement,))
+    finally:
+        cleanup_dist_env_and_memory()

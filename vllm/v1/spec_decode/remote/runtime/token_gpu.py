@@ -270,60 +270,75 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             next_prefill_tokens=np.zeros((len(rows), 1), dtype=np.int32),
         )
         torch.accelerator.set_device_index(self.device)
-        with set_current_vllm_config(self.vllm_config):
-            self.prepare_block_tables(plan)
-            batch = make_input_batch(
-                plan,
-                torch.tensor(
-                    [token for row in rows for token in row.tokens], dtype=torch.int32
-                ),
-                self.input_buffers,
-            )
-            tables = self.block_tables.gather_block_tables(batch.idx_mapping, len(rows))
-            slots = self.block_tables.compute_slot_mappings(
-                batch.idx_mapping, batch.query_start_loc, batch.positions, n
-            )
-            metadata = self.model_state.prepare_attn(
-                batch,
-                CUDAGraphMode.NONE,
-                tables,
-                slots,
-                self.attn_groups,
-                self.kv_config,
-            )
-            hidden = self.speculator._run_model(
-                batch.input_ids,
-                batch.positions,
-                metadata,
-                build_slot_mappings_by_layer(slots, self.kv_config),
-                None,
-            )
-            sample_rows = [i for i, row in enumerate(rows) if row.sample]
-            result: list[int | None] = [None] * len(rows)
-            if sample_rows:
-                indices = torch.tensor(
-                    sample_rows, dtype=torch.int64, device=self.device
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self.prepare_block_tables(plan)
+                batch = make_input_batch(
+                    plan,
+                    torch.tensor(
+                        [token for row in rows for token in row.tokens],
+                        dtype=torch.int32,
+                    ),
+                    self.input_buffers,
                 )
-                last = (
-                    batch.query_start_loc[1:].to(torch.int64).index_select(0, indices)
-                    - 1
+                tables = self.block_tables.gather_block_tables(
+                    batch.idx_mapping, len(rows)
                 )
-                self.speculator.current_draft_step.zero_()
-                sampled = self.speculator.sample_draft(
-                    hidden.index_select(0, last),
-                    batch.positions.index_select(0, last),
-                    batch.idx_mapping.index_select(0, indices),
-                    self.temperature,
-                    self.seeds,
-                    self.speculator.current_draft_step,
+                slots = self.block_tables.compute_slot_mappings(
+                    batch.idx_mapping, batch.query_start_loc, batch.positions, n
+                )
+                metadata = self.model_state.prepare_attn(
+                    batch,
+                    CUDAGraphMode.NONE,
+                    tables,
+                    slots,
+                    self.attn_groups,
+                    self.kv_config,
+                )
+                hidden = self.speculator._run_model(
+                    batch.input_ids,
+                    batch.positions,
+                    metadata,
+                    build_slot_mappings_by_layer(slots, self.kv_config),
                     None,
                 )
-                for row, token in zip(sample_rows, sampled.cpu().tolist()):
-                    result[row] = int(token)
-            else:
-                # Prefill/K0 must complete before ACK and shared buffer reuse.
-                torch.accelerator.synchronize(self.device)
-            return tuple(result)
+                sample_rows = [i for i, row in enumerate(rows) if row.sample]
+                result: list[int | None] = [None] * len(rows)
+                if sample_rows:
+                    indices = torch.tensor(
+                        sample_rows, dtype=torch.int64, device=self.device
+                    )
+                    last = (
+                        batch.query_start_loc[1:]
+                        .to(torch.int64)
+                        .index_select(0, indices)
+                        - 1
+                    )
+                    self.speculator.current_draft_step.zero_()
+                    sampled = self.speculator.sample_draft(
+                        hidden.index_select(0, last),
+                        batch.positions.index_select(0, last),
+                        batch.idx_mapping.index_select(0, indices),
+                        self.temperature,
+                        self.seeds,
+                        self.speculator.current_draft_step,
+                        None,
+                    )
+                    for row, token in zip(sample_rows, sampled.cpu().tolist()):
+                        result[row] = int(token)
+                else:
+                    # Prefill/K0 must complete before ACK and shared buffer reuse.
+                    torch.accelerator.synchronize(self.device)
+                return tuple(result)
+        except BaseException as error:
+            if not runtime_unusable(error):
+                try:
+                    torch.accelerator.synchronize(self.device)
+                except BaseException as completion_error:
+                    raise CompletionUnknownError(
+                        "token forward GPU completion is unknown"
+                    ) from completion_error
+            raise
 
     @torch.inference_mode()
     def warmup(self) -> None:
