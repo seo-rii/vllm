@@ -230,7 +230,6 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     from safetensors import safe_open
 
     import vllm.ir
-    from tests.v1.spec_decode.remote.runtime_fixtures import cpu_accelerator_cleanup
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -241,7 +240,8 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     )
     from vllm.model_executor.layers.attention import Attention
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-    from vllm.model_executor.model_loader import get_model
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MambaSpec
     from vllm.v1.kv_cache_layout import KVCacheLayout
     from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
@@ -272,7 +272,6 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     initialized = False
     try:
         with (
-            cpu_accelerator_cleanup(),
             set_current_vllm_config(config),
             vllm.ir.enable_torch_wrap(config.compilation_config.ir_enable_torch_wrap),
         ):
@@ -286,7 +285,24 @@ def _run_recurrent_native_cache_allocation(tmp_path):
             )
             initialized = True
             initialize_model_parallel(backend="gloo")
-            model = get_model(vllm_config=config)
+            # Checkpoint metadata needs native weights before CPU kernel packing.
+            loader = get_model_loader(config.load_config)
+            with (
+                set_default_torch_dtype(config.model_config.dtype),
+                torch.device("cpu"),
+            ):
+                model = loader.create_model(config, config.model_config)
+                loader.load_weights(model, config.model_config)
+            model.eval()
+            with safe_open(
+                tmp_path / "draft/model.safetensors", framework="pt"
+            ) as weights:
+                assert torch.equal(
+                    model.get_parameter("model.layers.0.mixer.conv1d.weight"),
+                    weights.get_tensor("backbone.layers.0.mixer.conv1d.weight").to(
+                        config.model_config.dtype
+                    ),
+                )
             specs: dict[str, KVCacheSpec] = {}
             for name, layer in model.named_modules():
                 if isinstance(layer, (Attention, MambaMixer2)):
