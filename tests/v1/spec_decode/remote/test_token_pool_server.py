@@ -410,6 +410,28 @@ def test_queue_owner_failure_completes_all_admitted_work(monkeypatch, fault):
         queue.start(lambda: pytest.fail("failed GPU owner was restarted"))
 
 
+def test_token_owner_failure_marks_server_unhealthy_and_wakes_stop(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+
+    _, _, server = make_server()
+    server.start(f"unix://{tmp_path}/failed-owner.sock")
+    error = MemoryError("owner batch allocation")
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(module, "tuple", fail, raising=False)
+    work = server.work_queue.submit(DraftWork("a", None, num_rows=1, num_tokens=1))
+    assert work.done.wait(3)
+    assert work.error is error
+    assert server.wait(timeout=0) and not server.healthy
+    assert server.queue_depth == 0
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        server.stop()
+
+
 @pytest.mark.parametrize("fault", ["before", "uncertain", "after"])
 def test_queue_start_failure_retains_uncertain_thread_ownership(monkeypatch, fault):
     queue = DraftWorkQueue(
