@@ -178,6 +178,44 @@ def wire_runtime(tmp_path, request):
         assert not server._handshaking
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_target_kv_acceptor_start_failure_rolls_back(
+    wire_runtime, monkeypatch, tmp_path, started
+):
+    server, _, original = wire_runtime
+    original.close()
+    server.stop()
+    path = tmp_path / "retry.sock"
+    endpoint = f"unix://{path}"
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            if self.name == "target-kv-acceptor":
+                if started:
+                    super().start()
+                raise RuntimeError("injected target-KV acceptor start failure")
+            return super().start()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Thread", FailingThread)
+        with pytest.raises(RuntimeError, match="injected target-KV"):
+            server.start(endpoint)
+    assert not path.exists()
+    assert server.endpoint is None
+    assert server.healthy
+    server.start(endpoint)
+    replacement = TargetKVRemoteSession(
+        endpoint, original.hello, expected_specs=original.expected_specs
+    )
+    try:
+        replacement.connect()
+        key = replacement.open_sequence(55, deadline=replacement.deadline())
+        assert propose(replacement, snapshot(replacement, key)).token_ids == (18,)
+    finally:
+        replacement.close()
+        server.stop()
+
+
 def snapshot(client, key, round_id=0, length=9):
     plans = snapshot_wire_plan(client.expected_specs, length, client.budget)
     return TargetKVSnapshot(
