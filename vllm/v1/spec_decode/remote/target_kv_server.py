@@ -61,7 +61,6 @@ from vllm.v1.spec_decode.remote.transport import (
     TransportTimeout,
     decode_data_frame,
     is_local_endpoint,
-    listen,
     validate_frame,
 )
 
@@ -334,17 +333,7 @@ class TargetKVDraftServer(RemoteDraftServer):
         except Exception as error:
             self._adapter_failed(error)
             raise
-        try:
-            self._listener = listen(endpoint)
-        except BaseException:
-            self.work_queue.stop(time.monotonic() + self.shutdown_timeout_s)
-            raise
-        self._stopping.clear()
-        self._acceptor = threading.Thread(
-            target=self._accept_loop, name="target-kv-acceptor", daemon=True
-        )
-        self._acceptor.start()
-        return self._listener.endpoint
+        return self._start_listener(endpoint, name="target-kv-acceptor")
 
     def _serve_connection(self, conn: FramedConnection):
         session: _TargetKVServerSession | None = None
