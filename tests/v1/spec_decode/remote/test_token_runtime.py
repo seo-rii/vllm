@@ -485,7 +485,7 @@ def test_token_open_metadata_oom_preserves_all_slots(monkeypatch, failure):
 
 
 @pytest.fixture
-def socket_runtime(tmp_path):
+def socket_runtime(tmp_path, request):
     state, oracle = machine(executor=BatchedKVOracle())
     contract = RuntimeContract(
         TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
@@ -499,7 +499,9 @@ def socket_runtime(tmp_path):
         "draft",
     )
     server = TokenDraftServer(
-        TokenOnlyDraftAdapter(state, contract), limits=RemoteServerLimits(4, 64, 4, 64)
+        TokenOnlyDraftAdapter(state, contract),
+        limits=RemoteServerLimits(4, 64, 4, 64),
+        max_connections=getattr(request, "param", 16),
     )
     endpoint = server.start(f"unix://{tmp_path}/t.sock")
     hello = TokenHello("verifier", "target", "draft", "tokenizer", 3, 128, 4, 64, 64)
@@ -512,6 +514,51 @@ def socket_runtime(tmp_path):
         server.stop()
         assert not state.sequences
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
+
+
+@pytest.mark.parametrize("socket_runtime", [1], indirect=True)
+def test_token_server_socket_close_error_releases_connection_admission(
+    socket_runtime, monkeypatch, caplog
+):
+    import os
+    import threading
+
+    state, oracle, server, session = socket_runtime
+    key = session.open_sequence(0, deadline=session.deadline())
+    session.prefill(key, (1,), is_final=True, deadline=session.deadline())
+    with server._connections_lock:
+        (connection,) = server._connections
+        worker = server._workers[0]
+    thread_errors: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", thread_errors.append)
+    os.close(connection._sock.fileno())
+    session.close()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    with server._connections_lock:
+        assert not server._connections and not server._handshaking
+    assert not state.sequences and server.healthy
+    assert not thread_errors
+    assert "Token connection cleanup failed" in caplog.text
+
+    replacement = TokenOnlyRemoteSession(
+        session.endpoint, session.hello, request_timeout_ms=5000
+    )
+    try:
+        key = replacement.open_sequence(1, deadline=replacement.deadline())
+        replacement.prefill(key, (2,), is_final=True, deadline=replacement.deadline())
+        result = replacement.collect(
+            replacement.dispatch(
+                0,
+                (TokenAdvanceRow(key, 1, None, 0, 0, (3,)),),
+                1,
+                deadline=replacement.deadline(),
+            )
+        )
+        assert result.valid_lengths == (1,)
+        assert result.token_ids[0][0] == oracle.predict([2, 3])
+    finally:
+        replacement.close()
 
 
 @pytest.mark.parametrize("policy", ["error", "target_only"])
