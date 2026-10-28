@@ -22,6 +22,7 @@ from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
     host_allocation_failure,
 )
+from vllm.v1.spec_decode.remote.metrics import RemoteDraftStats
 from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.session import (
@@ -182,6 +183,11 @@ class RemoteSpeculator(BaseSpeculator):
     def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
         if self._session is not None:
             self._session.observation.register(req_id, headers)
+
+    def take_remote_draft_stats(self) -> RemoteDraftStats | None:
+        if self._session is not None:
+            return self._session.observation.take_stats()
+        return None
 
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:

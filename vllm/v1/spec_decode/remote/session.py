@@ -1174,7 +1174,7 @@ class RemoteDraftSession:
         )
         if failed:
             for _, reason in failed:
-                self.observation.metrics.rows.labels("conditioned", reason).inc()
+                self.observation.record_failed_row(reason)
             self._raise_if_strict(f"batch {handle.batch_id} has failed rows: {failed}")
         return result
 

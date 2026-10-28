@@ -442,7 +442,7 @@ class TokenOnlyRemoteSession:
                 ):
                     raise ProtocolError("invalid token proposal values")
                 if status is not OK:
-                    self.observation.metrics.rows.labels("token", status.name).inc()
+                    self.observation.record_failed_row(status.name)
                     state.terminal = True
                     valid[i] = 0
                     if self.failure_policy == "error":
@@ -463,9 +463,7 @@ class TokenOnlyRemoteSession:
             if handle.request_id not in self.observation.pending and not (
                 isinstance(response, TokenProposal) and response.status is not OK
             ):
-                self.observation.metrics.failures.labels(
-                    "token", "proposal", reason
-                ).inc()
+                self.observation.record_failure("proposal", reason)
             self.observation.finish(
                 handle.request_id,
                 reason=reason,

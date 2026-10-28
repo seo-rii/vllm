@@ -80,6 +80,7 @@ def test_remote_mtp_observability_through_openai_server(
     tmp_path,
     tiny_ernie_mtp_model,
     tracing,
+    record_property,
 ):
     """Public serving metrics and OTLP spans preserve the target's exact tokens."""
     import requests
@@ -211,21 +212,42 @@ def test_remote_mtp_observability_through_openai_server(
                 ] == list(expected)
                 metrics = requests.get(api.url_for("metrics"), timeout=5)
                 metrics.raise_for_status()
+                cleanup_deadline = time.monotonic() + 10
+                while True:
+                    resources = {
+                        sample.labels["resource"]: sample.value
+                        for metric in text_string_to_metric_families(metrics.text)
+                        for sample in metric.samples
+                        if sample.name == "vllm:remote_draft_server_resources"
+                    }
+                    if all(
+                        resources.get(name) == 0
+                        for name in ("active_sequences", "kv_used_blocks")
+                    ):
+                        break
+                    if time.monotonic() >= cleanup_deadline:
+                        pytest.fail(
+                            f"idle remote cleanup was not published: {metrics.text}"
+                        )
+                    time.sleep(0.05)
+                    metrics = requests.get(api.url_for("metrics"), timeout=5)
+                    metrics.raise_for_status()
                 samples = [
                     sample
                     for metric in text_string_to_metric_families(metrics.text)
                     for sample in metric.samples
                 ]
+                (tmp_path / "serving-metrics.txt").write_text(metrics.text)
                 for name in (
                     "vllm:remote_draft_rpc_seconds_count",
                     "vllm:remote_draft_server_seconds_count",
                     "vllm:remote_draft_bytes_total",
                     "vllm:spec_decode_num_draft_tokens_total",
                 ):
-                    assert (
-                        sum(sample.value for sample in samples if sample.name == name)
-                        > 0
-                    )
+                    matching = [s for s in samples if s.name == name]
+                    total = sum(sample.value for sample in matching)
+                    record_property(name, total)
+                    assert total > 0, (name, matching, metrics.text)
                 if tracing:
                     with changed:
                         assert changed.wait_for(

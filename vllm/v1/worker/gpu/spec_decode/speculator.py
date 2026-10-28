@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.remote.metrics import RemoteDraftStats
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.spec_decode import (
     DraftWatermarker,
@@ -63,6 +64,9 @@ class BaseSpeculator(ABC):
     num_query_per_req: int = 1
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
+
+    def take_remote_draft_stats(self) -> RemoteDraftStats | None:
+        return None
 
     def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
         """Retain optional request context for a distributed draft backend."""

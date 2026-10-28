@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.remote.metrics import RemoteDraftStats
 
 logger = init_logger(__name__)
 
@@ -244,6 +245,7 @@ class SchedulerStats:
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
     spec_decoding_stats: SpecDecodingStats | None = None
+    remote_draft_stats: RemoteDraftStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
     ec_connector_stats: dict[str, Any] | None = None
 

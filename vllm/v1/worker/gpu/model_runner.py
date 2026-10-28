@@ -21,7 +21,7 @@ import gc
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from typing import Any, NamedTuple
 
@@ -1794,10 +1794,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
     ) -> ModelRunnerOutput:
         """Let the EC connector send/recv on a step with no work to run."""
-        return ModelRunnerOutput.with_ec_conn_output(
+        output = ModelRunnerOutput.with_ec_conn_output(
             output,
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
+        if self.speculator is not None:
+            stats = self.speculator.take_remote_draft_stats()
+            if stats is not None:
+                output = copy(output)
+                output.remote_draft_stats = stats
+        return output
 
     @torch.inference_mode()
     def execute_model(
@@ -2389,6 +2395,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if defer_kv_finalize:
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
+        if self.speculator is not None:
+            model_runner_output.remote_draft_stats = (
+                self.speculator.take_remote_draft_stats()
+            )
 
         return async_output
 

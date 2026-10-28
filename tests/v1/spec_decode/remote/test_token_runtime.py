@@ -452,22 +452,25 @@ def socket_runtime(tmp_path, request):
         assert state.block_pool.num_free_blocks == state.block_pool.num_blocks - 1
 
 
-@pytest.mark.parametrize("reset_collectors", [False, True])
-def test_token_rpc_metrics_include_server_resources_and_cleanup(
-    socket_runtime, reset_collectors
-):
+def test_token_rpc_metrics_include_server_resources_and_cleanup(socket_runtime):
     """A real client exposes server execution and returns its reported KV credit."""
     import urllib.request
 
-    from prometheus_client import start_http_server
+    from prometheus_client import CollectorRegistry, start_http_server
     from prometheus_client.parser import text_string_to_metric_families
 
-    state, _, _, session = socket_runtime
-    if reset_collectors:
-        from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+    from vllm.v1.spec_decode.remote.metrics import RemoteMetrics
 
-        unregister_vllm_metrics()
-    httpd, thread = start_http_server(0, addr="127.0.0.1")
+    state, _, _, session = socket_runtime
+    registry = CollectorRegistry()
+    publisher = RemoteMetrics(registry=registry)
+    httpd, thread = start_http_server(0, addr="127.0.0.1", registry=registry)
+
+    def publish():
+        stats = session.observation.take_stats()
+        assert stats is not None
+        publisher.observe(stats)
+        assert session.observation.take_stats() is None
 
     def values():
         with urllib.request.urlopen(
@@ -503,6 +506,7 @@ def test_token_rpc_metrics_include_server_resources_and_cleanup(
             )
         )
         assert result.valid_lengths == (2,)
+        publish()
         assert (
             value(
                 "vllm:remote_draft_rpc_seconds_count",
@@ -552,6 +556,7 @@ def test_token_rpc_metrics_include_server_resources_and_cleanup(
             for sample in values()
         )
         session.close_sequences((key,))
+        publish()
         assert (
             value(
                 "vllm:remote_draft_server_resources",
@@ -566,6 +571,105 @@ def test_token_rpc_metrics_include_server_resources_and_cleanup(
         httpd.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_remote_metrics_follow_stats_only_engine_output(tmp_path, monkeypatch):
+    """A frontend publishes worker deltas without a shared Prometheus registry."""
+    import math
+
+    import msgspec
+    from prometheus_client import generate_latest
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+    from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.spec_decode.remote.metrics import (
+        RemoteDraftStats,
+        RemoteHistogramStats,
+    )
+
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    config = token_config(tmp_path)
+    scheduler = create_scheduler(
+        model=config.model_config.model,
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+    )
+    frontend = PrometheusStatLogger(config)
+    durations = (0.0, 0.0001, 0.001, 0.003, 31.0)
+    histogram = RemoteHistogramStats()
+    for seconds in durations:
+        histogram.observe(seconds)
+    stats = RemoteDraftStats(
+        "token",
+        rounds={"proposal": histogram},
+        bytes={"sent": 123},
+        failures={"proposal": {"timeout": 2}},
+        rows={"CAPACITY_EXCEEDED": 3},
+        resources={"kv_used_blocks": 2},
+    )
+
+    def forward(delta):
+        outputs = scheduler.update_from_output(
+            scheduler.schedule(),
+            ModelRunnerOutput([], {}, remote_draft_stats=delta),
+        )
+        assert len(outputs) == 1
+        output = next(iter(outputs.values()))
+        assert not output.outputs
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(output), type=EngineCoreOutputs
+        )
+        frontend.record(decoded.scheduler_stats, None)
+
+    try:
+        assert "vllm:remote_draft_rpc_seconds" not in generate_latest().decode()
+        forward(stats)
+        samples = [
+            sample
+            for metric in text_string_to_metric_families(generate_latest().decode())
+            for sample in metric.samples
+        ]
+        remote = [s for s in samples if s.name.startswith("vllm:remote_draft_")]
+        assert all(s.labels["engine"] == "0" for s in remote)
+        assert all(s.labels["model_name"] == config.model_config.model for s in remote)
+        for sample in remote:
+            if sample.name == "vllm:remote_draft_rpc_seconds_bucket":
+                bound = float(sample.labels["le"])
+                assert sample.value == sum(seconds <= bound for seconds in durations)
+        for name, expected in (
+            ("rpc_seconds_count", len(durations)),
+            ("rpc_seconds_sum", sum(durations)),
+            ("bytes_total", 123),
+            ("rpc_failures_total", 2),
+            ("failed_rows_total", 3),
+        ):
+            matching = [
+                s.value for s in remote if s.name == f"vllm:remote_draft_{name}"
+            ]
+            assert matching == [expected]
+        # A metadata-only close publishes zero while idle, without replaying deltas.
+        forward(RemoteDraftStats("token", resources={"kv_used_blocks": 0}))
+        assert 'resource="kv_used_blocks"} 0.0' in generate_latest().decode()
+        assert frontend.remote_draft_prom is not None
+        for invalid in (
+            RemoteHistogramStats([1]),
+            RemoteHistogramStats([-1] + [0] * 16),
+            RemoteHistogramStats(sum=-1),
+            RemoteHistogramStats(sum=math.nan),
+            RemoteHistogramStats(sum=math.inf),
+        ):
+            with pytest.raises(ValueError, match="histogram aggregate"):
+                frontend.remote_draft_prom.observe(
+                    RemoteDraftStats("token", rounds={"proposal": invalid})
+                )
+    finally:
+        scheduler.shutdown()
+        unregister_vllm_metrics()
 
 
 def _check_token_otlp_trace_links(directory):
@@ -702,17 +806,6 @@ def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime)
         failure_policy="target_only",
         request_timeout_ms=5000,
     )
-    rows = session.observation.metrics.rows.labels("token", "SEQUENCE_DESYNC")
-
-    def failures():
-        return next(
-            sample.value
-            for metric in rows.collect()
-            for sample in metric.samples
-            if sample.name.endswith("_total")
-        )
-
-    before = failures()
     try:
         key = session.open_sequence(0, deadline=session.deadline())
         session.prefill(key, (1,), is_final=True, deadline=session.deadline())
@@ -725,7 +818,9 @@ def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime)
             )
         )
         assert result.valid_lengths == (0,)
-        assert failures() == before + 1
+        stats = session.observation.take_stats()
+        assert stats is not None
+        assert stats.rows == {"SEQUENCE_DESYNC": 1}
         assert not session.active(key)
         result = session.collect(
             session.dispatch(
@@ -736,7 +831,8 @@ def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime)
             )
         )
         assert result.valid_lengths == (0,)
-        assert failures() == before + 1
+        stats = session.observation.take_stats()
+        assert stats is None or not stats.rows
         session.close_sequences((key,))
         assert not state.sequences
     finally:
@@ -753,26 +849,15 @@ def test_token_prefill_failure_metric_preserves_server_status(socket_runtime):
         failure_policy="target_only",
         request_timeout_ms=5000,
     )
-    counter = session.observation.metrics.failures.labels(
-        "token", "prefill", "PROTOCOL_ERROR"
-    )
-
-    def failures():
-        return next(
-            sample.value
-            for metric in counter.collect()
-            for sample in metric.samples
-            if sample.name.endswith("_total")
-        )
-
-    before = failures()
     try:
         key = session.open_sequence(0, deadline=session.deadline())
         session.prefill(
             key, (session.hello.vocab_size,), is_final=True, deadline=session.deadline()
         )
         assert not session.active(key)
-        assert failures() == before + 1
+        stats = session.observation.take_stats()
+        assert stats is not None
+        assert stats.failures["prefill"]["PROTOCOL_ERROR"] == 1
     finally:
         session.close()
 

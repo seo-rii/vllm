@@ -45,9 +45,14 @@ replace that failure or interrupt the configured fallback.
 ## Metrics and OpenTelemetry
 
 Remote placement publishes host-side RPC measurements through the target's
-existing Prometheus `/metrics` endpoint. These measurements do not synchronize
-CUDA or require a telemetry collector. Counters aggregate remote sessions of the
-same backend (`conditioned` or `token`) within the target service.
+existing Prometheus `/metrics` endpoint, with its normal model and engine labels.
+These measurements do not synchronize CUDA or require a telemetry collector.
+The worker accumulates bounded CPU counters and exact histogram bins; existing
+engine statistics carry the deltas to the frontend that publishes them. This
+works with the default single API server and with multiprocess metric collection.
+The usual `--disable-log-stats` setting also disables these serving metrics.
+Counters aggregate sessions of the same backend (`conditioned` or `token`) per
+engine, without labeling individual requests or remote endpoints.
 
 | Metric | Meaning |
 | --- | --- |
@@ -56,13 +61,19 @@ same backend (`conditioned` or `token`) within the target service.
 | `vllm:remote_draft_bytes_total` | Socket bytes by `direction`, including frame/control metadata; excludes CUDA IPC device copies and can undercount an interrupted partial write |
 | `vllm:remote_draft_rpc_failures_total` | RPC failures by bounded `reason`, including transport and timeout failures |
 | `vllm:remote_draft_failed_rows_total` | Rejected proposal rows by protocol status; the configured failure policy determines whether these fall back or raise |
-| `vllm:remote_draft_server_resources` | Latest reported active sequences, used KV blocks and usable block capacity; maximum of the latest snapshots across live target workers |
+| `vllm:remote_draft_server_resources` | Latest reported active sequences, used KV blocks and usable block capacity per engine |
 
 Resource values are snapshots received with ordinary replies, not an independent
 server health check. KV counts exclude the reserved null block. A disconnected
 server's last report can be stale. The adapter reports KV only when it owns a
 block allocator; protocol test adapters do not invent a KV capacity. Repeated
 steps of an already terminal request do not count as new failed rows.
+Acknowledged cleanup is forwarded on an empty engine step, so the last request's
+resource release does not require another generation. Metrics follow the normal
+statistics cadence; an error that terminates the worker before its output is sent
+can lose the last deltas. They are not durable accounting records. Custom stat
+loggers receive the optional remote statistics. The built-in Prometheus logger
+publishes these metrics; Ray-native telemetry export is not supported.
 
 For example, the proposal round-trip p99 is:
 
