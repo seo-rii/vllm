@@ -43,6 +43,9 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
         if self.cache is not None:
             self.cache.warmup()
 
+    def close(self) -> None:
+        self.state.executor.close()
+
     def open_sequence(self, key: SequenceKey) -> None:
         self.state.open(key)
 

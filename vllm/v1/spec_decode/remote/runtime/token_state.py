@@ -74,6 +74,9 @@ class _TokenUpdate:
 
 
 class TokenStepExecutor(ABC):
+    def close(self) -> None:  # noqa: B027
+        """Retire executor-owned workers after the serving loop has stopped."""
+
     def warmup(self) -> None:  # noqa: B027
         """Finish device initialization before the listener becomes ready."""
 

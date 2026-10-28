@@ -4,6 +4,8 @@
 
 import math
 import tempfile
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +46,26 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class StandaloneParallelContext:
+    rank: int
+    world_size: int
+    init_method: str
+    timeout_s: float
+
+    def __post_init__(self) -> None:
+        if self.world_size != 2 or not 0 <= self.rank < self.world_size:
+            raise ValueError("standalone token draft group requires two valid ranks")
+        if (
+            not self.init_method
+            or not math.isfinite(self.timeout_s)
+            or self.timeout_s <= 0
+        ):
+            raise ValueError(
+                "standalone draft group requires a finite initialization budget"
+            )
 
 
 def initialize_standalone_kv_cache_config(
@@ -178,6 +200,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         device: torch.device,
         kv_cache_bytes: int,
         shared_weights_source: str = "auto",
+        parallel_context: StandaloneParallelContext | None = None,
     ) -> None:
         from vllm.distributed import (
             init_distributed_environment,
@@ -202,8 +225,24 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         self.vllm_config = vllm_config
         self.device = device
         parallel = vllm_config.parallel_config
-        if parallel.world_size != 1 or parallel.data_parallel_size != 1:
-            raise ValueError("standalone drafter requires world_size=1")
+        spec = vllm_config.speculative_config
+        if parallel_context is None:
+            if parallel.world_size != 1 or parallel.data_parallel_size != 1:
+                raise ValueError("standalone drafter requires world_size=1")
+        elif (
+            spec is None
+            or spec.method != "draft_model"
+            or parallel.world_size != parallel_context.world_size
+            or parallel.tensor_parallel_size != parallel_context.world_size
+            or parallel.rank != parallel_context.rank
+            or parallel.data_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "standalone token draft group topology differs from its rank"
+            )
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("standalone drafter currently requires enforce_eager")
         local_rank = _resolve_local_rank(device, parallel.assigned_physical_gpu_ids)
@@ -224,17 +263,30 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         vllm.ir.set_default_torch_wrap(
             vllm_config.compilation_config.ir_enable_torch_wrap
         )
-        self._dist_directory = tempfile.TemporaryDirectory(prefix="vllm-remote-draft-")
-        init_method = Path(self._dist_directory.name, "rendezvous").as_uri()
+        self._dist_directory: tempfile.TemporaryDirectory[str] | None = None
+        if parallel_context is None:
+            self._dist_directory = tempfile.TemporaryDirectory(
+                prefix="vllm-remote-draft-"
+            )
+            init_method = Path(self._dist_directory.name, "rendezvous").as_uri()
+        else:
+            init_method = parallel_context.init_method
         with set_current_vllm_config(vllm_config), torch.inference_mode():
             init_distributed_environment(
-                world_size=1,
-                rank=0,
+                world_size=parallel.world_size,
+                rank=parallel.rank,
                 local_rank=local_rank,
                 distributed_init_method=init_method,
                 backend="nccl",
+                timeout=(
+                    timedelta(seconds=parallel_context.timeout_s)
+                    if parallel_context is not None
+                    else None
+                ),
             )
-            initialize_model_parallel()
+            initialize_model_parallel(
+                tensor_model_parallel_size=parallel.tensor_parallel_size
+            )
             spec = vllm_config.speculative_config
             assert spec is not None
             self.speculator = self._load_speculator(

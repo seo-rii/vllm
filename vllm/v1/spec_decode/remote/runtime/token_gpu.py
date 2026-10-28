@@ -14,6 +14,7 @@ from vllm.v1.spec_decode.remote.errors import CompletionUnknownError, runtime_un
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.gpu import (
     GPUDraftStepExecutor,
+    StandaloneParallelContext,
     make_input_batch,
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
@@ -35,6 +36,7 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
 
 if TYPE_CHECKING:
     from vllm.v1.spec_decode.remote.runtime.token_cache import TokenCacheOptions
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TokenTPExecutor
 
 
 def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> None:
@@ -53,9 +55,12 @@ def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> N
 
 
 def create_token_executor_config(
-    config: VllmConfig, *, branch_slots: int = 0
+    config: VllmConfig,
+    *,
+    parallel_context: StandaloneParallelContext | None = None,
+    branch_slots: int = 0,
 ) -> VllmConfig:
-    """Reserve native buffers for live and cache branches without changing admission."""
+    """Give the standalone model its own geometry and rank-specific topology."""
     spec = config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
     resource = replace(
@@ -70,6 +75,13 @@ def create_token_executor_config(
         ),
     )
     resource = spec.apply_draft_overrides(resource)
+    if parallel_context is not None:
+        resource = replace(
+            resource,
+            parallel_config=replace(
+                resource.parallel_config, rank=parallel_context.rank
+            ),
+        )
     if type(branch_slots) is not int or branch_slots < 0:
         raise ValueError("branch slots must be a nonnegative integer")
     if branch_slots:
@@ -96,6 +108,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         *,
         device: torch.device,
         kv_cache_bytes: int,
+        parallel_context: StandaloneParallelContext | None = None,
         branch_slots: int = 0,
     ):
         self._token_contract = create_token_runtime_contract(config)
@@ -103,17 +116,25 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         assert spec is not None and spec.draft_model_config is not None
         if (
             config.parallel_config.tensor_parallel_size != 1
-            or spec.draft_parallel_config.tensor_parallel_size != 1
+            or spec.draft_parallel_config.tensor_parallel_size
+            != (1 if parallel_context is None else parallel_context.world_size)
         ):
-            raise ValueError("token-only runtime requires target TP1 and draft TP1")
+            raise ValueError(
+                "token-only runtime topology differs from its worker group"
+            )
         if spec.draft_model_config.quantization is not None:
             raise ValueError(
                 "token-only first runtime requires unquantized draft weights"
             )
-        # Allocate attention/KV from the independent draft's dimensions. No
-        # target modules, embeddings or output head are constructed here.
-        resource = create_token_executor_config(config, branch_slots=branch_slots)
-        super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
+        resource = create_token_executor_config(
+            config, parallel_context=parallel_context, branch_slots=branch_slots
+        )
+        super().__init__(
+            resource,
+            device=device,
+            kv_cache_bytes=kv_cache_bytes,
+            parallel_context=parallel_context,
+        )
 
     def _create_contract(self, config):
         return self._token_contract
@@ -178,6 +199,9 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
                         )
                         raise unknown from failure
                     raise unknown from completion_error
+
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        """TokenStateMachine owns the dense executor's request KV and slots."""
 
     def forward(self, key, req_index, start, tokens, blocks, *, sample):
         return self.forward_batch(
@@ -348,6 +372,7 @@ def make_token_gpu_adapter(
     *,
     device: torch.device,
     kv_cache_bytes: int,
+    devices: tuple[torch.device, ...] | None = None,
     outcome_cache: "TokenCacheOptions | None" = None,
 ) -> TokenOnlyDraftAdapter:
     spec = config.speculative_config
@@ -361,51 +386,71 @@ def make_token_gpu_adapter(
 
         if not supports_token_outcome_cache(config, require_remote=False):
             raise ValueError("outcome cache requires ordinary full-attention Qwen3 TP1")
-    executor = TokenGPUStepExecutor(
-        config,
-        device=device,
-        kv_cache_bytes=kv_cache_bytes,
-        branch_slots=0 if outcome_cache is None else outcome_cache.max_branches,
-    )
-    state = TokenStateMachine(
-        executor,
-        DraftBlockPool(executor.num_blocks, executor.block_size),
-        max_num_reqs=config.scheduler_config.max_num_seqs,
-        max_model_len=config.model_config.max_model_len,
-        vocab_size=config.model_config.get_vocab_size(),
-        max_k=spec.num_speculative_tokens,
-    )
-    cache = None
-    if outcome_cache is not None:
-        from vllm.v1.kv_cache_interface import AttentionSpec
-        from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+    executor: TokenGPUStepExecutor | TokenTPExecutor
+    if spec.draft_parallel_config.tensor_parallel_size > 1:
+        from vllm.v1.spec_decode.remote.runtime.tp_executor import (
+            TokenTPExecutor as TPExecutor,
+        )
 
-        if any(
-            not isinstance(group.kv_cache_spec, AttentionSpec)
-            or group.kv_cache_spec.dtype != torch.bfloat16
-            for group in executor.kv_config.kv_cache_groups
-        ):
-            raise ValueError("loaded outcome cache requires bfloat16 KV")
-        page_bytes = sum(
-            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-            for group in executor.kv_config.kv_cache_groups
+        if devices is None:
+            raise ValueError("draft TP2 requires two explicit CUDA devices")
+        executor = TPExecutor(config, devices=devices, kv_cache_bytes=kv_cache_bytes)
+    elif devices is not None:
+        raise ValueError("multiple draft devices require draft TP2")
+    else:
+        executor = TokenGPUStepExecutor(
+            config,
+            device=device,
+            kv_cache_bytes=kv_cache_bytes,
+            branch_slots=0 if outcome_cache is None else outcome_cache.max_branches,
         )
-        blocks = outcome_cache.kv_budget_bytes // page_bytes
-        if not 1 <= blocks <= executor.num_blocks - 1:
-            raise ValueError(
-                "outcome cache KV budget must fit the physical draft arena"
+    try:
+        state = TokenStateMachine(
+            executor,
+            DraftBlockPool(executor.num_blocks, executor.block_size),
+            max_num_reqs=config.scheduler_config.max_num_seqs,
+            max_model_len=config.model_config.max_model_len,
+            vocab_size=config.model_config.get_vocab_size(),
+            max_k=spec.num_speculative_tokens,
+        )
+        cache = None
+        if outcome_cache is not None:
+            assert isinstance(executor, TokenGPUStepExecutor)
+            from vllm.v1.kv_cache_interface import AttentionSpec
+            from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+
+            if any(
+                not isinstance(group.kv_cache_spec, AttentionSpec)
+                or group.kv_cache_spec.dtype != torch.bfloat16
+                for group in executor.kv_config.kv_cache_groups
+            ):
+                raise ValueError("loaded outcome cache requires bfloat16 KV")
+            page_bytes = sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in executor.kv_config.kv_cache_groups
             )
-        cache = TokenOutcomeCache(
-            state,
-            live_slots=config.scheduler_config.max_num_seqs,
-            max_branches=outcome_cache.max_branches,
-            max_branch_blocks=blocks,
-            copy_chunk_blocks=outcome_cache.copy_chunk_blocks,
-            contract_id=(
-                executor.contract.target_fingerprint,
-                executor.contract.draft_fingerprint,
-                executor.contract.tokenizer_fingerprint,
-                "greedy",
-            ),
-        )
+            blocks = outcome_cache.kv_budget_bytes // page_bytes
+            if not 1 <= blocks <= executor.num_blocks - 1:
+                raise ValueError(
+                    "outcome cache KV budget must fit the physical draft arena"
+                )
+            cache = TokenOutcomeCache(
+                state,
+                live_slots=config.scheduler_config.max_num_seqs,
+                max_branches=outcome_cache.max_branches,
+                max_branch_blocks=blocks,
+                copy_chunk_blocks=outcome_cache.copy_chunk_blocks,
+                contract_id=(
+                    executor.contract.target_fingerprint,
+                    executor.contract.draft_fingerprint,
+                    executor.contract.tokenizer_fingerprint,
+                    "greedy",
+                ),
+            )
+    except BaseException as error:
+        try:
+            executor.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"token executor cleanup failed: {cleanup_error}")
+        raise
     return TokenOnlyDraftAdapter(state, executor.contract, cache)
