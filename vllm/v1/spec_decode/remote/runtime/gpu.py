@@ -28,6 +28,10 @@ from vllm.v1.spec_decode.remote.runtime.kv_layout import (
     select_standalone_kv_spec,
 )
 from vllm.v1.spec_decode.remote.runtime.multi_module import MultiModuleReplay
+from vllm.v1.spec_decode.remote.runtime.quantization import (
+    require_complete_native_weights,
+    validate_loaded_weight_profile,
+)
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.step import (
     DraftStepPlan,
@@ -256,6 +260,11 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                     features.output_width,
                 )
             self.speculator.model.eval()
+            if profile := self.contract.weight_profile:
+                logger.info(
+                    "Standalone weight profile: %s",
+                    validate_loaded_weight_profile(self.speculator.model, profile),
+                )
 
             self.kv_config = initialize_standalone_kv_cache_config(
                 vllm_config, kv_cache_bytes
@@ -358,6 +367,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         )
         from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
+        if self.contract.weight_profile is not None:
+            config = require_complete_native_weights(
+                config, self.contract.weight_profile
+            )
         target_shell = materialize_target_shell(
             config.model_config,
             device,

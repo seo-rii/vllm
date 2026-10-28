@@ -1277,13 +1277,77 @@ def _save_qwen35_mtp_model(directory, *, routed=False):
     return model, receipt
 
 
-def _tiny_qwen35_mtp_model(tmp_path, *, routed):
+def _save_qwen35_fp8_mtp_model(directory):
+    """Serialize real E4M3 linear weights while retaining BF16 shared weights."""
+    import json
+    import shutil
+
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import input_to_float8
+
+    root = Path(directory)
+    original = root / "bf16"
+    original.mkdir()
+    model, receipt = _save_qwen35_mtp_model(original)
+    path = root / "model"
+    shutil.copytree(model, path)
+    weights = load_file(Path(model) / "model.safetensors")
+    quantized = {}
+    converted = []
+    for name, tensor in weights.items():
+        if tensor.ndim == 2 and name not in (
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ):
+            assert name.endswith(".weight") and tensor.dtype == torch.bfloat16
+            weight, scale = input_to_float8(tensor.float(), torch.float8_e4m3fn)
+            assert weight.dtype == torch.float8_e4m3fn
+            assert scale.dtype == torch.float32 and scale.numel() == 1
+            assert torch.isfinite(scale) and scale > 0
+            quantized[name] = weight
+            quantized[name.removesuffix(".weight") + ".weight_scale"] = scale
+            converted.append(name)
+        else:
+            quantized[name] = tensor
+    assert len(converted) == 23 and len(quantized) == 66
+    save_file(quantized, path / "model.safetensors", metadata={"format": "pt"})
+    loaded = load_file(path / "model.safetensors")
+    assert loaded.keys() == quantized.keys()
+    for name, tensor in quantized.items():
+        assert loaded[name].dtype == tensor.dtype
+        assert torch.equal(
+            loaded[name].reshape(-1).view(torch.uint8),
+            tensor.reshape(-1).view(torch.uint8),
+        )
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization_config"] = dict(
+        quant_method="fp8", activation_scheme="dynamic", ignored_layers=[]
+    )
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    receipt.update(
+        precision="serialized_e4m3fn_per_tensor_dynamic",
+        checkpoint_tensors=66,
+        quantized_linear_tensors=converted,
+        scale_dtype="float32",
+        activation_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        shared_weights_dtype="bfloat16",
+    )
+    (root / "fixture.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    return str(path), receipt
+
+
+def _tiny_qwen35_mtp_model(tmp_path, *, routed, fp8=False):
+    fixture = "_save_qwen35_fp8_mtp_model" if fp8 else "_save_qwen35_mtp_model"
     command = [
         sys.executable,
         "-c",
         "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_qwen35_mtp_model; "
-        "_save_qwen35_mtp_model(sys.argv[1], routed=sys.argv[2] == 'moe')",
+        f"import {fixture}; {fixture}(sys.argv[1]"
+        + (")" if fp8 else ", routed=sys.argv[2] == 'moe')"),
         str(tmp_path),
         "moe" if routed else "dense",
     ]
@@ -1315,6 +1379,34 @@ def tiny_qwen35_moe_mtp_model(tmp_path):
     return _tiny_qwen35_mtp_model(tmp_path, routed=True)
 
 
+@pytest.fixture
+def tiny_qwen35_fp8_mtp_model(tmp_path):
+    return _tiny_qwen35_mtp_model(tmp_path, routed=False, fp8=True)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_qwen35_fp8_mtp_matches_native_and_target(
+    k, vllm_runner, request, monkeypatch, tmp_path, record_property
+):
+    """Keep FP8 projections active in both the target and standalone head."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    model = request.getfixturevalue("tiny_qwen35_fp8_mtp_model")
+    record_property("fixture", json.loads((tmp_path / "fixture.json").read_text()))
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        "qwen35_fp8",
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
 @pytest.mark.parametrize("profile", ["dense", "moe"])
 @pytest.mark.parametrize("k", [1, 3])
 def test_remote_qwen35_text_mtp_matches_native_and_target(
@@ -1341,7 +1433,8 @@ def test_remote_qwen35_text_mtp_matches_native_and_target(
 
 @pytest.mark.parametrize(
     "fixture,projection",
-    [("dense", "q_proj")] + [("moe", part) for part in ("q_proj", "k_proj", "v_proj")],
+    [("dense", "q_proj"), ("fp8", "q_proj")]
+    + [("moe", part) for part in ("q_proj", "k_proj", "v_proj")],
 )
 def test_qwen35_mtp_rejects_incomplete_checkpoint_through_llm(
     fixture, projection, request, tmp_path
@@ -1379,7 +1472,9 @@ def test_qwen35_mtp_rejects_incomplete_checkpoint_through_llm(
             "method": "mtp",
             "num_speculative_tokens": 1,
             "draft_load_config": {
-                "model_loader_extra_config": {"enable_weights_track": None}
+                "model_loader_extra_config": {
+                    "enable_weights_track": True if fixture == "fp8" else None
+                }
             },
         },
     )
@@ -1486,6 +1581,58 @@ def _check_qwen35_model_weights(model, model_path, *, mtp=False):
     assert checked == required, (required - checked, checked - required)
     return dict(
         parameters=len(list(model.parameters())), checkpoint_keys=sorted(checked)
+    )
+
+
+def _qwen35_fp8_execution(model, model_path, *, mtp=False):
+    """Require actual FP8 projection kernels, retaining BF16 non-linear state."""
+    import torch
+    from safetensors.torch import load_file
+
+    from vllm import envs
+    from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+        MarlinFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+    assert not envs.VLLM_BATCH_INVARIANT
+    weights = load_file(Path(model_path) / "model.safetensors")
+    quantized = []
+    caches = []
+    for name, layer in model.named_modules():
+        if isinstance(layer, Attention):
+            assert layer.kv_cache_torch_dtype == torch.bfloat16
+            caches.append(str(layer.kv_cache_torch_dtype))
+        method = getattr(layer, "quant_method", None)
+        if isinstance(method, Fp8LinearMethod):
+            assert method.quant_config.is_checkpoint_fp8_serialized
+            assert method.quant_config.activation_scheme == "dynamic"
+            assert method.quant_config.weight_block_size is None
+            if method.use_marlin:
+                assert isinstance(method.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+                assert layer.weight.dtype == torch.int32
+            else:
+                assert layer.weight.dtype == torch.float8_e4m3fn
+            quantized.append(
+                dict(
+                    name=name,
+                    method=type(method).__name__,
+                    kernel=type(method.fp8_linear).__name__,
+                    packed_dtype=str(layer.weight.dtype),
+                    packed_shape=tuple(layer.weight.shape),
+                )
+            )
+        elif name in ("model.embed_tokens", "lm_head") or name.endswith(".conv1d"):
+            assert layer.weight.dtype == torch.bfloat16
+            assert torch.equal(layer.weight.cpu(), weights[name + ".weight"])
+    assert len(quantized) == (5 if mtp else 9)
+    assert caches == ["torch.bfloat16"]
+    return dict(
+        quantized=quantized,
+        cache_dtypes=caches,
+        bf16_shared_weights=True,
+        batch_invariant=False,
     )
 
 
@@ -3869,7 +4016,8 @@ def _compare_native_and_remote_draft(
     mimo_v2_flash = mtp_family == "mimo_v2_flash"
     step3p5 = mtp_family in ("step3p5_one_full", "step3p5_three_swa")
     step3p5_swa = mtp_family == "step3p5_three_swa"
-    qwen35 = mtp_family in ("qwen35_dense", "qwen35_moe")
+    qwen35_fp8 = mtp_family == "qwen35_fp8"
+    qwen35 = mtp_family in ("qwen35_dense", "qwen35_moe", "qwen35_fp8")
     detailed = (
         independent or eagle3 or deepseek_mtp or mimo_v2_flash or step3p5 or qwen35
     )
@@ -3878,6 +4026,7 @@ def _compare_native_and_remote_draft(
         "nemotron_h",
         "qwen35_dense",
         "qwen35_moe",
+        "qwen35_fp8",
     )
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
@@ -3940,6 +4089,7 @@ def _compare_native_and_remote_draft(
         or recurrent_draft
         or mtp_family == "deepseek_v3_dense"
         or mtp_family == "qwen35_dense"
+        or qwen35_fp8
         else "triton"
     )
     if moe_backend is not None:
@@ -4420,8 +4570,11 @@ def _compare_native_and_remote_draft(
         assert len(draft.model.layers) == draft.model.num_mtp_layers == 1
         assert draft.model.embed_tokens is target.model.embed_tokens
         assert draft.lm_head is target.lm_head
-        target_weights = _check_qwen35_model_weights(target, model)
-        draft_weights = _check_qwen35_model_weights(draft, model, mtp=True)
+        weight_check = (
+            _qwen35_fp8_execution if qwen35_fp8 else _check_qwen35_model_weights
+        )
+        target_weights = weight_check(target, model)
+        draft_weights = weight_check(draft, model, mtp=True)
         return dict(
             target_weights=target_weights,
             draft_weights=draft_weights,
@@ -4430,6 +4583,9 @@ def _compare_native_and_remote_draft(
             draft_rope=draft.model.config.rope_parameters,
             scalar_native_positions=True,
         )
+
+    def fp8_target_identity(target):
+        return _qwen35_fp8_execution(target, model)
 
     def step3p5_identity(worker):
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
@@ -4683,6 +4839,10 @@ def _compare_native_and_remote_draft(
         assert backends == [["TRITON"] * expected_moe_count]
         record_property("target.moe_backends", backends)
         check_recurrence(baseline, "target")
+        if qwen35_fp8:
+            record_property(
+                "target.fp8_execution", baseline.llm.apply_model(fp8_target_identity)
+            )
         expected = generate(baseline, "target")
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
     if native_control:
@@ -4733,9 +4893,8 @@ def _compare_native_and_remote_draft(
                     native.llm.collective_rpc(step3p5_identity),
                 )
             if qwen35:
-                record_property(
-                    "native.qwen35_identity", native.llm.collective_rpc(qwen35_identity)
-                )
+                qwen35_native_identity = native.llm.collective_rpc(qwen35_identity)
+                record_property("native.qwen35_identity", qwen35_native_identity)
             if dense_mla and not independent:
                 layout = native.llm.collective_rpc(draft_mla_layout)
                 assert layout == [[expected_mla_layout]]
@@ -4748,6 +4907,7 @@ def _compare_native_and_remote_draft(
                 and mtp_family != "ernie"
                 and mtp_family != "deepseek_v3_dense"
                 and mtp_family != "qwen35_dense"
+                and not qwen35_fp8
                 and not mimo_v2_flash
                 and not step3p5
             )
@@ -4819,6 +4979,11 @@ def _compare_native_and_remote_draft(
                     assert draft_config.architecture == "NemotronHForCausalLM"
                     assert draft_config.hf_config.num_nextn_predict_layers == 0
                 remote_recurrence = check_recurrence(remote, mode)
+                if qwen35_fp8:
+                    record_property(
+                        "remote.fp8_target_execution",
+                        remote.llm.apply_model(fp8_target_identity),
+                    )
                 if native_control:
                     assert remote_recurrence == native_recurrence
                 if independent:
@@ -4853,6 +5018,27 @@ def _compare_native_and_remote_draft(
                             remote_counts == native_counts,
                         )
                     assert remote_counts == native_counts
+    if qwen35_fp8:
+        server_lines = server_log.read_text().splitlines()
+        kernels = {
+            layer["kernel"]
+            for identity in qwen35_native_identity
+            for layer in identity["draft_weights"]["quantized"]
+        }
+        assert kernels
+        assert all(
+            any(
+                f"Selected {kernel} for Fp8LinearMethod" in line
+                for line in server_lines
+            )
+            for kernel in kernels
+        )
+        assert any(
+            "Standalone memory bytes:" in line
+            and "dtype=torch.bfloat16 draft_quantization=fp8" in line
+            for line in server_lines
+        )
+        record_property("remote.fp8_kernels_from_server_log", sorted(kernels))
     if multi_module:
         server_lines = server_log.read_text().splitlines()
         negotiated = [

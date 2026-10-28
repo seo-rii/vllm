@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 
 from vllm.v1.spec_decode.remote.capabilities import SpeculatorPlacementCapabilities
 from vllm.v1.spec_decode.remote.protocol import FeatureSlot, TargetFeatureSchema
+from vllm.v1.spec_decode.remote.runtime.quantization import (
+    resolve_native_weight_profile,
+)
 from vllm.v1.spec_decode.remote.runtime.schema import (
     RuntimeContract,
     _fingerprint,
@@ -239,6 +242,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     ):
         raise ValueError("token-only stateful target requires a single remote endpoint")
     _validate_token_model(draft, "draft")
+    weight_profile = resolve_native_weight_profile(draft, context="token-only draft")
     recurrent = draft.architecture == "NemotronHForCausalLM"
     if recurrent:
         from vllm.config.mamba import MambaBackendEnum
@@ -342,6 +346,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
             "ssm_dtype": "float32",
         }
     return RuntimeContract(
+        weight_profile=weight_profile,
         schema=TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",

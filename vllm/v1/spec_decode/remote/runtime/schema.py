@@ -16,6 +16,10 @@ from vllm.v1.spec_decode.remote.capabilities import (
     TargetFeatureKind,
 )
 from vllm.v1.spec_decode.remote.protocol import FeatureSlot, TargetFeatureSchema
+from vllm.v1.spec_decode.remote.runtime.quantization import (
+    NativeWeightProfile,
+    resolve_native_weight_profile,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -58,6 +62,7 @@ class RuntimeContract:
     draft_fingerprint: str
     eagle3_features: Eagle3FeatureContract | None = None
     requires_target_lm_head: bool = True
+    weight_profile: NativeWeightProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,7 @@ class _MTPModelContract:
     max_speculative_tokens: int | None = None
     requires_target_lm_head: bool = True
     canonical_text_mrope: bool = False
+    supports_fp8_per_tensor: bool = False
 
 
 # These native implementations consume one target hidden vector and own their
@@ -75,7 +81,11 @@ _MTP_MODELS = {
     "MiMoV2MTPModel": _MTPModelContract(("MiMoV2FlashForCausalLM",)),
     "ErnieMTPModel": _MTPModelContract(("Ernie4_5_MoeForCausalLM",), 1),
     "Qwen3NextMTP": _MTPModelContract(("Qwen3NextForCausalLM",)),
-    "Qwen3_5MTP": _MTPModelContract(("Qwen3_5ForCausalLM",), canonical_text_mrope=True),
+    "Qwen3_5MTP": _MTPModelContract(
+        ("Qwen3_5ForCausalLM",),
+        canonical_text_mrope=True,
+        supports_fp8_per_tensor=True,
+    ),
     "Qwen3_5MoeMTP": _MTPModelContract(
         ("Qwen3_5MoeForCausalLM",), canonical_text_mrope=True
     ),
@@ -93,7 +103,9 @@ _MTP_MODELS = {
 }
 
 
-def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
+def _validate_mtp_contract(
+    target: Any, spec: Any
+) -> tuple[_MTPModelContract, NativeWeightProfile | None]:
     draft = spec.draft_model_config
     config = draft.hf_config
     architectures = getattr(config, "architectures", None) or []
@@ -352,6 +364,7 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
                 raise ValueError(
                     "standalone DeepSeek MTP does not support a sparse indexer"
                 )
+    weight_profile = None
     if architecture in (
         "DeepSeekMTPModel",
         "MiMoV2MTPModel",
@@ -362,13 +375,23 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
         for model in (target, draft):
             if (
                 model.using_transformers_backend()
-                or model.quantization is not None
-                or getattr(model.hf_config, "quantization_config", None) is not None
                 or str(model.dtype) != "torch.bfloat16"
             ):
                 raise ValueError(
                     f"standalone {architecture} requires native unquantized bfloat16"
                 )
+            if not contract.supports_fp8_per_tensor and (
+                model.quantization is not None
+                or getattr(model.hf_config, "quantization_config", None) is not None
+            ):
+                raise ValueError(
+                    f"standalone {architecture} requires native unquantized bfloat16"
+                )
+            weight_profile = resolve_native_weight_profile(
+                model,
+                allow_fp8_per_tensor=contract.supports_fp8_per_tensor,
+                context=f"standalone {architecture}",
+            )
     if architecture in ("DeepSeekMTPModel", "MiMoV2MTPModel"):
         # These native heads construct some or all layers from target metadata.
         # Compare only fields read there; the remaining draft fields stay local.
@@ -415,7 +438,7 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
                 f"standalone {architecture} requires matching native configs "
                 "for target-derived MTP layers"
             )
-    return contract
+    return contract, weight_profile
 
 
 def _fingerprint(value: Any) -> str:
@@ -676,13 +699,13 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     target = vllm_config.model_config
     draft = spec.draft_model_config
     eagle3_features = None
+    weight_profile = None
     requires_target_lm_head = True
     if spec.method == "eagle3":
         eagle3_features = _resolve_eagle3_features(vllm_config)
     elif spec.method == "mtp":
-        requires_target_lm_head = _validate_mtp_contract(
-            target, spec
-        ).requires_target_lm_head
+        mtp_contract, weight_profile = _validate_mtp_contract(target, spec)
+        requires_target_lm_head = mtp_contract.requires_target_lm_head
         if draft.hf_config.architectures[0] in (
             "DeepSeekMTPModel",
             "MiMoV2MTPModel",
@@ -767,6 +790,7 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         schema=schema,
         eagle3_features=eagle3_features,
         requires_target_lm_head=requires_target_lm_head,
+        weight_profile=weight_profile,
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),

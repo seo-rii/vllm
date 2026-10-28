@@ -306,12 +306,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        quant_method = self.quant_config.get_name() if self.quant_config else None
         enable_weights_track = get_draft_load_config(
             self.vllm_config
         ).model_loader_extra_config.get("enable_weights_track")
         if enable_weights_track is None:
-            enable_weights_track = self.quant_config is None
-        strict_packed = self.quant_config is None and enable_weights_track
+            enable_weights_track = quant_method is None
+        strict_packed = quant_method in (None, "fp8") and enable_weights_track
         packed = {"qkv_proj": self.packed_modules_mapping["qkv_proj"]}
         if type(self) is Qwen3_5MTP:
             packed["gate_up_proj"] = self.packed_modules_mapping["gate_up_proj"]
