@@ -20,6 +20,7 @@ from transformers import (
     DeepseekV3Config,
     PreTrainedConfig,
     Qwen3Config,
+    Step3p7TextConfig,
     TokenizersBackend,
 )
 
@@ -45,7 +46,10 @@ from vllm.config import (
 )
 from vllm.config.speculative import RemoteDraftConfig, SpeculativeExecutionConfig
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
-from vllm.v1.spec_decode.remote.runtime.weights import materialize_target_shell
+from vllm.v1.spec_decode.remote.runtime.weights import (
+    materialize_target_shell,
+    model_weight_bytes,
+)
 
 MODELS = (
     ("mimo", "MiMoForCausalLM", "MiMoMTPModel", 1),
@@ -565,6 +569,320 @@ def test_deepseek_public_config_rejects_multiple_endpoints(tmp_path):
         create_runtime_contract(config)
 
 
+def _step35_public_config(
+    tmp_path,
+    *,
+    k=3,
+    options=None,
+    target_tp=1,
+    draft_tp=1,
+    transport="inline",
+    dtype="bfloat16",
+):
+    from transformers.models.step3p7.modeling_step3p7 import Step3p7TextModel
+
+    hf = Step3p7TextConfig(
+        **(
+            dict(
+                architectures=["Step3p5ForCausalLM"],
+                hidden_size=128,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                vocab_size=32,
+                max_position_embeddings=64,
+                num_nextn_predict_layers=1,
+                layer_types=["full_attention"] * 3,
+                mlp_layer_types=["dense", "sparse", "dense"],
+                n_routed_experts=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=64,
+                share_expert_dim=128,
+                rope_theta=10000.0,
+                zero_centered=True,
+                use_qk_norm=True,
+                use_head_wise_attn_gate=True,
+                per_layer_config=None,
+                bos_token_id=0,
+                eos_token_id=1,
+                pad_token_id=2,
+            )
+            | (options or {})
+        )
+    )
+    hf.save_pretrained(tmp_path)
+    if not hf.is_heterogeneous:
+        # HF serialization omits None; preserve the checkpoint's public choice.
+        path = tmp_path / "config.json"
+        saved = json.loads(path.read_text())
+        saved["per_layer_config"] = None
+        path.write_text(json.dumps(saved))
+    TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(32)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    ).save_pretrained(tmp_path)
+    if getattr(hf, "quantization_config", None) is None:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = Step3p7TextModel(hf).to(torch.bfloat16)
+            head = torch.nn.Linear(128, 32, bias=False).to(torch.bfloat16)
+        save_file(
+            {
+                "model.embed_tokens.weight": model.embed_tokens.weight.detach(),
+                "lm_head.weight": head.weight.detach(),
+            },
+            tmp_path / "model.safetensors",
+        )
+    target = ModelConfig(
+        model=str(tmp_path),
+        dtype=dtype,
+        max_model_len=64,
+        skip_tokenizer_init=True,
+    )
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
+    spec = SpeculativeConfig(
+        model=str(tmp_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=draft_tp,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        remote_draft=RemoteDraftConfig(
+            endpoint="unix:///tmp/step35-contract.sock", transport=transport
+        ),
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_step35_public_override_preserves_scalar_owned_head_contract(tmp_path, k):
+    config = _step35_public_config(tmp_path, k=k)
+    target = config.model_config
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    assert isinstance(target.hf_config, Step3p7TextConfig)
+    assert isinstance(draft.hf_config, Step3p7TextConfig)
+    assert target.hf_config.architectures == ["Step3p5ForCausalLM"]
+    assert draft.hf_config.architectures == ["Step3p5MTP"]
+    assert draft.hf_config.layer_types == ["full_attention"] * 2
+    assert draft.hf_config.mtp_layer_types == ["full_attention"]
+    assert draft.hf_config.mtp_mlp_layer_types == ["dense"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.dtype == draft.dtype == torch.bfloat16
+    assert target.quantization is None and draft.quantization is None
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[1].trailing_shape == ()
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (128,)
+    assert not contract.requires_target_lm_head
+
+
+def test_step35_public_contract_rejects_full_attention_head_chains(tmp_path):
+    config = _step35_public_config(
+        tmp_path,
+        options={
+            "num_nextn_predict_layers": 3,
+            "layer_types": ["full_attention"] * 5,
+            "mlp_layer_types": ["dense", "sparse", "dense", "dense", "dense"],
+        },
+    )
+    with pytest.raises(ValueError, match="multiple checkpoint heads"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "options,detail",
+    [
+        (
+            {"layer_types": ["full_attention"] * 2, "mtp_layer_types": []},
+            "homogeneous full/SWA dense MTP layers",
+        ),
+        ({"per_layer_config": {}}, "explicit MTP head geometry"),
+        (
+            {
+                "num_nextn_predict_layers": 2,
+                "layer_types": ["full_attention"] * 3 + ["sliding_attention"],
+                "mlp_layer_types": ["dense", "sparse", "dense", "dense"],
+            },
+            "homogeneous full/SWA dense MTP layers",
+        ),
+    ],
+)
+def test_step35_public_contract_requires_explicit_mtp_tail_geometry(
+    tmp_path, options, detail
+):
+    config = _step35_public_config(
+        tmp_path, k=options.get("num_nextn_predict_layers", 3), options=options
+    )
+    with pytest.raises(ValueError, match=detail):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_step35_public_three_swa_heads_use_only_one_configured_step(tmp_path, k):
+    config = _step35_public_config(
+        tmp_path,
+        k=k,
+        options={
+            "num_nextn_predict_layers": 3,
+            "layer_types": ["full_attention"] + ["sliding_attention"] * 4,
+            "mlp_layer_types": ["dense", "sparse", "dense", "dense", "dense"],
+            "sliding_window": 16,
+            "num_sliding_attention_heads": 4,
+            "per_layer_config": {},
+        },
+    )
+    assert config.speculative_config.draft_model_config.hf_config.n_predict == 3
+    if k == 3:
+        assert config.speculative_config.use_multi_module_mtp()
+        assert config.num_prefill_lookahead_tokens == 3
+        with pytest.raises(ValueError, match="multiple checkpoint heads"):
+            create_runtime_contract(config)
+    else:
+        assert not config.speculative_config.use_multi_module_mtp()
+        assert config.num_prefill_lookahead_tokens == 1
+        contract = create_runtime_contract(config)
+        assert not contract.requires_target_lm_head
+        assert not contract.capabilities.supports_multi_module
+        assert contract.capabilities.num_prefill_lookahead == 1
+
+
+@pytest.mark.parametrize(
+    "options,detail",
+    [
+        ({"target_tp": 2}, "TP1"),
+        ({"draft_tp": 2}, "TP1|draft_tensor_parallel_size"),
+        ({"transport": "cuda_ipc"}, "one inline endpoint"),
+        ({"dtype": "float32"}, "unquantized bfloat16"),
+    ],
+)
+def test_step35_public_contract_keeps_bounded_bf16_placement(tmp_path, options, detail):
+    with pytest.raises(ValueError, match=detail):
+        config = _step35_public_config(tmp_path, **options)
+        create_runtime_contract(config)
+
+
+def test_step35_public_contract_requires_rope_for_the_actual_mtp_type(tmp_path):
+    config = _step35_public_config(
+        tmp_path,
+        options={
+            "layer_types": ["sliding_attention"] * 2 + ["full_attention"],
+            "sliding_window": 16,
+            "num_sliding_attention_heads": 4,
+        },
+    )
+    assert "full_attention" not in config.model_config.hf_config.rope_parameters
+    with pytest.raises(ValueError, match="requires MTP attention RoPE parameters"):
+        create_runtime_contract(config)
+
+
+def test_step35_public_config_preserves_rejected_fp8_metadata(tmp_path):
+    quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    with pytest.raises(ValueError, match="quant|fp8|bfloat16"):
+        config = _step35_public_config(
+            tmp_path, options={"quantization_config": quantization}
+        )
+        create_runtime_contract(config)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["quantization_config"] == quantization
+
+
+def test_owned_head_materialization_requires_only_the_consumed_embedding(tmp_path):
+    config = _step35_public_config(tmp_path)
+    path = tmp_path / "model.safetensors"
+    embedding = load_file(path)["model.embed_tokens.weight"]
+    save_file({"model.embed_tokens.weight": embedding}, path)
+    shell = materialize_target_shell(
+        config.model_config, torch.device("cpu"), include_lm_head=False
+    )
+    assert not hasattr(shell, "lm_head")
+    assert list(dict(shell.named_parameters())) == ["model.embed_tokens.weight"]
+    assert torch.equal(shell.model.embed_tokens.weight[:32], embedding)
+    with pytest.raises(ValueError, match="no lm_head.weight"):
+        materialize_target_shell(config.model_config, torch.device("cpu"))
+
+
+def test_owned_head_alternate_weights_still_verify_the_consumed_embedding(tmp_path):
+    config = _step35_public_config(tmp_path / "target")
+    tensors = load_file(tmp_path / "target/model.safetensors")
+    alternate = tmp_path / "shared"
+    alternate.mkdir()
+    tensors["lm_head.weight"].add_(1)
+    save_file(tensors, alternate / "model.safetensors")
+    shell = materialize_target_shell(
+        config.model_config,
+        torch.device("cpu"),
+        shared_weights_source=str(alternate),
+        include_lm_head=False,
+    )
+    assert not hasattr(shell, "lm_head")
+    assert torch.equal(
+        shell.model.embed_tokens.weight[:32], tensors["model.embed_tokens.weight"]
+    )
+    tensors["model.embed_tokens.weight"][0, 0] += 1
+    save_file(tensors, alternate / "model.safetensors")
+    with pytest.raises(ValueError, match="differ from the target"):
+        materialize_target_shell(
+            config.model_config,
+            torch.device("cpu"),
+            shared_weights_source=str(alternate),
+            include_lm_head=False,
+        )
+
+
+def test_owned_head_bytes_count_distinct_nested_heads_once(tmp_path):
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    config = _step35_public_config(tmp_path)
+    shell = materialize_target_shell(config.model_config, torch.device("cpu"))
+    owned_head = ParallelLMHead(32, 128, params_dtype=torch.bfloat16)
+    shell.model.add_module(
+        "layers",
+        torch.nn.ModuleDict(
+            {
+                "2": torch.nn.ModuleDict({"shared_head": owned_head}),
+                "3": torch.nn.ModuleDict({"shared_head": shell.lm_head}),
+                "4": torch.nn.ModuleDict({"shared_head": owned_head}),
+            }
+        ),
+    )
+    shell.register_parameter(
+        "draft_weight", torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    )
+    embedding_bytes = shell.model.embed_tokens.weight.untyped_storage().nbytes()
+    head_bytes = (
+        shell.lm_head.weight.untyped_storage().nbytes()
+        + owned_head.weight.untyped_storage().nbytes()
+    )
+    assert model_weight_bytes(shell) == (6, embedding_bytes, head_bytes)
+
+
 @pytest.mark.parametrize("draft_dtype", [None, "auto", "fp8"])
 def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_dtype):
     options = {} if draft_dtype is None else {"kv_cache_dtype": draft_dtype}
@@ -918,6 +1236,7 @@ def test_native_mtp_config_override_resolves_own_kv_contract(
     assert contract.schema.slots[1].trailing_shape == ()
     assert contract.schema.slots[2].kind == "last_hidden_states"
     assert contract.schema.slots[2].trailing_shape == (16,)
+    assert contract.requires_target_lm_head
 
 
 @pytest.mark.parametrize("depth", [2, 3, 4])
