@@ -148,10 +148,63 @@ def supports_token_async_scheduling(config: "VllmConfig") -> bool:
     )
 
 
+def supports_token_outcome_cache(
+    config: "VllmConfig", *, require_remote: bool = True
+) -> bool:
+    """First cache consumer owns ordinary full-copy Qwen3 KV on one draft GPU."""
+    spec = config.speculative_config
+    if (
+        spec is None
+        or spec.method != "draft_model"
+        or spec.draft_model_config is None
+        or config.parallel_config.tensor_parallel_size != 1
+        or spec.draft_parallel_config.tensor_parallel_size != 1
+        or config.scheduler_config.async_scheduling
+        or not config.model_config.enforce_eager
+        or not config.use_v2_model_runner
+        or config.cache_config.sliding_window is not None
+        or (spec.kv_cache_dtype or config.cache_config.cache_dtype)
+        not in ("auto", "bfloat16")
+    ):
+        return False
+    if require_remote and not supports_token_prefix_replay(config):
+        return False
+    for model, role in (
+        (config.model_config, "target"),
+        (spec.draft_model_config, "draft"),
+    ):
+        if (
+            model.architecture != "Qwen3ForCausalLM"
+            or model.quantization is not None
+            or str(model.dtype) != "torch.bfloat16"
+            or model.is_moe
+            or model.is_hybrid
+            or model.has_inner_state
+            or model.use_mla
+        ):
+            return False
+        try:
+            _validate_token_model(model, role)
+        except ValueError:
+            return False
+    return True
+
+
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
         raise ValueError("token-only runtime requires an independent draft_model")
+    if spec.execution is not None and spec.execution.policy == "outcome_cache":
+        if (spec.kv_cache_dtype or config.cache_config.cache_dtype) not in (
+            "auto",
+            "bfloat16",
+        ):
+            raise ValueError("outcome cache requires bfloat16 KV")
+        if not supports_token_outcome_cache(config):
+            raise ValueError(
+                "outcome cache requires eager MRV2 full-attention Qwen3 TP1, "
+                "synchronous scheduling and one inline endpoint"
+            )
     if (
         spec.parallel_drafting
         or spec.draft_sample_method != "greedy"

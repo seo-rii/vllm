@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 class _Request:
     key: SequenceKey
     target_computed: int = 0
+    proposal_from_cache: bool = False
 
 
 @dataclass(eq=False)
@@ -87,6 +88,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         self._pending: _TokenHandle | None = None
         self._closed = False
         self._session: TokenOnlyRemoteSession | None = None
+        self._cache_hits = 0
+        self._cache_verified_proposals = 0
+        self._cache_accepted_tokens = 0
+        self._last_proposal_id = -1
+        self._last_valid_lengths: tuple[int, ...] = ()
+        self._last_origins: tuple[str, ...] = ()
         error = None
         if self._tp.rank_in_group == 0:
             try:
@@ -101,6 +108,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     vllm_config.scheduler_config.max_num_seqs,
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     vllm_config.model_config.max_model_len,
+                    policy=(
+                        "on_demand" if spec.execution is None else spec.execution.policy
+                    ),
                 )
                 self._session = TokenOnlyRemoteSession(
                     remote.endpoint,
@@ -122,6 +132,24 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
 
     def capture(self) -> None:
         pass
+
+    def get_cache_stats(
+        self,
+    ) -> dict[str, int | tuple[int, ...] | tuple[str, ...]]:
+        """Return host-side proposal/verification counters without GPU work."""
+        return dict(
+            cache_hits=self._cache_hits,
+            received_cache_hits=(
+                self._session.cache_hits
+                if isinstance(self._session, TokenOnlyRemoteSession)
+                else 0
+            ),
+            cache_verified_proposals=self._cache_verified_proposals,
+            cache_accepted_tokens=self._cache_accepted_tokens,
+            last_proposal_id=self._last_proposal_id,
+            last_valid_lengths=self._last_valid_lengths,
+            last_origins=self._last_origins,
+        )
 
     def register_cached_prefix(
         self,
@@ -349,6 +377,10 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 delta = tuple(tokens[start + skip : start + int(sampled[i])]) + (
                     int(recovery[i]),
                 )
+                if request.proposal_from_cache:
+                    self._cache_verified_proposals += int(offered > 0)
+                    self._cache_accepted_tokens += accepted
+                    request.proposal_from_cache = False
                 request.target_computed += int(sampled[i])
             state = session.records[request.key]
             rows.append(
@@ -398,6 +430,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 assert handle.output is not None
                 return handle.output
             payload = None
+            origins = ["on_demand"] * len(handle.step.request_ids)
             if self._tp.rank_in_group == 0:
                 try:
                     if handle.error is None and handle.rpc is not None:
@@ -409,6 +442,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                         handle.output.valid_lengths[list(handle.rows)] = torch.tensor(
                             result.valid_lengths, dtype=torch.int32
                         )
+                        for row, origin in zip(
+                            handle.rows,
+                            result.origins or ("on_demand",) * len(handle.rows),
+                            strict=True,
+                        ):
+                            origins[row] = origin
                     output = handle.output if handle.error is None else None
                     payload = (
                         handle.error,
@@ -435,12 +474,24 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             error, tokens, lengths = self._tp.broadcast_object(payload, src=0)
             if error is not None:
                 raise RuntimeError(f"token drafter proposal failed: {error}")
-            return SpeculatorOutput(
+            output = SpeculatorOutput(
                 torch.tensor(tokens, dtype=torch.int64, device=self.device).reshape(
                     len(handle.step.request_ids), self.num_speculative_steps
                 ),
                 torch.tensor(lengths, dtype=torch.int32, device=self.device),
             )
+            self._last_proposal_id = handle.round_id
+            self._last_valid_lengths = tuple(lengths)
+            self._last_origins = tuple(origins)
+            for req_id, origin, length in zip(
+                handle.step.request_ids, origins, lengths, strict=True
+            ):
+                from_cache = origin == "cache" and length > 0
+                self._cache_hits += int(from_cache)
+                request = self._requests.get(req_id)
+                if request is not None:
+                    request.proposal_from_cache = from_cache
+            return output
         finally:
             if not context.dummy_run and not context.is_profile:
                 for req_id in handle.step.request_ids:

@@ -143,7 +143,7 @@ def token_executor(monkeypatch):
     )
 
     def slots(indices, qsl, positions, n):
-        values = []
+        values: list[int] = []
         for row, index in enumerate(indices.tolist()):
             blocks = staged.gpu[index].tolist()
             block_size = executor.block_size
@@ -372,12 +372,15 @@ def test_token_warmup_preserves_initial_error_when_cleanup_fails(
 def test_token_server_fences_unusable_warmup_cleanup(
     token_executor, monkeypatch, tmp_path, cleanup_phase, cuda_error_code
 ):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_oracle_contract
     from vllm.v1.spec_decode.remote.errors import (
         CompletionUnknownError,
         CudaRuntimeError,
         runtime_unusable,
     )
-    from vllm.v1.spec_decode.remote.server import FakeDraftAdapter
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
     from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
     executor, _, _, _ = token_executor
@@ -406,8 +409,15 @@ def test_token_server_fences_unusable_warmup_cleanup(
     monkeypatch.setattr(executor, "forward", fail_forward)
     monkeypatch.setattr(torch.Tensor, "zero_", zero)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: clean("sync"))
-    adapter = FakeDraftAdapter(vocab_size=128)
-    monkeypatch.setattr(adapter, "warmup", executor.warmup)
+    state = TokenStateMachine(
+        executor,
+        DraftBlockPool(executor.num_blocks, executor.block_size),
+        max_num_reqs=1,
+        max_model_len=16,
+        vocab_size=128,
+        max_k=3,
+    )
+    adapter = TokenOnlyDraftAdapter(state, token_oracle_contract())
     server = TokenDraftServer(adapter)
     with pytest.raises(type(cleanup)) as raised:
         server.start(f"unix://{tmp_path}/not-listening.sock")
@@ -419,3 +429,59 @@ def test_token_server_fences_unusable_warmup_cleanup(
     assert calls == ["input_ids", "positions", "sync"][: calls.index(cleanup_phase) + 1]
     with pytest.raises(RuntimeError, match="unhealthy"):
         server.start(f"unix://{tmp_path}/not-listening.sock")
+
+
+@pytest.mark.parametrize("branch_slots, token_budget", [(0, 64), (2, 64), (1, 4)])
+def test_token_cache_executor_reserves_branch_slots_without_changing_live_budgets(
+    tmp_path, branch_slots, token_budget
+):
+    """Resident branch slots must fit without enlarging foreground admission."""
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+    )
+
+    assets = token_config(tmp_path)
+    assert assets.speculative_config is not None
+    assert assets.speculative_config.draft_model_config is not None
+    config = EngineArgs(
+        model=assets.model_config.model,
+        tokenizer_mode="hf",
+        dtype="float32",
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_seqs=4,
+        max_num_batched_tokens=token_budget,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        enforce_eager=True,
+        scheduling_policy="priority",
+        max_num_active_seqs=2,
+        speculative_config={
+            "method": "draft_model",
+            "model": assets.speculative_config.draft_model_config.model,
+            "num_speculative_tokens": 3,
+        },
+    ).create_engine_config()
+    scheduler = config.scheduler_config
+    resource = create_token_executor_config(config, branch_slots=branch_slots)
+
+    assert resource.scheduler_config.max_num_seqs == 4 + branch_slots
+    executor_token_budget = max(token_budget, 4 + branch_slots)
+    assert resource.scheduler_config.max_num_batched_tokens == executor_token_budget
+    assert (
+        resource.scheduler_config.max_num_encoder_input_tokens == executor_token_budget
+    )
+    assert resource.scheduler_config.encoder_cache_size == executor_token_budget
+    assert resource.scheduler_config.policy == "priority"
+    assert (
+        resource.scheduler_config.max_num_active_seqs == scheduler.max_num_active_seqs
+    )
+    assert resource.scheduler_config.async_scheduling is False
+    assert config.speculative_config is not None
+    assert resource.model_config is config.speculative_config.draft_model_config
+    assert config.scheduler_config is scheduler
+    assert scheduler.max_num_seqs == 4
+    assert scheduler.max_num_batched_tokens == token_budget
+    assert scheduler.max_num_scheduled_tokens == token_budget

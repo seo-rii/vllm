@@ -131,12 +131,12 @@ class RemoteDraftConfig:
 
 @config
 class SpeculativeExecutionConfig:
-    """Opt-in placement for the existing on-demand speculative methods."""
+    """Opt-in placement and bounded proposal policy."""
 
     placement: Literal["local", "remote"] = "local"
     """Use the existing in-process speculator or a standalone server."""
-    policy: Literal["on_demand"] = "on_demand"
-    """Generate proposals only after authoritative target outcomes."""
+    policy: Literal["on_demand", "outcome_cache"] = "on_demand"
+    """Use authoritative on-demand drafting or opt-in all-accepted prediction."""
     endpoints: tuple[str, ...] = ()
     """Exactly one same-host endpoint for remote execution; none for local."""
     transport: RemoteDraftTransport | None = None
@@ -150,6 +150,12 @@ class SpeculativeExecutionConfig:
 
     @model_validator(mode="after")
     def _validate_placement(self) -> Self:
+        if self.policy == "outcome_cache" and (
+            self.placement != "remote"
+            or len(self.endpoints) != 1
+            or self.transport not in (None, "auto", "inline")
+        ):
+            raise ValueError("outcome cache requires one remote inline endpoint")
         if self.placement == "local":
             if self.endpoints or any(
                 value is not None
@@ -1747,6 +1753,12 @@ class SpeculativeConfig:
         return self
 
     def _validate_remote_draft(self) -> None:
+        if (
+            self.execution is not None
+            and self.execution.policy == "outcome_cache"
+            and self.method != "draft_model"
+        ):
+            raise ValueError("outcome cache requires the token-only draft_model method")
         from vllm.v1.spec_decode.remote.capabilities import (
             remote_draft_config_incompatibilities,
         )

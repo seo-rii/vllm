@@ -54,9 +54,88 @@ Connections, partial frames, pending bytes and adapter waiters have server-side
 bounds. A shutdown grace timeout does not authorize freeing GPU storage whose
 completion is unknown; the process must be restarted in that state.
 
-This placement does not provide predictive caching, cross-node execution or
-N:M routing. Moving a speculator to another GPU does not by itself overlap its
+A separate [outcome cache](#all-accepted-outcome-cache) supports one dense
+Qwen3 verifier. N:M routing, pooled caching and cross-node execution remain
+unsupported. Moving a speculator to another GPU does not by itself overlap its
 computation with target verification or guarantee higher throughput.
+
+## All-accepted outcome cache
+
+`execution.policy="outcome_cache"` is an experimental opt-in for unquantized BF16
+full-attention Qwen3 target/draft models with BF16 KV and identical tokenizer artifacts.
+Use greedy sampling, eager MRV2, synchronous scheduling, target/draft TP1 and
+one same-host inline endpoint. Other models, remote pooling and async scheduling
+remain outside this policy's initial support.
+
+Start the existing token-only server with explicit prediction budgets:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 .venv/bin/python -m vllm.v1.spec_decode.remote.runtime.token_cli \
+  --endpoint unix:///tmp/token-draft.sock --device cuda:1 \
+  --target-model '<qwen3-target>' --draft-model '<tokenizer-identical-qwen3-draft>' \
+  --policy outcome_cache --num-speculative-tokens 3 \
+  --cache-max-branches 1 --cache-kv-budget-mib 64 --cache-copy-chunk-blocks 1 \
+  --draft-kv-cache-gib 0.25 --max-model-len 256 --max-feature-tokens 256
+```
+
+The cache budget is a cap within the draft KV arena. Branch slots and native
+copy scratch are initialized before serving. Executor buffers include the extra
+branch slots; `--max-batch-size` and `--max-feature-tokens` continue to bound
+foreground admission. The cache copies whole source pages and predicts one
+all-accepted continuation; longer contexts therefore cost more memory and copying.
+Foreground work has priority, and an unfinished or wrong prediction falls back
+to ordinary on-demand drafting for that round.
+
+Configure the target with `enforce_eager=True`, `async_scheduling=False` and:
+
+```json
+{
+  "method": "draft_model",
+  "model": "<tokenizer-identical-qwen3-draft>",
+  "num_speculative_tokens": 3,
+  "execution": {
+    "placement": "remote",
+    "policy": "outcome_cache",
+    "endpoints": ["unix:///tmp/token-draft.sock"],
+    "transport": "inline"
+  }
+}
+```
+
+Both peers must negotiate this policy. Ready predictions and consumed hits are
+logged separately; successful output alone does not demonstrate a cache hit.
+This policy does not promise lower latency or throughput gains.
+The [unpaced A100 measurements](https://github.com/seo-rii/vllm/pull/27) have median per-repeat cache/on-demand
+throughput ratios of 0.925 and 0.954 for Qwen3-0.6B at batches 1 and 4, and
+0.885 and 0.958 for Qwen3-8B with a 0.6B draft at those batch sizes. Batch 1
+consumed no cached proposals; batch 4 consumed three across both model pairs
+and all repeats. These workloads show no throughput benefit. Keep the default
+on-demand policy unless measurements for the intended workload justify the
+extra page copies and draft forwards; record readiness delay, copy volume and
+extra draft work alongside consumed hits.
+
+For a token-only remote backend, host-side counters can be read without GPU
+synchronization through the existing worker RPC. Passing a callable requires
+`VLLM_ALLOW_INSECURE_SERIALIZATION=1` before constructing `LLM`; use this opt-in
+for trusted local diagnostic callbacks. Production defaults remain unchanged:
+
+```python
+def cache_stats(worker):
+    return worker.model_runner.speculator.get_cache_stats()
+
+stats = llm.collective_rpc(cache_stats)
+```
+
+`received_cache_hits` counts validated cache-origin responses, and `cache_hits`
+counts those installed as draft proposals. `cache_verified_proposals` and
+`cache_accepted_tokens` count their subsequent target verification and acceptance.
+Server ready/hit logs include cumulative counters so these events can be matched
+to actual background progress. A correctness test may use the in-process engine
+(`VLLM_ENABLE_V1_MULTIPROCESSING=0`) to pause between public `step()` calls until
+a real ready event. A multiprocessing core advances independently of frontend
+`step()` calls. Such paced execution must not be reported as performance.
+Measure cache off/on latency and throughput separately without extra waiting or
+progress polling in the timed region.
 
 ## Standalone GPU example
 

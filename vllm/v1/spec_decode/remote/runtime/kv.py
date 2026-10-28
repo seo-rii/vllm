@@ -75,6 +75,13 @@ class DraftBlockPool:
         del self._owned[req_index]
         self._num_free = returned
 
+    def swap(self, first: int, second: int) -> None:
+        """Transfer two complete writable page leases without copying their KV."""
+        if first == second:
+            raise ValueError("draft KV lease swap requires distinct slots")
+        left, right = self._owned[first], self._owned[second]
+        self._owned[first], self._owned[second] = right, left
+
     def slot_mapping(self, req_index: int, positions: np.ndarray) -> np.ndarray:
         """KV slot of each position; positions must be covered by ``ensure``."""
         blocks = np.asarray(self._owned[req_index], dtype=np.int64)

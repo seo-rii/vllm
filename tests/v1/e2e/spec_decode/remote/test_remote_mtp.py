@@ -41,14 +41,18 @@ def draft_server(
     target_attention_backend: str | None = None,
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
+    max_batch_size: int = 4,
     max_model_len: int = 128,
     block_size: int = 16,
     trust_remote_code: bool = True,
     moe_backend: str | None = None,
     batch_invariant: bool | None = None,
     owned_processes: list[subprocess.Popen] | None = None,
+    outcome_cache: bool = False,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
+    if outcome_cache and token_only_draft is None:
+        raise ValueError("outcome cache requires the token-only server")
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
         command = [
@@ -108,7 +112,7 @@ def draft_server(
                 "--num-speculative-tokens",
                 str(num_speculative_tokens),
                 "--max-batch-size",
-                "4",
+                str(max_batch_size),
                 "--max-model-len",
                 "128",
                 "--max-feature-tokens",
@@ -120,6 +124,10 @@ def draft_server(
                 "--target-attention-backend",
                 target_attention_backend or attention_backend,
             ]
+            if outcome_cache:
+                command.extend(
+                    ["--policy", "outcome_cache", "--cache-kv-budget-mib", "8"]
+                )
         environment = None
         if batch_invariant is not None:
             environment = dict(
@@ -2381,3 +2389,449 @@ def _tiny_independent_qwen3_draft(tmp_path, target_path):
         (path / name).is_file() for name in ("tokenizer.json", "tokenizer_config.json")
     )
     return str(path)
+
+
+def _run_token_outcome_cache_oracle(model, result_path):
+    """Real native KV, codec and owner queue; no target engine or mocked model."""
+    import json
+    import threading
+
+    import torch
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits, SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import TokenGPUStepExecutor
+    from vllm.v1.spec_decode.remote.runtime.token_state import (
+        TokenAdvanceRow,
+        TokenStateMachine,
+    )
+    from vllm.v1.spec_decode.remote.token_protocol import TokenHello
+    from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
+    from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
+
+    config = EngineArgs(
+        model=model,
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=1,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        attention_config={"backend": "TRITON_ATTN"},
+        speculative_config=dict(
+            method="draft_model",
+            model=model,
+            num_speculative_tokens=4,
+            draft_tensor_parallel_size=1,
+            attention_backend="TRITON_ATTN",
+        ),
+    ).create_engine_config()
+    executor = TokenGPUStepExecutor(
+        config,
+        device=torch.device("cuda:0"),
+        kv_cache_bytes=32 << 20,
+        branch_slots=2,
+    )
+    pool = DraftBlockPool(executor.num_blocks, executor.block_size)
+    state_options = dict(max_model_len=128, vocab_size=128, max_k=4, max_num_reqs=1)
+    state = TokenStateMachine(executor, pool, **state_options)
+    reference = TokenStateMachine(executor, pool, req_index_offset=2, **state_options)
+    contract = executor.contract
+    cache = TokenOutcomeCache(
+        state,
+        live_slots=1,
+        max_branches=1,
+        max_branch_blocks=min(128, executor.num_blocks - 1),
+        copy_chunk_blocks=1,
+        contract_id=(
+            contract.target_fingerprint,
+            contract.draft_fingerprint,
+            contract.tokenizer_fingerprint,
+            "greedy",
+        ),
+    )
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, contract, cache),
+        limits=RemoteServerLimits(1, 32, 1, 128),
+    )
+    prompt = (3,) * 17
+    ref_key = SequenceKey("native-reference", 0, 0)
+    with tempfile.TemporaryDirectory(prefix="vllm-cache-oracle-") as directory:
+        endpoint = server.start(f"unix://{directory}/draft.sock")
+        hello = TokenHello(
+            "cache-oracle",
+            contract.target_fingerprint,
+            contract.draft_fingerprint,
+            contract.tokenizer_fingerprint,
+            4,
+            128,
+            1,
+            32,
+            128,
+            policy="outcome_cache",
+        )
+        client = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
+        try:
+            key = client.open_sequence(0, deadline=client.deadline())
+            client.prefill(key, prompt, is_final=True, deadline=client.deadline())
+
+            def reference_prefill():
+                reference.open(ref_key)
+                reference.prefill(ref_key, 0, prompt, is_final=True)
+
+            server.work_queue.call("reference", reference_prefill)
+            source = client.collect(
+                client.dispatch(
+                    7,
+                    (TokenAdvanceRow(key, 17, None, 0, 0, (4,)),),
+                    3,
+                    deadline=client.deadline(),
+                )
+            )
+            baseline = server.work_queue.call(
+                "reference",
+                lambda: reference.advance(
+                    7,
+                    TokenAdvanceRow(ref_key, 17, None, 0, 0, (4,)),
+                    4,
+                ),
+            )
+            assert source.valid_lengths == (3,)
+            draft = source.token_ids[0][:3]
+            assert draft == baseline.token_ids[:3]
+            bonus = baseline.token_ids[3]
+            deadline = time.monotonic() + 10
+            poll = threading.Event()
+            while cache.counters["ready"] == 0 and time.monotonic() < deadline:
+                poll.wait(0.001)
+            assert cache.counters["ready"] == 1
+            before = dict(cache.counters)
+            actual = client.collect(
+                client.dispatch(
+                    19,
+                    (TokenAdvanceRow(key, 18, 7, 3, 3, draft + (bonus,)),),
+                    3,
+                    deadline=client.deadline(),
+                )
+            )
+            expected = server.work_queue.call(
+                "reference",
+                lambda: reference.advance(
+                    19,
+                    TokenAdvanceRow(ref_key, 18, 7, 3, 3, draft + (bonus,)),
+                    3,
+                ),
+            )
+            assert actual.origins == ("cache",)
+            assert actual.token_ids[0][:3] == expected.token_ids
+            assert actual.valid_lengths == (3,) and client.cache_hits == 1
+            assert cache.counters["hits"] == 1 and cache.counters["copied_blocks"] > 0
+            client.close_sequences((key,))
+            server.work_queue.call("reference", lambda: reference.close((ref_key,)))
+        finally:
+            client.close()
+            server.stop()
+    assert not state.sequences and not reference.sequences and cache.branch_blocks == 0
+    assert pool.num_free_blocks == pool.num_blocks - 1
+    assert config.speculative_config is not None
+    Path(result_path).write_text(
+        json.dumps(
+            dict(
+                kind="same-checkpoint all-accepted native-KV control",
+                source=list(draft),
+                bonus=bonus,
+                actual=list(actual.token_ids[0][:3]),
+                expected=list(expected.token_ids),
+                origins=actual.origins,
+                valid_lengths=actual.valid_lengths,
+                client_cache_hits=client.cache_hits,
+                ready_before_hit=before["ready"],
+                counters=cache.counters,
+                num_blocks=pool.num_blocks,
+                free_blocks=pool.num_free_blocks,
+                branch_blocks_after_close=cache.branch_blocks,
+                live_sequences_after_close=len(state.sequences),
+                reference_sequences_after_close=len(reference.sequences),
+                resolved_config=dict(
+                    executor=type(executor).__name__,
+                    model=type(executor.speculator.model).__name__,
+                    target_tp=config.parallel_config.tensor_parallel_size,
+                    draft_tp=config.speculative_config.draft_parallel_config.tensor_parallel_size,
+                    enforce_eager=config.model_config.enforce_eager,
+                    async_scheduling=config.scheduler_config.async_scheduling,
+                    use_v2_model_runner=config.use_v2_model_runner,
+                    primitive_max_k=4,
+                    source_requested_k=3,
+                    executor_request_slots=executor.max_num_reqs,
+                ),
+            )
+        )
+    )
+
+
+def _token_remote_cache_progress(worker):
+    from vllm.v1.worker.gpu.spec_decode.token_remote import TokenOnlyRemoteSpeculator
+
+    backend = worker.model_runner.speculator
+    assert isinstance(backend, TokenOnlyRemoteSpeculator)
+    return backend.get_cache_stats()
+
+
+def _token_cache_log_progress(path):
+    import regex as re
+
+    text = path.read_text()
+    assert len(text) < 16 << 20
+    records = []
+    for event, fields in re.findall(r"Token outcome cache (ready|hit): ([^\n]+)", text):
+        records.append(
+            (
+                event,
+                {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", fields)},
+            )
+        )
+    return dict(
+        ready_proposals=[
+            fields["source"] for event, fields in records if event == "ready"
+        ],
+        ready=max(
+            (fields["ready"] for event, fields in records if event == "ready"),
+            default=0,
+        ),
+        hits=max(
+            (fields["hits"] for event, fields in records if event == "hit"), default=0
+        ),
+        records=records,
+    )
+
+
+def test_remote_token_outcome_cache_matches_native_and_target(
+    vllm_runner, monkeypatch, tmp_path, record_property, enable_pickle
+):
+    """Consume real ready cache proposals through the public synchronous engine."""
+    import hashlib
+    import json
+
+    from vllm.v1.engine.core_client import InprocClient
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # A multiprocessing core advances independently of the frontend's step().
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    module = "tests.v1.e2e.spec_decode.remote.test_remote_mtp"
+    with (tmp_path / "cache-fixture.log").open("w") as log:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; from {module} import "
+                "_save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+                str(tmp_path),
+            ],
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+            check=True,
+        )
+    target = str(tmp_path / "prefix-target")
+    record_property(
+        "outcome_cache.fixture",
+        {
+            str(path.relative_to(target)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(Path(target).rglob("*"))
+            if path.is_file()
+        },
+    )
+    result = tmp_path / "native-cache-oracle.json"
+    with (tmp_path / "native-cache-oracle.log").open("w") as log:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; from {module} import "
+                "_run_token_outcome_cache_oracle; "
+                "_run_token_outcome_cache_oracle(*sys.argv[1:])",
+                target,
+                str(result),
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=240,
+            check=True,
+        )
+    record_property(
+        "outcome_cache.native_socket_oracle", json.loads(result.read_text())
+    )
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    spec = dict(
+        method="draft_model",
+        model=target,
+        num_speculative_tokens=3,
+        draft_tensor_parallel_size=1,
+        attention_backend="TRITON_ATTN",
+    )
+    tokens, counts, resolved = {}, {}, {}
+
+    def run(mode, speculative=None):
+        with vllm_runner(
+            target,
+            speculative_config=speculative,
+            per_request_spec_decode_metrics="detailed" if speculative else "none",
+            **kwargs,
+        ) as runner:
+            assert isinstance(runner.llm.llm_engine.engine_core, InprocClient)
+            config = runner.llm.llm_engine.vllm_config
+            assert config.model_config.enforce_eager and config.use_v2_model_runner
+            assert not config.scheduler_config.async_scheduling
+            assert config.parallel_config.tensor_parallel_size == 1
+            policy = None
+            if config.speculative_config is not None:
+                actual_spec = config.speculative_config
+                assert actual_spec.draft_parallel_config.tensor_parallel_size == 1
+                if actual_spec.execution is not None:
+                    policy = actual_spec.execution.policy
+            if mode == "cache":
+                assert policy == "outcome_cache"
+            resolved[mode] = dict(
+                policy=policy,
+                target_tp=config.parallel_config.tensor_parallel_size,
+                draft_tp=None if speculative is None else 1,
+                enforce_eager=config.model_config.enforce_eager,
+                async_scheduling=config.scheduler_config.async_scheduling,
+                use_v2_model_runner=config.use_v2_model_runner,
+            )
+            prompt = {"prompt_token_ids": [3] * 17}
+            sampling = SamplingParams(
+                temperature=0, max_tokens=12, ignore_eos=True, detokenize=False
+            )
+            if mode == "cache":
+                import threading
+
+                engine = runner.llm.llm_engine
+                engine.add_request("public-cache", prompt, sampling)
+                steps, waits = [], []
+                output = None
+                while engine.has_unfinished_requests():
+                    outputs = engine.step()
+                    if outputs:
+                        output = outputs[-1]
+                    snapshots = runner.llm.collective_rpc(_token_remote_cache_progress)
+                    assert len(snapshots) == 1
+                    snapshot = snapshots[0]
+                    steps.append(snapshot)
+                    if engine.has_unfinished_requests() and any(
+                        snapshot["last_valid_lengths"]
+                    ):
+                        # Correctness-only verifier pacing: wait for the actual
+                        # background build, never insert a prediction or delay a
+                        # performance measurement.
+                        deadline = time.monotonic() + 10
+                        poll = threading.Event()
+                        while True:
+                            progress = _token_cache_log_progress(
+                                tmp_path / "cache-server.log"
+                            )
+                            if (
+                                snapshot["last_proposal_id"]
+                                in progress["ready_proposals"]
+                            ):
+                                waits.append(snapshot["last_proposal_id"])
+                                break
+                            assert time.monotonic() < deadline, progress
+                            poll.wait(0.001)
+                assert output is not None and output.finished
+                final = steps[-1]
+                server = _token_cache_log_progress(tmp_path / "cache-server.log")
+                assert (
+                    final["cache_hits"]
+                    == final["received_cache_hits"]
+                    == server["hits"]
+                )
+                assert final["cache_hits"] > 0
+                assert final["cache_verified_proposals"] > 0
+                assert final["cache_accepted_tokens"] > 0
+                record_property(
+                    "outcome_cache.public_cache_progress",
+                    dict(
+                        controlled_verifier_wait=True,
+                        engine_core_client="InprocClient",
+                        waited_for_ready_proposals=waits,
+                        steps=steps,
+                        client=final,
+                        server=server,
+                    ),
+                )
+            else:
+                output = runner.llm.generate([prompt], sampling, use_tqdm=False)[0]
+            tokens[mode] = list(output.outputs[0].token_ids)
+            assert len(tokens[mode]) == 12
+            if speculative:
+                detail = output.outputs[0].spec_decode_metrics
+                assert detail is not None and sum(detail.per_step_accepted) > 0
+                if mode == "cache":
+                    assert final["cache_accepted_tokens"] <= sum(
+                        detail.per_step_accepted
+                    )
+                counts[mode] = detail.to_dict()
+
+    run("target")
+    run("native", spec)
+    with draft_server(
+        target,
+        tmp_path / "cache-server.log",
+        token_only_draft=target,
+        outcome_cache=True,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+        max_batch_size=32,
+    ) as endpoint:
+        run(
+            "cache",
+            dict(
+                spec,
+                execution=dict(
+                    placement="remote",
+                    policy="outcome_cache",
+                    endpoints=[endpoint],
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                    startup_timeout_ms=600000,
+                ),
+            ),
+        )
+    assert tokens["target"] == tokens["native"] == tokens["cache"]
+    record_property("outcome_cache.public_llm_output_tokens", tokens)
+    record_property("outcome_cache.public_llm_speculation", counts)
+    record_property("outcome_cache.resolved_config", resolved)

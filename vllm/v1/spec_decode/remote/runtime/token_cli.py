@@ -14,6 +14,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--draft-revision")
     result.add_argument("--num-speculative-tokens", type=int, default=3)
     result.add_argument("--device", default="cuda:0")
+    result.add_argument(
+        "--policy", choices=("on_demand", "outcome_cache"), default="on_demand"
+    )
+    result.add_argument("--cache-max-branches", type=int, default=1)
+    result.add_argument("--cache-kv-budget-mib", type=int, default=64)
+    result.add_argument("--cache-copy-chunk-blocks", type=int, default=1)
     result.add_argument("--draft-kv-cache-gib", type=float, default=0.25)
     result.add_argument("--max-model-len", type=int, default=256)
     result.add_argument("--max-batch-size", type=int, default=4)
@@ -32,7 +38,22 @@ def create_adapter(args):
     from vllm.config import AttentionConfig
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenCacheOptions
     from vllm.v1.spec_decode.remote.runtime.token_gpu import make_token_gpu_adapter
+
+    cache = None
+    if args.policy == "outcome_cache":
+        cache = TokenCacheOptions(
+            max_branches=args.cache_max_branches,
+            kv_budget_bytes=args.cache_kv_budget_mib << 20,
+            copy_chunk_blocks=args.cache_copy_chunk_blocks,
+        )
+    elif (
+        args.cache_max_branches,
+        args.cache_kv_budget_mib,
+        args.cache_copy_chunk_blocks,
+    ) != (1, 64, 1):
+        raise ValueError("cache budgets require --policy outcome_cache")
 
     config = EngineArgs(
         model=args.target_model,
@@ -68,6 +89,7 @@ def create_adapter(args):
         config,
         device=torch.device(args.device),
         kv_cache_bytes=int(args.draft_kv_cache_gib * 1024**3),
+        outcome_cache=cache,
     )
 
 

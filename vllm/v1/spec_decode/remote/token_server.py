@@ -5,8 +5,10 @@
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     ErrorReply,
@@ -18,7 +20,12 @@ from vllm.v1.spec_decode.remote.protocol import (
     limit_shortfalls,
 )
 from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
-from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+from vllm.v1.spec_decode.remote.runtime.token_cache import TokenPredictionPlan
+from vllm.v1.spec_decode.remote.runtime.token_state import (
+    TokenAdvanceRow,
+    TokenRowResult,
+)
+from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
 from vllm.v1.spec_decode.remote.server import (
     AdapterError,
     AdapterQueueFull,
@@ -54,8 +61,145 @@ OK = SpeculatorStatusCode.OK
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class _AdvanceInput:
+    session: "_TokenServerSession"
+    batch_id: int
+    rows: tuple[TokenAdvanceRow, ...]
+    k: int
+    deadline: float | None
+
+
 class TokenDraftServer(RemoteDraftServer):
     adapter: TokenOnlyDraftAdapter
+
+    def __init__(
+        self,
+        adapter: TokenOnlyDraftAdapter,
+        *,
+        max_pending_jobs: int = 64,
+        max_queued_token_bytes: int = 64 << 20,
+        max_jobs_per_verifier: int = 8,
+        max_token_bytes_per_verifier: int = 16 << 20,
+        max_sequences_per_verifier: int | None = None,
+        batch_wait_ms: float = 1.0,
+        **kwargs,
+    ) -> None:
+        if adapter.cache is not None:
+            if kwargs.get("max_connections", 1) != 1:
+                raise ValueError(
+                    "outcome cache currently supports one verifier connection"
+                )
+            kwargs["max_connections"] = 1
+        super().__init__(adapter, **kwargs)
+        if max_sequences_per_verifier is None:
+            max_sequences_per_verifier = self.limits.max_sequences
+        if (
+            type(max_sequences_per_verifier) is not int
+            or not 0 < max_sequences_per_verifier <= self.limits.max_sequences
+        ):
+            raise ValueError("per-verifier sequence credit must fit the server limit")
+        self.max_sequences_per_verifier = max_sequences_per_verifier
+        self.work_queue = DraftWorkQueue(
+            self._execute_advances,
+            max_jobs=max_pending_jobs,
+            max_bytes=max_queued_token_bytes,
+            max_jobs_per_owner=max_jobs_per_verifier,
+            max_bytes_per_owner=max_token_bytes_per_verifier,
+            max_cleanup_jobs=self.max_connections,
+            max_batch_rows=self.limits.max_batch_size,
+            max_batch_tokens=self.limits.max_feature_tokens,
+            batch_wait_s=batch_wait_ms / 1000,
+            max_background_jobs=(
+                0 if adapter.cache is None else adapter.cache.max_branches
+            ),
+            max_background_bytes=(
+                0 if adapter.cache is None else max_queued_token_bytes
+            ),
+        )
+
+    @property
+    def queue_depth(self) -> int:
+        return max(super().queue_depth, self.work_queue.depth)
+
+    def _warmup_owner(self) -> None:
+        device = getattr(self.adapter.state.executor, "device", None)
+        if device is not None:
+            import torch
+
+            if device.type != "cpu":
+                torch.accelerator.set_device_index(device)
+                # The constructor may enqueue weight/KV initialization elsewhere.
+                torch.accelerator.synchronize(device)
+        self.adapter.warmup()
+
+    def stop(self) -> None:
+        deadline = time.monotonic() + self.shutdown_timeout_s
+        try:
+            super().stop()
+        finally:
+            try:
+                self.work_queue.stop(deadline)
+            except ServerShutdownTimeout:
+                self._shutdown_failed = True
+                raise
+
+    def _execute_advances(self, work: tuple[DraftWork, ...]) -> None:
+        with self.adapter_turn():
+            updates, deadlines, locations = [], [], []
+            results: list[list[tuple[SpeculatorStatusCode, TokenRowResult | None]]] = []
+            for job in work:
+                item = job.payload
+                rows: list[tuple[SpeculatorStatusCode, TokenRowResult | None]] = []
+                for row in item.rows:
+                    if not self.healthy:
+                        status = SpeculatorStatusCode.INTERNAL_ERROR
+                    elif item.session._expire_owned_sequences(
+                        item.deadline, (row.key,)
+                    ):
+                        status = SpeculatorStatusCode.TIMEOUT
+                    else:
+                        status, _ = self.registry.begin_round(
+                            row.key, item.batch_id, owner=item.session.session_id
+                        )
+                    rows.append((status, None))
+                    if status is OK:
+                        locations.append((len(results), len(rows) - 1))
+                        updates.append((item.batch_id, row, item.k))
+                        deadlines.append(item.deadline)
+                results.append(rows)
+            if updates:
+                outcomes = self.adapter.advance_many(
+                    tuple(updates), deadlines=tuple(deadlines)
+                )
+                if len(outcomes) != len(updates):
+                    raise RuntimeError("token executor returned an invalid row count")
+                for (batch, index), outcome in zip(locations, outcomes):
+                    if isinstance(outcome, Exception):
+                        self._adapter_failed(outcome)
+                        status = (
+                            outcome.status
+                            if isinstance(outcome, AdapterError)
+                            else SpeculatorStatusCode.INTERNAL_ERROR
+                        )
+                        logger.error(
+                            "Remote token batch %d row failed: %s",
+                            work[batch].payload.batch_id,
+                            outcome,
+                        )
+                        results[batch][index] = (status, None)
+                    else:
+                        results[batch][index] = (OK, outcome)
+            for job, rows in zip(work, results):
+                item = job.payload
+                for row, (status, result) in zip(item.rows, rows):
+                    if status is not OK:
+                        item.session._discard_owned_sequences((row.key,))
+                    else:
+                        entry = self.registry.get(row.key)
+                        assert entry is not None and result is not None
+                        entry.prefix_length = result.committed
+                job.result = rows
 
     def start(self, endpoint: str) -> str:
         if self._listener is not None or not self.healthy:
@@ -63,11 +207,15 @@ class TokenDraftServer(RemoteDraftServer):
         if not is_local_endpoint(endpoint):
             raise ValueError("token-only placement currently requires the same host")
         try:
-            self.adapter.warmup()
+            self.work_queue.start(self._warmup_owner)
         except Exception as error:
             self._adapter_failed(error)
             raise
-        self._listener = listen(endpoint)
+        try:
+            self._listener = listen(endpoint)
+        except BaseException:
+            self.work_queue.stop(time.monotonic() + self.shutdown_timeout_s)
+            raise
         self._stopping.clear()
         self._acceptor = threading.Thread(
             target=self._accept_loop, name="token-draft-acceptor", daemon=True
@@ -76,31 +224,38 @@ class TokenDraftServer(RemoteDraftServer):
         return self._listener.endpoint
 
     def _serve_connection(self, conn: FramedConnection) -> None:
-        session = _TokenServerSession(self, conn)
+        session: _TokenServerSession | None = None
         try:
+            session = _TokenServerSession(self, conn)
             session.run()
+        except AdapterQueueFull:
+            conn.close()
         except (
             TransportError,
             ProtocolError,
-            AdapterQueueFull,
             ServerShutdownTimeout,
             SequenceCleanupFailed,
         ):
             pass
         except Exception:
             logger.exception(
-                "Remote token draft session %s crashed", session.session_id
+                "Remote token draft session %s crashed",
+                getattr(session, "session_id", "<initializing>"),
             )
         finally:
             try:
-                if not self._shutdown_failed and not self._cleanup_failed:
+                if (
+                    session is not None
+                    and not self._shutdown_failed
+                    and not self._cleanup_failed
+                ):
                     session.cleanup()
             except SequenceCleanupFailed:
                 pass
             except Exception:
                 logger.exception(
                     "Failed to clean up remote token draft session %s",
-                    session.session_id,
+                    getattr(session, "session_id", "<initializing>"),
                 )
             finally:
                 conn.close()
@@ -111,6 +266,72 @@ class TokenDraftServer(RemoteDraftServer):
 
 class _TokenServerSession(_ServerSession):
     server: TokenDraftServer
+
+    def cleanup(self) -> None:
+        self.server.work_queue.call(
+            self.verifier_instance_id,
+            super().cleanup,
+            cleanup=True,
+        )
+
+    def _open(self, message: OpenSequence, request_id: int) -> None:
+        key = message.key
+        if not self._owns(key):
+            self._ack(
+                key,
+                request_id,
+                SpeculatorStatusCode.PROTOCOL_ERROR,
+                "key belongs to another verifier",
+            )
+            return
+
+        def open_sequence():
+            server = self.server
+            with server.adapter_turn():
+                registry = server.registry
+                if not server.healthy:
+                    return SpeculatorStatusCode.INTERNAL_ERROR, "runtime is unhealthy"
+                if not registry.has_identity(key) and (
+                    len(registry) >= server.limits.max_sequences
+                    or registry.count(self.verifier_instance_id)
+                    >= server.max_sequences_per_verifier
+                ):
+                    return SpeculatorStatusCode.QUEUE_FULL, "sequence credit exhausted"
+                replaced = registry.replaced_by(key)
+                if replaced is not None:
+                    server._retire_sequences((replaced,))
+                outcome = registry.open(key, owner=self.session_id)
+                if outcome.created:
+                    failure = self._call_adapter(server.adapter.open_sequence, key)
+                    if failure is not None:
+                        self._discard_owned_sequences((key,))
+                        return failure
+                    if (
+                        self.selected_policy == "outcome_cache"
+                        and server.adapter.cache is not None
+                    ):
+                        server.adapter.cache.bind_epoch(key, self.session_epoch)
+                return outcome.status, outcome.detail
+
+        status, detail = self.server.work_queue.call(
+            self.verifier_instance_id, open_sequence
+        )
+        self._ack(key, request_id, status, detail)
+
+    def _close(self, message: CloseSequence, request_id: int) -> None:
+        def close_sequences():
+            with self.server.adapter_turn(cleanup=True):
+                self._discard_owned_sequences(
+                    tuple(key for key in message.keys if self._owns(key))
+                )
+
+        self.server.work_queue.call(
+            self.verifier_instance_id, close_sequences, cleanup=True
+        )
+        deadline = time.monotonic() + self.server.send_timeout_s
+        for key in message.keys:
+            status = OK if self._owns(key) else SpeculatorStatusCode.PROTOCOL_ERROR
+            self._ack(key, request_id, status, deadline=deadline)
 
     def _send(self, message, request_id, *, deadline=None, frames=None):
         if deadline is None:
@@ -151,6 +372,10 @@ class _TokenServerSession(_ServerSession):
                 or hello.num_speculative_tokens != state.max_k
                 or hello.max_model_len != state.max_model_len
                 or self.server.limits.max_model_len != state.max_model_len
+                or (
+                    hello.policy == "outcome_cache"
+                    and self.server.adapter.cache is None
+                )
             ):
                 reasons.append(
                     "token-only checkpoint/tokenizer/method contract mismatch"
@@ -169,6 +394,7 @@ class _TokenServerSession(_ServerSession):
         self.verifier_instance_id = hello.verifier_instance_id
         self.num_speculative_tokens = hello.num_speculative_tokens
         self.selected_transport = "inline"
+        self.selected_policy = hello.policy
         self.max_pending_frames = 8
         slot = (1 << 64) - 1
         sizes = [check_data_frame_size(slot, "int64", (hello.max_num_seqs,))] * 5
@@ -186,6 +412,7 @@ class _TokenServerSession(_ServerSession):
                 self.session_epoch,
                 contract.tokenizer_fingerprint,
                 self.server.limits,
+                policy=self.selected_policy,
             ),
             envelope.request_id,
             deadline=deadline,
@@ -235,40 +462,50 @@ class _TokenServerSession(_ServerSession):
         frame_to_ints(frame)
         if frame_checksum([frame]) != message.checksum:
             raise ProtocolError("token prefill checksum mismatch")
-        with self.server.adapter_turn():
-            if not self.server.healthy:
-                status, detail, apply = (
-                    SpeculatorStatusCode.INTERNAL_ERROR,
-                    "unhealthy runtime",
-                    False,
-                )
-            elif self._expire_owned_sequences(deadline, (message.key,)):
-                status, detail, apply = (
-                    SpeculatorStatusCode.TIMEOUT,
-                    "execution budget expired before token prefill",
-                    False,
-                )
-            else:
-                status, detail, apply = self.server.registry.prefill(
-                    message.key,
-                    owner=self.session_id,
-                    offset=message.offset,
-                    num_tokens=message.num_tokens,
-                    checksum=message.checksum,
-                    is_final=message.is_final,
-                )
-            if apply:
-                failure = self._call_adapter(
-                    self.server.adapter.prefill,
-                    message.key,
-                    PrefillInputs(
-                        message.offset, message.num_tokens, message.is_final, (frame,)
-                    ),
-                )
-                if failure is not None:
-                    status, detail = failure
-            if status is not OK:
-                self._discard_owned_sequences((message.key,))
+
+        def prefill():
+            with self.server.adapter_turn():
+                if not self.server.healthy:
+                    status, detail, apply = (
+                        SpeculatorStatusCode.INTERNAL_ERROR,
+                        "unhealthy runtime",
+                        False,
+                    )
+                elif self._expire_owned_sequences(deadline, (message.key,)):
+                    status, detail, apply = (
+                        SpeculatorStatusCode.TIMEOUT,
+                        "execution budget expired before token prefill",
+                        False,
+                    )
+                else:
+                    status, detail, apply = self.server.registry.prefill(
+                        message.key,
+                        owner=self.session_id,
+                        offset=message.offset,
+                        num_tokens=message.num_tokens,
+                        checksum=message.checksum,
+                        is_final=message.is_final,
+                    )
+                if apply:
+                    failure = self._call_adapter(
+                        self.server.adapter.prefill,
+                        message.key,
+                        PrefillInputs(
+                            message.offset,
+                            message.num_tokens,
+                            message.is_final,
+                            (frame,),
+                        ),
+                    )
+                    if failure is not None:
+                        status, detail = failure
+                if status is not OK:
+                    self._discard_owned_sequences((message.key,))
+            return status, detail
+
+        status, detail = self.server.work_queue.call(
+            self.verifier_instance_id, prefill, num_bytes=len(frame.payload)
+        )
         self._ack(message.key, request_id, status, detail)
 
     def _advance_tokens(self, message: TokenAdvance, request_id: int) -> None:
@@ -318,74 +555,57 @@ class _TokenServerSession(_ServerSession):
             value < 0 for array in (base, offered, accepted) for value in array
         ) or any(value < -1 for value in previous):
             raise ProtocolError("negative token state metadata")
-        statuses = [SpeculatorStatusCode.INTERNAL_ERROR] * n
-        results = [None] * n
-        valid, committed, identities = [], [], []
+        rows = []
+        offset = 0
+        for i, key in enumerate(keys):
+            rows.append(
+                TokenAdvanceRow(
+                    key,
+                    base[i],
+                    None if previous[i] == -1 else previous[i],
+                    offered[i],
+                    accepted[i],
+                    tuple(tokens[offset : offset + lengths[i]]),
+                )
+            )
+            offset += lengths[i]
+        work = DraftWork(
+            self.verifier_instance_id,
+            None,
+            _AdvanceInput(
+                self,
+                message.batch_id,
+                tuple(rows),
+                message.num_speculative_tokens,
+                deadline,
+            ),
+            num_bytes=sum(len(frame.payload) for frame in frames),
+            num_rows=n,
+            num_tokens=len(tokens),
+        )
+        outcomes = self.server.work_queue.submit(work).wait()
+        statuses, valid, committed, identities = [], [], [], []
         drafts: list[int] = []
-        with self.server.adapter_turn():
-            updates = []
-            selected = []
-            offset = 0
-            for i, key in enumerate(keys):
-                if not self.server.healthy:
-                    status = SpeculatorStatusCode.INTERNAL_ERROR
-                elif self._expire_owned_sequences(deadline, (key,)):
-                    status = SpeculatorStatusCode.TIMEOUT
-                else:
-                    status, _ = self.server.registry.begin_round(
-                        key, message.batch_id, owner=self.session_id
-                    )
-                statuses[i] = status
-                if status is OK:
-                    selected.append(i)
-                    updates.append(
-                        (
-                            message.batch_id,
-                            TokenAdvanceRow(
-                                key,
-                                base[i],
-                                None if previous[i] == -1 else previous[i],
-                                offered[i],
-                                accepted[i],
-                                tuple(tokens[offset : offset + lengths[i]]),
-                            ),
-                            message.num_speculative_tokens,
-                        )
-                    )
-                offset += lengths[i]
-            if updates:
-                outcomes = self.server.adapter.state.advance_many(
-                    tuple(updates), deadlines=(deadline,) * len(updates)
-                )
-                for i, outcome in zip(selected, outcomes):
-                    if isinstance(outcome, Exception):
-                        self.server._adapter_failed(outcome)
-                        statuses[i] = (
-                            outcome.status
-                            if isinstance(outcome, AdapterError)
-                            else SpeculatorStatusCode.INTERNAL_ERROR
-                        )
-                    else:
-                        results[i] = outcome
-            for key, status, result in zip(keys, statuses, results):
-                if status is not OK:
-                    self._discard_owned_sequences((key,))
-                elif result is not None:
-                    entry = self.server.registry.get(key)
-                    assert entry is not None
-                    entry.prefix_length = result.committed
-                row_tokens = result.token_ids if result is not None else ()
-                drafts.extend(
-                    row_tokens + (0,) * (self.num_speculative_tokens - len(row_tokens))
-                )
-                valid.append(len(row_tokens))
-                committed.append(result.committed if result is not None else -1)
-                identities.append(result.proposal_id if result is not None else -1)
-        statuses = [int(status) for status in statuses]
+        for status, result in outcomes:
+            row_tokens = result.token_ids if result is not None else ()
+            drafts.extend(
+                row_tokens + (0,) * (self.num_speculative_tokens - len(row_tokens))
+            )
+            statuses.append(int(status))
+            valid.append(len(row_tokens))
+            committed.append(result.committed if result is not None else -1)
+            identities.append(result.proposal_id if result is not None else -1)
         slot = self.next_result_slot
         self.next_result_slot += 5
         self._send(
-            TokenProposal(message.batch_id, slot),
+            TokenProposal(
+                message.batch_id,
+                slot,
+                origins=tuple(
+                    result.origin if result is not None else "on_demand"
+                    for _, result in outcomes
+                ),
+            ),
             request_id,
             frames=[
                 ints_to_frame(
@@ -397,3 +617,43 @@ class _TokenServerSession(_ServerSession):
                 ints_to_frame(slot + 4, statuses),
             ],
         )
+        cache = self.server.adapter.cache
+        if cache is not None and self.selected_policy == "outcome_cache":
+            for _, result in outcomes:
+                if result is None or result.prediction is None:
+                    continue
+                prediction = result.prediction
+
+                def build_phase(source=prediction):
+                    if not self.server.healthy:
+                        return False
+                    try:
+                        with self.server.adapter_turn():
+                            return cache.step(source)
+                    except Exception as error:
+                        self.server._adapter_failed(error)
+                        if not runtime_unusable(error):
+                            try:
+                                cache.cancel(source)
+                            except Exception as cleanup_error:
+                                error.add_note(
+                                    f"prediction cleanup failed: {cleanup_error}"
+                                )
+                                self.server._adapter_failed(cleanup_error)
+                        logger.exception("Token outcome cache build failed")
+                        return False
+
+                def cancel_prediction(source: TokenPredictionPlan = prediction) -> None:
+                    if self.server.healthy:
+                        cache.cancel(source)
+
+                self.server.work_queue.submit_background(
+                    DraftWork(
+                        self.verifier_instance_id,
+                        build_phase,
+                        num_bytes=512
+                        + 8 * (len(prediction.source_blocks) + len(prediction.tokens)),
+                        background=True,
+                        on_cancel=cancel_prediction,
+                    )
+                )
