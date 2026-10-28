@@ -139,6 +139,8 @@ class SpeculativeExecutionConfig:
     """Generate proposals only after authoritative target outcomes."""
     endpoints: tuple[str, ...] = ()
     """One endpoint, or 2..16 sticky draft pool workers; none for local."""
+    routing_policy: Literal["least_sequences", "load_aware"] = "least_sequences"
+    """New-request placement; load-aware routing requires a token-only pool."""
     transport: RemoteDraftTransport | None = None
     """Remote transport override. Unset retains the inline default."""
     failure_policy: RemoteDraftFailurePolicy | None = None
@@ -151,13 +153,17 @@ class SpeculativeExecutionConfig:
     @model_validator(mode="after")
     def _validate_placement(self) -> Self:
         if self.placement == "local":
-            if self.endpoints or any(
-                value is not None
-                for value in (
-                    self.transport,
-                    self.failure_policy,
-                    self.request_timeout_ms,
-                    self.startup_timeout_ms,
+            if (
+                self.routing_policy != "least_sequences"
+                or self.endpoints
+                or any(
+                    value is not None
+                    for value in (
+                        self.transport,
+                        self.failure_policy,
+                        self.request_timeout_ms,
+                        self.startup_timeout_ms,
+                    )
                 )
             ):
                 raise ValueError("local execution cannot specify remote options")
@@ -168,6 +174,8 @@ class SpeculativeExecutionConfig:
                 raise ValueError("remote execution requires 1..16 distinct endpoints")
             for endpoint in self.endpoints:
                 RemoteDraftConfig(endpoint=endpoint, transport=self.transport or "auto")
+            if self.routing_policy == "load_aware" and len(self.endpoints) < 2:
+                raise ValueError("load-aware routing requires multiple token workers")
             self.remote_config()
         return self
 
@@ -1756,6 +1764,13 @@ class SpeculativeConfig:
         from vllm.v1.spec_decode.remote.capabilities import (
             remote_draft_config_incompatibilities,
         )
+
+        if (
+            self.execution is not None
+            and self.execution.routing_policy == "load_aware"
+            and self.method != "draft_model"
+        ):
+            raise ValueError("load-aware routing supports only token-only draft pools")
 
         if self.method == "draft_model" and self.execution is not None:
             remote = self.get_remote_draft_config()
