@@ -87,6 +87,22 @@ RemoteDraftFailurePolicy = Literal["error", "target_only"]
 
 
 @config
+class RemoteDraftCostConfig:
+    """Opt-in measured round-cost policy for independent remote drafts."""
+
+    min_samples: int = Field(default=2, ge=1, le=64)
+    """Stable decode observations required for each tested K, including K=0."""
+    ema_alpha: float = Field(default=0.25, gt=0, le=1, allow_inf_nan=False)
+    """Weight of a new observation in the per-batch-size moving averages."""
+    min_speedup: float = Field(default=1.05, ge=1, allow_inf_nan=False)
+    """Required goodput relative to measured target-only decoding."""
+    switch_margin: float = Field(default=0.05, ge=0, allow_inf_nan=False)
+    """Relative goodput improvement required to switch between positive K."""
+    probe_interval: int = Field(default=16, ge=1)
+    """Stable rounds between probes after the initial calibration."""
+
+
+@config
 class RemoteDraftConfig:
     """Placement configuration for running a target-conditioned speculator
     in a standalone process on a dedicated same-host GPU.
@@ -116,6 +132,8 @@ class RemoteDraftConfig:
     """
     startup_timeout_ms: int = Field(default=30_000, gt=0)
     """Deadline for the initial connection and HELLO handshake."""
+    cost_aware: RemoteDraftCostConfig | None = None
+    """Measure independent token-only round costs and adapt K. Disabled by default."""
 
     @model_validator(mode="after")
     def _validate_endpoint(self) -> Self:
@@ -147,6 +165,8 @@ class SpeculativeExecutionConfig:
     """Remote proposal deadline override; defaults to 100 milliseconds."""
     startup_timeout_ms: int | None = Field(default=None, gt=0)
     """Remote handshake deadline override; defaults to 30 seconds."""
+    cost_aware: RemoteDraftCostConfig | None = None
+    """Optional token-only measured-cost policy, independent of telemetry export."""
 
     @model_validator(mode="after")
     def _validate_placement(self) -> Self:
@@ -158,6 +178,7 @@ class SpeculativeExecutionConfig:
                     self.failure_policy,
                     self.request_timeout_ms,
                     self.startup_timeout_ms,
+                    self.cost_aware,
                 )
             ):
                 raise ValueError("local execution cannot specify remote options")
@@ -178,6 +199,7 @@ class SpeculativeExecutionConfig:
             startup_timeout_ms=(
                 30_000 if self.startup_timeout_ms is None else self.startup_timeout_ms
             ),
+            cost_aware=self.cost_aware,
         )
 
 
@@ -1750,6 +1772,13 @@ class SpeculativeConfig:
         from vllm.v1.spec_decode.remote.capabilities import (
             remote_draft_config_incompatibilities,
         )
+
+        remote = self.get_remote_draft_config()
+        assert remote is not None
+        if remote.cost_aware is not None and (
+            self.method != "draft_model" or self.execution is None
+        ):
+            raise ValueError("cost-aware drafting requires token-only remote execution")
 
         if self.method == "draft_model" and self.execution is not None:
             remote = self.get_remote_draft_config()

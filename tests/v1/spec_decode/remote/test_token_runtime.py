@@ -45,6 +45,65 @@ from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
 
 
+def test_measured_remote_cost_selects_goodput_and_respects_runner_budget():
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 3)
+    measurements = (
+        (0, 0.010, 0.100, 1),
+        (1, 0.012, 0.003, 2),
+        (2, 0.014, 0.004, 2),
+        (3, 0.016, 0.006, 4),
+    )
+    for k, target_seconds, rpc_seconds, emitted in measurements:
+        assert policy.choose(1, 3) == k
+        policy.observe(
+            batch_size=1,
+            k=k,
+            target_seconds=target_seconds,
+            rpc_seconds=rpc_seconds,
+            emitted_tokens=emitted,
+        )
+    assert policy.choose(1, 3) == 3
+    assert policy.choose(1, 1) == 1
+    assert policy.choose(2, 3) == 0
+    assert policy.snapshot()["observations"] == 4
+
+
+def test_measured_remote_cost_accounts_for_rpc_and_retires_unprofitable_work():
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 1)
+    policy.observe(
+        batch_size=2, k=0, target_seconds=0.010, rpc_seconds=0.100, emitted_tokens=2
+    )
+    policy.observe(
+        batch_size=2, k=1, target_seconds=0.012, rpc_seconds=0.020, emitted_tokens=4
+    )
+    assert policy.choose(2, 1) is None
+    assert policy.snapshot()["target_only_transitions"] == 2
+    # Another batch size must establish its own target-only baseline first.
+    assert policy.choose(1, 1) == 0
+    policy.reset_estimates()
+    assert policy.choose(2, 1) == 0
+    assert policy.snapshot()["observations"] == 2
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("inf"), float("nan")])
+def test_measured_remote_cost_ignores_invalid_timing(seconds):
+    from vllm.config.speculative import RemoteDraftCostConfig
+    from vllm.v1.spec_decode.remote.cost import RemoteDraftCostController
+
+    policy = RemoteDraftCostController(RemoteDraftCostConfig(min_samples=1), 1)
+    policy.observe(
+        batch_size=1, k=0, target_seconds=seconds, rpc_seconds=0.001, emitted_tokens=1
+    )
+    assert policy.snapshot()["observations"] == 0
+    assert policy.choose(1, 1) == 0
+
+
 @pytest.mark.parametrize("handshake", [False, True])
 def test_token_client_rejects_oversized_header_before_waiting_for_body(
     socket_runtime, handshake
