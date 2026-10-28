@@ -2056,25 +2056,9 @@ def _step3p5_standalone_ownership(model_path, k, profile, output):
     Path(output).write_text(json.dumps(result, indent=2) + "\n")
 
 
-@pytest.mark.parametrize(
-    "profile,k",
-    [("one_full", 1), ("one_full", 3), ("three_swa", 1)],
-    ids=["one_full-1", "one_full-3", "three_swa-1"],
-)
-def test_remote_step3p5_mtp_matches_native_and_target(
-    profile,
-    k,
-    vllm_runner,
-    request,
-    monkeypatch,
-    tmp_path,
-    record_property,
-):
-    """Keep checkpoint-owned MTP output heads through native and remote loading."""
-    import json
-
-    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+@pytest.fixture
+def tiny_step3p5_mtp_model(tmp_path, profile):
+    """Stage the initialized Step3.5 checkpoint without touching CUDA."""
     directory = tmp_path / "step3p5"
     command = [
         sys.executable,
@@ -2095,8 +2079,33 @@ def test_remote_step3p5_mtp_matches_native_and_target(
         VLLM_BATCH_INVARIANT="0",
     )
     subprocess.run(command, env=environment, check=True, timeout=180)
-    model = str(directory / "model")
-    record_property("fixture", json.loads((directory / "fixture.json").read_text()))
+    return str(directory / "model")
+
+
+@pytest.mark.parametrize(
+    "profile,k",
+    [("one_full", 1), ("one_full", 3), ("three_swa", 1)],
+    ids=["one_full-1", "one_full-3", "three_swa-1"],
+)
+def test_remote_step3p5_mtp_matches_native_and_target(
+    profile,
+    k,
+    vllm_runner,
+    request,
+    monkeypatch,
+    tmp_path,
+    record_property,
+    tiny_step3p5_mtp_model,
+):
+    """Keep checkpoint-owned MTP output heads through native and remote loading."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    model = tiny_step3p5_mtp_model
+    record_property(
+        "fixture", json.loads((Path(model).parent / "fixture.json").read_text())
+    )
     ownership = tmp_path / "step3p5-standalone.json"
     command = [
         sys.executable,
@@ -2128,6 +2137,111 @@ def test_remote_step3p5_mtp_matches_native_and_target(
         record_property,
         target_model=model,
     )
+
+
+@pytest.mark.parametrize("profile", ["one_full"])
+@pytest.mark.parametrize("omitted", [False, True], ids=["complete", "missing-q"])
+def test_step3p5_mtp_validates_packed_attention_through_llm(
+    tiny_step3p5_mtp_model, tmp_path, omitted
+):
+    """Public loading rejects a missing Q slice and preserves owned MTP heads."""
+    import json
+    import shutil
+
+    from safetensors.torch import load_file, save_file
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    draft_path = tmp_path / "draft"
+    shutil.copytree(tiny_step3p5_mtp_model, draft_path)
+    if omitted:
+        path = draft_path / "model.safetensors"
+        weights = load_file(path)
+        del weights["model.layers.2.self_attn.q_proj.weight"]
+        save_file(weights, path, metadata={"format": "pt"})
+    options = dict(
+        model=tiny_step3p5_mtp_model,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        disable_log_stats=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config={
+            "method": "mtp",
+            "model": str(draft_path),
+            "num_speculative_tokens": 1,
+        },
+    )
+    program = """
+import json
+import sys
+import torch
+from vllm import LLM, SamplingParams
+from tests.v1.e2e.spec_decode.utils import get_spec_decode_metric_value
+if sys.argv[2] == "missing":
+    try:
+        LLM(**json.loads(sys.argv[1]))
+    except ValueError as error:
+        assert "not initialized from checkpoint" in str(error), error
+        assert "q_proj.weight" in str(error), error
+    else:
+        raise AssertionError("LLM admitted an incomplete Step3.5 MTP Q projection")
+else:
+    llm = LLM(**json.loads(sys.argv[1]))
+
+    def owned_parameters(worker):
+        target = worker.model_runner.model
+        draft = worker.model_runner.get_draft_model()
+        head = draft.model.layers["2"].shared_head.head
+        return (
+            draft.model.embed_tokens is target.model.embed_tokens,
+            draft.has_own_lm_head,
+            head is not target.lm_head,
+            torch.equal(head.weight, target.lm_head.weight * 2),
+        )
+
+    proof = llm.collective_rpc(owned_parameters)
+    assert len(proof) == 1 and len(proof[0]) == 4 and all(proof[0]), proof
+    outputs = llm.generate(
+        {"prompt_token_ids": [4, 5, 6]},
+        SamplingParams(temperature=0, max_tokens=8, min_tokens=8, ignore_eos=True),
+    )
+    tokens = outputs[0].outputs[0].token_ids
+    assert len(tokens) == 8 and all(0 <= token < 128 for token in tokens), tokens
+    for name in ("num_draft_tokens", "num_accepted_tokens"):
+        assert get_spec_decode_metric_value(
+            llm.get_metrics(), "vllm:spec_decode_" + name
+        ) > 0, name
+"""
+    log_path = tmp_path / "step3p5-mtp-loading.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                json.dumps(options),
+                "missing" if omitted else "complete",
+            ],
+            env=dict(
+                os.environ,
+                VLLM_ENABLE_V1_MULTIPROCESSING="0",
+                VLLM_USE_V2_MODEL_RUNNER="1",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    assert result.returncode == 0, log_path.read_text()[-12000:]
 
 
 def _mimo_v2_flash_fixture_data():
@@ -7252,3 +7366,135 @@ def test_separate_mtp_checkpoint_settings_reach_public_llm(
                 draft_config["rope_parameters"]["rope_theta"],
             )
         ]
+
+
+def test_remote_mtp_socket_cleanup_failure_preserves_target_only_and_reconnects(
+    vllm_runner, monkeypatch, tmp_path, tiny_ernie_mtp_model, record_property
+):
+    """Finish a faulted request exactly and admit fresh remote state afterward."""
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    # Drive real engine steps explicitly while the draft stays process-separated.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    model = tiny_ernie_mtp_model
+    options = dict(
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        moe_backend="triton",
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (7 * i) % 125 for i in range(length)]}
+        for length in (17, 19)
+    ]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+    with vllm_runner(model, **options) as baseline:
+        expected = [
+            baseline.llm.generate(prompt, sampling, use_tqdm=False)[0]
+            .outputs[0]
+            .token_ids
+            for prompt in prompts
+        ]
+
+    def state(worker):
+        speculator = worker.model_runner.speculator
+        session = speculator._session
+        return {
+            "connected": session.connected,
+            "epoch": session.session_epoch,
+            "next_rpc": session._next_request_id,
+            "proposal_calls": speculator._stats["proposal_calls"],
+            "states": [
+                session.sequence_state(request.key).value
+                for request in speculator._requests.values()
+            ],
+            "backoff_ready": session._clock() >= session._reconnect_at,
+        }
+
+    def break_socket(worker):
+        session = worker.model_runner.speculator._session
+        assert session.connected and session._conn is not None
+        os.close(session._conn._sock.fileno())
+
+    with draft_server(
+        model,
+        tmp_path / "cleanup-draft.log",
+        revision=None,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+        trust_remote_code=False,
+        moe_backend="triton",
+    ) as endpoint:
+        config = dict(
+            method="mtp",
+            model=model,
+            num_speculative_tokens=1,
+            draft_tensor_parallel_size=1,
+            attention_backend="TRITON_ATTN",
+            remote_draft=dict(
+                endpoint=endpoint,
+                transport="inline",
+                failure_policy="target_only",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
+            ),
+        )
+        with vllm_runner(model, speculative_config=config, **options) as remote:
+            llm = remote.llm
+
+            def drafts():
+                llm.llm_engine.do_log_stats()
+                return get_spec_decode_metric_value(
+                    llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
+                )
+
+            llm.enqueue(prompts[0], sampling.clone(), use_tqdm=False)
+            for _ in range(2):
+                assert not llm.llm_engine.step()
+            before = llm.collective_rpc(state)[0]
+            assert before["connected"] and before["states"] == ["ready"]
+            assert before["proposal_calls"] == 2 and drafts() > 0
+            llm.collective_rpc(break_socket)
+            assert not llm.llm_engine.step()
+            faulted = llm.collective_rpc(state)[0]
+            assert not faulted["connected"] and faulted["states"] == ["invalid"]
+            faulted_drafts = drafts()
+            [output] = llm.wait_for_completion(use_tqdm=False)
+            assert list(output.outputs[0].token_ids) == list(expected[0])
+            terminal = llm.collective_rpc(state)[0]
+            assert not terminal["connected"]
+            assert terminal["epoch"] == faulted["epoch"] == before["epoch"]
+            assert terminal["next_rpc"] == faulted["next_rpc"]
+            assert terminal["proposal_calls"] > faulted["proposal_calls"]
+            assert drafts() == faulted_drafts
+
+            deadline = time.monotonic() + 5
+            while not terminal["backoff_ready"]:
+                assert time.monotonic() < deadline, "remote reconnect stayed in backoff"
+                terminal = llm.collective_rpc(state)[0]
+            [fresh] = llm.generate(prompts[1], sampling.clone(), use_tqdm=False)
+            assert list(fresh.outputs[0].token_ids) == list(expected[1])
+            recovered = llm.collective_rpc(state)[0]
+            assert recovered["connected"] and recovered["epoch"] > before["epoch"]
+            assert drafts() > faulted_drafts
+            record_property("cleanup.before", before)
+            record_property("cleanup.faulted", faulted)
+            record_property("cleanup.terminal", terminal)
+            record_property("cleanup.recovered", recovered)
+            record_property("cleanup.drafts_before_reconnect", faulted_drafts)
+            record_property("cleanup.drafts_after_reconnect", drafts())
