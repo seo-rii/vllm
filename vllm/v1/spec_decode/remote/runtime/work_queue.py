@@ -57,6 +57,7 @@ class DraftWorkQueue:
         batch_wait_s: float = 0.001,
         max_background_jobs: int = 0,
         max_background_bytes: int = 0,
+        on_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         for name, value in (
             ("max_jobs", max_jobs),
@@ -89,12 +90,17 @@ class DraftWorkQueue:
         self.max_background_bytes = max_background_bytes
         self._background: deque[DraftWork] = deque()
         self._background_jobs = self._background_bytes = 0
+        self.on_failure = on_failure
         self._condition = threading.Condition()
         self._queues: dict[str, deque[DraftWork]] = {}
         self._ready: deque[str] = deque()
         self._credits: dict[str, tuple[int, int]] = {}
+        # Admission ownership survives queue removal, batch allocation, execution,
+        # and credit release. Only a completed work item leaves this registry.
+        self._owned: dict[int, DraftWork] = {}
         self._jobs = self._bytes = self._cleanup_jobs = 0
         self._closing = False
+        self._failure: BaseException | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -109,6 +115,7 @@ class DraftWorkQueue:
 
     def start(self, initialize: Callable[[], None]) -> None:
         ready = DraftWork("", initialize)
+        start_error = None
 
         def run() -> None:
             try:
@@ -121,6 +128,10 @@ class DraftWorkQueue:
                 self._run()
 
         with self._condition:
+            if self._failure is not None:
+                raise ServerShutdownTimeout(
+                    "token GPU owner failed; process restart required"
+                ) from self._failure
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("draft work queue is already started")
             if (
@@ -133,6 +144,7 @@ class DraftWorkQueue:
                 or self._background
                 or self._background_jobs
                 or self._background_bytes
+                or self._owned
             ):
                 raise RuntimeError("draft work queue retains unfinished work")
             self._closing = False
@@ -140,7 +152,20 @@ class DraftWorkQueue:
                 target=run, name="token-draft-gpu-owner", daemon=True
             )
             self._thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException as error:
+                self._closing = True
+                self._condition.notify_all()
+                if isinstance(error, RuntimeError) and thread.ident is None:
+                    self._thread = None
+                    raise
+                # A low-memory start can raise after the OS thread exists,
+                # before Python publishes its ident. Retain its ownership.
+                start_error = error
+        if start_error is not None:
+            self._fail(start_error)
+            raise start_error
         try:
             ready.wait()
         except BaseException as error:
@@ -189,6 +214,7 @@ class DraftWorkQueue:
             total_bytes = self._bytes + (0 if work.cleanup else work.num_bytes)
             cleanup_jobs = self._cleanup_jobs + work.cleanup
             try:
+                self._owned[id(work)] = work
                 if not work.cleanup:
                     self._credits[work.owner] = credits
                 if created:
@@ -197,6 +223,7 @@ class DraftWorkQueue:
                 else:
                     queue.append(work)
             except BaseException:
+                self._owned.pop(id(work), None)
                 if created:
                     self._queues.pop(work.owner, None)
                 if not work.cleanup:
@@ -235,9 +262,15 @@ class DraftWorkQueue:
                 or self._background_bytes + work.num_bytes > self.max_background_bytes
             ):
                 return False
-            self._background.append(work)
-            self._background_jobs += 1
-            self._background_bytes += work.num_bytes
+            jobs = self._background_jobs + 1
+            size = self._background_bytes + work.num_bytes
+            self._owned[id(work)] = work
+            try:
+                self._background.append(work)
+            except BaseException:
+                self._owned.pop(id(work), None)
+                raise
+            self._background_jobs, self._background_bytes = jobs, size
             work._submitted = True
             self._condition.notify()
             return True
@@ -323,21 +356,59 @@ class DraftWorkQueue:
                         else:
                             self._credits[work.owner] = jobs - 1, size - work.num_bytes
                     work.done.set()
+                    del self._owned[id(work)]
+                self._condition.notify_all()
+
+    def _fail(self, error: BaseException) -> None:
+        with self._condition:
+            self._failure = error
+            self._closing = True
+        try:
+            if self.on_failure is not None:
+                self.on_failure(error)
+        except BaseException as cleanup_error:
+            self._failure = BaseExceptionGroup(
+                "draft owner and failure notification failed", [error, cleanup_error]
+            )
+        finally:
+            with self._condition:
+                # Do not reconstruct the partially consumed batch or rely on
+                # possibly half-updated credits while unwinding an allocation.
+                for work in self._owned.values():
+                    if not work.done.is_set():
+                        if work.error is None:
+                            work.error = error
+                        work.done.set()
+                self._owned.clear()
+                self._background.clear()
+                self._background_jobs = self._background_bytes = 0
+                self._queues.clear()
+                self._ready.clear()
+                self._credits.clear()
+                self._jobs = self._bytes = self._cleanup_jobs = 0
                 self._condition.notify_all()
 
     def _run(self) -> None:
-        while batch := self._next_batch():
-            self._execute(batch)
-            del batch
+        try:
+            while batch := self._next_batch():
+                self._execute(batch)
+                del batch
+        except BaseException as error:
+            self._fail(error)
 
     def stop(self, deadline: float) -> None:
         with self._condition:
             self._closing = True
             thread = self._thread
             self._condition.notify_all()
-        if thread is not None:
+        if thread is not None and thread.ident is not None:
             thread.join(max(0, deadline - time.monotonic()))
             if thread.is_alive():
                 raise ServerShutdownTimeout(
                     "token GPU owner is still running; process restart required"
                 )
+        with self._condition:
+            if self._failure is not None or self._owned or self.depth:
+                raise ServerShutdownTimeout(
+                    "token GPU owner failed; process restart required"
+                ) from self._failure

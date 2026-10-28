@@ -3550,3 +3550,136 @@ def test_public_outcome_cache_rejects_draft_tp2(tmp_path):
             },
         )
         create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize("fault", ["dequeue", "batch", "execute", "credit"])
+def test_queue_owner_failure_completes_all_admitted_work(monkeypatch, fault):
+    """Allocation failures cannot strand dequeued work or its waiting callers."""
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    class Completion(threading.Event):
+        count = 0
+
+        def set(self):
+            self.count += 1
+            super().set()
+
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=4,
+        max_bytes=16,
+        max_jobs_per_owner=4,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+        on_failure=failures.append,
+    )
+    queue.start(lambda: None)
+
+    def hold():
+        entered.set()
+        assert release.wait(3)
+
+    held = queue.submit(DraftWork("hold", hold))
+    assert entered.wait(3)
+    jobs = [
+        queue.submit(
+            DraftWork(
+                "a", None, num_rows=1, num_tokens=1, num_bytes=4, done=Completion()
+            )
+        )
+        for _ in range(3)
+    ]
+    error = MemoryError(f"injected {fault}")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    if fault == "dequeue":
+        original = queue._pop
+
+        def dequeue():
+            original()
+            raise error
+
+        monkeypatch.setattr(queue, "_pop", dequeue)
+    elif fault == "batch":
+        monkeypatch.setattr(module, "tuple", fail, raising=False)
+    elif fault == "execute":
+        monkeypatch.setattr(queue, "_execute", fail)
+    else:
+
+        class BrokenCredits(dict):
+            def __getitem__(self, key):
+                if key == "a":
+                    raise error
+                return super().__getitem__(key)
+
+        monkeypatch.setattr(queue, "_credits", BrokenCredits(queue._credits))
+    release.set()
+    held.wait()
+    assert all(work.done.wait(3) for work in jobs)
+    assert all(work.done.count == 1 for work in jobs)
+    for work in jobs:
+        with pytest.raises(MemoryError, match=f"injected {fault}"):
+            work.wait()
+    assert queue.depth == queue.pending_bytes == 0
+    assert failures == [error]
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.stop(time.monotonic() + 3)
+    with pytest.raises(ServerShutdownTimeout):
+        queue.submit(DraftWork("new", lambda: None))
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.start(lambda: pytest.fail("failed GPU owner was restarted"))
+
+
+@pytest.mark.parametrize("fault", ["before", "uncertain", "after"])
+def test_queue_start_failure_retains_uncertain_thread_ownership(monkeypatch, fault):
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+    )
+    start = threading.Thread.start
+    error = RuntimeError("start refused") if fault == "before" else MemoryError("start")
+
+    def fail(thread):
+        if fault == "after":
+            start(thread)
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail)
+        with pytest.raises(type(error)) as caught:
+            queue.start(lambda: None)
+        assert caught.value is error
+    if fault == "before":
+        queue.stop(time.monotonic() + 3)
+        queue.start(lambda: None)
+        assert queue.call("a", lambda: 7) == 7
+        queue.stop(time.monotonic() + 3)
+    else:
+        for _ in range(2):
+            with pytest.raises(ServerShutdownTimeout, match="restart required"):
+                queue.stop(time.monotonic() + 3)
+        with pytest.raises(ServerShutdownTimeout, match="restart required"):
+            queue.start(lambda: None)
