@@ -84,11 +84,7 @@ class ConditionedDraftServer(RemoteDraftServer):
         # Do not stop an already running owner's queue on a duplicate start.
         if self._listener is not None or not self.healthy:
             raise RuntimeError("conditioned runtime is already started or unhealthy")
-        try:
-            return super().start(endpoint)
-        except BaseException as error:
-            self._rollback_start(error)
-            raise
+        return super().start(endpoint)
 
     def stop(self, *, deadline: float | None = None) -> None:
         self._stop_with_owner(self.work_queue.stop, deadline=deadline)
