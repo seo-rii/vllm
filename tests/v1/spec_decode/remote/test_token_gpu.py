@@ -126,6 +126,70 @@ def test_recurrent_executor_rejects_full_prefix_beyond_server_token_budget(
         create_recurrent_executor_config(config)
 
 
+def test_recurrent_startup_reads_each_checkpoint_once_and_rechecks_changes(
+    tmp_path, monkeypatch
+):
+    """Each startup fingerprints current bytes once before device admission."""
+    import hashlib
+    from collections import Counter
+
+    from safetensors.torch import load_file, save_file
+
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.v1.spec_decode.remote.runtime import schema
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        RecurrentGPUStepExecutor,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+        spec_options={"attention_backend": "TRITON_ATTN"},
+    )
+    checkpoints = [
+        tmp_path / role / "model.safetensors" for role in ("target", "draft")
+    ]
+    observations: list[tuple[Path, str]] = []
+
+    def observe_hashes(frame, event, result):
+        if (
+            event == "return"
+            and frame.f_code is schema._local_artifact_digests.__code__
+        ):
+            observations.extend(
+                (frame.f_locals["path"] / name, digest)
+                for name, digest in result.items()
+            )
+
+    previous_draft_digest = None
+    for _ in range(2):
+        observations.clear()
+        expected = {
+            path: hashlib.sha256(path.read_bytes()).hexdigest() for path in checkpoints
+        }
+        unavailable = torch.device("cuda", torch.accelerator.device_count())
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(observe_hashes)
+            with pytest.raises(ValueError, match="not a visible CUDA GPU"):
+                RecurrentGPUStepExecutor(
+                    config, device=unavailable, kv_cache_bytes=1 << 20
+                )
+        finally:
+            sys.setprofile(previous_profile)
+        assert Counter(path for path, _ in observations) == Counter(checkpoints)
+        assert dict(observations) == expected
+        assert expected[checkpoints[1]] != previous_draft_digest
+        previous_draft_digest = expected[checkpoints[1]]
+        weights = load_file(str(checkpoints[1]))
+        weights[sorted(weights)[0]].add_(1)
+        save_file(weights, str(checkpoints[1]))
+
+
 def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
     from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
