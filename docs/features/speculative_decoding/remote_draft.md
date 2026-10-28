@@ -9,6 +9,18 @@ The standalone GPU runtime provides same-host target-conditioned execution with
 independent draft KV. It supports greedy, eager MRV2 execution, target TP1 or TP2
 and draft TP1. The protocol test adapter is for development only.
 
+Independent `method="draft_model"` placement uses the
+[token-only runtime](../../design/unified_speculation_runtime.md#token-only-state-contract).
+Its support includes attention-only models, selected dense MLA drafts and a
+bounded NemotronH recurrent draft with no MTP or expert blocks. Recurrent drafts
+use a dedicated ordinary model state and replay the full computed prefix on each
+forward; this trades extra computation for independent state placement. The
+linked contract describes tokenizer compatibility, state/token-page memory
+accounting and the single-endpoint inline limits.
+The recurrent executor preserves the runtime's effective `draft_load_config`,
+including its checkpoint format and loader options, when constructing the
+ordinary draft model.
+
 ## Configuration and lifecycle
 
 `speculative_config.remote_draft` takes a single `endpoint`, a `transport`
