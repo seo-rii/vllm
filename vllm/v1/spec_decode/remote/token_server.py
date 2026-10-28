@@ -18,7 +18,10 @@ from vllm.v1.spec_decode.remote.protocol import (
     limit_shortfalls,
 )
 from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
-from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+from vllm.v1.spec_decode.remote.runtime.token_state import (
+    TokenAdvanceRow,
+    TokenRowResult,
+)
 from vllm.v1.spec_decode.remote.server import (
     AdapterError,
     AdapterQueueFull,
@@ -103,10 +106,14 @@ class TokenDraftServer(RemoteDraftServer):
                     session.session_id,
                 )
             finally:
-                conn.close()
-                with self._connections_lock:
-                    self._connections.discard(conn)
-                    self._handshaking.discard(conn)
+                try:
+                    conn.close()
+                except OSError as error:
+                    logger.warning("Token connection cleanup failed: %s", error)
+                finally:
+                    with self._connections_lock:
+                        self._connections.discard(conn)
+                        self._handshaking.discard(conn)
 
 
 class _TokenServerSession(_ServerSession):
@@ -319,7 +326,7 @@ class _TokenServerSession(_ServerSession):
         ) or any(value < -1 for value in previous):
             raise ProtocolError("negative token state metadata")
         statuses = [SpeculatorStatusCode.INTERNAL_ERROR] * n
-        results = [None] * n
+        results: list[TokenRowResult | None] = [None] * n
         valid, committed, identities = [], [], []
         drafts: list[int] = []
         with self.server.adapter_turn():
@@ -381,7 +388,7 @@ class _TokenServerSession(_ServerSession):
                 valid.append(len(row_tokens))
                 committed.append(result.committed if result is not None else -1)
                 identities.append(result.proposal_id if result is not None else -1)
-        statuses = [int(status) for status in statuses]
+        status_values = [int(status) for status in statuses]
         slot = self.next_result_slot
         self.next_result_slot += 5
         self._send(
@@ -394,6 +401,6 @@ class _TokenServerSession(_ServerSession):
                 ints_to_frame(slot + 1, valid),
                 ints_to_frame(slot + 2, committed, dtype="int64"),
                 ints_to_frame(slot + 3, identities, dtype="int64"),
-                ints_to_frame(slot + 4, statuses),
+                ints_to_frame(slot + 4, status_values),
             ],
         )
