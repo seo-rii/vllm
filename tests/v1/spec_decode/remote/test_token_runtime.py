@@ -2426,6 +2426,33 @@ def test_token_recurrent_draft_validates_effective_public_ssm_dtype(
             create_token_runtime_contract(config)
 
 
+def test_token_recurrent_draft_rejects_resolved_bfloat16_ssm_dtype(
+    tmp_path, monkeypatch
+):
+    """The resolved contract rejects BF16 even on CPUs that normalize inputs."""
+    from vllm.config import replace as replace_config
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+    )
+    original_cache = config.cache_config
+    config.cache_config = replace_config(
+        original_cache, mamba_ssm_cache_dtype="bfloat16"
+    )
+    assert original_cache.mamba_ssm_cache_dtype == "float32"
+    assert config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+    with pytest.raises(ValueError, match="float32 SSM"):
+        create_token_runtime_contract(config)
+
+
 @pytest.mark.parametrize(
     "options",
     [
