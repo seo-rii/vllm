@@ -31,13 +31,20 @@ logger = init_logger(__name__)
 
 def create_recurrent_executor_config(config: VllmConfig) -> VllmConfig:
     """Resolve the complete draft as an ordinary model with no speculative state."""
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    create_token_runtime_contract(config)
+    return _create_recurrent_executor_config(config)
+
+
+def _create_recurrent_executor_config(config: VllmConfig) -> VllmConfig:
+    """Build ordinary execution resources after validating the token contract."""
     from vllm.config import AttentionConfig
     from vllm.config.mamba import MambaBackendEnum
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader.utils import get_draft_load_config
-    from vllm.v1.spec_decode.remote.runtime.token_schema import (
-        create_token_runtime_contract,
-    )
 
     spec = config.speculative_config
     if spec is None or spec.draft_model_config is None:
@@ -53,7 +60,6 @@ def create_recurrent_executor_config(config: VllmConfig) -> VllmConfig:
         or draft.hf_text_config.model_type != "nemotron_h"
     ):
         raise ValueError("recurrent drafting requires a full NemotronH model")
-    create_token_runtime_contract(config)
     scheduler = config.scheduler_config
     if config.model_config.max_model_len > scheduler.max_num_batched_tokens:
         raise ValueError("recurrent full-prefix replay must fit one token budget")
@@ -138,7 +144,7 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
         spec = config.speculative_config
         assert spec is not None
         self.max_k = spec.num_speculative_tokens
-        self.vllm_config = resource = create_recurrent_executor_config(config)
+        self.vllm_config = resource = _create_recurrent_executor_config(config)
         if kv_cache_bytes <= 0:
             raise ValueError("recurrent draft KV budget must be positive")
         if resource.speculative_config is not None or resource.num_speculative_tokens:
