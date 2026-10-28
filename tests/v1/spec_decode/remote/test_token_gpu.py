@@ -230,6 +230,7 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     from safetensors import safe_open
 
     import vllm.ir
+    from tests.v1.spec_decode.remote.runtime_fixtures import cpu_accelerator_cleanup
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -271,6 +272,7 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     initialized = False
     try:
         with (
+            cpu_accelerator_cleanup(),
             set_current_vllm_config(config),
             vllm.ir.enable_torch_wrap(config.compilation_config.ir_enable_torch_wrap),
         ):
