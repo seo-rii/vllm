@@ -49,8 +49,11 @@ def draft_server(
     moe_backend: str | None = None,
     batch_invariant: bool | None = None,
     owned_processes: list[subprocess.Popen] | None = None,
+    close_fault_receipt: Path | None = None,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
+    if close_fault_receipt is not None and token_only_draft is None:
+        raise ValueError("socket cleanup fault requires the token-only server")
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
         command = [
@@ -121,6 +124,16 @@ def draft_server(
                 attention_backend,
                 "--target-attention-backend",
                 target_attention_backend or attention_backend,
+            ]
+        if close_fault_receipt is not None:
+            command = [
+                sys.executable,
+                "-c",
+                "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+                "import _serve_token_socket_cleanup_fault; "
+                "_serve_token_socket_cleanup_fault(sys.argv[1], sys.argv[2:])",
+                str(close_fault_receipt),
+                *command[3:],
             ]
         environment = None
         if batch_invariant is not None:
@@ -1991,7 +2004,60 @@ def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
     record_property("dynamic_k.request_timing", timing)
 
 
-def _fail_token_session_during_socket_cleanup(worker):
+def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) -> None:
+    import json
+
+    from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+    from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
+
+    args = parser().parse_args(cli_args)
+    adapter = create_adapter(args)
+    server = TokenDraftServer(
+        adapter,
+        limits=RemoteServerLimits(
+            args.max_batch_size,
+            args.max_feature_tokens,
+            args.max_batch_size,
+            args.max_model_len,
+        ),
+        max_connections=1,
+    )
+
+    def close_verifier_socket(signum, frame):
+        with server._connections_lock:
+            connections = tuple(
+                connection
+                for connection in server._connections
+                if connection not in server._handshaking and not connection.closed
+            )
+        assert len(connections) == 1 and len(server.registry) > 0
+        pending_receipt = Path(receipt_path).with_suffix(".tmp")
+        payload = json.dumps(
+            dict(
+                server_socket_fd_closed=True,
+                live_verifier_connections=len(connections),
+                active_sequences=len(server.registry),
+            )
+        )
+        with pending_receipt.open("w") as receipt:
+            os.close(connections[0]._sock.fileno())
+            receipt.write(payload)
+        pending_receipt.replace(receipt_path)
+
+    signal.signal(signal.SIGUSR1, close_verifier_socket)
+    try:
+        endpoint = server.start(args.endpoint)
+        print(f"TOKEN_DRAFT_READY {endpoint}", flush=True)
+        server.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    assert server.healthy
+
+
+def _fail_token_session_during_socket_cleanup(worker, inject_close_error=True):
     import errno
     from unittest.mock import patch
 
@@ -2014,7 +2080,10 @@ def _fail_token_session_during_socket_cleanup(worker):
             injected = True
             raise OSError(errno.EIO, "injected socket cleanup failure")
 
-    with patch.object(socket.socket, "close", close_then_fail):
+    if inject_close_error:
+        with patch.object(socket.socket, "close", close_then_fail):
+            session.fail("injected primary token failure")
+    else:
         session.fail("injected primary token failure")
     return dict(
         cleanup_error_injected=injected,
@@ -2026,7 +2095,13 @@ def _fail_token_session_during_socket_cleanup(worker):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "lifecycle", ["abort-reuse", "timeout-recovery", "cleanup-error-fallback"]
+    "lifecycle",
+    [
+        "abort-reuse",
+        "timeout-recovery",
+        "cleanup-error-fallback",
+        "server-cleanup-admission",
+    ],
 )
 async def test_remote_token_async_lifecycle_preserves_healthy_requests(
     vllm_runner, monkeypatch, tmp_path, record_property, lifecycle, enable_pickle
@@ -2113,6 +2188,7 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
     assert expected[0][:32] != expected[1], "request reuse must change the transcript"
 
     owned_processes: list[subprocess.Popen] = []
+    close_fault_receipt = tmp_path / "server-close-fault.json"
     with draft_server(
         target,
         tmp_path / "lifecycle-draft.log",
@@ -2123,6 +2199,9 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=64,
         owned_processes=owned_processes,
+        close_fault_receipt=(
+            close_fault_receipt if lifecycle == "server-cleanup-admission" else None
+        ),
     ) as endpoint:
         spec = dict(
             method="draft_model",
@@ -2247,19 +2326,39 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
                     reused = await collect("reused", prompts[1], 32)
                     assert_active(reused, expected[1])
                     outputs.update(aborted=aborted, healthy=healthy, reused=reused)
-                elif lifecycle == "cleanup-error-fallback":
+                elif lifecycle in (
+                    "cleanup-error-fallback",
+                    "server-cleanup-admission",
+                ):
                     tasks = [asyncio.create_task(collect("reused", prompts[0], 96))]
                     await first_output.wait()
                     assert await engine.is_paused()
                     partial = observed["reused"]
                     partial_length = len(partial.outputs[0].token_ids)
                     assert not partial.finished and 0 < partial_length < 96
+                    if lifecycle == "server-cleanup-admission":
+                        import json
+
+                        assert len(owned_processes) == 1
+                        os.kill(owned_processes[0].pid, signal.SIGUSR1)
+                        async with asyncio.timeout(10):
+                            while not close_fault_receipt.exists():
+                                assert owned_processes[0].poll() is None
+                                await asyncio.sleep(0.01)
+                        receipt = json.loads(close_fault_receipt.read_text())
+                        assert receipt["server_socket_fd_closed"]
+                        assert receipt["live_verifier_connections"] == 1
+                        assert receipt["active_sequences"] > 0
+                        events["server_socket_cleanup"] = receipt
                     reports = await engine.collective_rpc(
-                        _fail_token_session_during_socket_cleanup
+                        _fail_token_session_during_socket_cleanup,
+                        args=(lifecycle == "cleanup-error-fallback",),
                     )
                     assert len(reports) == 1
                     report = reports[0]
-                    assert report["cleanup_error_injected"]
+                    assert report["cleanup_error_injected"] == (
+                        lifecycle == "cleanup-error-fallback"
+                    )
                     assert report["connection_detached"]
                     assert report["terminal_sequences"] == report["sequence_count"] > 0
                     events["cleanup_failure"] = report
