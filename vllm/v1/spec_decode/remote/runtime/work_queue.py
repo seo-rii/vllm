@@ -87,6 +87,7 @@ class DraftWorkQueue:
         self._owned: dict[int, DraftWork] = {}
         self._jobs = self._bytes = self._cleanup_jobs = 0
         self._closing = False
+        self._initialized = False
         self._failure: BaseException | None = None
         self._thread: threading.Thread | None = None
 
@@ -107,6 +108,8 @@ class DraftWorkQueue:
         def run() -> None:
             try:
                 initialize()
+                with self._condition:
+                    self._initialized = True
             except BaseException as error:
                 ready.error = error
             finally:
@@ -132,6 +135,7 @@ class DraftWorkQueue:
             ):
                 raise RuntimeError("draft work queue retains unfinished work")
             self._closing = False
+            self._initialized = False
             thread = threading.Thread(
                 target=run, name="token-draft-gpu-owner", daemon=True
             )
@@ -173,8 +177,15 @@ class DraftWorkQueue:
         with self._condition:
             if work._submitted:
                 raise RuntimeError("draft work cannot be submitted twice")
-            if self._closing or self._thread is None or not self._thread.is_alive():
-                raise ServerShutdownTimeout("token draft owner is stopping")
+            if (
+                not self._initialized
+                or self._closing
+                or self._thread is None
+                or not self._thread.is_alive()
+            ):
+                raise ServerShutdownTimeout(
+                    "token draft owner is not ready or stopping"
+                )
             previous = self._credits.get(work.owner)
             jobs, size = previous if previous is not None else (0, 0)
             if work.cleanup:
