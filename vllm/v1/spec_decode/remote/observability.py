@@ -14,6 +14,7 @@ from typing import Any
 
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
+from vllm.logger import init_logger
 from vllm.tracing import (
     extract_trace_context,
     is_tracing_available,
@@ -21,6 +22,8 @@ from vllm.tracing import (
 )
 from vllm.v1.spec_decode.remote.protocol import RemoteObservation, TraceContext
 from vllm.v1.spec_decode.remote.transport import TransportError, TransportTimeout
+
+logger = init_logger(__name__)
 
 _BUCKETS = (
     0.0001,
@@ -223,7 +226,27 @@ class RemoteClientObservation:
 
     def fail(self, reason: str) -> None:
         for request_id in tuple(self.pending):
-            self.finish(request_id, reason=reason)
+            try:
+                self.finish(request_id, reason=reason)
+            except Exception as error:
+                logger.warning(
+                    "Remote draft telemetry cleanup failed (%s)",
+                    type(error).__name__,
+                )
+            finally:
+                self.pending.pop(request_id, None)
+
+    def close(self, connection: Any) -> None:
+        try:
+            if connection is not None:
+                self.record_bytes(connection)
+            self.fail("connection")
+        except Exception as error:
+            logger.warning(
+                "Remote draft telemetry cleanup failed (%s)", type(error).__name__
+            )
+        finally:
+            self.pending.clear()
 
     def record_bytes(self, connection: Any) -> None:
         if self._connection is not connection:

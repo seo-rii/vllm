@@ -130,14 +130,12 @@ class TokenOnlyRemoteSession:
 
     def _invalidate(self) -> None:
         connection, self._conn = self._conn, None
-        if connection is not None:
-            self.observation.record_bytes(connection)
-        self.observation.fail("connection")
         for state in self.records.values():
             state.terminal = True
         for key in self._deferred_closes:
             self.records.pop(key, None)
         self._deferred_closes.clear()
+        self.observation.close(connection)
         if connection is not None:
             try:
                 connection.close()
@@ -227,7 +225,14 @@ class TokenOnlyRemoteSession:
             if handshake:
                 self._peer_protocol_minor = envelope.protocol_minor
             self.observation.finish(
-                request_id, envelope.observation if self._observability else None
+                request_id,
+                envelope.observation if self._observability else None,
+                reason=(
+                    message.status.name
+                    if isinstance(message, (SequenceAck, TokenProposal))
+                    and message.status is not OK
+                    else None
+                ),
             )
             return message, frames
 
@@ -399,6 +404,7 @@ class TokenOnlyRemoteSession:
         ):
             raise RuntimeError("stale, foreign or collected token handle")
         empty = None
+        response = None
         try:
             n, capacity = len(handle.rows), self.hello.num_speculative_tokens
             empty = TokenBatchResult(
@@ -454,7 +460,9 @@ class TokenOnlyRemoteSession:
             return TokenBatchResult(tuple(output), tuple(valid))
         except Exception as error:
             reason = failure_reason(error)
-            if handle.request_id not in self.observation.pending:
+            if handle.request_id not in self.observation.pending and not (
+                isinstance(response, TokenProposal) and response.status is not OK
+            ):
                 self.observation.metrics.failures.labels(
                     "token", "proposal", reason
                 ).inc()

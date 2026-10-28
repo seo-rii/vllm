@@ -743,6 +743,40 @@ def test_token_failed_row_metrics_count_terminal_transition_once(socket_runtime)
         session.close()
 
 
+def test_token_prefill_failure_metric_preserves_server_status(socket_runtime):
+    import msgspec
+
+    _, _, _, original = socket_runtime
+    session = TokenOnlyRemoteSession(
+        original.endpoint,
+        msgspec.structs.replace(original.hello, verifier_instance_id="prefill-metrics"),
+        failure_policy="target_only",
+        request_timeout_ms=5000,
+    )
+    counter = session.observation.metrics.failures.labels(
+        "token", "prefill", "PROTOCOL_ERROR"
+    )
+
+    def failures():
+        return next(
+            sample.value
+            for metric in counter.collect()
+            for sample in metric.samples
+            if sample.name.endswith("_total")
+        )
+
+    before = failures()
+    try:
+        key = session.open_sequence(0, deadline=session.deadline())
+        session.prefill(
+            key, (session.hello.vocab_size,), is_final=True, deadline=session.deadline()
+        )
+        assert not session.active(key)
+        assert failures() == before + 1
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("socket_runtime", [1], indirect=True)
 def test_token_server_socket_close_error_releases_connection_admission(
     socket_runtime, monkeypatch, caplog

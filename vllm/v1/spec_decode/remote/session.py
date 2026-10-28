@@ -1120,12 +1120,12 @@ class RemoteDraftSession:
         except TransportTimeout:
             # The deadline is exhausted. Do not delay fallback with an
             # advisory cancellation write; discard the late result instead.
+            self.observation.finish(handle.request_id, reason="timeout")
             self._abandoned_batches.add(handle.batch_id)
             if self._ipc_pending:
                 self._invalidate("CUDA IPC proposal timed out")
             outcome = HandleState.TIMED_OUT
             statuses = self._fail_rows(handle, SpeculatorStatusCode.TIMEOUT)
-            self.observation.finish(handle.request_id, reason="timeout")
         except TransportError as e:
             self._invalidate(
                 f"connection lost while collecting batch {handle.batch_id}: {e}"
@@ -1503,6 +1503,12 @@ class RemoteDraftSession:
             self.observation.finish(
                 envelope.request_id,
                 envelope.observation if self._observability else None,
+                reason=(
+                    message.status.name
+                    if isinstance(message, (SequenceAck, ProposalResponse))
+                    and message.status is not SpeculatorStatusCode.OK
+                    else None
+                ),
             )
             return envelope, message
 
@@ -1885,9 +1891,7 @@ class RemoteDraftSession:
 
     def _drop_connection(self) -> None:
         conn, self._conn = self._conn, None
-        if conn is not None:
-            self.observation.record_bytes(conn)
-        self.observation.fail("connection")
+        self.observation.close(conn)
         self._observability = False
         exporter, self._ipc_exporter = self._ipc_exporter, None
         if exporter is not None:
