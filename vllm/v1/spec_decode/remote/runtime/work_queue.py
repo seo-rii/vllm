@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.server import AdapterQueueFull, ServerShutdownTimeout
 
 
@@ -322,8 +323,6 @@ class DraftWorkQueue:
     def _execute(self, batch: tuple[DraftWork, ...]) -> None:
         try:
             if batch[0].background and self._closing:
-                if batch[0].on_cancel is not None:
-                    batch[0].on_cancel()
                 batch[0].result = False
             elif batch[0].action is None:
                 self.execute_batch(batch)
@@ -332,32 +331,55 @@ class DraftWorkQueue:
         except BaseException as error:
             for work in batch:
                 work.error = error
-        finally:
-            with self._condition:
-                for work in batch:
-                    if work.background:
-                        if work.error is None and work.result is True:
+        for work in batch:
+            if work.background:
+                if work.error is not None and runtime_unusable(work.error):
+                    # No cancellation may return blocks before CUDA completion
+                    # is known. The supervisor fences the owner and its server.
+                    raise work.error
+                if work.error is None and work.result is True:
+                    with self._condition:
+                        if not self._closing:
                             try:
                                 self._background.append(work)
                             except BaseException as error:
                                 work.error = error
                             else:
                                 continue
-                        self._background_jobs -= 1
-                        self._background_bytes -= work.num_bytes
-                    elif work.cleanup:
-                        self._cleanup_jobs -= 1
+                if self._closing or work.error is not None:
+                    self._cancel(work)
+            with self._condition:
+                if work.background:
+                    self._background_jobs -= 1
+                    self._background_bytes -= work.num_bytes
+                elif work.cleanup:
+                    self._cleanup_jobs -= 1
+                else:
+                    self._jobs -= 1
+                    self._bytes -= work.num_bytes
+                    jobs, size = self._credits[work.owner]
+                    if jobs == 1:
+                        del self._credits[work.owner]
                     else:
-                        self._jobs -= 1
-                        self._bytes -= work.num_bytes
-                        jobs, size = self._credits[work.owner]
-                        if jobs == 1:
-                            del self._credits[work.owner]
-                        else:
-                            self._credits[work.owner] = jobs - 1, size - work.num_bytes
-                    work.done.set()
-                    del self._owned[id(work)]
+                        self._credits[work.owner] = jobs - 1, size - work.num_bytes
+                work.done.set()
+                del self._owned[id(work)]
                 self._condition.notify_all()
+
+    def _cancel(self, work: DraftWork) -> None:
+        callback, work.on_cancel = work.on_cancel, None
+        if callback is None:
+            return
+        try:
+            callback()
+        except BaseException as error:
+            if work.error is None:
+                work.error = error
+                raise
+            work.error = BaseExceptionGroup(
+                "prediction and cancellation failed", [work.error, error]
+            )
+            raise work.error from error
 
     def _fail(self, error: BaseException) -> None:
         with self._condition:

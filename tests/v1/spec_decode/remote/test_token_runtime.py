@@ -3312,6 +3312,95 @@ def test_prediction_phases_keep_one_credit_and_yield_to_foreground():
         queue.stop(time.monotonic() + 3)
 
 
+@pytest.mark.parametrize("phase", ["copy", "bonus", "draft"])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_prediction_requeue_failure_retires_branch_outside_queue_lock(
+    monkeypatch, phase, cancel_fails
+):
+    import time
+    from collections import deque
+
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    state, _, cache = outcome_machine()
+    key = SequenceKey("cache", 1, 0)
+    state.open(key)
+    state.prefill(key, 0, (2, 5, 7), is_final=True)
+    cache.bind_epoch(key, 3)
+    result = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (3,)), 3),))[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    plan = result.prediction
+    free_blocks = state.block_pool.num_free_blocks
+    error = MemoryError("prediction requeue")
+    cleanup_error = CompletionUnknownError("prediction cancel completion")
+    fail_requeue = False
+    cancellations, failures = [], []
+
+    class RequeueFailure(deque):
+        def append(self, value):
+            if fail_requeue:
+                raise error
+            return super().append(value)
+
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=16,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=8,
+        max_background_jobs=1,
+        max_background_bytes=8,
+        on_failure=failures.append,
+    )
+    monkeypatch.setattr(queue, "_background", RequeueFailure())
+
+    def step():
+        nonlocal fail_requeue
+        branch = cache._builds.get(key)
+        current = "copy" if branch is None else branch.phase
+        more = cache.step(plan)
+        fail_requeue = current == phase
+        return more
+
+    def cancel():
+        assert not queue._condition._is_owned()
+        cancellations.append(phase)
+        if cancel_fails:
+            raise cleanup_error
+        cache.cancel(plan)
+
+    queue.start(lambda: None)
+    work = DraftWork("a", step, background=True, num_bytes=8, on_cancel=cancel)
+    assert queue.submit_background(work)
+    assert work.done.wait(3)
+    assert cancellations == [phase]
+    assert queue.depth == queue.pending_bytes == 0
+    if cancel_fails:
+        assert isinstance(work.error, BaseExceptionGroup)
+        assert work.error.exceptions == (error, cleanup_error)
+        assert failures == [work.error]
+        assert cache.branch_blocks > 0
+        with pytest.raises(ServerShutdownTimeout, match="restart required"):
+            queue.stop(time.monotonic() + 3)
+    else:
+        assert work.error is error
+        assert not failures
+        assert not cache._builds and not cache._branches.sequences
+        assert cache.branch_blocks == 0
+        assert state.block_pool.num_free_blocks == free_blocks
+        assert queue.call("a", lambda: 7) == 7
+        queue.stop(time.monotonic() + 3)
+    # The CPU oracle can be reclaimed after the failed owner has exited.
+    cache.close((key,))
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
+
+
 @pytest.mark.parametrize("family", ["qwen3", "llama", "mistral"])
 def test_public_engine_args_distinguish_dense_draft_tp_identity(tmp_path, family):
     """Separate draft ranks are an explicit contract, not target TP inheritance."""
