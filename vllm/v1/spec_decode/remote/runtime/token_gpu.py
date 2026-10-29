@@ -12,6 +12,7 @@ import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.remote.errors import CompletionUnknownError, runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.gpu import (
@@ -35,6 +36,8 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenStateMachine,
     TokenStepExecutor,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -60,7 +63,7 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
     spec = config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
     windows = _validate_token_model(spec.draft_model_config, "draft")
-    return replace(
+    resource = replace(
         config,
         model_config=spec.draft_model_config,
         parallel_config=spec.draft_parallel_config,
@@ -73,6 +76,7 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
             sliding_window=windows[0] if len(set(windows)) == 1 else None,
         ),
     )
+    return spec.apply_draft_overrides(resource)
 
 
 def validate_token_model_kv_specs(
@@ -80,14 +84,33 @@ def validate_token_model_kv_specs(
 ) -> None:
     """Verify loaded attention semantics by layer index, not group counts."""
     from vllm.model_executor.models.utils import extract_layer_index
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
+    )
     from vllm.v1.spec_decode.remote.runtime.kv_layout import (
         group_standalone_kv_specs,
     )
 
     expected = _validate_token_model(config.model_config, "draft")
     groups = group_standalone_kv_specs(specs)
-    if any(
+    if config.model_config.use_mla:
+        for group in groups:
+            layout = group.kv_cache_spec
+            if type(layout) is not MLAAttentionSpec:
+                raise ValueError("token-only loaded draft requires MLA KV")
+            if layout.topk_buffer_width is not None or layout.alignment is not None:
+                raise ValueError(
+                    "token-only draft requires dense MLA without an indexer"
+                )
+            if (
+                layout.head_size != config.model_config.get_head_size()
+                or layout.dtype != config.model_config.dtype
+                or layout.block_size != config.cache_config.block_size
+            ):
+                raise ValueError("token-only loaded MLA KV geometry differs from model")
+    elif any(
         type(group.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
         for group in groups
     ):
@@ -133,6 +156,38 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         # target modules, embeddings or output head are constructed here.
         resource = create_token_executor_config(config)
         super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
+
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        layouts = []
+        for group in self.kv_config.kv_cache_groups:
+            layout = group.kv_cache_spec
+            assert isinstance(layout, AttentionSpec)
+            layouts.append(
+                dict(
+                    kind=type(layout).__name__,
+                    layers=len(group.layer_names),
+                    kv_heads=layout.num_kv_heads,
+                    head_size=layout.head_size,
+                    window=getattr(layout, "sliding_window", None),
+                    dtype=str(layout.dtype),
+                )
+            )
+        logger.info(
+            "Token-only draft loaded: speculator=%s model=%s state=%s "
+            "attention_backends=%s kv_layouts=%s",
+            type(self.speculator).__name__,
+            type(self.speculator.model).__name__,
+            type(self.model_state).__name__,
+            sorted(
+                {
+                    group.backend.get_name()
+                    for groups in self.attn_groups
+                    for group in groups
+                }
+            ),
+            layouts,
+        )
 
     def _create_contract(self, config):
         return self._token_contract
@@ -184,6 +239,12 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             or len({row.req_index for row in rows}) != len(rows)
         ):
             raise ValueError("token forward must fit the configured batch budgets")
+        original_indices = list(range(len(rows)))
+        if self.vllm_config.model_config.use_mla:
+            # MLA metadata expects a uniform short-query prefix, followed by
+            # longer prefills. Preserve caller identities when returning tokens.
+            original_indices.sort(key=lambda index: len(rows[index].tokens))
+            rows = tuple(rows[index] for index in original_indices)
         lengths = np.array([len(row.tokens) for row in rows], dtype=np.int32)
         starts = np.array([row.start for row in rows], dtype=np.int32)
         qsl = np.concatenate(
@@ -276,7 +337,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
                         None,
                     )
                     for row, token in zip(sample_rows, sampled.cpu().tolist()):
-                        result[row] = int(token)
+                        result[original_indices[row]] = int(token)
                 else:
                     # Prefill/K0 must complete before ACK and shared buffer reuse.
                     torch.accelerator.synchronize(self.device)

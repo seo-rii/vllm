@@ -139,11 +139,13 @@ def test_native_independent_loader_never_needs_target_weights(monkeypatch):
 
 
 @pytest.fixture
-def token_executor(monkeypatch):
+def token_executor(monkeypatch, tmp_path):
     import vllm.v1.spec_decode.remote.runtime.token_gpu as runtime
     import vllm.v1.worker.gpu.buffer_utils as buffers
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
     from vllm.v1.worker.gpu.block_table import BlockTables
+
+    from .test_token_runtime import token_config
 
     class CpuPool:
         def copy_to_uva(self, values):
@@ -173,10 +175,7 @@ def token_executor(monkeypatch):
     executor.device = torch.device("cpu")
     executor.block_size = 4
     executor.num_blocks = 9
-    executor.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=16, get_vocab_size=lambda: 128),
-        speculative_config=SimpleNamespace(num_speculative_tokens=3),
-    )
+    executor.vllm_config = token_config(tmp_path)
     executor.input_buffers = InputBuffers(4, 16, executor.device)
     executor.temperature = torch.zeros(4)
     executor.seeds = torch.zeros(4, dtype=torch.int64)
