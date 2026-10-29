@@ -49,9 +49,15 @@ def draft_server(
     moe_backend: str | None = None,
     batch_invariant: bool | None = None,
     owned_processes: list[subprocess.Popen] | None = None,
+    draft_tensor_parallel_size: int = 1,
+    draft_devices: tuple[int, ...] | None = None,
     close_fault_receipt: Path | None = None,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
+    if token_only_draft is None and (
+        draft_tensor_parallel_size != 1 or draft_devices is not None
+    ):
+        raise ValueError("draft TP devices are supported by the token-only server")
     if close_fault_receipt is not None and token_only_draft is None:
         raise ValueError("socket cleanup fault requires the token-only server")
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
@@ -125,6 +131,14 @@ def draft_server(
                 "--target-attention-backend",
                 target_attention_backend or attention_backend,
             ]
+            if draft_tensor_parallel_size != 1:
+                command.extend(
+                    ["--draft-tensor-parallel-size", str(draft_tensor_parallel_size)]
+                )
+            if draft_devices is not None:
+                command.extend(
+                    ["--devices", *(f"cuda:{device}" for device in draft_devices)]
+                )
         if close_fault_receipt is not None:
             command = [
                 sys.executable,
@@ -2523,6 +2537,188 @@ def _tiny_independent_qwen3_draft(tmp_path, target_path):
         (path / name).is_file() for name in ("tokenizer.json", "tokenizer_config.json")
     )
     return str(path)
+
+
+@pytest.mark.distributed(num_gpus=2)
+@pytest.mark.parametrize("draft_devices", [(0, 1), (1, 0)], ids=["0-1", "1-0"])
+def test_remote_token_draft_tp_matches_target_and_uses_drafts(
+    vllm_runner, monkeypatch, tmp_path, record_property, draft_devices
+):
+    """Use two native draft ranks, including reversed local device binding."""
+    import hashlib
+    import json
+
+    import torch
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    assert torch.accelerator.device_count() >= 2, "this test requires two GPUs"
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "INFO")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        str(tmp_path),
+    ]
+    with (tmp_path / "tp-fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    target = str(tmp_path / "prefix-target")
+    draft = str(tmp_path / "independent-qwen3")
+    record_property(
+        "draft_tp.fixture",
+        {
+            role: {
+                str(path.relative_to(directory)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in sorted(directory.rglob("*"))
+                if path.is_file()
+            }
+            for role, directory in (("target", Path(target)), ("draft", Path(draft)))
+        },
+    )
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    spec = dict(
+        method="draft_model",
+        model=draft,
+        num_speculative_tokens=3,
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        attention_backend="TRITON_ATTN",
+    )
+    sampling = SamplingParams(
+        temperature=0, max_tokens=16, ignore_eos=True, detokenize=False
+    )
+    tokens, counts, resolved = {}, {}, {}
+
+    def run_mode(mode, speculative_config=None):
+        with vllm_runner(
+            target,
+            speculative_config=speculative_config,
+            per_request_spec_decode_metrics=(
+                "detailed" if speculative_config is not None else "none"
+            ),
+            **kwargs,
+        ) as runner:
+            actual = runner.llm.llm_engine.vllm_config
+            assert actual.parallel_config.tensor_parallel_size == 1
+            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert not actual.cache_config.enable_prefix_caching
+            assert not actual.scheduler_config.async_scheduling
+            draft_tp = None
+            if actual.speculative_config is not None:
+                draft_parallel = actual.speculative_config.draft_parallel_config
+                draft_tp = draft_parallel.tensor_parallel_size
+                assert draft_tp == (2 if mode == "remote" else 1)
+            resolved[mode] = dict(target_tp=1, draft_tp=draft_tp)
+            output = runner.llm.generate(
+                [{"prompt_token_ids": [3] * 65}], sampling, use_tqdm=False
+            )[0]
+            tokens[mode] = list(output.outputs[0].token_ids)
+            assert len(tokens[mode]) == 16
+            if speculative_config is not None:
+                runner.llm.llm_engine.do_log_stats()
+                metrics = runner.llm.get_metrics()
+                counts[mode] = {
+                    name: get_spec_decode_metric_value(
+                        metrics, f"vllm:spec_decode_num_{name}"
+                    )
+                    for name in ("drafts", "draft_tokens", "accepted_tokens")
+                }
+                assert counts[mode]["drafts"] > 0
+                assert (
+                    0 < counts[mode]["accepted_tokens"] <= counts[mode]["draft_tokens"]
+                )
+                detail = output.outputs[0].spec_decode_metrics
+                assert detail is not None and detail.num_spec_tokens == 3
+                assert sum(detail.per_step_accepted) > 0
+                assert counts[mode]["drafts"] == len(detail.per_step_drafted)
+                assert counts[mode]["draft_tokens"] == sum(detail.per_step_drafted)
+                assert counts[mode]["accepted_tokens"] == sum(detail.per_step_accepted)
+                record_property(f"draft_tp.{mode}.request_metrics", detail.to_dict())
+
+    run_mode("target")
+    run_mode("native", spec)
+    server_log = tmp_path / "tp-draft.log"
+    with draft_server(
+        target,
+        server_log,
+        token_only_draft=draft,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=32,
+        draft_tensor_parallel_size=2,
+        draft_devices=draft_devices,
+    ) as endpoint:
+        run_mode(
+            "remote",
+            dict(
+                spec,
+                draft_tensor_parallel_size=2,
+                execution=dict(
+                    placement="remote",
+                    policy="on_demand",
+                    endpoints=[endpoint],
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                    startup_timeout_ms=600000,
+                ),
+            ),
+        )
+    assert tokens["remote"] == tokens["native"] == tokens["target"]
+    marker = "TOKEN_DRAFT_TP_READY "
+    ready = [
+        json.loads(line.split(marker, 1)[1])
+        for line in server_log.read_text().splitlines()
+        if marker in line
+    ]
+    assert len(ready) == 1
+    topology = ready[0]
+    assert topology["world_size"] == 2
+    assert topology["devices"] == [f"cuda:{device}" for device in draft_devices]
+    assert topology["num_blocks"] >= 2 and topology["block_size"] == 16
+    assert topology["max_num_reqs"] == 4 and topology["max_num_tokens"] == 32
+    assert [rank["rank"] for rank in topology["ranks"]] == [0, 1]
+    assert len({rank["pid"] for rank in topology["ranks"]}) == 2
+    assert len({rank["device_uuid"] for rank in topology["ranks"]}) == 2
+    for rank, device in zip(topology["ranks"], topology["devices"]):
+        assert rank["pid"] > 0 and rank["world_size"] == 2
+        assert rank["device"] == device
+        assert rank["device_uuid"] and rank["num_blocks"] >= topology["num_blocks"]
+    record_property("draft_tp.ready", topology)
+    record_property("draft_tp.resolved_config", resolved)
+    record_property("draft_tp.output_token_ids", tokens)
+    record_property("draft_tp.speculation", counts)
 
 
 def test_remote_mtp_socket_cleanup_failure_preserves_target_only_and_reconnects(
