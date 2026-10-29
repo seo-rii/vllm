@@ -198,6 +198,7 @@ steps:
     - vllm/v1/spec_decode/remote/
     - vllm/v1/worker/gpu/
     - tests/v1/e2e/spec_decode/remote/
+    - tests/v1/spec_decode/remote/runtime_fixtures.py
     - tests/v1/spec_decode/remote/test_token_gpu.py
     - tests/v1/spec_decode/remote/test_token_runtime.py
     - tests/v1/spec_decode/remote/test_conditioned_pool.py
