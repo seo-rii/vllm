@@ -106,11 +106,14 @@ class TokenDraftServer(RemoteDraftServer):
             finally:
                 try:
                     conn.close()
-                except OSError as error:
+                except BaseException as error:
+                    self._lifecycle_failed(error)
                     logger.warning("Token connection cleanup failed: %s", error)
-                finally:
+                else:
                     with self._connections_lock:
                         self._connections.discard(conn)
+                finally:
+                    with self._connections_lock:
                         self._handshaking.discard(conn)
 
 
