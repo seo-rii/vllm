@@ -641,3 +641,126 @@ def test_registration_oom_retires_open_sequences_and_stays_terminal(
     finally:
         instance.close()
         server.stop()
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_collect_allocation_failure_cancels_owned_rpc(tmp_path, cleanup_failure):
+    """Verifier output allocation cannot discard a still-owned snapshot RPC."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+    from tests.v1.spec_decode.remote.test_target_kv_runtime import _native_config
+    from tests.v1.spec_decode.remote.test_target_kv_wire import SnapshotOracle, until
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+    from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
+        create_target_kv_contract,
+    )
+    from vllm.v1.spec_decode.remote.target_kv_server import TargetKVDraftServer
+
+    config = _native_config(tmp_path, max_model_len=64)
+    config.cache_config.kv_cache_layout = "HND"
+    contract = create_target_kv_contract(config)
+    executor = SnapshotOracle(contract.expected_specs, contract.receiver_budget)
+    server = TargetKVDraftServer(
+        executor,
+        contract_fingerprint=contract.fingerprint,
+        hidden_size=contract.hidden_size,
+        vocab_size=contract.vocab_size,
+        expected_specs=contract.expected_specs,
+        snapshot_budget=contract.snapshot_budget,
+        receiver_budget=contract.receiver_budget,
+    )
+    endpoint = server.start(f"unix://{tmp_path}/collect.sock")
+    config.speculative_config = replace(
+        config.speculative_config,
+        prompt_lookup_max=None,
+        prompt_lookup_min=None,
+        remote_draft=RemoteDraftConfig(endpoint=endpoint, request_timeout_ms=1000),
+    )
+    metadata = {}
+    with set_current_vllm_config(config), set_default_torch_dtype(torch.bfloat16):
+        for canonical, spec in contract.expected_specs.items():
+            index = contract.source_indices[canonical]
+            name = f"model.layers.{index}.self_attn.attn"
+            owner = Attention(
+                8,
+                spec.head_size,
+                spec.head_size**-0.5,
+                num_kv_heads=spec.num_kv_heads,
+                cache_config=config.cache_config,
+                per_layer_sliding_window=spec.sliding_window,
+                prefix=name,
+                attn_backend=TritonAttentionBackend,
+            )
+            owner.kv_cache = torch.zeros(
+                (5, spec.num_kv_heads, spec.block_size, 2 * spec.head_size),
+                dtype=torch.bfloat16,
+            )
+            metadata[name] = remote.TritonAttentionMetadata(
+                1,
+                1,
+                torch.tensor([0, 1]),
+                5,
+                torch.tensor([5]),
+                torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+                torch.tensor([20]),
+                0,
+                1,
+                torch.empty(0),
+                torch.empty(0),
+                torch.empty(0),
+                True,
+            )
+    instance = remote.TargetKVRemoteSpeculator(config, torch.device("cpu"))
+    batch = replace(
+        InputBatch.make_dummy(1, 1, InputBuffers(1, 1, torch.device("cpu"))),
+        req_ids=["request"],
+        positions=torch.tensor([4]),
+        seq_lens=torch.tensor([5]),
+    )
+    context = LocalExecutionContext(
+        batch,
+        metadata,
+        {},
+        torch.ones((1, contract.hidden_size), dtype=torch.bfloat16),
+        None,
+        torch.tensor([1]),
+        torch.tensor([0]),
+        torch.tensor([7]),
+        torch.tensor([0]),
+        torch.tensor([0.0]),
+        torch.tensor([1]),
+    )
+    failure = MemoryError("verifier result allocation")
+    cleanup_error = MemoryError("verifier cancellation allocation")
+    faults = [(remote.TargetKVRemoteSpeculator.collect, "tokens, lengths =", failure)]
+    if cleanup_failure:
+        faults.append(
+            (TargetKVRemoteSession.cancel, "self._invalidate()", cleanup_error)
+        )
+    try:
+        handle = instance.dispatch(DraftStep.from_batch(batch, 1), context)
+        assert isinstance(handle, remote._SnapshotHandle)
+        assert handle.error is None
+        rpc = handle.rpc
+        assert rpc is not None
+        with (
+            allocation_failures(faults) as triggered,
+            pytest.raises(
+                BaseExceptionGroup if cleanup_failure else MemoryError
+            ) as caught,
+        ):
+            instance.collect(handle)
+        assert triggered == ([failure, cleanup_error] if cleanup_failure else [failure])
+        if cleanup_failure:
+            assert caught.value.exceptions == (failure, cleanup_error)
+        else:
+            assert caught.value is failure
+        assert instance._pending is None and handle.rpc is None
+        assert not rpc.active and instance._session._pending is None
+        if not cleanup_failure:
+            until(lambda: not server._connections and len(server.registry) == 0)
+    finally:
+        instance.close()
+        server.stop()

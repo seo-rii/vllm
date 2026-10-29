@@ -215,6 +215,8 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
         raise ValueError("token-only runtime requires an independent draft_model")
+    if config.parallel_config.tensor_parallel_size != 1:
+        raise ValueError("token-only remote drafting requires target TP1")
     if (
         spec.parallel_drafting
         or spec.draft_sample_method != "greedy"

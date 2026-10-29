@@ -192,11 +192,17 @@ class TokenDraftServer(RemoteDraftServer):
 
     def _serve_connection(self, conn: FramedConnection) -> None:
         session: _TokenServerSession | None = None
+        close_failed = False
         try:
             session = _TokenServerSession(self, conn)
             session.run()
         except AdapterQueueFull:
-            conn.close()
+            try:
+                conn.close()
+            except BaseException as error:
+                close_failed = True
+                self._lifecycle_failed(error)
+                logger.warning("Token connection cleanup failed: %s", error)
         except (
             TransportError,
             ProtocolError,
@@ -226,12 +232,17 @@ class TokenDraftServer(RemoteDraftServer):
                 )
             finally:
                 try:
-                    conn.close()
-                except OSError as error:
+                    if not close_failed:
+                        conn.close()
+                except BaseException as error:
+                    self._lifecycle_failed(error)
                     logger.warning("Token connection cleanup failed: %s", error)
+                else:
+                    if not close_failed:
+                        with self._connections_lock:
+                            self._connections.discard(conn)
                 finally:
                     with self._connections_lock:
-                        self._connections.discard(conn)
                         self._handshaking.discard(conn)
 
 
