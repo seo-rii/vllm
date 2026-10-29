@@ -136,8 +136,8 @@ support homogeneous attention.
 Llama and Mistral also support a mixture of full and sliding-window layers via
 their checkpoint's `layer_types`. The runtime checks model capabilities and the
 loaded draft's actual per-layer KV specification. Loaded drafts
-must accept token IDs and positions alone and use the default decoder model
-state. Target and
+must accept token IDs and positions alone. Attention-only drafts use the default
+decoder model state. Target and
 draft may have different hidden sizes, layer counts, attention geometry and
 window sizes and layer ordering. Each layer uses its own attention window.
 Distinct windows and dense KV head geometry receive separate cache groups with
@@ -166,8 +166,42 @@ complete layer indices; it reuses the same bounded KV allocator and
 authoritative token correction path. Sparse indexers, sliding-window MLA,
 compressed/quantized MLA caches and pooled MLA drafts are not supported.
 
-Sparse MLA targets and recurrent or hybrid drafts remain unsupported. Other MLA
-draft architectures and target/draft combinations remain unsupported.
+An independent native `NemotronHForCausalLM` draft additionally supports its
+Mamba2/full-attention layout with a full-attention `Qwen3ForCausalLM` target.
+The draft must have no MTP heads or expert blocks; its native pattern can contain
+`M`, `*` and `-` and must include both Mamba2 and full attention. Both models use
+unquantized BF16 weights, target TP1/draft TP1 and one inline endpoint, with the
+same tokenizer artifact and special-token contract. This does not imply that
+arbitrary off-the-shelf NemotronH and Qwen3 checkpoints share token IDs.
+
+The recurrent draft uses an ordinary native model configuration with no
+speculative state, BF16 convolution state and FP32 SSM state. Its computed-token
+history can include a proposed tail. Each forward rebuilds the selected prefix
+from position zero, so rejected proposals cannot leave stale recurrent state in
+the next execution. History is published only after GPU completion and retired
+before its request slot is reused. This initial policy repeats full-prefix work
+for every draft token; it can be slower than target-only execution.
+
+The native allocator keeps attention token pages and `max_num_seqs + 1`
+recurrent slots in disjoint ranges of one backing allocation. Recurrent slot
+zero is reserved, and each live request owns a fixed slot independently of its
+attention block IDs. The KV budget first reserves those recurrent slots and then
+budgets attention pages. It does not allocate a recurrent state for every
+attention page. Native workspaces, weights and CPU computed-token history are
+separate from that byte budget.
+
+The server's `--max-feature-tokens` must cover `--max-model-len` for full-prefix
+replay; the verifier may use smaller token batches. Forward groups contain one
+request so round deadlines are checked between full-prefix executions. The
+backend uses deterministic Triton Mamba state with ordinary cache mode, without
+ReplaySSM, RecoverSSM or stochastic cache rounding. Run the draft process with
+`VLLM_BATCH_INVARIANT=0`, as required by native Mamba2; a full-attention target may
+use batch-invariant execution separately. Startup logs identify actual state
+dtypes, shapes, attention pages and recurrent slot capacity.
+
+Sparse MLA targets, other recurrent draft families and other MLA draft
+architectures or target/draft combinations remain unsupported. Recurrent draft
+pooling, CUDA IPC and quantized state are unsupported.
 Chunked attention, encoder-decoder, multimodal and Transformers-backend models
 remain unsupported in either role. Select the built-in `tokenizer_mode="hf"`
 explicitly.

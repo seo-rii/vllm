@@ -209,6 +209,9 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
     def max_num_reqs(self) -> int:
         return self.input_buffers.max_num_reqs
 
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        """TokenStateMachine owns the dense executor's request KV and slots."""
+
     def forward(self, key, req_index, start, tokens, blocks, *, sample):
         return self.forward_batch(
             (
@@ -397,11 +400,23 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
 def make_token_gpu_adapter(
     config: VllmConfig, *, device: torch.device, kv_cache_bytes: int
 ) -> TokenOnlyDraftAdapter:
-    executor = TokenGPUStepExecutor(
-        config, device=device, kv_cache_bytes=kv_cache_bytes
-    )
     spec = config.speculative_config
     assert spec is not None
+    draft = spec.draft_model_config
+    assert draft is not None
+    if draft.architecture == "NemotronHForCausalLM":
+        from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+            RecurrentGPUStepExecutor,
+        )
+
+        executor: TokenGPUStepExecutor | RecurrentGPUStepExecutor
+        executor = RecurrentGPUStepExecutor(
+            config, device=device, kv_cache_bytes=kv_cache_bytes
+        )
+    else:
+        executor = TokenGPUStepExecutor(
+            config, device=device, kv_cache_bytes=kv_cache_bytes
+        )
     state = TokenStateMachine(
         executor,
         DraftBlockPool(executor.num_blocks, executor.block_size),

@@ -49,6 +49,7 @@ def draft_server(
     max_feature_tokens: int = 64,
     trust_remote_code: bool = True,
     moe_backend: str | None = None,
+    batch_invariant: bool | None = None,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
 ):
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
@@ -149,9 +150,18 @@ def draft_server(
                 "--target-attention-backend",
                 target_attention_backend or attention_backend,
             ]
+        environment = None
+        if batch_invariant is not None:
+            environment = dict(
+                os.environ, VLLM_BATCH_INVARIANT=str(int(batch_invariant))
+            )
         with log_path.open("w") as log:
             process = subprocess.Popen(
-                command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
             )
             try:
                 deadline = time.monotonic() + 600
@@ -2029,6 +2039,213 @@ def _tiny_independent_mla_models(tmp_path, *, dense_ffn=False):
     return paths[0], paths[1]
 
 
+@pytest.fixture
+def tiny_independent_recurrent_models(tmp_path):
+    return _tiny_independent_recurrent_models(tmp_path)
+
+
+def _tiny_independent_recurrent_models(tmp_path):
+    """Complete ordinary Nemotron-H weights, separate from every MTP fixture."""
+    import hashlib
+    import json
+    import shutil
+
+    import torch
+    from transformers import (
+        NemotronHConfig,
+        NemotronHForCausalLM,
+        Qwen3Config,
+        Qwen3ForCausalLM,
+    )
+
+    common = dict(
+        vocab_size=128,
+        intermediate_size=256,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    target_config = Qwen3Config(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["full_attention"] * 2,
+        **common,
+    )
+    draft_config = NemotronHConfig(
+        architectures=["NemotronHForCausalLM"],
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layers_block_type=["linear_attention", "full_attention"],
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        ssm_state_size=64,
+        n_groups=1,
+        conv_kernel=4,
+        chunk_size=128,
+        n_routed_experts=0,
+        n_shared_experts=0,
+        num_nextn_predict_layers=0,
+        mtp_layers_block_type=[],
+        **common,
+    )
+    assert draft_config.hybrid_override_pattern == "M*"
+    paths = []
+    for name, cls, config, seed in (
+        ("qwen3-target", Qwen3ForCausalLM, target_config, 20261024),
+        ("nemotron-h-draft", NemotronHForCausalLM, draft_config, 20261025),
+    ):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            model = cls(config)
+        _two_candidate_head(model.lm_head.weight)
+        weights = dict(model.state_dict())
+        assert not any(name.startswith("mtp.") for name in weights)
+        config.architectures = [cls.__name__]
+        paths.append(_save_mtp_checkpoint(tmp_path / name, config, weights))
+    target, draft = map(Path, paths)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copyfile(target / name, draft / name)
+        assert (target / name).read_bytes() == (draft / name).read_bytes()
+    (tmp_path / "recurrent-fixture.json").write_text(
+        json.dumps(
+            dict(
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+                seeds=[20261024, 20261025],
+                target_architecture="Qwen3ForCausalLM",
+                draft_architecture="NemotronHForCausalLM",
+                independent_full_model=True,
+                num_nextn_predict_layers=0,
+                hybrid_pattern="M*",
+                target_hidden_size=64,
+                draft_hidden_size=128,
+                mamba_conv_channels=384,
+                mamba_conv_history=3,
+                mamba_ssm_shape=[4, 64, 64],
+                models={
+                    role: {
+                        file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+                        for file in sorted(path.iterdir())
+                        if file.is_file()
+                    }
+                    for role, path in (("target", target), ("draft", draft))
+                },
+            )
+        )
+        + "\n"
+    )
+    return paths[0], paths[1]
+
+
+def _check_independent_recurrent_weights(model, model_path):
+    """Verify every native parameter against the actual complete checkpoint."""
+    import torch
+    from safetensors.torch import load_file
+
+    from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+    assert isinstance(model, NemotronHForCausalLM)
+    assert model.model.config.hybrid_override_pattern == "M*"
+    assert model.model.config.num_nextn_predict_layers == 0
+    weights = load_file(Path(model_path) / "model.safetensors")
+    mapped: dict[str, list[tuple[str, str | None, torch.Tensor]]] = {}
+    for name, tensor in weights.items():
+        destinations = list(model.hf_to_vllm_mapper.apply(((name, tensor),)))
+        assert len(destinations) == 1, name
+        destination, value = destinations[0]
+        shard = getattr(value, "shard_id", None)
+        assert shard is None or isinstance(shard, str) and shard in ("q", "k", "v")
+        mapped.setdefault(destination, []).append((name, shard, value))
+    parameters = dict(model.named_parameters())
+    assert mapped.keys() == parameters.keys()
+    checked = set()
+    for name, parameter in parameters.items():
+        entries = mapped[name]
+        if len(entries) == 3:
+            shards = {shard: (source, tensor) for source, shard, tensor in entries}
+            assert set(shards) == {"q", "k", "v"}, name
+            names = [shards[shard][0] for shard in ("q", "k", "v")]
+            expected = torch.cat([shards[shard][1] for shard in ("q", "k", "v")])
+        else:
+            assert len(entries) == 1 and entries[0][1] is None, name
+            source, _, expected = entries[0]
+            names = [source]
+            if source.endswith(".A_log"):
+                assert name.endswith(".A")
+                expected = -torch.exp(expected.float())
+        assert torch.equal(parameter.detach().cpu(), expected.to(parameter.dtype)), name
+        checked.update(names)
+    assert checked == weights.keys(), weights.keys() - checked
+    return sorted(checked)
+
+
+def _check_independent_recurrent_state(model, model_state, config):
+    """Inspect the ordinary model's actual native attention and recurrent views."""
+    import torch
+
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    assert type(model) is NemotronHForCausalLM
+    assert type(model_state) is MambaHybridModelState
+    assert config.speculative_config is None and config.num_speculative_tokens == 0
+    assert config.model_config.hf_config.hybrid_override_pattern == "M*"
+    assert config.model_config.hf_config.num_nextn_predict_layers == 0
+    assert config.cache_config.mamba_cache_mode == "none"
+    assert not config.cache_config.use_replayssm
+    assert not config.cache_config.use_kda_recoverssm
+    assert config.mamba_config.backend.value == "triton"
+    recurrent = [layer for layer in model.modules() if isinstance(layer, MambaMixer2)]
+    attention = [layer for layer in model.modules() if isinstance(layer, Attention)]
+    assert len(recurrent) == len(attention) == 1
+    states = recurrent[0].kv_cache
+    state_spec = recurrent[0].get_kv_cache_spec(config)
+    assert isinstance(state_spec, MambaSpec)
+    assert state_spec.num_speculative_blocks == 0
+    assert state_spec.dtypes == (torch.bfloat16, torch.float32)
+    assert tuple(tuple(state.shape[1:]) for state in states) == state_spec.shapes
+    assert tuple(state.dtype for state in states) == state_spec.dtypes
+    assert sorted(state_spec.shapes[0]) == [3, 384]
+    assert state_spec.shapes[1] == (4, 64, 64)
+    attn_spec = attention[0].get_kv_cache_spec(config)
+    assert type(attn_spec) is FullAttentionSpec
+    assert (attn_spec.num_kv_heads, attn_spec.head_size, attn_spec.block_size) == (
+        2,
+        32,
+        config.cache_config.block_size,
+    )
+    assert attn_spec.dtype == torch.bfloat16
+    assert attention[0].get_attn_backend().get_name() == "TRITON_ATTN"
+    return dict(
+        model=type(model).__name__,
+        state=type(model_state).__name__,
+        speculative_config=None,
+        num_speculative_tokens=0,
+        hybrid_pattern="M*",
+        mamba_cache_mode=state_spec.mamba_cache_mode,
+        mamba_backend="triton",
+        state_shapes=state_spec.shapes,
+        state_dtypes=[str(dtype) for dtype in state_spec.dtypes],
+        state_slots=states[0].shape[0],
+        attention_backend="TRITON_ATTN",
+        attention_heads=attn_spec.num_kv_heads,
+        attention_head_size=attn_spec.head_size,
+        attention_block_size=attn_spec.block_size,
+        configured_attention_block_size=config.cache_config.block_size,
+    )
+
+
 def _check_independent_mla_weights(model, model_path):
     """Check the complete real checkpoint, including native packed projections."""
     import torch
@@ -2203,6 +2420,39 @@ def test_remote_independent_mla_draft_preserves_target(
     )
 
 
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_independent_recurrent_draft_preserves_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    k,
+    tiny_independent_recurrent_models,
+    record_property,
+):
+    """Use complete recurrent draft weights without moving target-owned state."""
+    import json
+
+    target, draft = tiny_independent_recurrent_models
+    record_property(
+        "fixture", json.loads((tmp_path / "recurrent-fixture.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        "qwen3",
+        None,
+        k,
+        record_property,
+        target_model=target,
+        independent_draft=draft,
+        independent_draft_kind="nemotron_h",
+        native_control=False,
+    )
+
+
 @pytest.mark.parametrize("eagle_target", ["llama", "qwen3", "qwen2", "mistral"])
 @pytest.mark.parametrize("k", [1, 3])
 def test_remote_eagle3_matches_native_and_target(
@@ -2255,14 +2505,18 @@ def _compare_native_and_remote_draft(
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     independent = independent_draft is not None
     mla_draft = independent and independent_draft_kind == "deepseek_v2"
+    recurrent_draft = independent and independent_draft_kind == "nemotron_h"
     if not native_control:
         import json
 
-        assert mla_draft
+        assert mla_draft or recurrent_draft
         assert mtp_family == "qwen3"
-        assert json.loads((Path(independent_draft) / "config.json").read_text())[
-            "n_routed_experts"
-        ] in (0, 4)
+        draft_config = json.loads((Path(independent_draft) / "config.json").read_text())
+        if mla_draft:
+            assert draft_config["n_routed_experts"] in (0, 4)
+        else:
+            assert draft_config["architectures"] == ["NemotronHForCausalLM"]
+            assert draft_config["num_nextn_predict_layers"] == 0
     eagle3 = eagle3_draft is not None
     detailed = independent or eagle3
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
@@ -2311,7 +2565,9 @@ def _compare_native_and_remote_draft(
     if independent:
         kwargs["tokenizer_mode"] = "hf"
     moe_backend = (
-        None if mtp_family.startswith("exaone") or eagle3 or mla_draft else "triton"
+        None
+        if mtp_family.startswith("exaone") or eagle3 or mla_draft or recurrent_draft
+        else "triton"
     )
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
@@ -2352,7 +2608,10 @@ def _compare_native_and_remote_draft(
             "Native mixed Qwen3/MLA execution builds draft metadata with the "
             "target head dimension; routed drafts also require an expert group "
             "that the dense target does not initialize. No native placement "
-            "parity is claimed; standalone native proposal replay is separate.",
+            "parity is claimed; standalone native proposal replay is separate."
+            if mla_draft
+            else "Mixed Qwen3/recurrent local speculation is outside this contract; "
+            "an ordinary standalone native Nemotron-H proposal reference is separate.",
         )
     record_property("batch_invariant", not hybrid_target)
 
@@ -2981,9 +3240,10 @@ def _compare_native_and_remote_draft(
         ),
         target_attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
-        max_feature_tokens=32,
+        max_feature_tokens=128 if recurrent_draft else 32,
         trust_remote_code=False,
         moe_backend=moe_backend,
+        batch_invariant=False if recurrent_draft else None,
     ) as endpoint:
         transports = ("inline", "cuda_ipc") if num_modules > 1 else ("inline",)
         for transport in transports:
@@ -3015,6 +3275,11 @@ def _compare_native_and_remote_draft(
                 actual_config = remote.llm.llm_engine.vllm_config.speculative_config
                 assert actual_config.use_remote_draft()
                 assert actual_config.get_remote_draft_endpoints() == (endpoint,)
+                if recurrent_draft:
+                    assert actual_config.method == "draft_model"
+                    draft_config = actual_config.draft_model_config
+                    assert draft_config.architecture == "NemotronHForCausalLM"
+                    assert draft_config.hf_config.num_nextn_predict_layers == 0
                 remote_recurrence = check_recurrence(remote, mode)
                 if native_control:
                     assert remote_recurrence == native_recurrence
@@ -3075,7 +3340,7 @@ def _compare_native_and_remote_draft(
             sum(identity in line for line in server_log.read_text().splitlines()) == 1
         )
         record_property("remote.eagle3_from_server_log", identity)
-    if independent:
+    if independent and not recurrent_draft:
         import ast
 
         identity_prefix = "Token-only draft loaded: "
@@ -3105,12 +3370,692 @@ def _compare_native_and_remote_draft(
         record_property(
             "remote.loaded_draft", {"identity": identity, "kv_layouts": layouts}
         )
+    if recurrent_draft:
+        import json
+
+        prefix = "Recurrent token-only draft loaded: "
+        identities = [
+            json.loads(line.split(prefix, 1)[1])
+            for line in server_log.read_text().splitlines()
+            if prefix in line
+        ]
+        assert len(identities) == 1
+        identity = identities[0]
+        assert identity["executor"] == "RecurrentGPUStepExecutor"
+        assert identity["model"] == "NemotronHForCausalLM"
+        assert identity["state"] == "MambaHybridModelState"
+        assert identity["speculative_config"] is None
+        assert identity["num_speculative_tokens"] == 0
+        assert identity["mamba_backend"] == "triton"
+        assert identity["replay_policy"] == "full_computed_prefix"
+        assert identity["max_num_reqs"] == 4 and identity["row_capacity"] == 1
+        assert identity["max_model_len"] == identity["max_num_tokens"] == 128
+        layouts = identity["kv_layouts"]
+        assert {layout["kind"] for layout in layouts} == {
+            "FullAttentionSpec",
+            "MambaSpec",
+        }
+        recurrent = next(layout for layout in layouts if layout["kind"] == "MambaSpec")
+        assert recurrent["blocks"] == 5
+        assert recurrent["num_speculative_blocks"] == 0
+        assert recurrent["cache_mode"] == "none"
+        assert recurrent["dtypes"] == ["torch.bfloat16", "torch.float32"]
+        assert sorted(recurrent["shapes"][0]) == [3, 384]
+        assert recurrent["shapes"][1] == [4, 64, 64]
+        assert len(identity["native_states"]) == 1
+        states = next(iter(identity["native_states"].values()))
+        assert states == [
+            dict(shape=[5, *shape], dtype=dtype)
+            for shape, dtype in zip(recurrent["shapes"], recurrent["dtypes"])
+        ]
+        record_property("remote.loaded_recurrent_draft", identity)
     if dense_mla and not independent:
         assert any(
             "Using " in line and "TRITON_MLA" in line and "backend." in line
             for line in server_log.read_text().splitlines()
         )
         record_property("remote.decode_backend_from_server_log", "TRITON_MLA")
+
+
+def _run_independent_recurrent_oracle(
+    target_path, draft_path, result_path, attention_blocks, live_slots
+):
+    """Exercise native compact caches with authoritative computed-prefix replay."""
+    import itertools
+    import json
+
+    import torch
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
+        RecurrentGPUStepExecutor,
+        create_recurrent_executor_config,
+    )
+    from vllm.v1.spec_decode.remote.runtime.token_state import (
+        TokenAdvanceRow,
+        TokenStateMachine,
+    )
+    from vllm.v1.spec_decode.remote.server import AdapterError
+
+    attention_blocks, live_slots = int(attention_blocks), int(live_slots)
+    assert (attention_blocks, live_slots) in ((2, 4), (9, 2))
+    torch.set_num_threads(1)
+    config = EngineArgs(
+        model=target_path,
+        tokenizer_mode="hf",
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=live_slots,
+        max_num_batched_tokens=128,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        attention_config={"backend": "TRITON_ATTN"},
+        speculative_config={
+            "method": "draft_model",
+            "model": draft_path,
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": 1,
+            "attention_backend": "TRITON_ATTN",
+        },
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    assert config.speculative_config.method == "draft_model"
+    ordinary = create_recurrent_executor_config(config)
+    state_spec = MambaSpec(
+        block_size=ordinary.cache_config.mamba_block_size,
+        shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(ordinary),
+        dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(ordinary),
+        page_size_padded=ordinary.cache_config.mamba_page_size_padded,
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
+    )
+    attention_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=32, dtype=torch.bfloat16
+    )
+    budget = (live_slots + 1) * state_spec.page_size_bytes + (
+        attention_blocks * attention_spec.page_size_bytes
+    )
+    executor = RecurrentGPUStepExecutor(
+        config, device=torch.device("cuda:0"), kv_cache_bytes=budget
+    )
+    identity = _check_independent_recurrent_state(
+        executor.model, executor.model_state, executor.vllm_config
+    )
+    checked_weights = _check_independent_recurrent_weights(executor.model, draft_path)
+    assert executor.num_blocks == attention_blocks
+    assert executor.kv_config.recurrent_num_blocks == live_slots + 1
+    assert identity["state_slots"] == live_slots + 1
+    assert executor.kv_config.kv_cache_tensors[0].size == budget
+    assert executor.max_num_reqs == 1
+    assert identity["attention_block_size"] == 16
+    assert [
+        group.kv_cache_spec
+        for group in executor.kv_config.kv_cache_groups
+        if type(group.kv_cache_spec) is FullAttentionSpec
+    ] == [attention_spec]
+    assert [
+        group.kv_cache_spec
+        for group in executor.kv_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ] == [state_spec]
+    assert state_spec.max_memory_usage_bytes(ordinary) == state_spec.page_size_bytes
+    assert state_spec.max_num_blocks_per_req(ordinary, 128) == 1
+    mamba = next(
+        layer for layer in executor.model.modules() if isinstance(layer, MambaMixer2)
+    )
+    attention = next(
+        layer for layer in executor.model.modules() if isinstance(layer, Attention)
+    )
+    assert attention.kv_cache.shape[1:] == (2, 16, 64)
+    spans = []
+    for tensor in executor.kv_caches.values():
+        size = 1 + sum(
+            (dim - 1) * stride for dim, stride in zip(tensor.shape, tensor.stride())
+        )
+        spans.append(
+            (tensor.data_ptr(), tensor.data_ptr() + size * tensor.element_size())
+        )
+    assert len(spans) == 2
+    assert spans[0][1] <= spans[1][0] or spans[1][1] <= spans[0][0]
+    assert (
+        len({t.untyped_storage().data_ptr() for t in executor.kv_caches.values()}) == 1
+    )
+    assert all(
+        t.untyped_storage().nbytes() == budget for t in executor.kv_caches.values()
+    )
+    executor.warmup()
+    assert executor.histories.num_sequences == executor.histories.token_count == 0
+    pool = DraftBlockPool(attention_blocks, 16)
+    state = TokenStateMachine(
+        executor,
+        pool,
+        max_num_reqs=live_slots,
+        max_model_len=128,
+        vocab_size=128,
+        max_k=3,
+    )
+    checks, references, outcomes, batch_ids = [], [], [], itertools.count()
+    state_references = []
+    max_attention_id = 0
+    reference_ids = itertools.count(100)
+
+    def allocation():
+        torch.accelerator.synchronize(executor.device)
+        return dict(
+            allocated=torch.accelerator.memory_allocated(executor.device),
+            reserved=torch.accelerator.memory_reserved(executor.device),
+        )
+
+    @torch.inference_mode()
+    def poison(key):
+        index = state.sequences[key].req_index
+        for cache in mamba.kv_cache:
+            cache[index + 1].fill_(torch.nan)
+        blocks = pool.blocks(index)
+        if blocks:
+            attention.kv_cache.index_fill_(
+                0, torch.tensor(blocks, device=executor.device), torch.nan
+            )
+
+    def snapshot(key, computed):
+        nonlocal max_attention_id
+        index = state.sequences[key].req_index
+        assert executor.histories.tokens(key) == tuple(computed)
+        blocks = pool.blocks(index)
+        max_attention_id = max(max_attention_id, *blocks)
+        native_state = [cache[index + 1].cpu().clone() for cache in mamba.kv_cache]
+        cache = attention.kv_cache.index_select(
+            0, torch.tensor(blocks, device=executor.device)
+        )
+        native_state.append(cache.transpose(1, 2).flatten(0, 1)[: len(computed)].cpu())
+        assert all(torch.isfinite(value).all() for value in native_state)
+        return native_state
+
+    def same_state(actual, expected, label):
+        assert len(actual) == len(expected) == 3
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected)), label
+
+    def independent_reference(computed, actual, label):
+        reference = SequenceKey("recurrent-reference", next(reference_ids), 0)
+        state.open(reference)
+        poison(reference)
+        state.prefill(reference, 0, tuple(computed), is_final=True)
+        same_state(actual, snapshot(reference, computed), label)
+        state.close((reference,))
+
+    def observe(key, authoritative, proposal, label, *, compare=True):
+        # The final sampled token has not been forwarded. This golden prefix is
+        # built independently from the accepted transcript and returned proposal.
+        computed = [*authoritative, *proposal[:-1]]
+        progress = state.sequences[key]
+        assert progress.committed == progress.materialized == len(authoritative)
+        assert progress.speculative_written_end == len(computed)
+        assert progress.pending_last_token == (
+            (len(computed), proposal[-1]) if proposal else None
+        )
+        actual = snapshot(key, computed)
+        if compare:
+            # Rebuild only after every live request closes. A long prefix may
+            # consume all eight token pages even though a state slot is free.
+            state_references.append((computed, actual, label))
+        if proposal:
+            references.append(
+                dict(
+                    case=label,
+                    committed_token_ids=list(authoritative),
+                    token_ids=list(proposal),
+                )
+            )
+        checks.append(
+            dict(
+                case=label,
+                committed=len(authoritative),
+                computed=len(computed),
+                k=len(proposal),
+                req_index=progress.req_index,
+                state_index=progress.req_index + 1,
+                independent_state_reference=compare,
+                poisoned_before_replay=True,
+            )
+        )
+        return computed, actual
+
+    before = allocation()
+    torch.accelerator.reset_peak_memory_stats(executor.device)
+    keys = [SequenceKey("recurrent-live", row, 0) for row in range(live_slots)]
+    for key in keys:
+        state.open(key)
+    key = keys[-1] if attention_blocks == 2 else keys[0]
+    if attention_blocks == 9:
+        state.close(tuple(keys[1:]))
+    else:
+        assert state.sequences[key].req_index == 3
+        assert state.sequences[key].req_index + 1 >= attention_blocks
+    authoritative = [7]
+    poison(key)
+    state.prefill(key, 0, tuple(authoritative), is_final=True)
+    proposal: list[int] = []
+    previous_id: int | None = None
+    schedule = [
+        (3, 0, 0, (5,)),
+        (0, 1, 0, (6,)),
+        (3, 0, 0, (8, 9)),
+        (1, 3, 2, (10,)),
+        (3, 1, 1, (11,)),
+        (0, 3, 3, (12,)),
+        (0, 0, 0, (13, 14)),
+    ]
+    for step, (k, offered, accepted, recovery) in enumerate(schedule):
+        delta = (*proposal[:accepted], *recovery)
+        advance_row = TokenAdvanceRow(
+            key, len(authoritative), previous_id, offered, accepted, delta
+        )
+        poison(key)
+        result = state.advance(next(batch_ids), advance_row, k)
+        authoritative.extend(delta)
+        proposal = list(result.token_ids)
+        previous_id = result.proposal_id
+        observe(
+            key,
+            authoritative,
+            proposal,
+            f"correction-{step}",
+            compare=attention_blocks == 9,
+        )
+        outcomes.append(
+            dict(k=k, offered=offered, accepted=accepted, delta=list(delta))
+        )
+    if attention_blocks == 2:
+        assert len(authoritative) == 16
+        prior = executor.histories.tokens(key)
+        forwards = executor.completed_forwards
+        with pytest.raises(AdapterError) as caught:
+            state.advance(
+                next(batch_ids),
+                TokenAdvanceRow(key, 16, previous_id, 0, 0, (15,)),
+                1,
+            )
+        assert caught.value.status is SpeculatorStatusCode.OUT_OF_MEMORY
+        assert executor.histories.tokens(key) == prior
+        assert executor.completed_forwards == forwards
+        assert state.sequences[key].ready
+    state.close(tuple(keys))
+    assert not state.sequences and executor.histories.num_sequences == 0
+    if attention_blocks == 9:
+        for length in (15, 16, 17, 31, 32, 33):
+            key = SequenceKey("boundary", length, 0)
+            state.open(key)
+            authoritative = [3 + (index * 7) % 125 for index in range(length)]
+            for offset in range(0, length, 15):
+                poison(key)
+                chunk = tuple(authoritative[offset : offset + 15])
+                state.prefill(
+                    key, offset, chunk, is_final=offset + len(chunk) == length
+                )
+            poison(key)
+            result = state.advance(
+                next(batch_ids), TokenAdvanceRow(key, length, None, 0, 0, (19,)), 3
+            )
+            authoritative.append(19)
+            observe(key, authoritative, list(result.token_ids), f"boundary-{length}")
+            state.close((key,))
+        # Two live rows exercise caller order with distinct state slots/pages.
+        live = [SequenceKey("reorder", row, 0) for row in range(2)]
+        transcripts = [[7] * 15, [9] * 17]
+        proposals: list[list[int]] = [[], []]
+        ids: list[int | None] = [None, None]
+        for item, tokens in zip(live, transcripts):
+            state.open(item)
+            poison(item)
+            state.prefill(item, 0, tuple(tokens), is_final=True)
+        assert not set(pool.blocks(state.sequences[live[0]].req_index)) & set(
+            pool.blocks(state.sequences[live[1]].req_index)
+        )
+        for step, order in enumerate(((0, 1), (1, 0))):
+            updates = []
+            for row in order:
+                offered = len(proposals[row]) if row else min(1, len(proposals[row]))
+                accepted = int(step == 1 and row == 1)
+                delta = (*proposals[row][:accepted], 23 + row)
+                updates.append(
+                    (
+                        next(batch_ids),
+                        TokenAdvanceRow(
+                            live[row],
+                            len(transcripts[row]),
+                            ids[row],
+                            offered,
+                            accepted,
+                            delta,
+                        ),
+                        3 if step == 0 else 1,
+                    )
+                )
+                transcripts[row].extend(delta)
+                poison(live[row])
+            results = state.advance_many(tuple(updates))
+            for row, result in zip(order, results):
+                assert not isinstance(result, Exception), results
+                proposals[row] = list(result.token_ids)
+                ids[row] = result.proposal_id
+                observe(
+                    live[row],
+                    transcripts[row],
+                    proposals[row],
+                    f"reorder-{step}-{row}",
+                )
+        state.close(tuple(live))
+        for length in (125, 126, 127):
+            key = SequenceKey("max-context", length, 0)
+            state.open(key)
+            poison(key)
+            state.prefill(key, 0, tuple([7] * length), is_final=True)
+            poison(key)
+            result = state.advance(
+                next(batch_ids), TokenAdvanceRow(key, length, None, 0, 0, (19,)), 3
+            )
+            assert len(result.token_ids) == 127 - length
+            observe(
+                key,
+                [*([7] * length), 19],
+                list(result.token_ids),
+                f"max-context-{length}",
+            )
+            state.close((key,))
+        assert max_attention_id >= live_slots + 1
+    cycles, previous = [], None
+    for generation in (1, 2, 3):
+        key = SequenceKey("recurrent-live", live_slots - 1, generation)
+        state.open(key)
+        poison(key)
+        state.prefill(key, 0, (7,), is_final=True)
+        poison(key)
+        result = state.advance(
+            next(batch_ids), TokenAdvanceRow(key, 1, None, 0, 0, (5,)), 1
+        )
+        _, actual = observe(
+            key,
+            [7, 5],
+            list(result.token_ids),
+            f"reuse-{generation}",
+            compare=attention_blocks == 9,
+        )
+        if previous is not None:
+            same_state(actual, previous, "poisoned generation reuse")
+        previous = actual
+        state.close((key,))
+        assert executor.histories.num_sequences == executor.histories.token_count == 0
+        assert pool.num_free_blocks == attention_blocks - 1
+        cycles.append(allocation())
+    assert cycles[-1]["allocated"] == cycles[-2]["allocated"]
+    assert not state.sequences and executor.histories.num_sequences == 0
+    for computed, actual, label in state_references:
+        independent_reference(computed, actual, label)
+    assert not state.sequences and executor.histories.num_sequences == 0
+    assert pool.num_free_blocks == attention_blocks - 1
+    Path(result_path).write_text(
+        json.dumps(
+            dict(
+                identity=identity,
+                loaded_identity=executor.loaded_identity,
+                checkpoint_weights=checked_weights,
+                attention_blocks=attention_blocks,
+                recurrent_blocks=live_slots + 1,
+                kv_budget_bytes=budget,
+                disjoint_backing_ranges=True,
+                max_attention_block_id=max_attention_id,
+                checks=checks,
+                independent_state_references=[
+                    label for _, _, label in state_references
+                ],
+                outcomes=outcomes,
+                proposal_references=references,
+                histories_after_close=executor.histories.num_sequences,
+                computed_tokens_after_close=executor.histories.token_count,
+                free_blocks_after_close=pool.num_free_blocks,
+                completed_forwards=executor.completed_forwards,
+                replayed_tokens=executor.replayed_tokens,
+                allocation=dict(
+                    before=before,
+                    after_close=allocation(),
+                    close_reopen_cycles=cycles,
+                    peak_allocated=torch.accelerator.max_memory_allocated(
+                        executor.device
+                    ),
+                    peak_reserved=torch.accelerator.max_memory_reserved(
+                        executor.device
+                    ),
+                ),
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "attention_blocks,live_slots", [(2, 4), (9, 2)], ids=["b2-r5", "b9-r3"]
+)
+def test_remote_independent_recurrent_state_matches_native_full_prefix(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    tiny_independent_recurrent_models,
+    attention_blocks,
+    live_slots,
+    record_property,
+):
+    """Use independent native state slots and ordinary one-token prefix references."""
+    import json
+    import math
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    target, draft = tiny_independent_recurrent_models
+    result_path = tmp_path / "recurrent-oracle.json"
+    log_path = tmp_path / "recurrent-oracle.log"
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _run_independent_recurrent_oracle; "
+        "_run_independent_recurrent_oracle(*sys.argv[1:])",
+        target,
+        draft,
+        str(result_path),
+        str(attention_blocks),
+        str(live_slots),
+    ]
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            assert process.wait(timeout=300) == 0, (
+                f"recurrent state oracle failed: {log_path}"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    receipt = json.loads(result_path.read_text())
+    record_property("native.recurrent_state_oracle", receipt)
+    assert receipt["attention_blocks"] == attention_blocks
+    assert receipt["recurrent_blocks"] == live_slots + 1
+    assert len(receipt["checks"]) == (10 if attention_blocks == 2 else 23)
+    assert receipt["independent_state_references"] == [
+        check["case"]
+        for check in receipt["checks"]
+        if check["independent_state_reference"]
+    ]
+    assert (
+        receipt["histories_after_close"] == receipt["computed_tokens_after_close"] == 0
+    )
+    assert receipt["free_blocks_after_close"] == attention_blocks - 1
+    assert {outcome["accepted"] for outcome in receipt["outcomes"]} == {0, 1, 2, 3}
+    assert receipt["disjoint_backing_ranges"]
+    if attention_blocks == 2:
+        assert all(
+            check["state_index"] >= attention_blocks for check in receipt["checks"]
+        )
+    else:
+        assert receipt["max_attention_block_id"] >= live_slots + 1
+        assert {f"boundary-{length}" for length in (15, 16, 17, 31, 32, 33)} <= {
+            check["case"] for check in receipt["checks"]
+        }
+    cases = receipt["proposal_references"]
+
+    def identity(worker):
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MambaSpec,
+            iter_layer_specs,
+        )
+
+        runner = worker.model_runner
+        config = worker.vllm_config
+        result = _check_independent_recurrent_state(
+            runner.get_model(), runner.model_state, config
+        )
+        result["checkpoint_weights"] = _check_independent_recurrent_weights(
+            runner.get_model(), draft
+        )
+        groups = runner.kv_cache_config.kv_cache_groups
+        attention = next(
+            layer
+            for layer in runner.get_model().modules()
+            if isinstance(layer, Attention)
+        )
+        public_attention_spec = attention.get_kv_cache_spec(config)
+        assert type(public_attention_spec) is FullAttentionSpec
+        full_specs = []
+        native_groups = []
+        for index, group in enumerate(groups):
+            specs = list(iter_layer_specs(group.kv_cache_spec))
+            assert len(specs) == 1
+            spec = specs[0]
+            assert isinstance(spec, (FullAttentionSpec, MambaSpec))
+            if type(spec) is FullAttentionSpec:
+                assert group.layer_names == [attention.layer_name]
+                assert (
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    spec.dtype,
+                ) == (
+                    public_attention_spec.num_kv_heads,
+                    public_attention_spec.head_size,
+                    public_attention_spec.dtype,
+                )
+                full_specs.append(spec)
+            native_groups.append(
+                dict(
+                    kind=type(spec).__name__,
+                    layers=list(group.layer_names),
+                    block_size=spec.block_size,
+                    page_size_bytes=spec.page_size_bytes,
+                    page_size_padded=spec.page_size_padded,
+                    kernel_block_size=runner.kernel_block_sizes[index],
+                )
+            )
+        assert len(full_specs) == 1
+        assert {group["kind"] for group in native_groups} == {
+            "FullAttentionSpec",
+            "MambaSpec",
+        }
+        result["kv_groups"] = native_groups
+        return result
+
+    observations = []
+    with vllm_runner(
+        draft,
+        tokenizer_mode="hf",
+        skip_tokenizer_init=True,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        enable_chunked_prefill=False,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        mamba_backend="triton",
+        mamba_cache_dtype="bfloat16",
+        mamba_ssm_cache_dtype="float32",
+        use_replayssm=False,
+    ) as native:
+        native_identity = native.llm.collective_rpc(identity)
+        assert native_identity[0]["checkpoint_weights"] == receipt["checkpoint_weights"]
+        for case in cases:
+            prefix = list(case["committed_token_ids"])
+            for position, expected in enumerate(case["token_ids"]):
+                output = native.llm.generate(
+                    [{"prompt_token_ids": list(prefix)}],
+                    SamplingParams(
+                        temperature=0,
+                        max_tokens=1,
+                        ignore_eos=True,
+                        detokenize=False,
+                        logprobs=5,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                generated = output.outputs[0]
+                assert output.prompt_token_ids is not None
+                observed = dict(
+                    case=case["case"],
+                    position=position,
+                    prefix=list(prefix),
+                    native_prompt_token_ids=list(output.prompt_token_ids),
+                    expected_token=expected,
+                    token_ids=list(generated.token_ids),
+                    finish_reason=generated.finish_reason,
+                    logprobs=[
+                        {
+                            token: dict(logprob=value.logprob, rank=value.rank)
+                            for token, value in values.items()
+                        }
+                        for values in generated.logprobs or []
+                    ],
+                )
+                observations.append(observed)
+                prefix.append(expected)
+    record_property(
+        "native.recurrent_proposal_replay",
+        dict(
+            identity=native_identity,
+            comparison="exact_tokens_one_full_prefix_per_draft_position",
+            requests=len(cases),
+            tokens=len(observations),
+            observations=observations,
+        ),
+    )
+    for observed in observations:
+        expected = observed["expected_token"]
+        assert observed["native_prompt_token_ids"] == observed["prefix"]
+        assert observed["finish_reason"] == "length"
+        assert observed["token_ids"] == [expected], observed
+        assert len(observed["logprobs"]) == 1
+        values = observed["logprobs"][0]
+        assert expected in values and len(values) >= 5
+        assert all(math.isfinite(value["logprob"]) for value in values.values())
 
 
 def _run_independent_mla_oracle(target_path, draft_path, result_path):

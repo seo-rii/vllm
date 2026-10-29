@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.remote.runtime.token_schema import (
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenAdvanceRow,
+    TokenForwardRow,
     TokenStateMachine,
     TokenStepExecutor,
 )
@@ -270,6 +271,122 @@ class KVOracle(TokenStepExecutor):
         if sample:
             return self.predict([kv[i] for i in range(start + len(tokens))])
         return None
+
+
+def test_recurrent_history_rewinds_computed_tail_only_after_commit():
+    from vllm.v1.spec_decode.remote.runtime.recurrent import RecurrentTokenHistory
+
+    history = RecurrentTokenHistory(max_num_reqs=1, max_model_len=8, vocab_size=128)
+    key = SequenceKey("replay", 0, 0)
+    first = history.prepare(TokenForwardRow(key, 0, 0, (2, 3), (), False))
+    assert history.tokens(key) == () and history.token_count == 0
+    history.commit(first)
+    speculative = history.prepare(TokenForwardRow(key, 0, 2, (11, 12), (), True))
+    assert speculative.tokens == (2, 3, 11, 12)
+    assert history.tokens(key) == (2, 3)
+    history.commit(speculative)
+    correction = history.prepare(TokenForwardRow(key, 0, 2, (7,), (), True))
+    assert correction.tokens == (2, 3, 7)
+    assert history.tokens(key) == speculative.tokens
+    history.commit(correction)
+    assert history.tokens(key) == (2, 3, 7)
+    assert speculative.tokens == (2, 3, 11, 12)
+    assert history.num_sequences == 1 and history.token_count == 3
+
+
+def test_recurrent_history_fences_closed_generation_without_touching_sibling():
+    from vllm.v1.spec_decode.remote.runtime.recurrent import RecurrentTokenHistory
+
+    history = RecurrentTokenHistory(max_num_reqs=2, max_model_len=8, vocab_size=128)
+    old = SequenceKey("replay", 0, 0)
+    new = SequenceKey("replay", 0, 1)
+    sibling = SequenceKey("replay", 1, 0)
+    abandoned = history.prepare(TokenForwardRow(old, 0, 0, (2,), (), False))
+    pending = history.prepare(TokenForwardRow(sibling, 1, 0, (3, 4), (), False))
+    history.close_sequences((SequenceKey("unknown", 99, 0), old))
+    replacement = history.prepare(TokenForwardRow(new, 0, 0, (6,), (), False))
+    history.commit(replacement)
+    with pytest.raises(ValueError, match="stale recurrent replay completion"):
+        history.commit(abandoned)
+    history.commit(pending)
+    with pytest.raises(ValueError, match="stale recurrent replay completion"):
+        history.commit(pending)
+    history.close_sequences((old,))
+    assert history.tokens(new) == (6,) and history.tokens(sibling) == (3, 4)
+    assert history.num_sequences == 2 and history.token_count == 3
+    history.close_sequences((new, sibling))
+    assert history.num_sequences == history.token_count == 0
+
+
+def test_recurrent_history_budget_failure_preserves_live_prefix_and_slots():
+    from vllm.v1.spec_decode.remote.runtime.recurrent import RecurrentTokenHistory
+
+    history = RecurrentTokenHistory(max_num_reqs=1, max_model_len=4, vocab_size=16)
+    key, other = SequenceKey("replay", 0, 0), SequenceKey("replay", 1, 0)
+    history.commit(history.prepare(TokenForwardRow(key, 0, 0, (1, 2, 3), (), False)))
+    for invalid in (
+        TokenForwardRow(key, 0, 3, (4, 5), (), True),
+        TokenForwardRow(key, 0, 4, (4,), (), True),
+        TokenForwardRow(key, 0, 3, (16,), (), True),
+        TokenForwardRow(other, 0, 0, (1,), (), False),
+    ):
+        with pytest.raises(ValueError):
+            history.prepare(invalid)
+        assert history.tokens(key) == (1, 2, 3)
+        assert history.num_sequences == 1 and history.token_count == 3
+    history.close_sequences((key,))
+    history.commit(history.prepare(TokenForwardRow(other, 0, 0, (4,), (), False)))
+    assert history.tokens(other) == (4,)
+
+
+def test_token_close_retires_recurrent_history_before_reusing_slot():
+    from vllm.v1.spec_decode.remote.runtime.recurrent import RecurrentTokenHistory
+
+    history = RecurrentTokenHistory(max_num_reqs=1, max_model_len=16, vocab_size=128)
+    closed: list[SequenceKey] = []
+
+    class RecurrentOracle(KVOracle):
+        def forward(self, key, req_index, start, tokens, blocks, *, sample):
+            update = history.prepare(
+                TokenForwardRow(key, req_index, start, tokens, blocks, sample)
+            )
+            result = super().forward(
+                key, req_index, start, tokens, blocks, sample=sample
+            )
+            history.commit(update)
+            return result
+
+        def close_sequences(self, keys):
+            for key in keys:
+                # Executor storage must retire while the old slot/KV owner exists.
+                progress = state.sequences[key]
+                closed.append((key, progress.req_index, history.tokens(key)))
+                assert state.block_pool.blocks(progress.req_index)
+            history.close_sequences(keys)
+
+    oracle = RecurrentOracle()
+    state = TokenStateMachine(
+        oracle,
+        DraftBlockPool(5, 4),
+        max_num_reqs=1,
+        max_model_len=16,
+        vocab_size=128,
+        max_k=3,
+    )
+    old, new = SequenceKey("replay", 0, 0), SequenceKey("replay", 0, 1)
+    state.open(old)
+    state.prefill(old, 0, (1, 2, 3), is_final=True)
+    state.close((SequenceKey("unknown", 99, 0), old))
+    assert closed == [(old, 0, (1, 2, 3))]
+    assert history.num_sequences == 0 and state.block_pool.num_free_blocks == 4
+    state.open(new)
+    state.prefill(new, 0, (9, 10), is_final=True)
+    state.close((old,))
+    assert history.tokens(new) == (9, 10) and len(closed) == 1
+    state.close((new,))
+    assert closed[-1] == (new, 0, (9, 10))
+    assert history.num_sequences == 0 and not state.sequences
+    assert state.block_pool.num_free_blocks == 4
 
 
 def machine(*, max_len=64, blocks=33, k=3, executor=None):
@@ -2083,6 +2200,8 @@ def token_config(
     target_options=None,
     spec_options=None,
     attention_config=None,
+    cache_options=None,
+    scheduler_options=None,
     dtype="float32",
     target_tp=1,
     **draft_options,
@@ -2226,26 +2345,226 @@ def token_config(
         speculative_config=spec,
         attention_config=attention_config or AttentionConfig(),
         scheduler_config=SchedulerConfig(
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            max_model_len=64,
-            async_scheduling=False,
-            is_encoder_decoder=False,
+            **dict(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                max_model_len=64,
+                async_scheduling=False,
+                is_encoder_decoder=False,
+            )
+            | (scheduler_options or {}),
         ),
         cache_config=CacheConfig(
-            enable_prefix_caching=False,
-            sliding_window=(
-                target.get_sliding_window()
-                if getattr(target.hf_text_config, "layer_types", None) is None
-                or all(
-                    layer == "sliding_attention"
-                    for layer in target.hf_text_config.layer_types
-                )
-                else None
-            ),
+            **dict(
+                enable_prefix_caching=False,
+                sliding_window=(
+                    target.get_sliding_window()
+                    if getattr(target.hf_text_config, "layer_types", None) is None
+                    or all(
+                        layer == "sliding_attention"
+                        for layer in target.hf_text_config.layer_types
+                    )
+                    else None
+                ),
+            )
+            | (cache_options or {}),
         ),
         device_config=DeviceConfig("cpu"),
     )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_token_recurrent_draft_admits_public_independent_nemotron(
+    tmp_path, monkeypatch, k
+):
+    """A real no-MTP checkpoint keeps its native architecture through overrides."""
+    import torch
+
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        spec_options={"num_speculative_tokens": k},
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+    )
+    spec = config.speculative_config
+    assert spec.method == "draft_model"
+    draft = spec.draft_model_config
+    assert draft.architecture == "NemotronHForCausalLM"
+    assert draft.hf_config.architectures == ["NemotronHForCausalLM"]
+    assert draft.hf_config.num_nextn_predict_layers == 0
+    assert draft.hf_config.hybrid_override_pattern == "M*"
+    assert draft.is_hybrid and draft.has_inner_state and not draft.use_mla
+    assert config.model_config.architecture == "Qwen3ForCausalLM"
+    assert MambaStateDtypeCalculator.mamba2_state_dtype(
+        draft.dtype,
+        config.cache_config.mamba_cache_dtype,
+        config.cache_config.mamba_ssm_cache_dtype,
+    ) == (torch.bfloat16, torch.float32)
+    contract = create_token_runtime_contract(config)
+    assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    assert contract.capabilities.num_prefill_lookahead == 0
+    assert contract.capabilities.state_dependency == "own_kv"
+
+
+def test_token_recurrent_draft_client_budget_can_be_smaller_than_replay_context(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+        scheduler_options={"max_num_batched_tokens": 32},
+        spec_options={
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": ["unix:///tmp/recurrent-draft.sock"],
+                "transport": "inline",
+            }
+        },
+    )
+    assert config.speculative_config.use_remote_draft()
+    assert config.model_config.max_model_len == 64
+    assert config.scheduler_config.max_num_batched_tokens == 32
+    assert create_token_runtime_contract(config).capabilities.num_prefill_lookahead == 0
+
+
+def test_token_recurrent_draft_validates_effective_public_ssm_dtype(
+    tmp_path, monkeypatch
+):
+    import torch
+
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "bfloat16"},
+    )
+    cache = config.cache_config
+    draft = config.speculative_config.draft_model_config
+    _, ssm_dtype = MambaStateDtypeCalculator.mamba2_state_dtype(
+        draft.dtype, cache.mamba_cache_dtype, cache.mamba_ssm_cache_dtype
+    )
+    if cache.mamba_ssm_cache_dtype == "float32":
+        assert ssm_dtype == torch.float32
+        contract = create_token_runtime_contract(config)
+        assert contract.capabilities.state_dependency == "own_kv"
+        assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    else:
+        assert cache.mamba_ssm_cache_dtype == "bfloat16"
+        assert ssm_dtype == torch.bfloat16
+        with pytest.raises(ValueError, match="float32 SSM"):
+            create_token_runtime_contract(config)
+
+
+def test_token_recurrent_draft_rejects_resolved_bfloat16_ssm_dtype(
+    tmp_path, monkeypatch
+):
+    """The resolved contract rejects BF16 even on CPUs that normalize inputs."""
+    from vllm.config import replace as replace_config
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = token_config(
+        tmp_path,
+        draft_type="nemotron_h",
+        dtype="bfloat16",
+        num_nextn_predict_layers=0,
+        cache_options={"mamba_ssm_cache_dtype": "float32"},
+    )
+    original_cache = config.cache_config
+    config.cache_config = replace_config(
+        original_cache, mamba_ssm_cache_dtype="bfloat16"
+    )
+    assert original_cache.mamba_ssm_cache_dtype == "float32"
+    assert config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+    with pytest.raises(ValueError, match="float32 SSM"):
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"dtype": "float32"},
+        {"cache_options": {"mamba_cache_dtype": "float32"}},
+        {"cache_options": {"use_replayssm": True}},
+        {"target_type": "llama"},
+        {"target_tp": 2, "spec_options": {"draft_tensor_parallel_size": 1}},
+        {"spec_options": {"draft_tensor_parallel_size": 2}},
+        {"spec_options": {"quantization": "fp8"}},
+        {"spec_options": {"kv_cache_dtype": "fp8"}},
+        {
+            "spec_options": {
+                "execution": {
+                    "placement": "remote",
+                    "endpoints": ["unix:///tmp/a.sock", "unix:///tmp/b.sock"],
+                }
+            }
+        },
+        {
+            "spec_options": {
+                "execution": {
+                    "placement": "remote",
+                    "endpoints": ["unix:///tmp/a.sock"],
+                    "transport": "cuda_ipc",
+                }
+            }
+        },
+        {
+            "layers_block_type": ["linear_attention", "moe", "full_attention"],
+            "n_routed_experts": 2,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 32,
+            "moe_shared_expert_intermediate_size": 32,
+        },
+    ],
+)
+def test_token_recurrent_draft_rejects_unvalidated_public_configuration(
+    tmp_path, monkeypatch, options
+):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    options = dict(options)
+    options["cache_options"] = {"mamba_ssm_cache_dtype": "float32"} | options.get(
+        "cache_options", {}
+    )
+    with pytest.raises(ValueError):
+        create_token_runtime_contract(
+            token_config(
+                tmp_path,
+                draft_type="nemotron_h",
+                num_nextn_predict_layers=0,
+                **({"dtype": "bfloat16"} | options),
+            )
+        )
 
 
 @pytest.mark.parametrize("k", [1, 3])
@@ -2448,9 +2767,12 @@ def test_token_contract_still_rejects_recurrent_and_mla_drafts(tmp_path, family)
     # SpeculativeConfig can reinterpret these checkpoints as MTP. Exercise the
     # dense-draft gate on their real original ModelConfig, without that rewrite.
     config = token_config(tmp_path, target_type=family)
-    with pytest.raises(
-        ValueError, match="token-only draft requires a native decoder-only"
-    ):
+    reason = (
+        "recurrent draft requires unquantized bfloat16"
+        if family == "nemotron_h"
+        else "token-only draft requires a native decoder-only"
+    )
+    with pytest.raises(ValueError, match=reason):
         _validate_token_model(config.model_config, "draft")
 
 

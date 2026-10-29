@@ -199,8 +199,11 @@ steps:
     - tests/v1/e2e/spec_decode/remote/
     - tests/v1/spec_decode/remote/runtime_fixtures.py
     - tests/v1/spec_decode/remote/test_token_gpu.py
+    - tests/v1/spec_decode/remote/test_token_runtime.py
     - tests/v1/spec_decode/remote/test_conditioned_pool.py
   commands:
+    - pytest -v --noconftest v1/spec_decode/remote/test_token_gpu.py::test_recurrent_startup_reads_each_checkpoint_once_and_rechecks_changes
+    - pytest -v --noconftest v1/spec_decode/remote/test_token_runtime.py -k 'validates_effective_public_ssm_dtype or rejects_resolved_bfloat16_ssm_dtype'
     - pytest -v -s v1/e2e/spec_decode/remote/
     - pytest -v -s --noconftest v1/spec_decode/remote/test_token_gpu.py::test_token_cuda_forward_failure_completes_before_native_kv_reuse
     - pytest -v -s --noconftest v1/spec_decode/remote/test_conditioned_pool.py::test_inline_cuda_nondefault_stream_preserves_ragged_features
