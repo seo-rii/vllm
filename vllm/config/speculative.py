@@ -1761,6 +1761,11 @@ class SpeculativeConfig:
             remote = self.get_remote_draft_config()
             assert remote is not None
             unsupported = []
+            if (
+                self.target_parallel_config is not None
+                and self.target_parallel_config.tensor_parallel_size != 1
+            ):
+                unsupported.append("token-only remote drafting requires target TP1")
             if remote.transport not in ("auto", "inline"):
                 unsupported.append("token-only execution supports inline transport")
             if self.draft_tensor_parallel_size not in (None, 1):
