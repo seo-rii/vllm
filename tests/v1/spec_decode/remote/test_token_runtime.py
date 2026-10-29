@@ -586,6 +586,77 @@ def test_token_server_socket_close_error_retains_owner_and_requires_restart(
         close_socket(connection._sock)
 
 
+def test_token_queue_full_socket_close_failure_is_supervised(
+    socket_runtime, monkeypatch
+):
+    import errno
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.transport import TransportError
+
+    state, _, server, session = socket_runtime
+    with server._connections_lock:
+        (connection,) = server._connections
+        worker = server._workers[0]
+    queue = server.work_queue
+    entered, release, closing = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    errors: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected overloaded socket close failure")
+
+    def blocked():
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def fail_close(sock):
+        if sock is connection._sock:
+            closing.set()
+            raise failure
+        close_socket(sock)
+
+    try:
+        for index in range(queue.max_jobs_per_owner):
+            queue.submit(
+                DraftWork(
+                    session.hello.verifier_instance_id,
+                    blocked if index == 0 else lambda: None,
+                )
+            )
+        assert entered.wait(timeout=3)
+        with (
+            monkeypatch.context() as patch,
+            ThreadPoolExecutor(max_workers=1) as requests,
+        ):
+            patch.setattr(socket.socket, "close", fail_close)
+            pending = requests.submit(
+                session.open_sequence, 1, deadline=session.deadline()
+            )
+            try:
+                assert closing.wait(timeout=3)
+            finally:
+                release.set()
+            with pytest.raises((RemoteDraftError, TransportError)):
+                pending.result(timeout=3)
+            worker.join(timeout=3)
+        assert not worker.is_alive() and not errors
+        assert not server.healthy and server.wait(timeout=0)
+        assert server._lifecycle_error is failure
+        assert connection in server._connections and not server._handshaking
+        server.stop()
+        assert not state.sequences and queue.depth == 0
+    finally:
+        release.set()
+        close_socket(connection._sock)
+
+
 @pytest.mark.parametrize("started", [False, True])
 def test_token_acceptor_start_failure_rolls_back_and_allows_restart(
     socket_runtime, monkeypatch, tmp_path, started
