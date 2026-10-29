@@ -5,6 +5,9 @@
 import pytest
 from pydantic import ValidationError
 
+from tests.v1.spec_decode.remote.runtime_fixtures import (
+    cpu_parallel_state as cpu_parallel_state,
+)
 from vllm.config.speculative import (
     RemoteDraftConfig,
     SpeculativeConfig,
@@ -189,6 +192,222 @@ def test_legacy_remote_does_not_silently_switch_to_token_only_protocol():
     assert spec.get_remote_draft_config() is spec.remote_draft
     with pytest.raises(ValueError, match="method 'draft_model'"):
         spec._validate_remote_draft()
+
+
+# One contract table drives public API, runtime schema, CLI, and supported TP1
+# native-load checks. Device enumeration is the only simulated CLI service.
+_TOKEN_COMPATIBILITY_CASES = [
+    pytest.param(1, "float32", "on_demand", {}, None, id="dense-tp1-fp32"),
+    pytest.param(1, "bfloat16", "on_demand", {}, None, id="dense-tp1-bf16"),
+    pytest.param(2, "bfloat16", "on_demand", {}, None, id="dense-tp2-bf16"),
+    pytest.param(2, "float32", "on_demand", {}, "unquantized bfloat16", id="tp2-fp32"),
+    pytest.param(
+        2,
+        "bfloat16",
+        "on_demand",
+        {"draft_type": "mistral", "sliding_window": 16},
+        "dense full-attention",
+        id="tp2-sliding",
+    ),
+    pytest.param(
+        2,
+        "bfloat16",
+        "on_demand",
+        {"sliding_window": 16, "layer_types": ["full_attention", "sliding_attention"]},
+        "dense full-attention",
+        id="tp2-mixed-windows",
+    ),
+    pytest.param(
+        2,
+        "bfloat16",
+        "on_demand",
+        {"draft_type": "nemotron_h"},
+        "dense full-attention",
+        id="tp2-recurrent",
+    ),
+    pytest.param(
+        2,
+        "bfloat16",
+        "outcome_cache",
+        {},
+        "outcome cache requires.*TP1",
+        id="cache-tp2",
+    ),
+]
+
+
+def _token_cli_contract(arguments):
+    """Stop real CLI startup after contract validation, before any GPU owner."""
+    import sys
+
+    from vllm.v1.spec_decode.remote.runtime.schema import RuntimeContract
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    class Validated(Exception):
+        pass
+
+    observed = []
+
+    def stop_after_validation(frame, event, result):
+        if (
+            event == "return"
+            and frame.f_code is create_token_runtime_contract.__code__
+            and isinstance(result, RuntimeContract)
+        ):
+            observed.append((frame.f_locals["config"], result))
+            raise Validated
+
+    previous = sys.getprofile()
+    sys.setprofile(stop_after_validation)
+    try:
+        try:
+            create_adapter(parser().parse_args(arguments))
+        except Validated:
+            assert len(observed) == 1
+            return observed[0]
+    finally:
+        sys.setprofile(previous)
+    pytest.fail("CLI did not validate a token runtime contract")
+
+
+@pytest.mark.parametrize(
+    "draft_tp,dtype,policy,draft_options,reason", _TOKEN_COMPATIBILITY_CASES
+)
+def test_token_compatibility_contract_matches_public_schema_cli_and_native_load(
+    tmp_path, monkeypatch, request, draft_tp, dtype, policy, draft_options, reason
+):
+    from dataclasses import replace
+
+    import torch
+
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.platforms import current_platform
+    from vllm.v1.spec_decode.remote.protocol import FeatureSlot
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    assets = token_config(
+        tmp_path, dtype=dtype, enforce_eager=True, head_dim=64, **draft_options
+    )
+    target = assets.model_config.model
+    draft = assets.speculative_config.draft_model_config.model
+    endpoint = "unix:///tmp/compatibility.sock"
+    options = {
+        "method": "draft_model",
+        "model": draft,
+        "num_speculative_tokens": 3,
+        "draft_tensor_parallel_size": draft_tp,
+        "execution": {
+            "placement": "remote",
+            "policy": policy,
+            "endpoints": [endpoint],
+            "transport": "inline",
+        },
+    }
+
+    def public():
+        config = EngineArgs(
+            model=target,
+            tokenizer_mode="hf",
+            dtype=dtype,
+            skip_tokenizer_init=True,
+            max_model_len=64,
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            enforce_eager=True,
+            speculative_config=options,
+        ).create_engine_config()
+        return config, create_token_runtime_contract(config)
+
+    def schema():
+        config = replace(
+            assets,
+            speculative_config=SpeculativeConfig(
+                target_model_config=assets.model_config,
+                target_parallel_config=assets.parallel_config,
+                **options,
+            ),
+        )
+        return config, create_token_runtime_contract(config)
+
+    arguments = [
+        "--endpoint",
+        endpoint,
+        "--target-model",
+        target,
+        "--draft-model",
+        draft,
+        "--dtype",
+        dtype,
+        "--policy",
+        policy,
+        "--max-model-len",
+        "64",
+        "--max-feature-tokens",
+        "64",
+        "--draft-tensor-parallel-size",
+        str(draft_tp),
+    ]
+    if draft_tp == 2:
+        arguments.extend(("--devices", "cuda:0", "cuda:1"))
+    contracts = []
+    for construct in (public, schema, lambda: _token_cli_contract(arguments)):
+        with monkeypatch.context() as hardware:
+            hardware.setattr(torch.accelerator, "device_count", lambda: 2)
+            hardware.setattr(
+                current_platform, "visible_device_id_to_physical_device_id", int
+            )
+            if reason is not None:
+                with pytest.raises(ValueError, match=reason):
+                    construct()
+                continue
+            config, contract = construct()
+        assert (
+            config.speculative_config.draft_parallel_config.tensor_parallel_size
+            == draft_tp
+        )
+        assert config.speculative_config.draft_model_config.dtype == getattr(
+            torch, dtype
+        )
+        assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+        contracts.append(contract)
+    if reason is not None:
+        return
+    assert len({contract.tokenizer_fingerprint for contract in contracts}) == 1
+    assert len({contract.draft_fingerprint for contract in contracts}) == 1
+    if draft_tp != 1:
+        return  # Native TP2 execution requires the GPU matrix.
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.model_loader import get_model
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.spec_decode.remote.runtime.token_gpu import (
+        create_token_executor_config,
+        validate_token_model_inputs,
+    )
+    from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+
+    request.getfixturevalue("cpu_parallel_state")
+    resource = create_token_executor_config(config)
+    with monkeypatch.context() as hardware, set_current_vllm_config(resource):
+        hardware.setattr(torch.accelerator, "empty_cache", lambda: None)
+        model = get_model(vllm_config=resource)
+        validate_token_model_inputs(resource, model)
+        specs = get_kv_cache_spec(resource)
+    assert type(model).__name__ == "Qwen3ForCausalLM"
+    assert len(specs) == resource.model_config.get_total_num_hidden_layers()
+    assert all(type(spec) is FullAttentionSpec for spec in specs.values())
+    assert all(
+        isinstance(spec, FullAttentionSpec) and spec.dtype == getattr(torch, dtype)
+        for spec in specs.values()
+    )
 
 
 @pytest.mark.parametrize("target_tp", [1, 2])

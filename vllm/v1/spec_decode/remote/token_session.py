@@ -75,6 +75,7 @@ class TokenProposalHandle(ProposalHandle):
 class TokenBatchResult:
     token_ids: tuple[tuple[int, ...], ...]
     valid_lengths: tuple[int, ...]
+    origins: tuple[str, ...] = ()
 
 
 class TokenOnlyRemoteSession:
@@ -115,6 +116,7 @@ class TokenOnlyRemoteSession:
         self._deferred_closes: set[SequenceKey] = set()
         self._closed = False
         self._last_batch = -1
+        self.cache_hits = 0
 
     def deadline(self) -> float:
         return self.clock() + self.request_timeout_s
@@ -219,6 +221,7 @@ class TokenOnlyRemoteSession:
                 not isinstance(ack, TokenHelloAck)
                 or frames
                 or ack.tokenizer_fingerprint != self.hello.tokenizer_fingerprint
+                or ack.policy != self.hello.policy
             ):
                 raise ProtocolError("invalid token hello acknowledgment")
             if (
@@ -396,6 +399,11 @@ class TokenOnlyRemoteSession:
             ):
                 raise ProtocolError("token proposal result shape mismatch")
             tokens, valid, committed, identities, statuses = values
+            origins = response.origins
+            if (origins and len(origins) != n) or (
+                self.hello.policy == "outcome_cache" and len(origins) != n
+            ):
+                raise ProtocolError("missing token proposal origin metadata")
             output = []
             for i, row in enumerate(handle.rows):
                 status = SpeculatorStatusCode(statuses[i])
@@ -422,8 +430,12 @@ class TokenOnlyRemoteSession:
                         )
                     state.committed, state.proposal_id = committed[i], identities[i]
                     state.proposal_tokens = row_tokens[: valid[i]]
+                    if origins and origins[i] == "cache":
+                        if valid[i] == 0 or self.hello.policy != "outcome_cache":
+                            raise ProtocolError("invalid cache proposal origin")
+                        self.cache_hits += 1
                 output.append(row_tokens)
-            return TokenBatchResult(tuple(output), tuple(valid))
+            return TokenBatchResult(tuple(output), tuple(valid), origins)
         except Exception as error:
             self.fail(f"token collect failed: {error}")
             if empty is None:

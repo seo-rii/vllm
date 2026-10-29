@@ -88,6 +88,41 @@ def test_pool_release_returns_blocks_and_slots_cross_blocks():
     assert pool.ensure(2, 2) == [2]
 
 
+@pytest.mark.parametrize("close_source_first", [False, True])
+def test_pool_prefix_fork_releases_each_physical_page_once(close_source_first):
+    pool = DraftBlockPool(num_blocks=8, block_size=2)
+    assert pool.ensure(0, 6) == [1, 2, 3]
+    assert pool.fork_prefix(0, 1, 2, 8) == [4, 5]
+    assert pool.blocks(0) == (1, 2, 3)
+    assert pool.blocks(1) == (1, 2, 4, 5)
+    assert pool.num_free_blocks == 2
+    assert pool.exclusive_blocks(0) == 1
+    assert pool.exclusive_blocks(1) == 2
+    first, second = (0, 1) if close_source_first else (1, 0)
+    pool.release(first)
+    assert pool.exclusive_blocks(second) == len(pool.blocks(second))
+    pool.release(first)
+    pool.release(second)
+    assert pool.num_free_blocks == 7
+    assert len(set(pool.ensure(2, 14))) == 7
+
+
+def test_pool_prefix_fork_oom_preserves_both_leases_and_capacity():
+    pool = DraftBlockPool(num_blocks=5, block_size=2)
+    pool.ensure(0, 6)
+    with pytest.raises(DraftKVExhausted):
+        pool.fork_prefix(0, 1, 2, 10)
+    assert pool.blocks(0) == (1, 2, 3) and pool.blocks(1) == ()
+    assert pool.num_free_blocks == 1 and pool.exclusive_blocks(0) == 3
+    assert pool.fork_prefix(0, 1, 2, 6) == [4]
+    pool.swap(0, 1)
+    pool.release(1)
+    assert pool.blocks(0) == (1, 2, 4)
+    assert pool.exclusive_blocks(0) == 3 and pool.num_free_blocks == 1
+    pool.release(0)
+    assert pool.num_free_blocks == 4
+
+
 # ----------------------------------------------------------------------
 # Step planning
 # ----------------------------------------------------------------------

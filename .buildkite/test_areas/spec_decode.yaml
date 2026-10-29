@@ -213,7 +213,9 @@ steps:
     - vllm/v1/spec_decode/remote/
     - vllm/v1/worker/gpu/
     - tests/v1/e2e/spec_decode/remote/
+    - tests/v1/spec_decode/remote/test_token_runtime.py
   commands:
+    - pytest -v -s v1/spec_decode/remote/test_token_runtime.py -k 'test_token_cli_rejects_outcome_cache_with_draft_tp_before_loading or test_public_outcome_cache_rejects_draft_tp2'
     - pytest -v -s v1/e2e/spec_decode/remote/test_remote_mtp.py::test_remote_token_draft_tp_matches_target_and_uses_drafts
 
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode MTP DeepSeek + MiMo"

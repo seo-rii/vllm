@@ -5,11 +5,15 @@
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool, DraftKVExhausted
 from vllm.v1.spec_decode.remote.server import AdapterError
+
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenPredictionPlan
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class TokenProgress:
     proposal_tokens: tuple[int, ...] = ()
     pending_last_token: tuple[int, int] | None = None
     ready: bool = False
+    prefix_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,8 @@ class TokenRowResult:
     token_ids: tuple[int, ...]
     committed: int
     proposal_id: int
+    origin: str = "on_demand"
+    prediction: "TokenPredictionPlan | None" = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,13 @@ class TokenStepExecutor(ABC):
 
     def warmup(self) -> None:  # noqa: B027
         """Finish device initialization before the listener becomes ready."""
+
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:  # noqa: B027
+        """Retire executor-owned state before request slots are reused."""
+
+    def copy_blocks(self, copies: tuple[tuple[int, int], ...]) -> None:
+        """Complete independent copies of native scheduler KV pages."""
+        raise NotImplementedError("this token executor does not support branch KV")
 
     @abstractmethod
     def forward(
@@ -131,6 +145,7 @@ class TokenStateMachine:
         max_model_len: int,
         vocab_size: int,
         max_k: int,
+        req_index_offset: int = 0,
     ) -> None:
         self.executor = executor
         self.block_pool = block_pool
@@ -139,7 +154,9 @@ class TokenStateMachine:
         self.max_k = max_k
         self.sequences: dict[SequenceKey, TokenProgress] = {}
         # Retain capacity so returning a slot cannot grow a Python list.
-        self._free = list(range(max_num_reqs - 1, -1, -1))
+        self._free = list(
+            range(req_index_offset + max_num_reqs - 1, req_index_offset - 1, -1)
+        )
         self._num_free = max_num_reqs
 
     def open(self, key: SequenceKey) -> None:
@@ -184,15 +201,26 @@ class TokenStateMachine:
         state.reserved_end = len(blocks) * self.block_pool.block_size
         return blocks
 
-    def prefill(
-        self, key: SequenceKey, offset: int, tokens: tuple[int, ...], *, is_final: bool
-    ) -> None:
+    def validate_prefill(
+        self, key: SequenceKey, offset: int, tokens: tuple[int, ...]
+    ) -> TokenProgress:
+        """Validate a prompt chunk before allocation or prediction eviction."""
         state = self.sequences[key]
         self._tokens(tokens)
         if state.ready or offset != state.committed:
             raise AdapterError(
                 SpeculatorStatusCode.SEQUENCE_DESYNC, "prefill offset/finality mismatch"
             )
+        if offset + len(tokens) > self.max_model_len:
+            raise AdapterError(
+                SpeculatorStatusCode.OUT_OF_MEMORY, "context limit exceeded"
+            )
+        return state
+
+    def prefill(
+        self, key: SequenceKey, offset: int, tokens: tuple[int, ...], *, is_final: bool
+    ) -> None:
+        state = self.validate_prefill(key, offset, tokens)
         blocks = self._reserve(state, offset + len(tokens))
         self.executor.forward(
             key, state.req_index, offset, tokens, blocks, sample=False
@@ -200,10 +228,12 @@ class TokenStateMachine:
         state.committed += len(tokens)
         state.materialized = state.speculative_written_end = state.committed
         state.ready = is_final
+        state.prefix_revision += 1
 
-    def _prepare_advance(
+    def validate_advance(
         self, batch_id: int, row: TokenAdvanceRow, k: int
-    ) -> _TokenUpdate:
+    ) -> tuple[TokenProgress, int, int]:
+        """Check an authoritative update before touching live or branch storage."""
         state = self.sequences[row.key]
         self._tokens(row.delta)
         if (
@@ -240,7 +270,17 @@ class TokenStateMachine:
                 SpeculatorStatusCode.PROTOCOL_ERROR, "invalid draft budget"
             )
         committed = state.committed + len(row.delta)
+        if committed > self.max_model_len:
+            raise AdapterError(
+                SpeculatorStatusCode.OUT_OF_MEMORY, "context limit exceeded"
+            )
         valid_k = min(k, max(0, self.max_model_len - committed))
+        return state, committed, valid_k
+
+    def _prepare_advance(
+        self, batch_id: int, row: TokenAdvanceRow, k: int
+    ) -> _TokenUpdate:
+        state, committed, valid_k = self.validate_advance(batch_id, row, k)
         blocks = self._reserve(state, committed + max(valid_k - 1, 0))
         keep = min(state.speculative_written_end, state.committed + row.accepted)
         missing = row.delta[keep - state.committed :]
@@ -403,6 +443,7 @@ class TokenStateMachine:
             state.speculative_written_end = update.written_end
             state.proposal_tokens = tuple(update.drafts)
             state.proposal_id = update.batch_id
+            state.prefix_revision += 1
             state.pending_last_token = (
                 (update.written_end, update.drafts[-1]) if update.drafts else None
             )
