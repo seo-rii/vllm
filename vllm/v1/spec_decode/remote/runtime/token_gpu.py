@@ -24,6 +24,7 @@ from vllm.v1.spec_decode.remote.runtime.step import (
 )
 from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.token_schema import (
+    _validate_token_model,
     create_token_runtime_contract,
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import (
@@ -49,6 +50,23 @@ def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> N
         raise ValueError("token-only draft requires the default decoder model state")
 
 
+def create_token_executor_config(config: VllmConfig) -> VllmConfig:
+    """Give the standalone model its own dimensions, topology and attention window."""
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    return replace(
+        config,
+        model_config=spec.draft_model_config,
+        parallel_config=spec.draft_parallel_config,
+        quant_config=None,
+        cache_config=replace(
+            config.cache_config,
+            cache_dtype=spec.kv_cache_dtype or config.cache_config.cache_dtype,
+            sliding_window=_validate_token_model(spec.draft_model_config, "draft"),
+        ),
+    )
+
+
 class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
     def __init__(
         self, config: VllmConfig, *, device: torch.device, kv_cache_bytes: int
@@ -67,17 +85,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             )
         # Allocate attention/KV from the independent draft's dimensions. No
         # target modules, embeddings or output head are constructed here.
-        resource = replace(
-            config,
-            model_config=spec.draft_model_config,
-            parallel_config=spec.draft_parallel_config,
-            quant_config=None,
-            cache_config=(
-                replace(config.cache_config, cache_dtype=spec.kv_cache_dtype)
-                if spec.kv_cache_dtype is not None
-                else config.cache_config
-            ),
-        )
+        resource = create_token_executor_config(config)
         super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
 
     def _create_contract(self, config):
@@ -91,17 +99,23 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
         validate_token_model_inputs(config, speculator.model)
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
         from vllm.v1.spec_decode.remote.runtime.kv_layout import (
             select_standalone_kv_spec,
         )
         from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
 
         actual = select_standalone_kv_spec(get_kv_cache_spec(config))
-        if type(actual) is not FullAttentionSpec:
+        if type(actual) not in (FullAttentionSpec, SlidingWindowSpec):
             raise ValueError(
-                "token-only loaded draft requires homogeneous full attention KV"
+                "token-only loaded draft requires homogeneous full or "
+                "sliding-window attention KV"
             )
+        window = (
+            actual.sliding_window if isinstance(actual, SlidingWindowSpec) else None
+        )
+        if window != config.cache_config.sliding_window:
+            raise ValueError("loaded draft attention window differs from its contract")
         return speculator
 
     @property

@@ -112,10 +112,11 @@ head; it does not load the target transformer or target LM head.
 The server retains no request KV between proposals. K0 and unfinished prefill
 need no assistant forward because the next snapshot contains authoritative
 state. Sequence generation, connection epoch, monotonically increasing round
-and materialized length fence results. There is one active verifier connection
-with bounded open request identities. Unrelated closes wait until a pending
-batch reply has been collected; cancelling a participating request fences that
-connection. Import storage is released only after the assistant consumer completes.
+and materialized length fence results. The server defaults to one verifier
+connection; explicit connection and sequence credits enable multiple verifiers.
+Unrelated closes wait until a pending batch reply has been collected; cancelling
+a participating request fences its participating connections. Import storage is
+released only after the assistant consumer completes.
 
 HELLO negotiates a checkpoint/geometry fingerprint and bounded snapshot capacity.
 A control manifest for the entire batch precedes fixed-shape data frames. Each frame's byte cap is
@@ -129,20 +130,25 @@ warms up singleton and configured maximum batches before listening.
 The CLI defaults to one sequence. Singleton clients retain the existing v4 wire
 path. A batched client requires the server to acknowledge its requested capacity
 before using batch messages; an older singleton server rejects this handshake.
-Both processes must set compatible sequence limits. This is batching within one
-verifier, not N:M snapshot routing or cross-client scheduling.
+Both processes must set compatible per-batch sequence limits.
+[Shared workers](../features/speculative_decoding/draft_pool.md#gemma4-snapshot-workers)
+add sticky multi-endpoint routing and a single GPU owner that batches compatible
+snapshots across verifier connections. Ingress credits include snapshots being
+received, queued and executed; aggregate snapshot budgets also apply when jobs
+are combined. The singleton wire contract is unchanged.
 
 Timeout and cancellation close the connection. Affected requests remain
 terminal target-only, or raise under `failure_policy="error"`; a late reply
-cannot reactivate them. A new request can reconnect. A recoverable assistant
+cannot reactivate them. Healthy pool workers continue independently, and a new
+request can reconnect after backoff. A recoverable assistant
 forward OOM fences all rows submitted in that forward while preserving unrelated
 open requests. A verifier preparation or transport failure fences its connection.
 Socket cleanup errors preserve the selected failure policy and retire cancelled
 proposals. If registering a new request runs out of memory, its opened sequence
 credits are returned and the request remains terminal target-only until it ends.
 New requests can use the recovered capacity.
-Server socket cleanup errors also return connection admission and sequence
-credits, so a fresh verifier can reconnect after the failed connection retires.
+Server socket cleanup errors also return connection, verifier and sequence
+credits, so the same verifier or a fresh verifier can reconnect after retirement.
 Unknown CUDA completion and context-fatal errors propagate and
 require process restart. Closing a socket never serves as a GPU completion fence.
 

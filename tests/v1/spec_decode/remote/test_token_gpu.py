@@ -193,7 +193,7 @@ def token_executor(monkeypatch):
     )
 
     def slots(indices, qsl, positions, n):
-        values = []
+        values: list[int] = []
         for row, index in enumerate(indices.tolist()):
             blocks = staged.gpu[index].tolist()
             block_size = executor.block_size
@@ -422,12 +422,19 @@ def test_token_warmup_preserves_initial_error_when_cleanup_fails(
 def test_token_server_fences_unusable_warmup_cleanup(
     token_executor, monkeypatch, tmp_path, cleanup_phase, cuda_error_code
 ):
+    from vllm.v1.spec_decode.remote.capabilities import (
+        SpeculatorPlacementCapabilities,
+    )
     from vllm.v1.spec_decode.remote.errors import (
         CompletionUnknownError,
         CudaRuntimeError,
         runtime_unusable,
     )
-    from vllm.v1.spec_decode.remote.server import FakeDraftAdapter
+    from vllm.v1.spec_decode.remote.protocol import FeatureSlot, TargetFeatureSchema
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.schema import RuntimeContract
+    from vllm.v1.spec_decode.remote.runtime.token_adapter import TokenOnlyDraftAdapter
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
     from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
     executor, _, _, _ = token_executor
@@ -456,9 +463,26 @@ def test_token_server_fences_unusable_warmup_cleanup(
     monkeypatch.setattr(executor, "forward", fail_forward)
     monkeypatch.setattr(torch.Tensor, "zero_", zero)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: clean("sync"))
-    adapter = FakeDraftAdapter(vocab_size=128)
-    monkeypatch.setattr(adapter, "warmup", executor.warmup)
-    server = TokenDraftServer(adapter)
+    state = TokenStateMachine(
+        executor,
+        DraftBlockPool(executor.num_blocks, executor.block_size),
+        max_num_reqs=4,
+        max_model_len=16,
+        vocab_size=128,
+        max_k=3,
+    )
+    contract = RuntimeContract(
+        TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
+        SpeculatorPlacementCapabilities(
+            state_dependency="own_kv",
+            required_features=("token_ids",),
+            standalone_weights="complete",
+        ),
+        "target",
+        "tokenizer",
+        "draft",
+    )
+    server = TokenDraftServer(TokenOnlyDraftAdapter(state, contract))
     with pytest.raises(type(cleanup)) as raised:
         server.start(f"unix://{tmp_path}/not-listening.sock")
     assert raised.value is cleanup

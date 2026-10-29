@@ -4,6 +4,8 @@
 target-conditioned adapter driven end to end through the server."""
 
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import numpy as np
@@ -17,6 +19,7 @@ from tests.v1.spec_decode.remote.runtime_fixtures import (
     digest_row,
     make_planner,
 )
+from tests.v1.spec_decode.remote.test_token_pool_server import until
 from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
@@ -40,14 +43,21 @@ from vllm.v1.spec_decode.remote.runtime.step import (
     DraftStepRow,
 )
 from vllm.v1.spec_decode.remote.server import (
+    PrefillInputs,
     RemoteDraftServer,
+    StandaloneProposalBatch,
 )
-from vllm.v1.spec_decode.remote.session import RemoteDraftSession, VerifierIdentity
+from vllm.v1.spec_decode.remote.session import (
+    RemoteDraftSession,
+    VerifierIdentity,
+    frame_to_tensor,
+)
 from vllm.v1.spec_decode.remote.state import (
     FeatureBatch,
     RemoteProposalBatch,
     SequenceState,
 )
+from vllm.v1.spec_decode.remote.transport import DeviceFeature, ints_to_frame
 
 OK = SpeculatorStatusCode.OK
 
@@ -299,6 +309,88 @@ def round_(
             )
         )
     )
+
+
+class GatedFeatureTensor(torch.Tensor):
+    def __new__(cls, tensor, entered, release):
+        result = tensor.as_subclass(cls)
+        result.entered, result.release = entered, release
+        return result
+
+    def to(self, *args, **kwargs):
+        self.entered.set()
+        assert self.release.wait(5), "test must release feature materialization"
+        return self.as_subclass(torch.Tensor).to(*args, **kwargs)
+
+
+def test_pooled_deadlines_expiring_during_feature_materialization_preserve_live_rows():
+    planner = make_planner(num_blocks=12)
+    executor = KVDigestExecutor(planner.block_pool, max_num_tokens=8)
+    adapter = TargetConditionedDraftAdapter(
+        executor,
+        planner,
+        capabilities=CAPABILITIES,
+        feature_schema=SCHEMA,
+        methods={"mtp"},
+    )
+    expired = (SequenceKey("short", 0, 0), SequenceKey("short", 1, 0))
+    healthy = SequenceKey("live", 0, 0)
+    entered, release = threading.Event(), threading.Event()
+    for sequence, token in zip((*expired, healthy), (11, 12, 21)):
+        adapter.open_sequence(sequence)
+        tensor = GatedFeatureTensor(
+            torch.tensor([token], dtype=torch.int32), entered, release
+        )
+        adapter.prefill(
+            sequence,
+            PrefillInputs(
+                offset=0,
+                num_tokens=1,
+                is_final=True,
+                features=(DeviceFeature(0, "int32", (1,), tensor), None),
+            ),
+        )
+    batches = [
+        StandaloneProposalBatch(
+            batch_id=0,
+            keys=keys,
+            active_rows=tuple(range(len(keys))),
+            num_speculative_tokens=K,
+            accepted_counts=ints_to_frame(0, [0] * len(keys)),
+            recovery_tokens=ints_to_frame(0, recovery, dtype="int64"),
+            features=(ints_to_frame(0, []), None),
+            query_lens=(0,) * len(keys),
+        )
+        for keys, recovery in ((expired, [16, 16]), ((healthy,), [22]))
+    ]
+    deadline = time.monotonic() + 0.5
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            result = threads.submit(
+                adapter.advance_many, batches, deadlines=(deadline, deadline + 3)
+            )
+            try:
+                assert entered.wait(3)
+                until(lambda: time.monotonic() >= deadline)
+            finally:
+                release.set()
+            expired_result, healthy_result = result.result(3)
+        assert [row.key for plan in executor.plans for row in plan.rows] == [healthy]
+        assert not isinstance(expired_result, Exception), expired_result
+        assert not isinstance(healthy_result, Exception), healthy_result
+        assert expired_result.row_statuses == (SpeculatorStatusCode.TIMEOUT,) * 2
+        assert frame_to_tensor(expired_result.valid_lengths).tolist() == [0, 0]
+        assert healthy_result.row_statuses == (OK,)
+        assert frame_to_tensor(healthy_result.token_ids).tolist() == [
+            digest_row([21], 22)
+        ]
+        assert frame_to_tensor(healthy_result.valid_lengths).tolist() == [K]
+        assert planner.num_computed(healthy) == 1
+        assert all(planner.num_computed(sequence) == 0 for sequence in expired)
+    finally:
+        adapter.close_sequences((*expired, healthy))
+    assert planner.num_open == 0
+    assert planner.block_pool.num_free_blocks == planner.block_pool.num_blocks - 1
 
 
 @pytest.mark.parametrize("runtime", [(None, 64), (4, 8)], indirect=True)

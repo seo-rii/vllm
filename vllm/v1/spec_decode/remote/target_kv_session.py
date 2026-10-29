@@ -140,6 +140,11 @@ class TargetKVRemoteSession:
     def active(self, key: SequenceKey) -> bool:
         return self.records.get(key, False)
 
+    def epoch_for(self, key: SequenceKey) -> int:
+        if key not in self.records:
+            raise ValueError("unknown target-KV sequence")
+        return self._epoch
+
     def _invalidate(self):
         connection, self._conn = self._conn, None
         self._closing.clear()
@@ -235,20 +240,24 @@ class TargetKVRemoteSession:
 
     def _open_sequence(self, key: SequenceKey, *, deadline: float) -> SequenceKey:
         self.records[key] = True
+        row_error = None
         try:
             self.connect(deadline=deadline)
             self._flush_closes(deadline)
             request_id = next(self._ids)
             self._send(OpenSequence(key), request_id, deadline)
             ack = self._recv(request_id, deadline)
-            if (
-                not isinstance(ack, SequenceAck)
-                or ack.key != key
-                or ack.status is not SpeculatorStatusCode.OK
-            ):
+            if not isinstance(ack, SequenceAck) or ack.key != key:
                 raise ProtocolError("invalid target-KV open acknowledgment")
+            if ack.status is not SpeculatorStatusCode.OK:
+                self.records[key] = False
+                row_error = f"{ack.status.name}: {ack.detail}"
         except Exception as error:
             self.fail(f"target-KV open failed: {error}")
+        if row_error is not None:
+            logger.warning("Target-KV open rejected for %s: %s", key, row_error)
+            if self.failure_policy == "error":
+                raise RemoteDraftError(f"target-KV open rejected: {row_error}")
         return key
 
     def open_sequences(

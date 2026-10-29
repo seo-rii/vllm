@@ -22,6 +22,11 @@ from vllm.v1.spec_decode.remote.runtime.token_schema import (
     create_token_runtime_contract,
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+from vllm.v1.spec_decode.remote.token_pool import (
+    TokenDraftPool,
+    TokenPoolHandle,
+    TokenPoolRow,
+)
 from vllm.v1.spec_decode.remote.token_protocol import TokenHello
 from vllm.v1.spec_decode.remote.token_session import (
     TokenOnlyRemoteSession,
@@ -43,7 +48,7 @@ class _TokenHandle(ProposalHandle):
     round_id: int
     step: DraftStep
     context: LocalExecutionContext | None
-    rpc: TokenProposalHandle | None = None
+    rpc: TokenProposalHandle | TokenPoolHandle | None = None
     rows: tuple[int, ...] = ()
     output: SpeculatorOutput | None = None
     error: str | None = None
@@ -73,7 +78,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         self._terminal_requests: set[str] = set()
         self._pending: _TokenHandle | None = None
         self._closed = False
-        self._session: TokenOnlyRemoteSession | None = None
+        self._session: TokenOnlyRemoteSession | TokenDraftPool | None = None
         error = None
         if self._tp.rank_in_group == 0:
             try:
@@ -89,13 +94,18 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     vllm_config.model_config.max_model_len,
                 )
-                self._session = TokenOnlyRemoteSession(
-                    remote.endpoint,
-                    hello,
+                endpoints = spec.get_remote_draft_endpoints()
+                options = dict(
                     failure_policy=remote.failure_policy,
                     request_timeout_ms=remote.request_timeout_ms,
                     startup_timeout_ms=remote.startup_timeout_ms,
                 )
+                if len(endpoints) > 1:
+                    self._session = TokenDraftPool(endpoints, hello, **options)
+                else:
+                    self._session = TokenOnlyRemoteSession(
+                        remote.endpoint, hello, **options
+                    )
                 self._session.connect()
             except Exception as exc:
                 self.close()
@@ -193,7 +203,8 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         sampled = context.num_sampled.cpu().tolist()
         rejected = context.num_rejected.cpu().tolist()
         recovery = context.last_sampled[batch.idx_mapping].reshape(-1).cpu().tolist()
-        rows, indices = [], []
+        rows, prepared, indices = [], [], []
+        pooled = isinstance(session, TokenDraftPool)
         for i, req_id in enumerate(handle.step.request_ids):
             if req_id in self._terminal_requests:
                 continue
@@ -202,12 +213,17 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             if q < 1:
                 raise ValueError("target query cannot be empty")
             request = self._requests.get(req_id)
+            open_required = request is None
             if request is None:
                 if not handle.step.is_prefilling[i] or positions[start] != 0:
                     raise ValueError(
                         "new token requests must prefill from position zero"
                     )
-                key = session.open_sequence(next(self._sequences), deadline=deadline)
+                key = (
+                    session.reserve_sequence(next(self._sequences), deadline=deadline)
+                    if isinstance(session, TokenDraftPool)
+                    else session.open_sequence(next(self._sequences), deadline=deadline)
+                )
                 try:
                     request = _Request(key)
                     self._requests[req_id] = request
@@ -223,6 +239,8 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 range(request.target_computed, request.target_computed + q)
             ):
                 raise ValueError("token target positions are discontinuous")
+            prefill = None
+            final = False
             if handle.step.is_prefilling[i]:
                 remaining = int(batch.prefill_len_np[i]) - request.target_computed
                 if remaining <= 0:
@@ -239,14 +257,20 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     or sampled[i] != int(final)
                 ):
                     raise ValueError("unexpected sampling counts in token prefill")
-                session.prefill(
-                    request.key,
-                    tuple(tokens[start : start + prompt_tokens]),
-                    is_final=final,
-                    deadline=deadline,
-                )
+                prefill = tuple(tokens[start : start + prompt_tokens])
+                if not pooled:
+                    session.prefill(
+                        request.key, prefill, is_final=final, deadline=deadline
+                    )
                 request.target_computed += prompt_tokens
                 if not final or not session.active(request.key):
+                    if pooled and session.active(request.key):
+                        prepared.append(
+                            TokenPoolRow(
+                                request.key, open_required, prefill, final, None
+                            )
+                        )
+                        indices.append(i)
                     continue
                 accepted, offered = 0, 0
                 delta = (int(recovery[i]),)
@@ -269,20 +293,39 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     int(recovery[i]),
                 )
                 request.target_computed += int(sampled[i])
-            state = session.records[request.key]
-            rows.append(
-                TokenAdvanceRow(
-                    request.key,
-                    state.committed,
-                    state.proposal_id,
-                    offered,
-                    accepted,
-                    delta,
+            if pooled:
+                prepared.append(
+                    TokenPoolRow(
+                        request.key,
+                        open_required,
+                        prefill,
+                        final,
+                        (offered, accepted, delta),
+                    )
                 )
-            )
+            else:
+                state = session.records[request.key]
+                rows.append(
+                    TokenAdvanceRow(
+                        request.key,
+                        state.committed,
+                        state.proposal_id,
+                        offered,
+                        accepted,
+                        delta,
+                    )
+                )
             indices.append(i)
         handle.rows = tuple(indices)
-        if rows:
+        if prepared:
+            assert isinstance(session, TokenDraftPool)
+            handle.rpc = session.dispatch_prepared(
+                handle.round_id,
+                tuple(prepared),
+                handle.step.num_speculative_tokens,
+                deadline=deadline,
+            )
+        elif rows:
             handle.rpc = session.dispatch(
                 handle.round_id,
                 tuple(rows),
@@ -321,7 +364,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 try:
                     if handle.error is None and handle.rpc is not None:
                         assert self._session is not None and handle.output is not None
-                        result = self._session.collect(handle.rpc)
+                        if isinstance(handle.rpc, TokenPoolHandle):
+                            assert isinstance(self._session, TokenDraftPool)
+                            result = self._session.collect(handle.rpc)
+                        else:
+                            assert isinstance(self._session, TokenOnlyRemoteSession)
+                            result = self._session.collect(handle.rpc)
                         handle.output.token_ids[list(handle.rows)] = torch.tensor(
                             result.token_ids, dtype=torch.int64
                         )
@@ -370,7 +418,12 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             if self._session is not None:
                 try:
                     if handle.rpc is not None:
-                        self._session.cancel(handle.rpc)
+                        if isinstance(handle.rpc, TokenPoolHandle):
+                            assert isinstance(self._session, TokenDraftPool)
+                            self._session.cancel(handle.rpc)
+                        else:
+                            assert isinstance(self._session, TokenOnlyRemoteSession)
+                            self._session.cancel(handle.rpc)
                     else:
                         self._session._invalidate()
                 except Exception as exc:

@@ -23,6 +23,7 @@ import itertools
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Sequence
+from dataclasses import replace
 
 import torch
 
@@ -30,12 +31,14 @@ from vllm.v1.spec_decode.remote.capabilities import (
     SpeculatorPlacementCapabilities,
     TargetFeatureKind,
 )
+from vllm.v1.spec_decode.remote.errors import runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import (
     SequenceKey,
     SpeculatorStatusCode,
     TargetFeatureSchema,
 )
 from vllm.v1.spec_decode.remote.runtime.step import (
+    BlockTableUpdate,
     DraftStepPlan,
     DraftStepPlanner,
     DraftStepRow,
@@ -48,7 +51,12 @@ from vllm.v1.spec_decode.remote.server import (
     StandaloneProposalResult,
 )
 from vllm.v1.spec_decode.remote.session import frame_to_tensor, tensor_to_frame
-from vllm.v1.spec_decode.remote.transport import DataFrame, DeviceFeature, frame_to_ints
+from vllm.v1.spec_decode.remote.transport import (
+    DataFrame,
+    DeviceFeature,
+    frame_to_ints,
+    ints_to_frame,
+)
 
 Features = list[torch.Tensor | None]
 
@@ -173,9 +181,16 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         self.planner.commit(plan)
 
     def advance_and_propose(
-        self, batch: StandaloneProposalBatch
+        self,
+        batch: StandaloneProposalBatch,
+        *,
+        row_deadlines: Sequence[float | None] | None = None,
     ) -> StandaloneProposalResult:
         num_rows = len(batch.keys)
+        if row_deadlines is None:
+            row_deadlines = (batch.execution_deadline,) * num_rows
+        if len(row_deadlines) != num_rows:
+            raise ValueError("proposal deadlines do not match the rows")
         effective_k = batch.effective_num_speculative_tokens
         if effective_k is None:
             effective_k = batch.num_speculative_tokens
@@ -189,7 +204,17 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
         rows: list[DraftStepRow] = []
         batch_rows: list[int] = []
         sources: list[Features] = []
+
+        def expired(index: int) -> bool:
+            deadline = row_deadlines[index]
+            if deadline is not None and time.monotonic() >= deadline:
+                statuses[index] = SpeculatorStatusCode.TIMEOUT
+                return True
+            return False
+
         for i in batch.active_rows:
+            if expired(i):
+                continue
             key = batch.keys[i]
             query_len = batch.query_lens[i]
             last_chunk = self._last_chunks.get(key)
@@ -240,45 +265,48 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             num_rows, batch.num_speculative_tokens, dtype=torch.int64
         )
         for group in groups:
-            if (
-                batch.execution_deadline is not None
-                and time.monotonic() >= batch.execution_deadline
-            ):
-                for index in group:
-                    statuses[batch_rows[index]] = SpeculatorStatusCode.TIMEOUT
-                continue
-            plan, failures = self.planner.plan(
-                [rows[i] for i in group], num_speculative_tokens=effective_k
-            )
-            for index, (status, _) in failures.items():
-                statuses[batch_rows[group[index]]] = status
-            planned = [
-                (batch_rows[i], sources[i])
-                for index, i in enumerate(group)
-                if index not in failures
-            ]
-            if not planned:
-                continue
-            step_features = self._step_features(features, planned)
-            if (
-                batch.execution_deadline is not None
-                and time.monotonic() >= batch.execution_deadline
-            ):
-                for index, _ in planned:
-                    statuses[index] = SpeculatorStatusCode.TIMEOUT
-                continue
-            drafts = self.executor.execute(
-                plan,
-                step_features,
-                num_speculative_tokens=effective_k,
-            )
-            self.planner.commit(plan)
-            row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
-            token_ids[row_index, :effective_k] = drafts[:, :effective_k].to(
-                "cpu", torch.int64
-            )
-            for row in plan.rows:
-                self._last_chunks.pop(row.key, None)
+            pending_updates: dict[int, BlockTableUpdate] = {}
+            while group:
+                # Earlier work can consume another verifier's remaining budget.
+                group = [i for i in group if not expired(batch_rows[i])]
+                plan, failures = self.planner.plan(
+                    [rows[i] for i in group], num_speculative_tokens=effective_k
+                )
+                pending_updates.update(plan.block_table_updates)
+                for index, (status, _) in failures.items():
+                    statuses[batch_rows[group[index]]] = status
+                group = [i for index, i in enumerate(group) if index not in failures]
+                planned = [(batch_rows[i], sources[i]) for i in group]
+                if not planned:
+                    break
+                # Replanning reserves no new blocks for surviving rows, so retain
+                # the unapplied table updates from their first reservation.
+                plan = replace(
+                    plan,
+                    block_table_updates={
+                        int(index): pending_updates[int(index)]
+                        for index in plan.req_indices
+                        if int(index) in pending_updates
+                    },
+                )
+                step_features = self._step_features(features, planned)
+                live = [i for i in group if not expired(batch_rows[i])]
+                if len(live) != len(group):
+                    group = live
+                    continue
+                drafts = self.executor.execute(
+                    plan,
+                    step_features,
+                    num_speculative_tokens=effective_k,
+                )
+                self.planner.commit(plan)
+                row_index = torch.tensor([i for i, _ in planned], dtype=torch.long)
+                token_ids[row_index, :effective_k] = drafts[:, :effective_k].to(
+                    "cpu", torch.int64
+                )
+                for row in plan.rows:
+                    self._last_chunks.pop(row.key, None)
+                break
         valid_lengths = torch.tensor(
             [
                 effective_k if status is SpeculatorStatusCode.OK else 0
@@ -291,6 +319,117 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             valid_lengths=tensor_to_frame(0, valid_lengths),
             row_statuses=tuple(statuses),
         )
+
+    def advance_many(
+        self,
+        batches: Sequence[StandaloneProposalBatch],
+        *,
+        deadlines: Sequence[float | None] | None = None,
+    ) -> list[StandaloneProposalResult | Exception]:
+        """Batch compatible verifier rounds without changing any row's K budget."""
+        if deadlines is None:
+            deadlines = tuple(batch.execution_deadline for batch in batches)
+        if len(deadlines) != len(batches):
+            raise ValueError("proposal deadlines do not match the batches")
+        groups: dict[tuple[int, tuple[bool, ...]], list[int]] = {}
+        for i, batch in enumerate(batches):
+            k = batch.effective_num_speculative_tokens
+            if k is None:
+                k = batch.num_speculative_tokens
+            groups.setdefault(
+                (k, tuple(f is not None for f in batch.features)), []
+            ).append(i)
+        results: list[StandaloneProposalResult | Exception] = [
+            RuntimeError("draft batch was not executed") for _ in batches
+        ]
+        fatal: Exception | None = None
+        for (k, _), indexes in groups.items():
+            if fatal is not None:
+                for i in indexes:
+                    results[i] = fatal
+                continue
+            try:
+                group = [batches[i] for i in indexes]
+                row_deadlines = tuple(
+                    deadlines[i] for i in indexes for _ in batches[i].keys
+                )
+                if len(group) == 1:
+                    results[indexes[0]] = self.advance_and_propose(
+                        group[0], row_deadlines=row_deadlines
+                    )
+                    continue
+                starts = list(
+                    itertools.accumulate((len(b.keys) for b in group), initial=0)
+                )
+                features: list[DeviceFeature | None] = []
+                for slot in range(len(self._schema.slots)):
+                    frames = [batch.features[slot] for batch in group]
+                    if frames[0] is None:
+                        features.append(None)
+                        continue
+                    present = [frame for frame in frames if frame is not None]
+                    assert len(present) == len(frames)
+                    tensors = [frame_to_tensor(frame) for frame in present]
+                    device = next(
+                        (t.device for t in tensors if t.is_cuda), tensors[0].device
+                    )
+                    tensor = torch.cat([t.to(device) for t in tensors])
+                    features.append(
+                        DeviceFeature(
+                            slot, present[0].dtype, tuple(tensor.shape), tensor
+                        )
+                    )
+                width = max(batch.num_speculative_tokens for batch in group)
+                merged = StandaloneProposalBatch(
+                    batch_id=group[0].batch_id,
+                    keys=tuple(key for batch in group for key in batch.keys),
+                    active_rows=tuple(
+                        start + row
+                        for start, batch in zip(starts, group)
+                        for row in batch.active_rows
+                    ),
+                    num_speculative_tokens=width,
+                    accepted_counts=ints_to_frame(
+                        0,
+                        [
+                            value
+                            for batch in group
+                            for value in frame_to_ints(batch.accepted_counts)
+                        ],
+                    ),
+                    recovery_tokens=ints_to_frame(
+                        0,
+                        [
+                            value
+                            for batch in group
+                            for value in frame_to_ints(batch.recovery_tokens)
+                        ],
+                    ),
+                    features=tuple(features),
+                    query_lens=tuple(
+                        length for batch in group for length in batch.query_lens
+                    ),
+                    effective_num_speculative_tokens=k,
+                )
+                result = self.advance_and_propose(merged, row_deadlines=row_deadlines)
+                tokens, lengths = (
+                    frame_to_tensor(result.token_ids),
+                    frame_to_tensor(result.valid_lengths),
+                )
+                for index, start, end, batch in zip(indexes, starts, starts[1:], group):
+                    results[index] = StandaloneProposalResult(
+                        tensor_to_frame(
+                            0, tokens[start:end, : batch.num_speculative_tokens]
+                        ),
+                        tensor_to_frame(0, lengths[start:end]),
+                        result.row_statuses[start:end],
+                    )
+            except Exception as error:
+                for index in indexes:
+                    results[index] = error
+                if runtime_unusable(error):
+                    fatal = error
+        return results
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
         for key in keys:
@@ -323,7 +462,11 @@ class TargetConditionedDraftAdapter(StandaloneDraftAdapter):
             if any(segment is None for segment in segments):
                 step.append(None)
             else:
-                step.append(torch.cat(segments))  # type: ignore[arg-type]
+                tensors = [segment for segment in segments if segment is not None]
+                device = next(
+                    (t.device for t in tensors if t.is_cuda), tensors[0].device
+                )
+                step.append(torch.cat([t.to(device) for t in tensors]))
         return step
 
 

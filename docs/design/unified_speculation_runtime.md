@@ -2,7 +2,9 @@
 
 The native local speculator remains the default. An opt-in backend boundary
 adds local wrappers, same-step dispatch/collect and a token-only standalone
-draft. Predictive caching, N:M pooling, stochastic remote sampling, prefix
+draft. [N:M draft pooling](../features/speculative_decoding/draft_pool.md)
+adds sticky routing and bounded cross-client batching. Predictive caching,
+stochastic remote sampling, prefix
 reuse, async scheduling, cross-node transport and draft TP expansion are
 outside this implementation.
 
@@ -65,7 +67,9 @@ a remote reader finished.
 ## Configuration and protocol boundaries
 
 Execution separates placement from the speculative method. Only `on_demand`
-policy and one endpoint are accepted. Local execution rejects remote endpoint,
+policy is accepted. Own-KV target-conditioned, token-only and Gemma4 target-KV
+snapshot execution accept a bounded pool of same-contract workers.
+Local execution rejects remote endpoint,
 transport, failure-policy, and timeout options. Supplying both legacy
 `remote_draft` and `execution` is an error. Legacy remote configuration keeps its
 existing defaults and v2 semantics; `transport="auto"` still means inline.
@@ -125,15 +129,20 @@ tail KV cannot be treated as committed state.
 
 A standalone loader and forward path reuse native model execution without a
 target shell or a second inference engine. The supported mode is greedy,
-text-only native decoder models with homogeneous causal full attention,
-same-host inline, target TP1 and draft TP1, with no heterogeneous vocabulary or
-parallel drafting. Qwen3, Llama and Mistral configured with `sliding_window=null`
-are examples; the runtime checks model capabilities and the loaded draft's
+text-only native decoder models with homogeneous causal full or sliding-window
+attention, same-host inline, target TP1 and draft TP1, with no heterogeneous
+vocabulary or parallel drafting. Qwen3, Llama and Mistral are examples; the runtime
+checks model capabilities and the loaded draft's
 actual KV specification rather than requiring a model-type name. Loaded drafts
 must accept token IDs and positions alone and use the default decoder model
 state. Target and
-draft may have different hidden sizes, layer counts and attention geometry.
-Sliding-window, chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
+draft may have different hidden sizes, layer counts, attention geometry and
+window sizes. Each model uses its own attention window; all draft layers must
+share one KV layout and window. The standalone draft retains full-context KV
+blocks, including positions outside the current window, so rejection and replay
+never depend on evicted pages. Sliding-window support therefore does not reduce
+the draft KV reservation to the window size.
+Mixed full/sliding attention, chunked, sparse/MLA, recurrent/hybrid, encoder-decoder,
 multimodal and Transformers-backend execution remain unsupported. Select the built-in
 `tokenizer_mode="hf"` explicitly.
 Tokenizer compatibility is checked against the draft checkpoint's own artifacts,
