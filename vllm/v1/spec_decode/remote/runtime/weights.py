@@ -74,6 +74,7 @@ def materialize_target_shell(
     device: torch.device,
     *,
     shared_weights_source: str = "auto",
+    include_lm_head: bool = True,
 ) -> torch.nn.Module:
     """Create only the modules the existing local draft loader shares."""
     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -105,7 +106,11 @@ def materialize_target_shell(
             *embedding_names,
         )
     tied = getattr(model_config.hf_config, "tie_word_embeddings", False)
-    names = embedding_names if tied else (*embedding_names, "lm_head.weight")
+    names = (
+        (*embedding_names, "lm_head.weight")
+        if include_lm_head and not tied
+        else embedding_names
+    )
     tensors = selected_checkpoint_weights(source, revision, names)
     if source != model_config.model:
         expected = selected_checkpoint_weights(
@@ -127,11 +132,15 @@ def materialize_target_shell(
             f"found {present_embeddings}"
         )
     embed = tensors[present_embeddings[0]]
-    head = embed if tied else tensors.get("lm_head.weight")
-    if head is None:
+    head = (
+        (embed if tied else tensors.get("lm_head.weight")) if include_lm_head else None
+    )
+    if include_lm_head and head is None:
         raise ValueError(f"{source} has no lm_head.weight and is not tied")
     shape = (model_config.get_vocab_size(), model_config.get_hidden_size())
     for name, tensor in (("embedding", embed), ("LM head", head)):
+        if tensor is None:
+            continue
         if tuple(tensor.shape) != shape or tensor.dtype not in (
             torch.float16,
             torch.bfloat16,
@@ -148,6 +157,9 @@ def materialize_target_shell(
         shell.model.embed_tokens = VocabParallelEmbedding(
             *shape, params_dtype=model_config.dtype, quant_config=None
         )
+    shell.model.embed_tokens.weight_loader(shell.model.embed_tokens.weight, embed)
+    if not include_lm_head:
+        return shell
     # The unquantized, bias-free head needs no second materialized allocation.
     with torch.device("meta") if tied else device:
         shell.lm_head = ParallelLMHead(
@@ -155,14 +167,16 @@ def materialize_target_shell(
         )
     if tied:
         shell.lm_head = shell.lm_head.tie_weights(shell.model.embed_tokens)
-    shell.model.embed_tokens.weight_loader(shell.model.embed_tokens.weight, embed)
     if not tied:
+        assert head is not None
         shell.lm_head.weight_loader(shell.lm_head.weight, head)
     return shell
 
 
 def model_weight_bytes(model: torch.nn.Module) -> tuple[int, int, int]:
     """Count draft, embedding, and head weights, assigning ties to embedding."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
     remaining = {id(p): p for p in model.parameters()}
 
     def take(module: torch.nn.Module | None) -> int:
@@ -175,5 +189,8 @@ def model_weight_bytes(model: torch.nn.Module) -> tuple[int, int, int]:
 
     embedding = take(getattr(model.model, "embed_tokens", None))
     head = take(getattr(model, "lm_head", None))
+    for module in model.modules():
+        if isinstance(module, ParallelLMHead):
+            head += take(module)
     draft = sum(p.numel() * p.element_size() for p in remaining.values())
     return draft, embedding, head
