@@ -3,7 +3,6 @@
 """Actual v4 socket boundaries with CPU snapshots; no GPU/model claims."""
 
 import errno
-import os
 import socket
 import struct
 import threading
@@ -405,27 +404,69 @@ def test_snapshot_capacity_rejects_before_receiving_data_or_executor(wire_runtim
     assert not executor.calls
 
 
-def test_second_connection_is_refused_without_running_adapter(wire_runtime):
-    _, executor, client = wire_runtime
+@pytest.mark.parametrize("wire_runtime", [{"max_connections": 2}], indirect=True)
+@pytest.mark.parametrize("close_error", [False, True])
+def test_second_connection_is_refused_without_running_adapter(
+    wire_runtime, monkeypatch, close_error
+):
+    server, executor, client = wire_runtime
+    accepted = []
+    accepting = threading.Event()
+    accept_socket, close_socket = socket.socket.accept, socket.socket.close
+    failure = OSError(errno.EIO, "injected rejected socket close failure")
+    with server._connections_lock:
+        previous_workers = tuple(server._workers)
+
+    def accept(sock):
+        accepting.set()
+        connection, address = accept_socket(sock)
+        accepted.append(connection)
+        return connection, address
+
+    def close(sock):
+        if close_error and sock in accepted:
+            raise failure
+        close_socket(sock)
+
     second = TargetKVRemoteSession(
         client.endpoint, client.hello, expected_specs=client.expected_specs
     )
     try:
-        with pytest.raises(TransportError):
-            second.connect()
+        with monkeypatch.context() as patch:
+            patch.setattr(socket.socket, "accept", accept)
+            patch.setattr(socket.socket, "close", close)
+            assert accepting.wait(timeout=3)
+            with pytest.raises(TransportError):
+                second.connect()
+            with server._connections_lock:
+                workers = tuple(w for w in server._workers if w not in previous_workers)
+            for worker in workers:
+                worker.join(timeout=3)
+                assert not worker.is_alive()
+        assert len(accepted) == len(workers) == 1
         assert not executor.calls
+        if close_error:
+            assert not server.healthy and server.wait(timeout=0)
+            assert server._lifecycle_error is failure
+            with server._connections_lock:
+                assert any(c._sock is accepted[0] for c in server._connections)
+        else:
+            assert server.healthy
     finally:
         second.close()
+        for connection in accepted:
+            close_socket(connection)
 
 
 @pytest.mark.parametrize(
     "wire_runtime", [{"max_connections": 1}, {"max_connections": 2}], indirect=True
 )
-def test_server_close_error_returns_connection_and_sequence_credit(
-    wire_runtime, monkeypatch
+@pytest.mark.parametrize("closed_before_error", [False, True])
+def test_server_close_error_retains_connection_and_requires_restart(
+    wire_runtime, monkeypatch, closed_before_error
 ):
-    """A failed accepted socket cannot retain pool or verifier admission."""
-    server, executor, client = wire_runtime
+    """Unconfirmed socket cleanup keeps its owner and forbids runtime reuse."""
+    server, _, client = wire_runtime
     key = client.open_sequence(0, deadline=client.deadline())
     assert propose(client, snapshot(client, key)).token_ids == (18,)
     assert len(server.registry) == 1
@@ -434,45 +475,36 @@ def test_server_close_error_returns_connection_and_sequence_credit(
         worker = server._workers[0]
     errors: list[threading.ExceptHookArgs] = []
     monkeypatch.setattr(threading, "excepthook", errors.append)
-    replacement = TargetKVRemoteSession(
-        client.endpoint,
-        client.hello,
-        expected_specs=client.expected_specs,
-        startup_timeout_ms=1000,
-        request_timeout_ms=1000,
-    )
-    other = TargetKVRemoteSession(
-        client.endpoint,
-        msgspec.structs.replace(client.hello, verifier_instance_id="other-verifier"),
-        expected_specs=client.expected_specs,
-        startup_timeout_ms=1000,
-        request_timeout_ms=1000,
-    )
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected target-KV socket close failure")
+
+    def fail_close(sock):
+        if sock is connection._sock:
+            if closed_before_error:
+                close_socket(sock)
+            raise failure
+        close_socket(sock)
+
     try:
-        # Close the real descriptor only after its snapshot job has completed.
-        os.close(connection._sock.fileno())
-        client.close()
-        worker.join(timeout=3)
+        with monkeypatch.context() as patch:
+            patch.setattr(socket.socket, "close", fail_close)
+            client.close()
+            worker.join(timeout=3)
         assert not worker.is_alive()
-        assert not server._connections and not server._handshaking
-        assert not server._verifiers
-        assert len(server.registry) == 0 and server.healthy
-        assert server.pending_snapshot_jobs == server.pending_snapshot_bytes == 0
         assert connection.closed
+        assert (connection._sock.fileno() == -1) is closed_before_error
         assert not errors, [error.exc_value for error in errors]
-        # Both the same identity and an unrelated verifier must recover capacity.
-        replacement.connect()
-        key = replacement.open_sequence(0, deadline=replacement.deadline())
-        assert propose(replacement, snapshot(replacement, key)).token_ids == (18,)
-        replacement.close()
-        until(lambda: not server._connections and not len(server.registry))
-        other.connect()
-        key = other.open_sequence(0, deadline=other.deadline())
-        assert propose(other, snapshot(other, key)).token_ids == (18,)
-        assert len(executor.calls) == 3
+        assert connection in server._connections and not server._handshaking
+        assert not server._verifiers
+        assert server.pending_snapshot_jobs == server.pending_snapshot_bytes == 0
+        assert server.registry.get(key) is not None and not server.healthy
+        assert server.wait(timeout=0) and server._lifecycle_error is failure
+        server.stop()
+        assert not server.healthy and server._lifecycle_error is failure
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            server.start(client.endpoint)
     finally:
-        replacement.close()
-        other.close()
+        close_socket(connection._sock)
 
 
 def test_session_construction_failure_releases_connection_admission(
@@ -1289,3 +1321,33 @@ def test_partial_batch_open_retires_unreturned_sequences(wire_runtime):
     assert client.active(key)
     client.close_sequences((key,))
     assert not client.records
+
+
+@pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_collect_allocation_failure_retires_pending_snapshot(wire_runtime, policy):
+    """Result allocation belongs to the same cleanup boundary as socket reads."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+
+    server, _, client = wire_runtime
+    client.failure_policy = policy
+    key = client.open_sequence(0, deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    failure = MemoryError("snapshot result allocation")
+    with allocation_failures(
+        [(TargetKVRemoteSession.collect_batch, "results = [TargetKVResult()", failure)]
+    ) as failures:
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="snapshot result allocation"):
+                client.collect(handle)
+        else:
+            assert client.collect(handle).valid_length == 0
+    assert failures == [failure]
+    assert not handle.active
+    assert client._pending is None
+    assert not client.active(key)
+    until(lambda: not server._connections and len(server.registry) == 0)
