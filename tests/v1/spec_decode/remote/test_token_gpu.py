@@ -44,6 +44,54 @@ def test_token_native_input_contract_rejects_unsupported_dependencies(tmp_path, 
         validate_token_model_inputs(config, model)
 
 
+@pytest.mark.parametrize(
+    "backend,expected",
+    [
+        (None, None),
+        ("auto", None),
+        ("AUTO", None),
+        ("triton_attn", "TRITON_ATTN"),
+        ("TRITON_ATTN", "TRITON_ATTN"),
+        ("unknown_backend", "invalid"),
+    ],
+)
+def test_token_cli_target_attention_uses_native_normalization(
+    monkeypatch, backend, expected
+):
+    import vllm.engine.arg_utils as engine
+    import vllm.v1.spec_decode.remote.runtime.token_cli as cli
+    import vllm.v1.spec_decode.remote.runtime.token_gpu as runtime
+
+    captured = {}
+
+    def engine_args(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(create_engine_config=lambda: object())
+
+    monkeypatch.setattr(engine, "EngineArgs", engine_args)
+    monkeypatch.setattr(runtime, "make_token_gpu_adapter", lambda *a, **kw: object())
+    argv = [
+        "--endpoint",
+        "unix:///tmp/unused-token-cli.sock",
+        "--target-model",
+        "test/target",
+        "--draft-model",
+        "test/draft",
+    ]
+    if backend is not None:
+        argv.extend(["--target-attention-backend", backend])
+    args = cli.parser().parse_args(argv)
+    if expected == "invalid":
+        with pytest.raises(ValueError, match="Unknown attention backend"):
+            cli.create_adapter(args)
+        assert not captured
+        return
+    cli.create_adapter(args)
+    actual = captured["attention_config"].backend
+    assert (actual.name if actual is not None else None) == expected
+    assert captured["speculative_config"]["attention_backend"] is None
+
+
 def test_native_independent_loader_never_needs_target_weights(monkeypatch):
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
 
