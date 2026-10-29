@@ -119,11 +119,14 @@ class TargetKVDraftServer(RemoteDraftServer):
         if not self._connection_turn.acquire(blocking=False):
             try:
                 conn.close()
-            except OSError as error:
+            except BaseException as error:
+                self._lifecycle_failed(error)
                 logger.warning("Target-KV connection cleanup failed: %s", error)
-            finally:
+            else:
                 with self._connections_lock:
                     self._connections.discard(conn)
+            finally:
+                with self._connections_lock:
                     self._handshaking.discard(conn)
             return
         session: _TargetKVServerSession | None = None
@@ -143,11 +146,14 @@ class TargetKVDraftServer(RemoteDraftServer):
             finally:
                 try:
                     conn.close()
-                except OSError as error:
+                except BaseException as error:
+                    self._lifecycle_failed(error)
                     logger.warning("Target-KV connection cleanup failed: %s", error)
-                finally:
+                else:
                     with self._connections_lock:
                         self._connections.discard(conn)
+                finally:
+                    with self._connections_lock:
                         self._handshaking.discard(conn)
                     self._connection_turn.release()
 
