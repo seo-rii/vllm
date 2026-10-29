@@ -13,7 +13,8 @@ import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
+from multiprocessing.connection import Connection
 from unittest.mock import Mock, call
 
 import msgspec
@@ -218,6 +219,78 @@ def test_draft_tp_socket_cleanup_failure_still_reaps_every_rank(
             )
     finally:
         group.close()
+
+
+@pytest.mark.parametrize("stage", ["pipe", "process"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_draft_tp_startup_closes_unregistered_descriptors(
+    monkeypatch, stage, cleanup_failure
+):
+    """Retained startup errors must not retain open pre-registration channels."""
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    context = multiprocessing.get_context("spawn")
+    socketpair, pipe = socket.socketpair, context.Pipe
+    opened: list[socket.socket | Connection] = []
+    failure = OSError(errno.EMFILE, f"{stage} descriptor exhaustion")
+    close_error = OSError(errno.EIO, "startup socket cleanup")
+
+    class CleanupSocket(socket.socket):
+        def close(self):
+            live = self.fileno() >= 0
+            super().close()
+            if live and cleanup_failure:
+                raise close_error
+
+    def channels():
+        parent, child = socketpair()
+        parent = CleanupSocket(fileno=parent.detach())
+        opened.extend((parent, child))
+        return parent, child
+
+    def death_pipe(*args, **kwargs):
+        if stage == "pipe":
+            raise failure
+        pair = pipe(*args, **kwargs)
+        opened.extend(pair)
+        return pair
+
+    def process(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(socket, "socketpair", channels)
+    monkeypatch.setattr(context, "Pipe", death_pipe)
+    monkeypatch.setattr(context, "Process", process)
+    try:
+        with pytest.raises(CompletionUnknownError) as caught:
+            TPProcessGroup(2, _draft_tp_gloo_worker)
+        assert len(opened) == (2 if stage == "pipe" else 4)
+        assert all(
+            resource.fileno() == -1
+            if isinstance(resource, socket.socket)
+            else resource.closed
+            for resource in opened
+        )
+        pending, errors = [caught.value], set()
+        while pending:
+            error = pending.pop()
+            if error in errors:
+                continue
+            errors.add(error)
+            if error.__cause__ is not None:
+                pending.append(error.__cause__)
+            if error.__context__ is not None:
+                pending.append(error.__context__)
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+        assert failure in errors
+        if cleanup_failure:
+            assert close_error in errors
+    finally:
+        for resource in opened:
+            with suppress(OSError):
+                resource.close()
 
 
 def _draft_tp_sigint_owner(connection, init_method):
