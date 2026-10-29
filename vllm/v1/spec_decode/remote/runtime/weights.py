@@ -11,6 +11,7 @@ from huggingface_hub.errors import EntryNotFoundError
 from safetensors import safe_open
 
 from vllm.transformers_utils.repo_utils import hf_api
+from vllm.v1.spec_decode.remote.runtime.quantization import validate_shared_weight
 from vllm.v1.spec_decode.remote.runtime.schema import checkpoint_revision
 
 if TYPE_CHECKING:
@@ -141,16 +142,7 @@ def materialize_target_shell(
     for name, tensor in (("embedding", embed), ("LM head", head)):
         if tensor is None:
             continue
-        if tuple(tensor.shape) != shape or tensor.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-            torch.float64,
-        ):
-            raise ValueError(
-                f"standalone {name} requires an unquantized {shape} weight; "
-                f"got {tuple(tensor.shape)} {tensor.dtype}"
-            )
+        validate_shared_weight(name, tensor, shape)
     shell = torch.nn.Module()
     shell.model = torch.nn.Module()
     with device:

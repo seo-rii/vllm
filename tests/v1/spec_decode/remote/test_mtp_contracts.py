@@ -980,6 +980,7 @@ def _qwen35_public_config(
     dtype="bfloat16",
     wrapped=False,
     endpoints=None,
+    cache_dtype="auto",
 ):
     from transformers import Qwen3_5ForCausalLM
 
@@ -1040,13 +1041,22 @@ def _qwen35_public_config(
             model_cls = Qwen3_5MoeForCausalLM if moe else Qwen3_5ForCausalLM
             model = model_cls(hf).to(torch.bfloat16)
         embedding = model.get_input_embeddings().weight.detach()
-        save_file(
-            {
-                "model.embed_tokens.weight": embedding,
-                "lm_head.weight": model.get_output_embeddings().weight.detach(),
-            },
-            path / "model.safetensors",
-        )
+        weights = {
+            "model.embed_tokens.weight": embedding,
+            "lm_head.weight": model.get_output_embeddings().weight.detach(),
+        }
+        if model_options.get("quantization_config") is not None:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                input_to_float8,
+            )
+
+            name = "model.layers.1.self_attn.o_proj"
+            quantized, scale = input_to_float8(
+                model.state_dict()[name + ".weight"].float(), torch.float8_e4m3fn
+            )
+            weights[name + ".weight"] = quantized
+            weights[name + ".weight_scale"] = scale
+        save_file(weights, path / "model.safetensors")
 
     target_path = draft_path = tmp_path
     if draft_options is not None:
@@ -1087,7 +1097,7 @@ def _qwen35_public_config(
         model_config=target,
         parallel_config=parallel,
         speculative_config=spec,
-        cache_config=CacheConfig(enable_prefix_caching=False),
+        cache_config=CacheConfig(enable_prefix_caching=False, cache_dtype=cache_dtype),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=64,
@@ -1225,6 +1235,357 @@ def test_qwen35_shared_shell_materializes_the_native_embedding_and_head(tmp_path
     assert torch.equal(shell.lm_head.weight[:32], expected["lm_head.weight"])
     assert shell.model.embed_tokens.weight is not shell.lm_head.weight
     assert model_weight_bytes(shell) == (0, 16384, 16384)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_qwen35_serialized_fp8_preserves_bf16_features_and_shared_weights(tmp_path, k):
+    """Real FP8 weight bytes do not change the target feature or shared shell dtype."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    config = _qwen35_public_config(
+        tmp_path,
+        k=k,
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+    )
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    assert (
+        config.model_config.quantization
+        == spec.draft_model_config.quantization
+        == "fp8"
+    )
+    assert isinstance(config.quant_config, Fp8Config)
+    assert config.quant_config.is_checkpoint_fp8_serialized
+    assert config.quant_config.activation_scheme == "dynamic"
+    assert config.quant_config.weight_block_size is None
+    assert config.quant_config.store_dtype is None
+    saved = load_file(tmp_path / "model.safetensors")
+    projection = "model.layers.1.self_attn.o_proj"
+    assert saved[projection + ".weight"].dtype == torch.float8_e4m3fn
+    scale = saved[projection + ".weight_scale"]
+    assert scale.dtype == torch.float32 and scale.ndim == 0 and scale > 0
+    contract = create_runtime_contract(config)
+    assert contract.schema.slots[2].dtype == "bfloat16"
+    assert contract.weight_profile is not None
+    assert contract.weight_profile.format == "fp8_per_tensor_dynamic"
+    assert contract.weight_profile.compute_dtype == torch.bfloat16
+    shell = materialize_target_shell(config.model_config, torch.device("cpu"))
+    assert (
+        shell.model.embed_tokens.weight.dtype
+        == shell.lm_head.weight.dtype
+        == (torch.bfloat16)
+    )
+    assert torch.equal(shell.lm_head.weight[:32], saved["lm_head.weight"])
+
+
+def _qwen35_complete_fp8_config(tmp_path):
+    from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
+        _save_qwen35_fp8_mtp_model,
+    )
+    from vllm.engine.arg_utils import EngineArgs
+
+    model, receipt = _save_qwen35_fp8_mtp_model(tmp_path)
+    assert receipt["checkpoint_tensors"] == 66
+    return EngineArgs(
+        model=model,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        block_size=16,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        attention_config={"backend": "TRITON_ATTN"},
+        speculative_config=dict(
+            method="mtp",
+            model=model,
+            num_speculative_tokens=1,
+            draft_tensor_parallel_size=1,
+            draft_sample_method="greedy",
+        ),
+        mamba_backend="triton",
+        use_replayssm=False,
+        gdn_prefill_backend="triton",
+    ).create_engine_config()
+
+
+@pytest.mark.parametrize(
+    "layout,omitted",
+    [
+        ("split", None),
+        ("fused", None),
+        ("split", "self_attn.o_proj.weight"),
+        ("split", "self_attn.o_proj.weight_scale"),
+        ("split", "self_attn.q_proj.weight"),
+        ("split", "self_attn.k_proj.weight_scale"),
+        ("split", "mlp.gate_proj.weight"),
+        ("split", "mlp.up_proj.weight_scale"),
+    ],
+)
+def test_qwen35_fp8_native_load_requires_projection_and_scale(
+    tmp_path, layout, omitted
+):
+    """Independent projection omissions must fail before native postprocessing."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.model_executor.model_loader.utils import get_draft_load_config
+    from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm.v1.spec_decode.remote.runtime.quantization import (
+        require_complete_native_weights,
+        resolve_native_weight_profile,
+        validate_loaded_weight_profile,
+    )
+
+    config = _qwen35_complete_fp8_config(tmp_path)
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    profile = resolve_native_weight_profile(draft, allow_fp8_per_tensor=True)
+    config = require_complete_native_weights(config, profile)
+    path = Path(draft.model) / "model.safetensors"
+    weights = load_file(path)
+    groups = (
+        ("self_attn", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+        ("mlp", "gate_up_proj", ("gate_proj", "up_proj")),
+    )
+    if layout == "fused":
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            input_to_float8,
+        )
+
+        for parent, fused, sources in groups:
+            prefix = "mtp.layers.0." + parent + "."
+            dense = torch.cat(
+                [
+                    weights.pop(prefix + source + ".weight").float()
+                    * weights.pop(prefix + source + ".weight_scale")
+                    for source in sources
+                ]
+            )
+            (
+                weights[prefix + fused + ".weight"],
+                weights[prefix + fused + ".weight_scale"],
+            ) = input_to_float8(dense, torch.float8_e4m3fn)
+    if omitted is not None:
+        del weights["mtp.layers.0." + omitted]
+    if layout == "fused" or omitted is not None:
+        save_file(weights, path, metadata={"format": "pt"})
+    loader = get_model_loader(get_draft_load_config(config))
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        model = loader.create_model(config, draft)
+        if omitted is None:
+            loader.load_weights(model, draft)
+            projection = model.model.layers[0].self_attn.o_proj
+            expected = weights["mtp.layers.0.self_attn.o_proj.weight"]
+            assert projection.weight.dtype == expected.dtype == torch.float8_e4m3fn
+            assert torch.equal(
+                projection.weight.view(torch.uint8), expected.view(torch.uint8)
+            )
+            assert torch.equal(
+                projection.weight_scale,
+                weights["mtp.layers.0.self_attn.o_proj.weight_scale"].reshape_as(
+                    projection.weight_scale
+                ),
+            )
+            for parent, fused, sources in groups:
+                prefix = "mtp.layers.0." + parent + "."
+                projection = model.model.layers[0].get_submodule(parent + "." + fused)
+                if layout == "fused":
+                    expected = weights[prefix + fused + ".weight"]
+                    scales = weights[prefix + fused + ".weight_scale"].expand(
+                        len(sources)
+                    )
+                else:
+                    expected = torch.cat(
+                        [weights[prefix + source + ".weight"] for source in sources]
+                    )
+                    scales = torch.stack(
+                        [
+                            weights[prefix + source + ".weight_scale"]
+                            for source in sources
+                        ]
+                    )
+                assert torch.equal(
+                    projection.weight.view(torch.uint8), expected.view(torch.uint8)
+                )
+                assert torch.equal(projection.weight_scale, scales)
+            loaded = validate_loaded_weight_profile(model, profile)
+            assert loaded["format"] == profile.format
+            count = loaded["quantized_linear_modules"]
+            assert isinstance(count, int) and count > 0
+            assert loaded["storage_dtypes"] == ["torch.float8_e4m3fn"]
+        else:
+            with pytest.raises(ValueError, match="not initialized.*checkpoint"):
+                loader.load_weights(model, draft)
+
+
+@pytest.mark.parametrize("explicit_draft", [False, True])
+def test_fp8_native_load_policy_uses_effective_draft_config_without_mutating_target(
+    tmp_path, explicit_draft
+):
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.utils import get_draft_load_config
+    from vllm.v1.spec_decode.remote.runtime.quantization import (
+        require_complete_native_weights,
+    )
+
+    config = _qwen35_public_config(
+        tmp_path,
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+    )
+    config.load_config = LoadConfig(model_loader_extra_config={"num_threads": 2})
+    spec = config.speculative_config
+    if explicit_draft:
+        spec.draft_load_config = LoadConfig(
+            load_format="safetensors",
+            model_loader_extra_config={"num_threads": 3},
+        )
+    target_before = copy.deepcopy(config.load_config)
+    draft_before = copy.deepcopy(spec.draft_load_config)
+    selected_before = get_draft_load_config(config)
+    before = create_runtime_contract(config)
+    runtime = require_complete_native_weights(config, before.weight_profile)
+    selected = get_draft_load_config(runtime)
+    assert selected is not selected_before
+    assert selected.load_format == selected_before.load_format
+    assert selected.model_loader_extra_config == {
+        **selected_before.model_loader_extra_config,
+        "enable_weights_track": True,
+    }
+    assert config.load_config == target_before
+    assert spec.draft_load_config == draft_before
+    assert runtime.model_config is config.model_config
+    after = create_runtime_contract(runtime)
+    assert after.target_fingerprint == before.target_fingerprint
+    assert after.draft_fingerprint == before.draft_fingerprint
+
+
+@pytest.mark.parametrize(
+    "load_options",
+    [
+        {"model_loader_extra_config": {"enable_weights_track": False}},
+        {"load_format": "dummy"},
+    ],
+)
+def test_fp8_native_load_policy_rejects_disabled_or_untracked_loaders(
+    tmp_path, load_options
+):
+    from vllm.config import LoadConfig
+    from vllm.v1.spec_decode.remote.runtime.quantization import (
+        require_complete_native_weights,
+    )
+
+    config = _qwen35_public_config(
+        tmp_path,
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+    )
+    spec = config.speculative_config
+    spec.draft_load_config = LoadConfig(**load_options)
+    original = copy.deepcopy(spec.draft_load_config)
+    profile = create_runtime_contract(config).weight_profile
+    with pytest.raises(ValueError, match="track|loader|loading"):
+        require_complete_native_weights(config, profile)
+    assert spec.draft_load_config == original
+
+
+def test_bf16_native_weight_profile_keeps_original_load_policy(tmp_path):
+    from vllm.model_executor.model_loader.utils import get_draft_load_config
+    from vllm.v1.spec_decode.remote.runtime.quantization import (
+        require_complete_native_weights,
+    )
+
+    config = _qwen35_public_config(tmp_path)
+    contract = create_runtime_contract(config)
+    assert contract.weight_profile is not None
+    assert contract.weight_profile.format == "unquantized"
+    assert contract.weight_profile.compute_dtype == torch.bfloat16
+    selected = get_draft_load_config(config)
+    runtime = require_complete_native_weights(config, contract.weight_profile)
+    assert get_draft_load_config(runtime) is selected
+    assert not selected.model_loader_extra_config.get("enable_weights_track", False)
+
+
+@pytest.mark.parametrize(
+    "moe,quantization",
+    [
+        (False, {"activation_scheme": "static"}),
+        (False, {"weight_block_size": [128, 128]}),
+        (False, {"store_dtype": "mxfp4"}),
+        (True, {}),
+    ],
+)
+def test_qwen35_fp8_rejects_unverified_quantization_profiles(
+    tmp_path, moe, quantization
+):
+    config = _qwen35_public_config(
+        tmp_path,
+        moe=moe,
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+            | quantization
+        },
+    )
+    with pytest.raises(ValueError, match="per-tensor|unquantized bfloat16"):
+        create_runtime_contract(config)
+
+
+def test_qwen35_fp8_rejects_different_target_and_draft_precision(tmp_path):
+    config = _qwen35_public_config(
+        tmp_path,
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+        draft_options={"quantization_config": None},
+    )
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    assert config.model_config.quantization == "fp8"
+    assert spec.draft_model_config.quantization is None
+    with pytest.raises(ValueError, match="matching native text configs"):
+        create_runtime_contract(config)
+
+
+def test_qwen35_serialized_fp8_does_not_enable_fp8_kv(tmp_path):
+    config = _qwen35_public_config(
+        tmp_path,
+        cache_dtype="fp8",
+        options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="bfloat16 KV"):
+        create_runtime_contract(config)
 
 
 def test_qwen35_text_only_replicated_axes_match_the_native_scalar_rotation(tmp_path):

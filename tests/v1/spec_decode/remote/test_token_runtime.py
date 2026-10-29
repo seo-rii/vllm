@@ -2373,6 +2373,66 @@ def token_config(
     )
 
 
+def test_token_dense_quantized_draft_is_rejected_before_gpu_executor(tmp_path):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        spec_options={"quantization": "fp8"},
+    )
+    assert config.speculative_config.draft_model_config.quantization == "fp8"
+    with pytest.raises(ValueError, match="unquantized draft|draft.*unquantized"):
+        create_token_runtime_contract(config)
+
+
+def test_token_only_native_weight_profile_does_not_restrict_quantized_target(tmp_path):
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import input_to_float8
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    config = token_config(
+        tmp_path,
+        dtype="bfloat16",
+        target_options={
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+            }
+        },
+    )
+    target = config.model_config
+    draft = config.speculative_config.draft_model_config
+    assert target.quantization == "fp8" and draft.quantization is None
+    path = tmp_path / "target" / "model.safetensors"
+    weights = load_file(path)
+    serialized = {}
+    for name, tensor in weights.items():
+        if tensor.ndim == 2 and name not in (
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ):
+            serialized[name], scale = input_to_float8(
+                tensor.float(), torch.float8_e4m3fn
+            )
+            serialized[name.removesuffix(".weight") + ".weight_scale"] = scale
+        else:
+            serialized[name] = tensor
+    save_file(serialized, path, metadata={"format": "pt"})
+    assert any(tensor.dtype == torch.float8_e4m3fn for tensor in serialized.values())
+    contract = create_token_runtime_contract(config)
+    assert contract.weight_profile is not None
+    assert contract.weight_profile.format == "unquantized"
+    assert contract.weight_profile.compute_dtype == draft.dtype == torch.bfloat16
+    assert contract.capabilities.state_dependency == "own_kv"
+
+
 @pytest.mark.parametrize("k", [1, 3])
 def test_token_recurrent_draft_admits_public_independent_nemotron(
     tmp_path, monkeypatch, k
