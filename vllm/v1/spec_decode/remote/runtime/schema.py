@@ -65,6 +65,7 @@ class _MTPModelContract:
     target_architectures: tuple[str, ...]
     max_speculative_tokens: int | None = None
     requires_target_lm_head: bool = True
+    canonical_text_mrope: bool = False
 
 
 # These native implementations consume one target hidden vector and own their
@@ -74,6 +75,10 @@ _MTP_MODELS = {
     "MiMoV2MTPModel": _MTPModelContract(("MiMoV2FlashForCausalLM",)),
     "ErnieMTPModel": _MTPModelContract(("Ernie4_5_MoeForCausalLM",), 1),
     "Qwen3NextMTP": _MTPModelContract(("Qwen3NextForCausalLM",)),
+    "Qwen3_5MTP": _MTPModelContract(("Qwen3_5ForCausalLM",), canonical_text_mrope=True),
+    "Qwen3_5MoeMTP": _MTPModelContract(
+        ("Qwen3_5MoeForCausalLM",), canonical_text_mrope=True
+    ),
     "Glm4MoeMTPModel": _MTPModelContract(("Glm4MoeForCausalLM",)),
     "Glm4MoeLiteMTPModel": _MTPModelContract(("Glm4MoeLiteForCausalLM",)),
     "DeepSeekMTPModel": _MTPModelContract(("DeepseekV3ForCausalLM",)),
@@ -113,7 +118,13 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
             f"({draft.max_model_len}) to cover target max_model_len "
             f"({target.max_model_len}); reduce the target context limit"
         )
-    num_modules = getattr(config, "num_nextn_predict_layers", None)
+    num_modules = getattr(
+        config,
+        "mtp_num_hidden_layers"
+        if contract.canonical_text_mrope
+        else "num_nextn_predict_layers",
+        None,
+    )
     if type(num_modules) is not int or num_modules < 1:
         raise ValueError(
             "standalone MTP requires a positive checkpoint MTP module count"
@@ -227,15 +238,67 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
             or {}
         )
         if (
-            getattr(model, "is_multimodal_model", False)
-            or getattr(model, "uses_mrope", False)
+            (
+                getattr(model, "is_multimodal_model", False)
+                and not (contract.canonical_text_mrope and model is draft)
+            )
+            or (
+                getattr(model, "uses_mrope", False)
+                and not contract.canonical_text_mrope
+            )
             or getattr(hf_config, "text_config", None) is not None
-            or "mrope_section" in rope
+            or ("mrope_section" in rope and not contract.canonical_text_mrope)
             or getattr(hf_config, "hc_mult", 1) != 1
         ):
             raise ValueError(
                 "standalone MTP requires scalar positions and text features"
             )
+    if contract.canonical_text_mrope:
+        if spec.use_multi_module_mtp():
+            raise ValueError("standalone Qwen3.5 requires one checkpoint MTP head")
+        if target.uses_mrope:
+            raise ValueError("standalone Qwen3.5 requires native flat-text positions")
+        if getattr(target.hf_text_config, "mtp_num_hidden_layers", None) != num_modules:
+            raise ValueError(
+                "standalone Qwen3.5 requires matching checkpoint head counts"
+            )
+        for model in (target, draft):
+            if model.uses_mrope and model.mrope_num_dims != 3:
+                raise ValueError(
+                    "standalone Qwen3.5 requires three canonical text axes"
+                )
+        # Native flat-text target initialization strips these inherited fields;
+        # the native MTP proposer still feeds scalar positions to its head.
+        ropes = [
+            {
+                key: value
+                for key, value in model.hf_text_config.rope_parameters.items()
+                if key not in ("mrope_section", "mrope_interleaved")
+            }
+            for model in (target, draft)
+        ]
+        if ropes[0] != ropes[1]:
+            raise ValueError(
+                "standalone Qwen3.5 requires matching text RoPE parameters"
+            )
+        # The native Qwen head is constructed from the target text config.
+        # Draft metadata must describe the same geometry and expert layout.
+        configs = []
+        for model, rope in zip((target, draft), ropes):
+            text = model.hf_text_config.to_dict()
+            for field in (
+                "architectures",
+                "model_type",
+                "n_predict",
+                "_name_or_path",
+                "transformers_version",
+                "_commit_hash",
+            ):
+                text.pop(field, None)
+            text["rope_parameters"] = rope
+            configs.append(text)
+        if configs[0] != configs[1]:
+            raise ValueError("standalone Qwen3.5 requires matching native text configs")
     if architecture == "NemotronHMTPModel":
         pattern = getattr(config, "mtp_hybrid_override_pattern", "")
         if not pattern or "*" not in pattern or set(pattern) - {"*", "E"}:
@@ -289,7 +352,13 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
                 raise ValueError(
                     "standalone DeepSeek MTP does not support a sparse indexer"
                 )
-    if architecture in ("DeepSeekMTPModel", "MiMoV2MTPModel", "Step3p5MTP"):
+    if architecture in (
+        "DeepSeekMTPModel",
+        "MiMoV2MTPModel",
+        "Step3p5MTP",
+        "Qwen3_5MTP",
+        "Qwen3_5MoeMTP",
+    ):
         for model in (target, draft):
             if (
                 model.using_transformers_backend()
@@ -618,6 +687,8 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
             "DeepSeekMTPModel",
             "MiMoV2MTPModel",
             "Step3p5MTP",
+            "Qwen3_5MTP",
+            "Qwen3_5MoeMTP",
         ):
             name = draft.hf_config.architectures[0]
             if (

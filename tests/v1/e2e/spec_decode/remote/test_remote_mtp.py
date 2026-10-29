@@ -1248,6 +1248,314 @@ def tiny_deepseek_mtp_model(tmp_path, ffn_layout):
     return str(root / "model")
 
 
+def _save_qwen35_mtp_model(directory, *, routed=False):
+    """Real text/GDN weights, an independent attention head and inherited RoPE."""
+    import json
+
+    import torch
+    from transformers import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeTextConfig,
+        Qwen3_5TextConfig,
+    )
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
+    assert not torch.cuda.is_initialized()
+    config_cls = Qwen3_5MoeTextConfig if routed else Qwen3_5TextConfig
+    model_cls = Qwen3_5MoeForCausalLM if routed else Qwen3_5ForCausalLM
+    config = config_cls(
+        architectures=[model_cls.__name__],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        layer_types=["linear_attention", "full_attention"],
+        linear_conv_kernel_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        mtp_num_hidden_layers=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        dtype="bfloat16",
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261028)
+        target = model_cls(config)
+        _two_candidate_head(target.lm_head.weight)
+        owner_config = config_cls.from_dict(
+            config.to_dict(), num_hidden_layers=1, layer_types=["full_attention"]
+        )
+        owner = model_cls(owner_config)
+        weights = dict(target.state_dict())
+        weights.update(
+            {
+                f"mtp.layers.0.{name}": value
+                for name, value in owner.model.layers[0].state_dict().items()
+            }
+        )
+        for name in ("norm", "pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+            norm = Qwen3_5RMSNorm(128, eps=config.rms_norm_eps)
+            assert torch.count_nonzero(norm.weight) == 0
+            weights[f"mtp.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        _conditioned_mtp_fusion(fusion.weight)
+        weights["mtp.fc.weight"] = fusion.weight.detach().clone()
+    root = Path(directory)
+    model = _save_mtp_checkpoint(root / "model", config, _unpack_mtp_experts(weights))
+    receipt = dict(
+        synthetic_profile=True,
+        seed=20261028,
+        target_architecture=model_cls.__name__,
+        draft_architecture="Qwen3_5MoeMTP" if routed else "Qwen3_5MTP",
+        target_layers=["linear_attention", "full_attention"],
+        mtp_layers=["full_attention"],
+        checkpoint_tensors=len(_unpack_mtp_experts(weights)),
+        target_hf_class=type(target).__name__,
+        head_hf_class=type(owner.model.layers[0]).__name__,
+        fusion="embedding_1_4_target_hidden_3_4",
+        head_candidate_ids=[3, 4],
+        head_scale=32,
+        saved_mrope_section=config.rope_parameters["mrope_section"],
+        saved_mrope_interleaved=True,
+        routed=routed,
+        cuda_initialized=False,
+    )
+    (root / "fixture.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    return model, receipt
+
+
+def _tiny_qwen35_mtp_model(tmp_path, *, routed):
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_qwen35_mtp_model; "
+        "_save_qwen35_mtp_model(sys.argv[1], routed=sys.argv[2] == 'moe')",
+        str(tmp_path),
+        "moe" if routed else "dense",
+    ]
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        VLLM_TARGET_DEVICE="cpu",
+        VLLM_BATCH_INVARIANT="0",
+    )
+    with (tmp_path / "fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            env=environment,
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    return str(tmp_path / "model")
+
+
+@pytest.fixture
+def tiny_qwen35_dense_mtp_model(tmp_path):
+    return _tiny_qwen35_mtp_model(tmp_path, routed=False)
+
+
+@pytest.fixture
+def tiny_qwen35_moe_mtp_model(tmp_path):
+    return _tiny_qwen35_mtp_model(tmp_path, routed=True)
+
+
+@pytest.mark.parametrize("profile", ["dense", "moe"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_qwen35_text_mtp_matches_native_and_target(
+    profile, k, vllm_runner, request, monkeypatch, tmp_path, record_property
+):
+    """Use native flat-text RoPE and GDN rollback with a full-attention head."""
+    import json
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    model = request.getfixturevalue(f"tiny_qwen35_{profile}_mtp_model")
+    record_property("fixture", json.loads((tmp_path / "fixture.json").read_text()))
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        f"qwen35_{profile}",
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture,projection",
+    [("dense", "q_proj")] + [("moe", part) for part in ("q_proj", "k_proj", "v_proj")],
+)
+def test_qwen35_mtp_rejects_incomplete_checkpoint_through_llm(
+    fixture, projection, request, tmp_path
+):
+    """Reject a missing shard during public LLM loading, before serving tokens."""
+    import json
+
+    from safetensors.torch import load_file, save_file
+
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    model = request.getfixturevalue(f"tiny_qwen35_{fixture}_mtp_model")
+    path = Path(model) / "model.safetensors"
+    weights = load_file(path)
+    missing = f"mtp.layers.0.self_attn.{projection}.weight"
+    del weights[missing]
+    save_file(weights, path, metadata={"format": "pt"})
+    options = dict(
+        model=model,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=True,
+        async_scheduling=False,
+        attention_config={"backend": "TRITON_ATTN"},
+        mamba_backend="triton",
+        use_replayssm=False,
+        gdn_prefill_backend="triton",
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+            "draft_load_config": {
+                "model_loader_extra_config": {"enable_weights_track": None}
+            },
+        },
+    )
+    program = """
+import json
+import sys
+from vllm import LLM
+try:
+    LLM(**json.loads(sys.argv[1]))
+except ValueError as error:
+    assert "not initialized from checkpoint" in str(error), error
+    assert sys.argv[2] in str(error), error
+else:
+    raise AssertionError("LLM admitted an incomplete MTP checkpoint")
+"""
+    log_path = tmp_path / "incomplete-mtp.log"
+    with log_path.open("w") as log:
+        result = subprocess.run(
+            [sys.executable, "-c", program, json.dumps(options), missing],
+            env=dict(
+                os.environ,
+                VLLM_ENABLE_V1_MULTIPROCESSING="0",
+                VLLM_USE_V2_MODEL_RUNNER="1",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    assert result.returncode == 0, log_path.read_text()[-12000:]
+
+
+def _check_qwen35_model_weights(model, model_path, *, mtp=False):
+    """Check packed attention, GDN and expert tensors against the saved bytes."""
+    import torch
+    from safetensors.torch import load_file
+
+    weights = load_file(Path(model_path) / "model.safetensors")
+    checked = set()
+    for name, parameter in model.named_parameters():
+        source = (
+            name.replace("model.", "mtp.", 1)
+            if mtp and name != "model.embed_tokens.weight"
+            else name
+        )
+        if source in weights:
+            names = [source]
+        else:
+            projections = next(
+                (
+                    (packed, shards)
+                    for packed, shards in (
+                        ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                        ("gate_up_proj", ("gate_proj", "up_proj")),
+                        ("in_proj_qkvz", ("in_proj_qkv", "in_proj_z")),
+                        ("in_proj_ba", ("in_proj_b", "in_proj_a")),
+                    )
+                    if source.endswith(f".{packed}.weight")
+                ),
+                None,
+            )
+            if projections is not None:
+                packed, shards = projections
+                names = [source.replace(packed, shard) for shard in shards]
+            else:
+                assert source.endswith((".w13_weight", ".w2_weight")), name
+                prefix, projection = source.rsplit(".", 1)
+                prefix = prefix.removesuffix(".routed_experts")
+                shards = (
+                    ("gate_proj", "up_proj")
+                    if projection == "w13_weight"
+                    else ("down_proj",)
+                )
+                expected = torch.stack(
+                    [
+                        torch.cat([weights[f"{prefix}.{e}.{p}.weight"] for p in shards])
+                        for e in range(parameter.shape[0])
+                    ]
+                )
+                names = [
+                    f"{prefix}.{e}.{p}.weight"
+                    for e in range(parameter.shape[0])
+                    for p in shards
+                ]
+                assert torch.equal(
+                    parameter.detach().cpu(), expected.to(parameter.dtype)
+                ), name
+                checked.update(names)
+                continue
+        expected = torch.cat(
+            [weights[key].reshape(-1, weights[key].shape[-1]) for key in names]
+        )
+        assert torch.equal(
+            parameter.detach().cpu(),
+            expected.reshape(parameter.shape).to(parameter.dtype),
+        ), name
+        checked.update(names)
+    required = (
+        {name for name in weights if name.startswith("mtp.")}
+        | {"model.embed_tokens.weight", "lm_head.weight"}
+        if mtp
+        else {name for name in weights if not name.startswith("mtp.")}
+    )
+    assert checked == required, (required - checked, checked - required)
+    return dict(
+        parameters=len(list(model.parameters())), checkpoint_keys=sorted(checked)
+    )
+
+
 def _save_step3p5_mtp_model(directory, profile="one_full"):
     import json
 
@@ -3742,8 +4050,16 @@ def _compare_native_and_remote_draft(
     mimo_v2_flash = mtp_family == "mimo_v2_flash"
     step3p5 = mtp_family in ("step3p5_one_full", "step3p5_three_swa")
     step3p5_swa = mtp_family == "step3p5_three_swa"
-    detailed = independent or eagle3 or deepseek_mtp or mimo_v2_flash or step3p5
-    hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
+    qwen35 = mtp_family in ("qwen35_dense", "qwen35_moe")
+    detailed = (
+        independent or eagle3 or deepseek_mtp or mimo_v2_flash or step3p5 or qwen35
+    )
+    hybrid_target = mtp_family in (
+        "qwen3_next",
+        "nemotron_h",
+        "qwen35_dense",
+        "qwen35_moe",
+    )
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
@@ -3804,13 +4120,14 @@ def _compare_native_and_remote_draft(
         or mla_draft
         or recurrent_draft
         or mtp_family == "deepseek_v3_dense"
+        or mtp_family == "qwen35_dense"
         else "triton"
     )
     if moe_backend is not None:
         kwargs["moe_backend"] = moe_backend
     if hybrid_target:
         kwargs.update(mamba_backend="triton", use_replayssm=False)
-    if mtp_family == "qwen3_next":
+    if mtp_family == "qwen3_next" or qwen35:
         kwargs["gdn_prefill_backend"] = "triton"
         monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
     prompts = [
@@ -4140,11 +4457,18 @@ def _compare_native_and_remote_draft(
         if step3p5:
             assert policy["model"] == "Step3p5ForCausalLM"
             assert policy["attention_backends"] == ["TRITON_ATTN"] * 2
+        if qwen35:
+            assert policy["model"] == (
+                "Qwen3_5MoeForCausalLM"
+                if mtp_family == "qwen35_moe"
+                else "Qwen3_5ForCausalLM"
+            )
+            assert policy["attention_backends"] == ["TRITON_ATTN"]
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
             layer = policy["layers"][0]
-            is_gdn = mtp_family == "qwen3_next"
+            is_gdn = mtp_family == "qwen3_next" or qwen35
             assert layer["type"] == ("GDN_ATTN" if is_gdn else "MAMBA2")
             conv_shape, state_shape = layer["shapes"]
             assert sorted(conv_shape) == [3 + policy["k"], 512 if is_gdn else 384]
@@ -4260,6 +4584,32 @@ def _compare_native_and_remote_draft(
             ),
             metadata_builders=[type(builder).__name__ for builder in builders],
             geometry=_mimo_v2_flash_gpu_geometry(runner.get_draft_model(), mtp=True),
+        )
+
+    def qwen35_identity(worker):
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, MTPSpeculator)
+        target, draft = runner.get_model(), runner.get_draft_model()
+        assert type(draft).__name__ == (
+            "Qwen3_5MoeMTP" if mtp_family == "qwen35_moe" else "Qwen3_5MTP"
+        )
+        assert draft.model.config is target.model.config
+        assert not worker.vllm_config.model_config.uses_mrope
+        assert not worker.vllm_config.model_config.is_multimodal_model
+        assert len(draft.model.layers) == draft.model.num_mtp_layers == 1
+        assert draft.model.embed_tokens is target.model.embed_tokens
+        assert draft.lm_head is target.lm_head
+        target_weights = _check_qwen35_model_weights(target, model)
+        draft_weights = _check_qwen35_model_weights(draft, model, mtp=True)
+        return dict(
+            target_weights=target_weights,
+            draft_weights=draft_weights,
+            shared_embedding_and_head=True,
+            target_rope=target.model.config.rope_parameters,
+            draft_rope=draft.model.config.rope_parameters,
+            scalar_native_positions=True,
         )
 
     def step3p5_identity(worker):
@@ -4508,7 +4858,9 @@ def _compare_native_and_remote_draft(
             assert layout == [[expected_mla_layout] * 2]
             record_property("target.mla_layout", layout)
         backends = baseline.llm.apply_model(moe_backends)
-        expected_moe_count = 2 if mtp_family == "qwen3_next" else int(bool(moe_backend))
+        expected_moe_count = (
+            2 if mtp_family in ("qwen3_next", "qwen35_moe") else int(bool(moe_backend))
+        )
         assert backends == [["TRITON"] * expected_moe_count]
         record_property("target.moe_backends", backends)
         check_recurrence(baseline, "target")
@@ -4561,6 +4913,10 @@ def _compare_native_and_remote_draft(
                     "native.step3p5_identity",
                     native.llm.collective_rpc(step3p5_identity),
                 )
+            if qwen35:
+                record_property(
+                    "native.qwen35_identity", native.llm.collective_rpc(qwen35_identity)
+                )
             if dense_mla and not independent:
                 layout = native.llm.collective_rpc(draft_mla_layout)
                 assert layout == [[expected_mla_layout]]
@@ -4572,6 +4928,7 @@ def _compare_native_and_remote_draft(
                 and not mtp_family.startswith("exaone")
                 and mtp_family != "ernie"
                 and mtp_family != "deepseek_v3_dense"
+                and mtp_family != "qwen35_dense"
                 and not mimo_v2_flash
                 and not step3p5
             )

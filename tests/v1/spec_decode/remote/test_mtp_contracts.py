@@ -19,6 +19,10 @@ from transformers import (
     AutoModelForCausalLM,
     DeepseekV3Config,
     PreTrainedConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3Config,
     Step3p7TextConfig,
     TokenizersBackend,
@@ -963,6 +967,376 @@ def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_d
         create_runtime_contract(config)
 
 
+def _qwen35_public_config(
+    tmp_path,
+    *,
+    moe=False,
+    k=3,
+    options=None,
+    draft_options=None,
+    target_tp=1,
+    draft_tp=1,
+    transport="inline",
+    dtype="bfloat16",
+    wrapped=False,
+    endpoints=None,
+):
+    from transformers import Qwen3_5ForCausalLM
+
+    config_cls = Qwen3_5MoeTextConfig if moe else Qwen3_5TextConfig
+    architecture = "Qwen3_5MoeForCausalLM" if moe else "Qwen3_5ForCausalLM"
+    options = dict(
+        architectures=[architecture],
+        hidden_size=128,
+        intermediate_size=256,
+        vocab_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=64,
+        layer_types=["linear_attention", "full_attention"],
+        linear_conv_kernel_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        mtp_num_hidden_layers=1,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [2, 1, 1],
+            "mrope_interleaved": True,
+        },
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    ) | (options or {})
+
+    def checkpoint(path, model_options):
+        hf = config_cls(**model_options)
+        saved = (
+            Qwen3_5Config(
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                text_config=hf,
+            )
+            if wrapped
+            else hf
+        )
+        saved.save_pretrained(path)
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(32)})),
+            bos_token="token0",
+            eos_token="token1",
+            pad_token="token2",
+        ).save_pretrained(path)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(20261025)
+            model_cls = Qwen3_5MoeForCausalLM if moe else Qwen3_5ForCausalLM
+            model = model_cls(hf).to(torch.bfloat16)
+        embedding = model.get_input_embeddings().weight.detach()
+        save_file(
+            {
+                "model.embed_tokens.weight": embedding,
+                "lm_head.weight": model.get_output_embeddings().weight.detach(),
+            },
+            path / "model.safetensors",
+        )
+
+    target_path = draft_path = tmp_path
+    if draft_options is not None:
+        target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    checkpoint(target_path, options)
+    if draft_path != target_path:
+        checkpoint(draft_path, options | draft_options)
+    target = ModelConfig(
+        model=str(target_path),
+        dtype=dtype,
+        max_model_len=64,
+        skip_tokenizer_init=True,
+    )
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
+    placement = (
+        dict(
+            execution=SpeculativeExecutionConfig(
+                placement="remote", endpoints=endpoints, transport=transport
+            )
+        )
+        if endpoints
+        else dict(
+            remote_draft=RemoteDraftConfig(
+                endpoint="unix:///tmp/qwen35-contract.sock", transport=transport
+            )
+        )
+    )
+    spec = SpeculativeConfig(
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=draft_tp,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        **placement,
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("moe,k", [(False, 1), (False, 3), (True, 3)])
+def test_qwen35_public_flat_text_override_preserves_native_position_policy(
+    tmp_path, moe, k
+):
+    """Native flat-text normalization keeps logical wire positions scalar."""
+    config = _qwen35_public_config(tmp_path, moe=moe, k=k)
+    target = config.model_config
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    suffix = "Moe" if moe else ""
+    assert target.hf_config.architectures == [f"Qwen3_5{suffix}ForCausalLM"]
+    assert draft.hf_config.architectures == [f"Qwen3_5{suffix}MTP"]
+    assert target.hf_text_config.model_type == (
+        "qwen3_5_moe_text" if moe else "qwen3_5_text"
+    )
+    assert draft.hf_config.model_type == "qwen3_5_mtp"
+    assert draft.hf_config.n_predict == draft.hf_config.mtp_num_hidden_layers == 1
+    assert not hasattr(draft.hf_config, "num_nextn_predict_layers")
+    assert not target.uses_mrope and not target.is_multimodal_model
+    assert draft.uses_mrope and draft.mrope_num_dims == 3
+    assert draft.is_multimodal_model and not draft.supports_multimodal_inputs
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["rope_parameters"]["mrope_section"] == [2, 1, 1]
+    assert "mrope_section" not in target.hf_text_config.rope_parameters
+    assert draft.hf_text_config.rope_parameters["mrope_section"] == [2, 1, 1]
+    contract = create_runtime_contract(config)
+    assert contract.requires_target_lm_head
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[1].kind == "positions"
+    assert contract.schema.slots[1].trailing_shape == ()
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (128,)
+
+
+@pytest.mark.parametrize(
+    "options,detail",
+    [
+        ({"k": 2, "options": {"mtp_num_hidden_layers": 2}}, "one checkpoint"),
+        (
+            {"options": {"architectures": ["Qwen3_5MoeForCausalLM"]}},
+            "matching target architecture",
+        ),
+        ({"target_tp": 2}, "TP1"),
+        ({"draft_tp": 2}, "TP1|draft_tensor_parallel_size"),
+        ({"transport": "cuda_ipc"}, "one inline endpoint"),
+        ({"dtype": "float32"}, "unquantized bfloat16"),
+        (
+            {"endpoints": ("unix:///tmp/qwen35-a.sock", "unix:///tmp/qwen35-b.sock")},
+            "one inline endpoint",
+        ),
+        (
+            {
+                "options": {
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 0.25,
+                        "mrope_section": [1, 1, 1, 1],
+                    }
+                }
+            },
+            "three canonical text axes",
+        ),
+    ],
+)
+def test_qwen35_public_contract_rejects_unverified_profiles(tmp_path, options, detail):
+    with pytest.raises(ValueError, match=detail):
+        create_runtime_contract(_qwen35_public_config(tmp_path, **options))
+
+
+def test_qwen35_public_contract_rejects_a_multimodal_wrapper(tmp_path):
+    with pytest.raises(ValueError, match="matching target architecture|text"):
+        create_runtime_contract(_qwen35_public_config(tmp_path, wrapped=True))
+
+
+def test_qwen35_native_target_config_must_match_the_draft_attention_geometry(tmp_path):
+    config = _qwen35_public_config(
+        tmp_path,
+        draft_options={
+            "num_attention_heads": 2,
+            "head_dim": 64,
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [4, 2, 2],
+                "mrope_interleaved": True,
+            },
+        },
+    )
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    assert config.model_config.get_hidden_size() == draft.get_hidden_size() == 128
+    assert config.model_config.get_vocab_size() == draft.get_vocab_size() == 32
+    assert config.model_config.hf_text_config.head_dim == 32
+    assert draft.hf_text_config.head_dim == 64
+    with pytest.raises(ValueError, match="matching native text configs"):
+        create_runtime_contract(config)
+
+
+def test_qwen35_native_single_head_rejects_conflicting_module_count_metadata(tmp_path):
+    config = _qwen35_public_config(
+        tmp_path, k=2, options={"num_nextn_predict_layers": 2}
+    )
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    assert spec.draft_model_config.hf_config.mtp_num_hidden_layers == 1
+    assert spec.use_multi_module_mtp()
+    with pytest.raises(ValueError, match="one checkpoint MTP head"):
+        create_runtime_contract(config)
+
+
+def test_qwen35_shared_shell_materializes_the_native_embedding_and_head(tmp_path):
+    config = _qwen35_public_config(tmp_path)
+    expected = load_file(tmp_path / "model.safetensors")
+    shell = materialize_target_shell(config.model_config, torch.device("cpu"))
+    assert torch.equal(
+        shell.model.embed_tokens.weight[:32], expected["model.embed_tokens.weight"]
+    )
+    assert torch.equal(shell.lm_head.weight[:32], expected["lm_head.weight"])
+    assert shell.model.embed_tokens.weight is not shell.lm_head.weight
+    assert model_weight_bytes(shell) == (0, 16384, 16384)
+
+
+def test_qwen35_text_only_replicated_axes_match_the_native_scalar_rotation(tmp_path):
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    config = _qwen35_public_config(tmp_path)
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    target_rope = get_rope(
+        head_size=32,
+        max_position=64,
+        dtype=torch.bfloat16,
+        rope_parameters=config.model_config.hf_text_config.rope_parameters,
+    )
+    checkpoint_rope = get_rope(
+        head_size=32,
+        max_position=64,
+        dtype=torch.bfloat16,
+        rope_parameters=spec.draft_model_config.hf_text_config.rope_parameters,
+    )
+    positions = torch.tensor([0, 1, 15, 16, 31, 63])
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261025)
+        query = torch.randn(6, 128, dtype=torch.bfloat16)
+        key = torch.randn(6, 64, dtype=torch.bfloat16)
+    scalar = target_rope.forward_native(positions, query, key)
+    repeated = checkpoint_rope.forward_native(
+        positions.unsqueeze(0).expand(3, -1), query, key
+    )
+    assert torch.equal(scalar[0], repeated[0])
+    assert scalar[1] is not None and repeated[1] is not None
+    assert torch.equal(scalar[1], repeated[1])
+
+
+@pytest.mark.parametrize("omitted", [None, "self_attn.q_proj", "mlp.gate_proj"])
+@pytest.mark.parametrize(
+    "load_options",
+    [
+        pytest.param({}, id="default"),
+        pytest.param({"enable_weights_track": None}, id="none"),
+        pytest.param({"enable_weights_track": True}, id="enabled"),
+        pytest.param({"enable_weights_track": False}, id="disabled"),
+    ],
+)
+def test_qwen35_bf16_native_load_requires_every_packed_projection(
+    tmp_path, omitted, load_options
+):
+    """A loaded K/V or up projection must not conceal an uninitialized sibling."""
+    from tests.v1.e2e.spec_decode.remote.test_remote_mtp import _save_qwen35_mtp_model
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    source, _ = _save_qwen35_mtp_model(tmp_path)
+    config = EngineArgs(
+        model=source,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        enforce_eager=True,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+        model_loader_extra_config=load_options,
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    draft = config.speculative_config.draft_model_config
+    assert draft is not None
+    path = Path(source) / "model.safetensors"
+    weights = load_file(path)
+    reference = weights.copy()
+    if omitted is not None:
+        del weights["mtp.layers.0." + omitted + ".weight"]
+        save_file(weights, path, metadata={"format": "pt"})
+    loader = get_model_loader(config.load_config)
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        model = loader.create_model(config, draft)
+        if (
+            omitted is not None
+            and load_options.get("enable_weights_track") is not False
+        ):
+            with pytest.raises(ValueError, match="not initialized.*checkpoint"):
+                loader.load_weights(model, draft)
+        else:
+            if omitted is not None:
+                parent, _ = omitted.split(".")
+                fused = "qkv_proj" if parent == "self_attn" else "gate_up_proj"
+                projection = model.model.layers[0].get_submodule(parent + "." + fused)
+                with torch.no_grad():
+                    projection.weight.fill_(-2)
+            loader.load_weights(model, draft)
+            for parent, fused, sources in (
+                ("self_attn", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                ("mlp", "gate_up_proj", ("gate_proj", "up_proj")),
+            ):
+                expected = torch.cat(
+                    [
+                        torch.full_like(
+                            reference[f"mtp.layers.0.{parent}.{part}.weight"], -2
+                        )
+                        if f"{parent}.{part}" == omitted
+                        else reference[f"mtp.layers.0.{parent}.{part}.weight"]
+                        for part in sources
+                    ]
+                )
+                projection = model.model.layers[0].get_submodule(parent + "." + fused)
+                assert torch.equal(projection.weight, expected)
+
+
 def _mimo_flash_public_config(
     tmp_path,
     *,
@@ -1596,7 +1970,7 @@ def test_mtp_contract_does_not_accept_unrelated_target(kind):
 
 @pytest.mark.parametrize(
     "architecture",
-    ["MiMoMTP", "Gemma4MTPModel", "Qwen3_5MTP", "DeepSeekV4MTPModel"],
+    ["MiMoMTP", "Gemma4MTPModel", "InternS2MobiusMTP", "DeepSeekV4MTPModel"],
 )
 def test_unsupported_feature_and_state_families_remain_fail_closed(architecture):
     config = _config()

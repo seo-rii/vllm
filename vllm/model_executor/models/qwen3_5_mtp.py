@@ -21,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models.interfaces import LocalArgmaxMixin
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -305,15 +306,44 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        enable_weights_track = get_draft_load_config(
+            self.vllm_config
+        ).model_loader_extra_config.get("enable_weights_track")
+        if enable_weights_track is None:
+            enable_weights_track = self.quant_config is None
+        strict_packed = self.quant_config is None and enable_weights_track
+        packed = {"qkv_proj": self.packed_modules_mapping["qkv_proj"]}
+        if type(self) is Qwen3_5MTP:
+            packed["gate_up_proj"] = self.packed_modules_mapping["gate_up_proj"]
+        source_to_packed = {
+            source: fused for fused, sources in packed.items() for source in sources
+        }
+        loaded_parts: dict[tuple[str, str, str], set[str]] = {}
+
         def remap_weight_names(weights):
             for name, weight in weights:
                 if self.is_unused_checkpoint_weight(name):
                     continue
+                if strict_packed and name.endswith((".weight", ".weight_scale")):
+                    module, _, parameter = name.rpartition(".")
+                    prefix, _, source = module.rpartition(".")
+                    fused = source_to_packed.get(source, source)
+                    if fused in packed:
+                        loaded_parts.setdefault((prefix, fused, parameter), set()).add(
+                            source
+                        )
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
                 elif "embed_tokens" in name:
                     name = name.replace("language_model.", "")
                 yield name, weight
+            for (prefix, fused, parameter), sources in loaded_parts.items():
+                if fused not in sources and (missing := set(packed[fused]) - sources):
+                    names = sorted(f"{prefix}.{part}.{parameter}" for part in missing)
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {names}"
+                    )
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(remap_weight_names(weights))
