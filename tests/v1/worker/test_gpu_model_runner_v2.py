@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.local_backend import LocalDraftBackend
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
@@ -69,6 +71,147 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback(monkeypatch):
     postprocess_num_computed_tokens.assert_called_once_with(global_batch)
     postprocess_state.assert_called_once_with(global_batch.idx_mapping, 0)
     restore_for_sampling.assert_not_called()
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_sample_tokens_preserves_native_hooks_and_workspace_order(monkeypatch, unified):
+    events = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = runner.pp_handler = runner.aux_output_connector = None
+    runner.adaptive_verification = None
+    runner.main_stream = runner.output_copy_stream = runner.check_ep_fault = None
+    runner.num_speculative_steps = 3
+    runner._draft_workspace_lane = 17
+    batch = SimpleNamespace(
+        req_ids=["a"],
+        num_reqs=1,
+        idx_mapping=torch.tensor([0]),
+        query_start_loc_np=[0, 2],
+        query_start_loc=torch.tensor([0, 2]),
+        is_prefilling_np=[True],
+    )
+    hidden = torch.zeros(2, 4)
+    target = SimpleNamespace(compute_logits=Mock())
+    runner.model = target
+    sampled, rejected = (
+        torch.ones(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    sample_output = SimpleNamespace(sampled_token_ids=torch.tensor([[7]]))
+    monkeypatch.setattr(
+        runner, "sample", Mock(return_value=(sample_output, sampled, rejected))
+    )
+    runner.prompt_logprobs_worker = Mock()
+    runner.prompt_logprobs_worker.compute_prompt_logprobs.return_value = {}
+    runner.prompt_logprobs_worker.compute_prompt_token_id_logprobs.return_value = {}
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.zeros(1, 8)),
+        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(1)),
+        prompt_len=SimpleNamespace(np=[2]),
+        last_sampled_tokens=torch.tensor([[7]]),
+        next_prefill_tokens=torch.tensor([[0]]),
+        draft_tokens=torch.zeros(1, 3, dtype=torch.int64),
+    )
+    runner.sampler = Mock(spec=model_runner_module.GPUWatermarkSampler)
+    runner.sampler.sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(gpu=torch.zeros(1)),
+        seeds=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64)),
+    )
+    mm_inputs = ([torch.zeros(1, 4)], torch.tensor([True]))
+
+    def gather_mm(*args, **kwargs):
+        events.append("mm")
+        return mm_inputs
+
+    runner.model_state = SimpleNamespace(
+        supports_mm_inputs=True,
+        gather_mm_embeddings=Mock(side_effect=gather_mm),
+    )
+    monkeypatch.setattr(
+        runner,
+        "postprocess_sampled",
+        Mock(side_effect=lambda *a: events.append("postprocess")),
+    )
+    native = Mock(spec=DraftModelSpeculator)
+    native.num_speculative_steps = 3
+    native.supports_mm_inputs = True
+    native.observe_verification.side_effect = lambda *a: events.append("observe")
+    native.prepare_watermarking.side_effect = lambda *a: events.append("watermark")
+
+    def propose(*args, **kwargs):
+        events.append("propose")
+        assert (kwargs["input_batch"] if unified else args[0]) is batch
+        assert (kwargs["last_hidden_states"] if unified else args[3]) is hidden
+        assert kwargs["mm_inputs"] is mm_inputs
+        assert kwargs["num_speculative_tokens"] == 1
+        return torch.tensor([[8, 9, 10]])
+
+    native.propose.side_effect = propose
+    runner.speculator = native
+    runner.draft_backend = LocalDraftBackend(native) if unified else None
+    if unified:
+        for name in ("dispatch", "collect"):
+            original = getattr(runner.draft_backend, name)
+
+            def record(*args, _name=name, _fn=original):
+                events.append(_name)
+                return _fn(*args)
+
+            monkeypatch.setattr(
+                runner.draft_backend,
+                name,
+                Mock(side_effect=record),
+            )
+    runner.draft_tokens_handler = Mock()
+    runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
+    runner.eplb = SimpleNamespace(step=Mock())
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=batch,
+        attn_metadata={},
+        slot_mappings_by_layer={},
+        hidden_states=hidden,
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=1,
+    )
+
+    @contextlib.contextmanager
+    def workspace(lane):
+        assert lane == 17
+        events.append("workspace-enter")
+        yield
+        events.append("workspace-exit")
+
+    output = object()
+
+    def async_output(**kwargs):
+        events.append("output-copy")
+        return output
+
+    monkeypatch.setattr(model_runner_module, "use_workspace_lane", workspace)
+    monkeypatch.setattr(
+        model_runner_module,
+        "AsyncOutput",
+        async_output,
+    )
+
+    assert runner.sample_tokens(None) is output
+    expected = [
+        "output-copy",
+        "mm",
+        "postprocess",
+        "observe",
+        "watermark",
+        "workspace-enter",
+    ]
+    expected += ["dispatch", "propose", "collect"] if unified else ["propose"]
+    assert events == [*expected, "workspace-exit"]
+    assert runner.speculator is native
+    assert runner.req_states.draft_tokens.tolist() == [[8, -1, -1]]
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

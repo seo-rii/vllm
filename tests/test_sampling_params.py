@@ -7,7 +7,11 @@ import pytest
 
 from vllm import SamplingParams
 from vllm.config.diffusion import DiffusionConfig
-from vllm.config.speculative import RemoteDraftConfig
+from vllm.config.speculative import (
+    RemoteDraftConfig,
+    SpeculativeConfig,
+    SpeculativeExecutionConfig,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.v1.engine.input_processor import InputProcessor
@@ -57,17 +61,33 @@ def test_non_diffusion_models_unaffected():
     params.verify(MockModelConfig(), None, None, None)
 
 
+@dataclass
+class MockSpeculativePlacement:
+    remote_draft: RemoteDraftConfig | None = None
+    execution: SpeculativeExecutionConfig | None = None
+
+    use_remote_draft = SpeculativeConfig.use_remote_draft
+
+
+@pytest.mark.parametrize("new_execution", [False, True])
 @pytest.mark.parametrize("temperature", [0.7, 1e-6])
 @pytest.mark.parametrize("failure_policy", ["target_only", "error"])
 def test_remote_draft_rejects_nonzero_temperature_at_admission(
-    temperature, failure_policy
+    temperature, failure_policy, new_execution
 ):
-    speculative = SimpleNamespace(
+    speculative = MockSpeculativePlacement(
         remote_draft=RemoteDraftConfig(
             endpoint="unix:///run/vllm/drafter.sock",
             failure_policy=failure_policy,
         )
     )
+    if new_execution:
+        speculative.remote_draft = None
+        speculative.execution = SpeculativeExecutionConfig(
+            placement="remote",
+            endpoints=("unix:///run/vllm/drafter.sock",),
+            failure_policy=failure_policy,
+        )
     params = SamplingParams(temperature=temperature)
     with pytest.raises(VLLMValidationError, match="greedy target sampling") as error:
         params.verify(MockModelConfig(), speculative, None, None)
@@ -77,7 +97,7 @@ def test_remote_draft_rejects_nonzero_temperature_at_admission(
 
 @pytest.mark.parametrize("seed", [None, 42])
 def test_remote_draft_accepts_greedy_sampling_at_admission(seed):
-    speculative = SimpleNamespace(
+    speculative = MockSpeculativePlacement(
         remote_draft=RemoteDraftConfig(endpoint="unix:///run/vllm/drafter.sock")
     )
     SamplingParams(temperature=0.0, seed=seed).verify(
@@ -85,7 +105,14 @@ def test_remote_draft_accepts_greedy_sampling_at_admission(seed):
     )
 
 
-@pytest.mark.parametrize("speculative", [None, SimpleNamespace(remote_draft=None)])
+@pytest.mark.parametrize(
+    "speculative",
+    [
+        None,
+        MockSpeculativePlacement(),
+        MockSpeculativePlacement(execution=SpeculativeExecutionConfig()),
+    ],
+)
 def test_non_remote_requests_keep_probabilistic_sampling(speculative):
     SamplingParams(temperature=0.7).verify(MockModelConfig(), speculative, None, None)
 
