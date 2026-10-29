@@ -2,9 +2,10 @@
 
 The native local speculator remains the default. An opt-in backend boundary
 adds local wrappers, same-step dispatch/collect and a token-only standalone
-draft. Predictive caching, N:M pooling, stochastic remote sampling, prefix
-reuse, async scheduling, cross-node transport and draft TP expansion are
-outside this implementation.
+draft. Full-attention token-only execution additionally supports bounded
+target-prefix replay and eager MRV2 async scheduling. Predictive caching, N:M
+pooling, stochastic remote sampling, general prefix reuse, cross-node transport
+and draft TP expansion remain outside this implementation.
 
 ## Native local execution
 
@@ -48,8 +49,9 @@ the host synchronized the device.
 The runner keeps dispatch and collect adjacent inside the
 existing workspace lane, after authoritative sampling and request postprocessing.
 It establishes an explicit boundary without claiming additional compute overlap.
-It does not enable the vLLM async scheduler. Moving collection across another
-forward requires a separate snapshot and buffer-lease design.
+The separately gated token-only async mode retains this same-step ordering.
+Moving collection across another forward requires a separate snapshot and
+buffer-lease design.
 
 All target TP ranks invoke backend and lifecycle methods in the same order.
 Rank-zero preparation and transport errors are carried to the collect-side CPU
@@ -166,10 +168,53 @@ For the verifier, combine `tokenizer_mode="hf"` with this speculative configurat
 }
 ```
 
-Use greedy sampling, disable prefix caching and async scheduling, and retain
-target TP1. These explicit restrictions apply to remote execution. A same-GPU
+Use greedy sampling and retain target TP1. Prefix caching and async scheduling
+are available only for the full-attention combinations below; other remote
+combinations require them disabled. A same-GPU
 two-process run is a lifecycle test; normal single-GPU placement remains native
 local execution. Neither `auto` transport nor GPU visibility selects placement.
+
+### Cached target prefixes
+
+Set `enable_prefix_caching=True` on the verifier when both target and draft use
+an existing native causal full-attention token-only contract, target/draft TP1
+and one inline endpoint. This includes full-attention Qwen3, Llama and Mistral
+configurations. Sliding-window, MLA and recurrent state, pooled placement,
+input streaming and target-conditioned MTP/EAGLE placement remain excluded.
+
+On a target cache hit, the worker retains the authoritative CPU token prefix
+and replays it into a fresh draft sequence before sending the scheduled suffix.
+Replay chunks respect the negotiated token/frame limits and share the original
+round deadline with open, suffix prefill and proposal. The draft still computes
+that prefix; this does not reuse another request's draft KV or guarantee lower
+TTFT. A long replay may need a larger explicit request budget.
+
+Finish, cancellation and preemption retire the draft generation and its pending
+CPU prefix. Resuming a preempted request replays its current authoritative
+prefix, including any committed output tokens. A replay failure follows the
+existing terminal target-only or strict policy; a late ACK cannot resume it.
+
+### Async verifier scheduling
+
+Set `async_scheduling=True` and `enforce_eager=True` on the verifier, with
+`VLLM_USE_V2_MODEL_RUNNER=1`, for an existing native causal full-attention
+token-only target/draft combination. Target and draft must use TP1 and one inline
+endpoint. The existing greedy, tokenizer and model/weight contracts still apply.
+Prefix caching may be enabled independently when the cached-prefix contract
+above is satisfied.
+
+The backend keeps dispatch and collect adjacent, with at most one pending
+proposal. Async verifier scheduling does not move collection across another
+forward or make a single request's target and draft computations overlap.
+Logical valid draft lengths remain separate from the scheduler's physical
+placeholder slots; an invalid slot is never an authoritative token delta.
+The existing terminal fallback, generation fencing and request retirement rules
+remain in effect.
+
+Target-conditioned MTP/EAGLE, Gemma target-KV snapshots, recurrent or MLA state,
+sliding-window attention, pooled endpoints, CUDA graphs and larger TP are
+excluded from this async mode. Native local execution retains its own support.
+This mode is experimental; no performance improvement is established.
 
 ### Batched token execution
 

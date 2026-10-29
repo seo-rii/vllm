@@ -2131,6 +2131,13 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens
+        if model_runner_output.num_invalid_spec_tokens is not None:
+            num_invalid_spec_tokens = dict(num_invalid_spec_tokens or {})
+            for req_id, count in model_runner_output.num_invalid_spec_tokens.items():
+                num_invalid_spec_tokens[req_id] = max(
+                    num_invalid_spec_tokens.get(req_id, 0), count
+                )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -2223,18 +2230,16 @@ class Scheduler(SchedulerInterface):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    num_invalid_spec_tokens=num_invalid_spec_tokens,
                     request_id=req_id,
                 )
                 if request.spec_decode_metrics is not None:
-                    # Exclude grammar-invalidated drafts from the proposed
+                    # Exclude invalid draft slots from the proposed
                     # count, mirroring make_spec_decoding_stats; the accepted
                     # bucket (j) is unaffected.
                     adj_draft_tokens = num_draft_tokens
-                    if scheduler_output.num_invalid_spec_tokens:
-                        adj_draft_tokens -= (
-                            scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
-                        )
+                    if num_invalid_spec_tokens:
+                        adj_draft_tokens -= num_invalid_spec_tokens.get(req_id, 0)
                     request.spec_decode_metrics.observe(
                         num_draft_tokens=adj_draft_tokens,
                         num_accepted=num_accepted,
