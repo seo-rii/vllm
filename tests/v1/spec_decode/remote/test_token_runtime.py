@@ -2638,8 +2638,9 @@ def test_prefix_replay_preserves_unsupported_state_and_topology_gates(
         )
     else:
         options["target_tp"] = 2
-    if unsupported == "pool":
-        with pytest.raises(ValueError, match="exactly one endpoint"):
+    if unsupported in ("pool", "tp2"):
+        reason = "exactly one endpoint" if unsupported == "pool" else "target TP1"
+        with pytest.raises(ValueError, match=reason):
             token_config(tmp_path, **options)
         return
     config = token_config(tmp_path, **options)

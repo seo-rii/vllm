@@ -2009,7 +2009,6 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
 
     from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits
     from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
-    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
     from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
     args = parser().parse_args(cli_args)
@@ -2066,7 +2065,7 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
         server.stop()
     if Path(receipt_path).exists():
         assert not server.healthy and server.wait(timeout=0)
-        with pytest.raises(ServerShutdownTimeout, match="process restart"):
+        with pytest.raises(RuntimeError, match="unhealthy"):
             server.start(args.endpoint)
         receipt = dict(
             healthy=server.healthy,
