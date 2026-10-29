@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    SparseMLAKVContract,
     group_standalone_kv_specs,
     make_grouped_standalone_kv_config,
     select_standalone_kv_spec,
@@ -51,7 +52,10 @@ logger = init_logger(__name__)
 
 
 def initialize_standalone_kv_cache_config(
-    vllm_config: VllmConfig, kv_cache_bytes: int
+    vllm_config: VllmConfig,
+    kv_cache_bytes: int,
+    *,
+    sparse_mla: SparseMLAKVContract | None = None,
 ) -> "KVCacheConfig":
     """Resolve the loaded draft's KV layout and attention cache capacity."""
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -72,9 +76,73 @@ def initialize_standalone_kv_cache_config(
     layout = resolve_kv_cache_layout(
         vllm_config, [[layout.name for layout in layouts]], specs.values()
     )
-    kv_config = make_grouped_standalone_kv_config(specs, kv_cache_bytes, layout)
+    kv_config = make_grouped_standalone_kv_config(
+        specs, kv_cache_bytes, layout, sparse_mla=sparse_mla
+    )
     vllm_config.cache_config.num_gpu_blocks = kv_config.num_blocks
     return kv_config
+
+
+def _validate_sparse_mla_model(
+    model: torch.nn.Module, contract: SparseMLAKVContract, config: VllmConfig
+) -> None:
+    from vllm.models.deepseek_v32.nvidia.mtp import DeepseekV32MTP
+    from vllm.v1.attention.backends.mla.index_group import (
+        SparseMLAIndexGroup,
+        get_sparse_mla_index_group_max_rows,
+    )
+
+    if not isinstance(model, DeepseekV32MTP) or len(model.model.layers) != 1:
+        raise ValueError("standalone sparse MLA requires one native V3.2 MTP head")
+    layer = next(iter(model.model.layers.values())).mtp_block.self_attn
+    indexer = layer.indexer
+    logical = layer.topk_indices_buffer
+    group = layer.impl.index_group
+    rows = get_sparse_mla_index_group_max_rows(config)
+    if (
+        not layer.use_sparse
+        or not layer.get_attn_backend().is_sparse()
+        or indexer is None
+        or type(group) is not SparseMLAIndexGroup
+        or not group.has_indexer
+        or group.num_layers != 1
+        or layer.impl.index_group_index != 0
+        or logical.shape
+        != (config.scheduler_config.max_num_batched_tokens, contract.topk_tokens)
+        or logical.dtype != torch.int32
+        or logical.device.type != "cuda"
+        or indexer.topk_indices_buffer is not logical
+        or indexer.indexer_op.topk_indices_buffer is not logical
+        or indexer.indexer_op.k_cache is not indexer.k_cache
+        or group.logical_topk_indices is not logical
+        or group.physical_topk_indices.shape != (rows + 1, contract.topk_tokens)
+        or group.valid_topk_counts.shape != (rows + 1,)
+        or any(
+            value.dtype != torch.int32 or value.device != logical.device
+            for value in (group.physical_topk_indices, group.valid_topk_counts)
+        )
+        or indexer.quant_block_size != 128
+        or indexer.head_dim != 128
+        or indexer.scale_fmt != "ue8m0"
+        or indexer.indexer_op.use_fp4_cache
+        or indexer.indexer_op.compress_ratio != 1
+        or indexer.indexer_op.skip_k_cache_insert
+    ):
+        raise ValueError(
+            "standalone sparse MLA requires draft-owned native top-k state"
+        )
+    workspace_bytes = sum(
+        value.numel() * value.element_size()
+        for value in (logical, group.physical_topk_indices, group.valid_topk_counts)
+    )
+    logger.info(
+        "Standalone sparse MLA: model=%s backend=%s mla_head_size=576 "
+        "indexer_record_bytes=132 topk=%d topk_workspace_bytes=%d",
+        type(model).__name__,
+        layer.get_attn_backend().get_name(),
+        contract.topk_tokens,
+        workspace_bytes,
+    )
 
 
 def _resolve_local_rank(
@@ -265,9 +333,13 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                     "Standalone weight profile: %s",
                     validate_loaded_weight_profile(self.speculator.model, profile),
                 )
+            if sparse_mla := self.contract.sparse_mla_kv:
+                _validate_sparse_mla_model(
+                    self.speculator.model, sparse_mla, vllm_config
+                )
 
             self.kv_config = initialize_standalone_kv_cache_config(
-                vllm_config, kv_cache_bytes
+                vllm_config, kv_cache_bytes, sparse_mla=self.contract.sparse_mla_kv
             )
             group_specs = [g.kv_cache_spec for g in self.kv_config.kv_cache_groups]
             self.block_size = group_specs[0].block_size
@@ -295,6 +367,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.attn_groups, _, kernel_sizes = init_attn_backend(
                 self.kv_config, vllm_config, device
             )
+            if self.contract.sparse_mla_kv is not None and any(
+                size != self.block_size for size in kernel_sizes
+            ):
+                raise ValueError("standalone sparse MLA requires unsplit kernel blocks")
             self.model_state = DefaultModelState(
                 vllm_config, self.speculator.model, None, device
             )
@@ -319,6 +395,47 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                     for g in groups
                 ),
             )
+            if self.contract.sparse_mla_kv is not None:
+                from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+                layouts = []
+                attention = next(
+                    iter(self.speculator.model.model.layers.values())
+                ).mtp_block.self_attn
+                indexer_cache = attention.indexer.k_cache
+                bound = {
+                    attention.layer_name: attention.kv_cache,
+                    indexer_cache.prefix: indexer_cache.kv_cache,
+                }
+                for group in self.kv_config.kv_cache_groups:
+                    cache_spec = group.kv_cache_spec
+                    assert isinstance(cache_spec, MLAAttentionSpec)
+                    for name in group.layer_names:
+                        cache = self.kv_caches[name]
+                        if (
+                            cache.dtype != cache_spec.dtype
+                            or cache.shape
+                            != (
+                                self.num_blocks,
+                                1,
+                                self.block_size,
+                                cache_spec.head_size,
+                            )
+                            or bound[name].data_ptr() != cache.data_ptr()
+                        ):
+                            raise ValueError(
+                                "standalone sparse MLA KV binding mismatch"
+                            )
+                        layouts.append(
+                            dict(
+                                role=cache_spec.cache_role.value,
+                                dtype=str(cache.dtype),
+                                shape=tuple(cache.shape),
+                                block_stride_bytes=cache.stride(0)
+                                * cache.element_size(),
+                            )
+                        )
+                logger.info("Standalone sparse MLA bound caches: %s", layouts)
             self._init_sampling_buffers(scheduler.max_num_seqs)
         draft_bytes, embedding_bytes, head_bytes = model_weight_bytes(
             self.speculator.model
@@ -392,8 +509,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             raise ValueError(
                 "standalone MTP contract requires checkpoint-owned LM heads"
             )
-        if spec.use_multi_module_mtp():
-            group_standalone_kv_specs(get_kv_cache_spec(config))
+        if spec.use_multi_module_mtp() or self.contract.sparse_mla_kv is not None:
+            group_standalone_kv_specs(
+                get_kv_cache_spec(config), sparse_mla=self.contract.sparse_mla_kv
+            )
         else:
             select_standalone_kv_spec(get_kv_cache_spec(config))
         return speculator

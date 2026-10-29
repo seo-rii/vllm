@@ -335,6 +335,7 @@ def _deepseek_public_config(
     cache_dtype="auto",
     spec_options=None,
     model_impl="auto",
+    sparse=False,
 ):
     options = dict(
         architectures=["DeepseekV3ForCausalLM"],
@@ -362,9 +363,25 @@ def _deepseek_public_config(
         eos_token_id=1,
         pad_token_id=2,
     )
+    if sparse:
+        options.update(
+            architectures=["DeepseekV32ForCausalLM"],
+            model_type="deepseek_v32",
+            index_topk=512,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_share_for_mtp_iteration=False,
+        )
 
     def checkpoint(path, hf):
         hf.save_pretrained(path)
+        if isinstance(hf, DeepseekV3Config):
+            # HF shares the V3 config class; native V3.2 is selected by this
+            # checkpoint discriminator before its MTP architecture override.
+            config_path = path / "config.json"
+            saved = json.loads(config_path.read_text())
+            saved["model_type"] = "deepseek_v32" if sparse else "deepseek_v3"
+            config_path.write_text(json.dumps(saved))
         TokenizersBackend(
             tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(32)})),
             bos_token="token0",
@@ -376,10 +393,12 @@ def _deepseek_public_config(
                 torch.manual_seed(0)
                 model = AutoModelForCausalLM.from_config(hf, dtype=torch.bfloat16)
             embedding = model.get_input_embeddings().weight.detach()
-            save_file(
-                {"model.embed_tokens.weight": embedding},
-                path / "model.safetensors",
-            )
+            weights = {"model.embed_tokens.weight": embedding}
+            if sparse:
+                weights["lm_head.weight"] = (
+                    model.get_output_embeddings().weight.detach()
+                )
+            save_file(weights, path / "model.safetensors")
 
     target_path = draft_path = tmp_path
     if target_options or draft_options or wrong_target:
@@ -433,7 +452,7 @@ def _deepseek_public_config(
         **placement,
         **(spec_options or {}),
     )
-    return VllmConfig(
+    config = VllmConfig(
         model_config=target,
         parallel_config=parallel,
         speculative_config=spec,
@@ -447,6 +466,11 @@ def _deepseek_public_config(
         ),
         device_config=DeviceConfig("cpu"),
     )
+    if sparse:
+        # CPU platform initialization normalizes blocks to 16; these admission
+        # checks describe the native sparse planner's 64-token resource contract.
+        config.cache_config.block_size = 64
+    return config
 
 
 @pytest.mark.parametrize("k", [1, 3])
@@ -571,6 +595,101 @@ def test_deepseek_public_config_rejects_multiple_endpoints(tmp_path):
     )
     with pytest.raises(ValueError, match="one inline endpoint"):
         create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_deepseek_v32_public_override_preserves_sparse_mtp_resources(tmp_path, k):
+    config = _deepseek_public_config(tmp_path, k=k, sparse=True)
+    target = config.model_config
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    assert isinstance(target.hf_config, DeepseekV3Config)
+    assert isinstance(draft.hf_config, DeepseekV3Config)
+    assert target.hf_config.model_type == "deepseek_v32"
+    assert draft.hf_config.model_type == "deepseek_mtp"
+    assert target.hf_config.architectures == ["DeepseekV32ForCausalLM"]
+    assert draft.hf_config.architectures == ["DeepseekV32MTPModel"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.dtype == draft.dtype == torch.bfloat16
+    assert target.quantization is None and draft.quantization is None
+    assert not target.uses_mrope and not draft.uses_mrope
+    contract = create_runtime_contract(config)
+    assert contract.requires_target_lm_head
+    assert contract.sparse_mla_kv is not None
+    assert contract.sparse_mla_kv.topk_tokens == 512
+    assert contract.sparse_mla_kv.block_size == 64
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[1].trailing_shape == ()
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (16,)
+    shell = materialize_target_shell(target, torch.device("cpu"))
+    saved = load_file(tmp_path / "model.safetensors")
+    torch.testing.assert_close(
+        shell.model.embed_tokens.weight[: target.get_vocab_size()],
+        saved["model.embed_tokens.weight"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shell.lm_head.weight[: target.get_vocab_size()],
+        saved["lm_head.weight"],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "options,detail",
+    [
+        ({"target_tp": 2}, "TP1"),
+        ({"transport": "cuda_ipc"}, "one inline endpoint"),
+        ({"dtype": "float32"}, "unquantized bfloat16"),
+        ({"cache_dtype": "fp8"}, "bfloat16 KV"),
+        ({"spec_options": {"kv_cache_dtype": "fp8"}}, "bfloat16 KV"),
+        ({"k": 2, "draft_options": {"num_nextn_predict_layers": 2}}, "one checkpoint"),
+        ({"target_options": {"index_n_heads": 32}}, "sparse indexer geometry"),
+        ({"draft_options": {"index_head_dim": 64}}, "sparse indexer geometry"),
+        ({"draft_options": {"index_topk": 256}}, "top-k 512, 1024 or 2048"),
+        ({"target_options": {"kv_lora_rank": 256}}, "MLA geometry"),
+        ({"draft_options": {"q_lora_rank": None}}, "positive query LoRA rank"),
+        (
+            {"draft_options": {"index_share_for_mtp_iteration": True}},
+            "index sharing",
+        ),
+        ({"target_options": {"index_topk_freq": 2}}, "index sharing"),
+        ({"draft_options": {"rms_norm_eps": 1e-5}}, "matching native configs"),
+    ],
+)
+def test_deepseek_v32_public_contract_rejects_unverified_resources(
+    tmp_path, options, detail
+):
+    with pytest.raises(ValueError, match=detail):
+        create_runtime_contract(
+            _deepseek_public_config(tmp_path, sparse=True, **options)
+        )
+
+
+def test_deepseek_v32_sparse_resource_identity_changes_with_topk(tmp_path):
+    first = create_runtime_contract(
+        _deepseek_public_config(tmp_path / "first", sparse=True)
+    )
+    second = create_runtime_contract(
+        _deepseek_public_config(
+            tmp_path / "second",
+            sparse=True,
+            target_options={"index_topk": 1024},
+            draft_options={"index_topk": 1024},
+        )
+    )
+    assert first.sparse_mla_kv is not None
+    assert second.sparse_mla_kv is not None
+    assert first.sparse_mla_kv.topk_tokens == 512
+    assert second.sparse_mla_kv.topk_tokens == 1024
+    assert first.target_fingerprint != second.target_fingerprint
+    assert first.draft_fingerprint != second.draft_fingerprint
 
 
 def _step35_public_config(
