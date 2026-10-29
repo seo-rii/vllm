@@ -442,9 +442,9 @@ class TargetKVRemoteSession:
             or handle.epoch != self._epoch
         ):
             raise RuntimeError("stale, foreign or collected target-KV handle")
-        results = [TargetKVResult() for _ in handle.identities]
         row_error = None
         try:
+            results = [TargetKVResult() for _ in handle.identities]
             if not handle.wire_rows or self._conn is None:
                 return tuple(results)
             message = self._recv(handle.request_id, handle.deadline)

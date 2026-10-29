@@ -151,16 +151,24 @@ def draft_server(
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv", [("inline", False), ("cuda_ipc", False), ("inline", True)]
+    "transport,target_kv,collection_oom",
+    [
+        ("inline", False, False),
+        ("cuda_ipc", False, False),
+        ("inline", True, False),
+        ("inline", True, True),
+    ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport, target_kv
+    vllm_runner, monkeypatch, tmp_path, transport, target_kv, collection_oom
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if collection_oom:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     model = maybe_model_redirect(GEMMA_MODEL if target_kv else MODEL)
     revision = GEMMA_REVISION if target_kv else REVISION
     backend = "TRITON_ATTN" if target_kv else "FLASH_ATTN"
@@ -206,7 +214,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             remote_draft=dict(
                 endpoint=endpoint,
                 transport=transport,
-                failure_policy="error",
+                failure_policy="target_only" if collection_oom else "error",
                 request_timeout_ms=5000,
                 startup_timeout_ms=600000,
             ),
@@ -215,6 +223,41 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
             assert actual_config.remote_draft.transport == transport
+            metric_names = (
+                "vllm:spec_decode_num_draft_tokens",
+                "vllm:spec_decode_num_accepted_tokens",
+            )
+            before_recovery = None
+            if collection_oom:
+                from tests.v1.spec_decode.remote.runtime_fixtures import (
+                    allocation_failures,
+                )
+                from vllm.v1.spec_decode.remote.target_kv_session import (
+                    TargetKVRemoteSession,
+                )
+
+                failure = MemoryError("target-KV result allocation")
+                with allocation_failures(
+                    [
+                        (
+                            TargetKVRemoteSession.collect_batch,
+                            "results = [TargetKVResult()",
+                            failure,
+                        )
+                    ]
+                ) as failures:
+                    recovered = remote.llm.generate(
+                        prompts[:1], sampling, use_tqdm=False
+                    )
+                assert failures == [failure]
+                assert list(recovered[0].outputs[0].token_ids) == list(
+                    expected[0].outputs[0].token_ids
+                )
+                remote.llm.llm_engine.do_log_stats()
+                before_recovery = {
+                    name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                    for name in metric_names
+                }
             for inputs, reference in (
                 (prompts, expected),
                 (list(reversed(prompts)), list(reversed(expected))),
@@ -225,6 +268,14 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                     list(x.outputs[0].token_ids) for x in reference
                 ]
                 assert all(len(x.outputs[0].token_ids) == 16 for x in outputs)
+                if before_recovery is not None:
+                    remote.llm.llm_engine.do_log_stats()
+                    for name in metric_names:
+                        assert (
+                            get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                            > before_recovery[name]
+                        )
+                    before_recovery = None
             remote.llm.llm_engine.do_log_stats()
             metrics = remote.llm.get_metrics()
             for name in (

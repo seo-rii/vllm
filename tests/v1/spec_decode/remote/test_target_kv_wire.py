@@ -306,6 +306,36 @@ def test_stale_round_epoch_and_double_collect_fail_before_execution(wire_runtime
 
 
 @pytest.mark.parametrize("policy", ["error", "target_only"])
+def test_collect_allocation_failure_retires_pending_snapshot(wire_runtime, policy):
+    """Result allocation belongs to the same cleanup boundary as socket reads."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+
+    server, _, client = wire_runtime
+    client.failure_policy = policy
+    key = client.open_sequence(0, deadline=client.deadline())
+    handle = client.dispatch(
+        snapshot(client, key),
+        10,
+        torch.ones((1, 8), dtype=torch.bfloat16),
+        deadline=client.deadline(),
+    )
+    failure = MemoryError("snapshot result allocation")
+    with allocation_failures(
+        [(TargetKVRemoteSession.collect_batch, "results = [TargetKVResult()", failure)]
+    ) as failures:
+        if policy == "error":
+            with pytest.raises(RemoteDraftError, match="snapshot result allocation"):
+                client.collect(handle)
+        else:
+            assert client.collect(handle).valid_length == 0
+    assert failures == [failure]
+    assert not handle.active
+    assert client._pending is None
+    assert not client.active(key)
+    until(lambda: not server._connections and len(server.registry) == 0)
+
+
+@pytest.mark.parametrize("policy", ["error", "target_only"])
 def test_executor_oom_fences_request_and_releases_connection(wire_runtime, policy):
     server, executor, client = wire_runtime
     client.failure_policy = policy
