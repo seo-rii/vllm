@@ -284,6 +284,8 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
         raise ValueError("token-only runtime requires an independent draft_model")
+    if config.parallel_config.tensor_parallel_size != 1:
+        raise ValueError("token-only remote drafting requires target TP1")
     if spec.execution is not None and spec.execution.policy == "outcome_cache":
         if (spec.kv_cache_dtype or config.cache_config.cache_dtype) not in (
             "auto",

@@ -404,4 +404,105 @@ def test_token_compatibility_contract_matches_public_schema_cli_and_native_load(
     assert type(model).__name__ == "Qwen3ForCausalLM"
     assert len(specs) == resource.model_config.get_total_num_hidden_layers()
     assert all(type(spec) is FullAttentionSpec for spec in specs.values())
-    assert all(spec.dtype == getattr(torch, dtype) for spec in specs.values())
+    assert all(
+        isinstance(spec, FullAttentionSpec) and spec.dtype == getattr(torch, dtype)
+        for spec in specs.values()
+    )
+
+
+@pytest.mark.parametrize("target_tp", [1, 2])
+@pytest.mark.parametrize("entrypoint", ["engine_args", "vllm_config", "schema"])
+def test_token_target_topology_is_checked_before_worker_creation(
+    tmp_path, target_tp, entrypoint
+):
+    """Every public construction path must reject the worker's unsupported TP."""
+    from dataclasses import replace
+
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.config import ParallelConfig
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.spec_decode.remote.protocol import FeatureSlot
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    assets = token_config(tmp_path)
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
+    options = {
+        "model": assets.speculative_config.draft_model_config.model,
+        "method": "draft_model",
+        "num_speculative_tokens": 3,
+        "draft_tensor_parallel_size": 1,
+        "execution": {
+            "placement": "remote",
+            "endpoints": ["unix:///tmp/token-topology.sock"],
+            "transport": "inline",
+        },
+    }
+
+    def construct():
+        if entrypoint == "engine_args":
+            config = EngineArgs(
+                model=assets.model_config.model,
+                tokenizer_mode="hf",
+                dtype="float32",
+                skip_tokenizer_init=True,
+                max_model_len=64,
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                tensor_parallel_size=target_tp,
+                enforce_eager=True,
+                enable_prefix_caching=False,
+                async_scheduling=False,
+                speculative_config=options,
+            ).create_engine_config()
+        elif entrypoint == "vllm_config":
+            config = replace(
+                assets,
+                parallel_config=parallel,
+                speculative_config=SpeculativeConfig(
+                    target_model_config=assets.model_config,
+                    target_parallel_config=parallel,
+                    **options,
+                ),
+            )
+        else:
+            config = replace(assets, parallel_config=parallel)
+        return create_token_runtime_contract(config)
+
+    if target_tp == 1:
+        assert construct().schema.slots == (FeatureSlot("token_ids", "int32", ()),)
+    else:
+        with pytest.raises(ValueError, match="token-only.*target TP1"):
+            construct()
+
+
+def test_llm_rejects_remote_token_target_tp2_before_starting_workers(tmp_path):
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm import LLM
+
+    assets = token_config(tmp_path)
+    with pytest.raises(ValueError, match="token-only.*target TP1"):
+        LLM(
+            model=assets.model_config.model,
+            tokenizer_mode="hf",
+            dtype="float32",
+            max_model_len=64,
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            tensor_parallel_size=2,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            speculative_config={
+                "model": assets.speculative_config.draft_model_config.model,
+                "method": "draft_model",
+                "num_speculative_tokens": 3,
+                "draft_tensor_parallel_size": 1,
+                "execution": {
+                    "placement": "remote",
+                    "endpoints": ["unix:///tmp/token-topology.sock"],
+                    "transport": "inline",
+                },
+            },
+        )

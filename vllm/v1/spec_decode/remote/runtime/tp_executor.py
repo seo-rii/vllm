@@ -228,29 +228,57 @@ class TPProcessGroup:
         deadline = time.monotonic() + startup_timeout_s
         try:
             for rank in range(world_size):
-                parent, child = socket.socketpair()
-                death_reader, death_writer = context.Pipe(duplex=False)
-                channel = TPWorkerConnection(parent, timeout_s=timeout_s)
-                process = context.Process(
-                    target=_run_process,
-                    args=(
+                parent = child = death_reader = death_writer = process = None
+                registered = False
+                failure = None
+                try:
+                    parent, child = socket.socketpair()
+                    death_reader, death_writer = context.Pipe(duplex=False)
+                    channel = TPWorkerConnection(parent, timeout_s=timeout_s)
+                    process = context.Process(
+                        target=_run_process,
+                        args=(
+                            child,
+                            death_reader,
+                            rank,
+                            timeout_s,
+                            worker_target,
+                            worker_args,
+                        ),
+                        name=f"draft-tp-{rank}",
+                        daemon=True,
+                    )
+                    owner = _Rank(process, parent, channel, death_writer)
+                    self._ranks.append(owner)
+                    registered = True
+                    try:
+                        process.start()
+                    finally:
+                        owner.pid = process.pid
+                except BaseException as error:
+                    failure = error
+                finally:
+                    cleanup_errors = []
+                    for resource in (
                         child,
                         death_reader,
-                        rank,
-                        timeout_s,
-                        worker_target,
-                        worker_args,
-                    ),
-                    name=f"draft-tp-{rank}",
-                    daemon=True,
-                )
-                self._ranks.append(_Rank(process, parent, channel, death_writer))
-                try:
-                    process.start()
-                    self._ranks[-1].pid = process.pid
-                finally:
-                    child.close()
-                    death_reader.close()
+                        None if registered else parent,
+                        None if registered else death_writer,
+                        None if registered else process,
+                    ):
+                        if resource is not None:
+                            try:
+                                resource.close()
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                    if cleanup_errors:
+                        if failure is not None:
+                            cleanup_errors.insert(0, failure)
+                        raise BaseExceptionGroup(
+                            "draft TP startup resource cleanup failed", cleanup_errors
+                        )
+                if failure is not None:
+                    raise failure
             self.ready = self._collect(0, "ready", deadline)
         except BaseException as error:
             try:
