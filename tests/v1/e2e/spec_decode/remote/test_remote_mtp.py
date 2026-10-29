@@ -320,18 +320,20 @@ def test_remote_mtp_matches_target_and_uses_drafts(
 
                 index_copy = torch.Tensor.index_copy_
 
-                def delayed_result_copy(tensor, *args, **kwargs):
+                def observe_result_copy(tensor, *args, **kwargs):
                     if (
-                        tensor.is_cuda
-                        and tensor.dtype == torch.int32
+                        tensor.dtype == torch.int32
                         and tensor.ndim == 1
                         and threading.current_thread().name.startswith("draft-feature-")
                     ):
-                        torch.cuda._sleep(50_000_000)
+                        # The model runner stages recovery tokens on CPU, so
+                        # its session results are CPU tensors too. The CUDA
+                        # result handoff is exercised by the pool stream test.
+                        assert tensor.device.type == "cpu"
                         result_writes.append(threading.get_ident())
                     return index_copy(tensor, *args, **kwargs)
 
-                monkeypatch.setattr(torch.Tensor, "index_copy_", delayed_result_copy)
+                monkeypatch.setattr(torch.Tensor, "index_copy_", observe_result_copy)
             metric_names = (
                 "vllm:spec_decode_num_draft_tokens",
                 "vllm:spec_decode_num_accepted_tokens",
@@ -473,7 +475,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             for name in metric_names:
                 assert get_spec_decode_metric_value(metrics, name) > 0
             if not target_kv and num_workers > 1:
-                assert result_writes, "the driver result delay was not exercised"
+                assert len(set(result_writes)) == num_workers
 
 
 @pytest.fixture
