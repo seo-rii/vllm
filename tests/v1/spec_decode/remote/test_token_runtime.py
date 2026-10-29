@@ -2690,7 +2690,8 @@ def test_token_mla_draft_keeps_independent_model_and_backend(tmp_path, k, kv_dty
         ({"spec_options": {"kv_cache_dtype": "fp8"}}, "MLA draft requires bfloat16 KV"),
         (
             {"target_tp": 2, "spec_options": {"draft_tensor_parallel_size": 1}},
-            "MLA draft requires target TP1 and draft TP1",
+            # Public configuration rejects target TP before MLA admission.
+            "token-only remote drafting requires target TP1",
         ),
         (
             {
