@@ -47,6 +47,7 @@ def draft_server(
     target_attention_backend: str | None = None,
     draft_kv_cache_gib: float = 0.25,
     max_feature_tokens: int = 64,
+    max_model_len: int = 128,
     trust_remote_code: bool = True,
     moe_backend: str | None = None,
     batch_invariant: bool | None = None,
@@ -77,7 +78,7 @@ def draft_server(
             "--max-batch-size",
             "4",
             "--max-model-len",
-            "128",
+            str(max_model_len),
             "--max-feature-tokens",
             str(max_feature_tokens),
             "--draft-kv-cache-gib",
@@ -1006,6 +1007,576 @@ def _save_mtp_checkpoint(path, config, weights):
     return str(path)
 
 
+def _check_deepseek_mtp_weights(target, draft, model_path):
+    """Account for every checkpoint tensor and native packed parameter."""
+    import torch
+    from safetensors.torch import load_file
+
+    weights = load_file(Path(model_path) / "model.safetensors")
+    checked = set()
+    parameter_counts = {}
+    assert type(target).__name__ == "DeepseekV3ForCausalLM"
+    assert type(draft).__name__ == "DeepSeekMTP"
+
+    def equal(actual, names):
+        expected = torch.cat([weights[name] for name in names]).to(actual.dtype)
+        assert torch.equal(actual.detach().cpu(), expected), names
+        checked.update(names)
+
+    for role, model in (("target", target), ("draft", draft)):
+        parameters = dict(model.named_parameters())
+        for name, parameter in parameters.items():
+            source = name.replace(".mtp_block.", ".")
+            if source in weights:
+                equal(parameter, [source])
+            elif source.endswith(".fused_qkv_a_proj.weight"):
+                equal(
+                    parameter,
+                    [
+                        source.replace("fused_qkv_a_proj", projection)
+                        for projection in ("q_a_proj", "kv_a_proj_with_mqa")
+                    ],
+                )
+            elif source.endswith(".gate_up_proj.weight"):
+                equal(
+                    parameter,
+                    [
+                        source.replace("gate_up_proj", projection)
+                        for projection in ("gate_proj", "up_proj")
+                    ],
+                )
+            elif source.endswith((".w13_weight", ".w2_weight")):
+                prefix, projection = source.rsplit(".", 1)
+                prefix = prefix.removesuffix(".routed_experts")
+                for expert, value in enumerate(parameter):
+                    names = (
+                        ("gate_proj", "up_proj")
+                        if projection == "w13_weight"
+                        else ("down_proj",)
+                    )
+                    equal(
+                        value,
+                        [f"{prefix}.{expert}.{name}.weight" for name in names],
+                    )
+            elif source.endswith((".W_UV", ".W_UK_T")):
+                prefix = source.rsplit(".self_attn.", 1)[0]
+                checkpoint_name = f"{prefix}.self_attn.kv_b_proj.weight"
+                config = model.config
+                original = (
+                    weights[checkpoint_name]
+                    .to(parameter.dtype)
+                    .T.reshape(
+                        config.kv_lora_rank,
+                        config.num_attention_heads,
+                        config.qk_nope_head_dim + config.v_head_dim,
+                    )
+                )
+                key, value = original.split(
+                    [config.qk_nope_head_dim, config.v_head_dim], dim=-1
+                )
+                expected = (
+                    value.transpose(0, 1)
+                    if source.endswith(".W_UV")
+                    else key.permute(1, 2, 0)
+                )
+                assert torch.equal(parameter.detach().cpu(), expected), name
+                checked.add(checkpoint_name)
+            else:
+                raise AssertionError(f"unchecked native {role} parameter: {name}")
+        parameter_counts[role] = len(parameters)
+
+    assert draft.model.embed_tokens is target.model.embed_tokens
+    assert draft.lm_head is target.lm_head
+    assert tuple(draft.model.layers) == ("2",)
+    layer = draft.model.layers["2"]
+    assert layer.shared_head.head is target.lm_head
+    equal(target.model.embed_tokens.weight, ["model.layers.2.embed_tokens.weight"])
+    equal(target.lm_head.weight, ["model.layers.2.shared_head.head.weight"])
+    assert checked == weights.keys(), weights.keys() - checked
+    return dict(
+        target=type(target).__name__,
+        draft=type(draft).__name__,
+        parameters=parameter_counts,
+        checkpoint_tensors=len(checked),
+        exact_parameter_roundtrip=True,
+        shared_embedding_and_head=True,
+        mtp_absolute_layer=2,
+    )
+
+
+def _save_deepseek_mtp_model(directory, ffn_layout):
+    """Save a complete initialized HF V3 target and independent native MTP block."""
+    import json
+
+    import torch
+    from transformers import DeepseekV3Config, DeepseekV3ForCausalLM
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3DecoderLayer,
+        DeepseekV3RMSNorm,
+    )
+
+    assert current_platform.is_cpu() and not torch.cuda.is_initialized()
+    assert ffn_layout in ("dense", "moe")
+    torch.set_num_threads(1)
+    root = Path(directory)
+    dense = ffn_layout == "dense"
+    config = DeepseekV3Config(
+        architectures=["DeepseekV3ForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        n_routed_experts=0 if dense else 4,
+        n_shared_experts=0 if dense else 1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        first_k_dense_replace=3 if dense else 1,
+        n_group=1,
+        topk_group=1,
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        num_nextn_predict_layers=1,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        attention_bias=False,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        dtype="bfloat16",
+        topk_method="noaux_tc",
+        scoring_func="sigmoid",
+    )
+    assert not hasattr(config, "index_topk")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20261026)
+        target = DeepseekV3ForCausalLM(config)
+        _two_candidate_head(target.lm_head.weight)
+        # HF initializes expert tensors in the owning model's post_init().
+        # Use its independently initialized absolute-N layer, not raw empty
+        # expert Parameters from a standalone decoder constructor.
+        mtp_config = DeepseekV3Config.from_dict(config.to_dict(), num_hidden_layers=3)
+        mtp = DeepseekV3ForCausalLM(mtp_config).model.layers[2]
+        assert isinstance(mtp, DeepseekV3DecoderLayer)
+        state = dict(target.state_dict())
+        state.update(
+            {
+                f"model.layers.2.{name}": value
+                for name, value in mtp.state_dict().items()
+            }
+        )
+        for name in ("enorm", "hnorm", "shared_head.norm"):
+            norm = DeepseekV3RMSNorm(128, config.rms_norm_eps)
+            state[f"model.layers.2.{name}.weight"] = norm.weight.detach().clone()
+        fusion = torch.nn.Linear(256, 128, bias=False)
+        _conditioned_mtp_fusion(fusion.weight)
+        state["model.layers.2.eh_proj.weight"] = fusion.weight.detach().clone()
+        state["model.layers.2.embed_tokens.weight"] = state[
+            "model.embed_tokens.weight"
+        ].clone()
+        state["model.layers.2.shared_head.head.weight"] = state[
+            "lm_head.weight"
+        ].clone()
+    weights = _unpack_mtp_experts(state)
+    _save_mtp_checkpoint(root / "model", config, weights)
+    assert not torch.cuda.is_initialized()
+    receipt = dict(
+        target_architecture=config.architectures[0],
+        draft_architecture="DeepSeekMTPModel",
+        target_hf_class=type(target).__name__,
+        mtp_hf_class=type(mtp).__name__,
+        mtp_source="independently_initialized_hf_layer_2_of_3",
+        fusion="embedding_1_4_target_hidden_3_4",
+        checkpoint_tensors=len(weights),
+        exact_checkpoint_roundtrip=True,
+        mtp_absolute_layer=2,
+        ffn_layout=ffn_layout,
+        routed_experts=config.n_routed_experts,
+        first_k_dense_replace=config.first_k_dense_replace,
+        latent_width=576,
+        seed=20261026,
+        head_candidate_ids=[3, 4],
+        head_scale=32,
+        cuda_initialized=False,
+    )
+    (root / "fixture.json").write_text(json.dumps(receipt) + "\n")
+
+
+@pytest.fixture
+def tiny_deepseek_mtp_model(tmp_path, ffn_layout):
+    """Build real initialized weights without changing the serving CUDA platform."""
+    root = (tmp_path / f"deepseek-v3-{ffn_layout}").resolve()
+    root.mkdir()
+    source = Path(__file__).resolve().parents[5]
+    command = [
+        sys.executable,
+        "-c",
+        "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_deepseek_mtp_model; "
+        "import sys; _save_deepseek_mtp_model(*sys.argv[1:])",
+        str(root),
+        ffn_layout,
+    ]
+    log_path = root / "fixture.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command,
+            env=dict(
+                os.environ,
+                PYTHONPATH=str(source),
+                CUDA_VISIBLE_DEVICES="",
+                VLLM_TARGET_DEVICE="cpu",
+                VLLM_BATCH_INVARIANT="0",
+            ),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            assert process.wait(timeout=210) == 0, (
+                f"DeepSeek fixture failed: {log_path}"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+    return str(root / "model")
+
+
+def _mimo_v2_flash_fixture_data():
+    import torch
+    from transformers import AutoConfig
+
+    config = AutoConfig.for_model(
+        "mimo_v2_flash",
+        **{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 192,
+            "v_head_dim": 128,
+            "swa_num_attention_heads": 2,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 192,
+            "swa_v_head_dim": 128,
+            "hybrid_layer_pattern": [0, 1],
+            "sliding_window": 128,
+            "sliding_window_size": 128,
+            "attention_chunk_size": 128,
+            "attention_bias": False,
+            "add_swa_attention_sink_bias": True,
+            "add_full_attention_sink_bias": False,
+            "attention_value_scale": 0.707,
+            "partial_rotary_factor": 0.334,
+            "rope_theta": 5000000,
+            "swa_rope_theta": 10000,
+            "layernorm_epsilon": 1e-05,
+            "max_position_embeddings": 256,
+            "hidden_act": "silu",
+            "moe_layer_freq": [0, 1],
+            "moe_intermediate_size": 128,
+            "n_routed_experts": 4,
+            "n_shared_experts": None,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": True,
+            "scoring_func": "sigmoid",
+            "n_group": 1,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "routed_scaling_factor": None,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0,
+            "tie_word_embeddings": False,
+            "torch_dtype": "bfloat16",
+        },
+    )
+    generator = torch.Generator(device="cpu").manual_seed(20261024)
+    weights = {}
+
+    def weight(name, shape, *, norm=False, router=False):
+        value = (
+            torch.ones(shape)
+            if norm
+            else torch.randn(shape, generator=generator) * 0.02
+        )
+        weights[name] = value.to(
+            torch.float32 if router else torch.bfloat16
+        ).contiguous()
+
+    def attention(prefix, kv_heads, sink):
+        for projection, rows in [
+            ("q_proj", 384),
+            ("k_proj", kv_heads * 192),
+            ("v_proj", kv_heads * 128),
+        ]:
+            weight(prefix + "." + projection + ".weight", (rows, 64))
+        weight(prefix + ".o_proj.weight", (64, 256))
+        if sink:
+            weight(prefix + ".attention_sink_bias", (2,))
+
+    def mlp(prefix):
+        for name in ["gate_proj", "up_proj"]:
+            weight(prefix + "." + name + ".weight", (128, 64))
+        weight(prefix + ".down_proj.weight", (64, 128))
+
+    weight("model.embed_tokens.weight", (128, 64))
+    weight("lm_head.weight", (128, 64))
+    weight("model.norm.weight", (64,), norm=True)
+    for i, kv_heads in enumerate([1, 2]):
+        prefix = f"model.layers.{i}"
+        weight(prefix + ".input_layernorm.weight", (64,), norm=True)
+        weight(prefix + ".post_attention_layernorm.weight", (64,), norm=True)
+        attention(prefix + ".self_attn", kv_heads, i == 1)
+        if i == 0:
+            mlp(prefix + ".mlp")
+        else:
+            weight(prefix + ".mlp.gate.weight", (4, 64), router=True)
+            weight(prefix + ".mlp.gate.e_score_correction_bias", (4,), router=True)
+            for expert in range(4):
+                mlp(prefix + f".mlp.experts.{expert}")
+    mtp = "model.mtp.layers.0"
+    weight(mtp + ".eh_proj.weight", (64, 128))
+    _conditioned_mtp_fusion(weights[mtp + ".eh_proj.weight"])
+    for name in [
+        "enorm",
+        "hnorm",
+        "input_layernorm",
+        "pre_mlp_layernorm",
+        "final_layernorm",
+    ]:
+        weight(mtp + "." + name + ".weight", (64,), norm=True)
+    attention(mtp + ".self_attn", 2, True)
+    mlp(mtp + ".mlp")
+    assert len(weights) == 47
+    target_keys = {name for name in weights if ".mtp." not in name}
+    draft_keys = {
+        name
+        for name in weights
+        if ".mtp." in name or name in ["model.embed_tokens.weight", "lm_head.weight"]
+    }
+    assert len(target_keys) == 33 and len(draft_keys) == 16
+    assert all(torch.isfinite(value).all() for value in weights.values())
+    _two_candidate_head(weights["lm_head.weight"])
+    return config, weights
+
+
+@pytest.fixture
+def tiny_mimo_v2_flash_mtp_model(tmp_path):
+    """Complete synthetic BF16 Flash target and first native MTP head, not quality."""
+    config, weights = _mimo_v2_flash_fixture_data()
+    import json
+
+    model = _save_mtp_checkpoint(tmp_path / "mimo-v2-flash", config, weights)
+    (tmp_path / "fixture.json").write_text(
+        json.dumps(
+            dict(
+                seed=20261024,
+                head_candidate_ids=[3, 4],
+                head_scale=32,
+                architecture="MiMoV2FlashForCausalLM",
+                synthetic_bf16=True,
+                fusion="embedding_1_4_target_hidden_3_4",
+                checkpoint_tensors=47,
+                exact_checkpoint_roundtrip=True,
+                native_used_heads=1,
+                max_model_len=256,
+                window=128,
+                qk_head_dim=192,
+                v_head_dim=128,
+                target_kv_heads=[1, 2],
+                draft_kv_heads=[2],
+            )
+        )
+        + "\n"
+    )
+    return model
+
+
+def _check_mimo_v2_flash_model_weights(model, model_path, role):
+    """Check every original and fused parameter without claiming execution stage."""
+    import torch
+    from safetensors.torch import load_file
+
+    assert role in ("target", "mtp")
+    weights = load_file(Path(model_path) / "model.safetensors")
+    assert len(weights) == 47
+    required = {
+        name
+        for name in weights
+        if (
+            ".mtp." not in name
+            if role == "target"
+            else ".mtp." in name
+            or name in {"model.embed_tokens.weight", "lm_head.weight"}
+        )
+    }
+    checked = set()
+    parameters = []
+    expert_mapping = model.get_expert_mapping() if role == "target" else []
+    for name, parameter in model.named_parameters():
+        if name in weights:
+            expected = weights[name]
+            inputs = [name]
+        elif ".qkv_proj." in name:
+            inputs = [
+                name.replace("qkv_proj", projection)
+                for projection in ["q_proj", "k_proj", "v_proj"]
+            ]
+            expected = torch.cat([weights[key] for key in inputs])
+        elif ".gate_up_proj." in name:
+            inputs = [
+                name.replace("gate_up_proj", projection)
+                for projection in ["gate_proj", "up_proj"]
+            ]
+            expected = torch.cat([weights[key] for key in inputs])
+        elif name.endswith("w13_weight") or name.endswith("w2_weight"):
+            inputs = []
+            parts = {}
+            for native_name, source_name, expert, shard in expert_mapping:
+                for key in required:
+                    if (
+                        source_name in key
+                        and key.replace(source_name, native_name) == name
+                    ):
+                        parts[expert, shard] = weights[key]
+                        inputs.append(key)
+            if name.endswith("w13_weight"):
+                assert set(parts) == {
+                    (e, shard) for e in range(4) for shard in ["w1", "w3"]
+                }
+                expected = torch.stack(
+                    [torch.cat([parts[e, "w1"], parts[e, "w3"]]) for e in range(4)]
+                )
+            else:
+                assert set(parts) == {(e, "w2") for e in range(4)}
+                expected = torch.stack([parts[e, "w2"] for e in range(4)])
+        else:
+            raise AssertionError(f"unaccounted native parameter: {name}")
+        assert parameter.shape == expected.shape, (
+            name,
+            parameter.shape,
+            expected.shape,
+        )
+        assert torch.equal(parameter.detach().cpu(), expected.to(parameter.dtype)), name
+        checked.update(inputs)
+        parameters.append(
+            dict(
+                name=name,
+                shape=list(parameter.shape),
+                dtype=str(parameter.dtype),
+                checkpoint_keys=sorted(inputs),
+            )
+        )
+    assert checked == required, (role, required - checked, checked - required)
+    return dict(parameters=len(parameters), checkpoint_keys=sorted(checked))
+
+
+def _check_mimo_v2_flash_mtp_weights(target, draft, model_path):
+    """Exact postprocessed values and native sharing after the real GPU loader."""
+    from vllm.model_executor.models.mimo_v2 import MiMoV2FlashForCausalLM
+    from vllm.model_executor.models.mimo_v2_mtp import MiMoV2MTP
+
+    assert type(target) is MiMoV2FlashForCausalLM
+    assert type(draft) is MiMoV2MTP
+    proofs = {
+        role: _check_mimo_v2_flash_model_weights(model, model_path, role)
+        for role, model in (("target", target), ("mtp", draft))
+    }
+    counts = {role: proof["parameters"] for role, proof in proofs.items()}
+    assert counts == {"target": 18, "mtp": 13}
+    all_checked = set().union(*(proof["checkpoint_keys"] for proof in proofs.values()))
+    assert len(all_checked) == 47
+    assert draft.model.embed_tokens is target.model.embed_tokens
+    assert draft.lm_head is target.lm_head
+    assert draft.model.num_mtp_layers == 1 and tuple(draft.model.mtp.layers) == ("0",)
+    return dict(
+        target=type(target).__name__,
+        draft=type(draft).__name__,
+        checkpoint_keys=len(all_checked),
+        parameters=counts,
+        exact_parameter_roundtrip=True,
+        first_native_head_only=True,
+        shared_embedding_and_head=True,
+    )
+
+
+def _mimo_v2_flash_gpu_geometry(model, *, mtp=False):
+    """Observe actual allocated native cache geometry without changing its values."""
+    import torch
+
+    from vllm.model_executor.layers.attention import Attention
+
+    rows = []
+    for layer in model.modules():
+        if not isinstance(layer, Attention):
+            continue
+        assert layer.get_attn_backend().get_name() == "TRITON_ATTN_DIFFKV"
+        assert (layer.head_size, layer.head_size_v) == (192, 128)
+        cache = layer.kv_cache
+        assert cache.ndim == 4 and cache.dtype == torch.bfloat16
+        assert cache.shape[1] == layer.num_kv_heads and cache.shape[-1] == 320
+        key, value = cache.split([192, 128], dim=-1)
+        rows.append(
+            dict(
+                layer=layer.layer_name,
+                kv_heads=layer.num_kv_heads,
+                query_heads=layer.num_heads,
+                qk=192,
+                value=128,
+                window=layer.sliding_window,
+                sink=layer.has_sink,
+                cache_shape=list(cache.shape),
+                key_shape=list(key.shape),
+                value_shape=list(value.shape),
+                cache_stride=list(cache.stride()),
+            )
+        )
+    assert [r["kv_heads"] for r in rows] == ([2] if mtp else [1, 2])
+    assert [r["window"] for r in rows] == ([128] if mtp else [None, 128])
+    assert [r["sink"] for r in rows] == ([True] if mtp else [False, True])
+    return rows
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_mimo_v2_flash_mtp_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    k,
+    tiny_mimo_v2_flash_mtp_model,
+    record_property,
+):
+    """Compare native first-head Flash drafting and remote inline across windows."""
+    import json
+
+    model = tiny_mimo_v2_flash_mtp_model
+    record_property(
+        "fixture", json.loads((Path(model).parent / "fixture.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        "mimo_v2_flash",
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
 @pytest.fixture
 def tiny_glm4_moe_mtp_model(tmp_path):
     """Keep a real routed target layer and its initialized native MTP counterpart."""
@@ -1793,6 +2364,17 @@ def tiny_independent_qwen3_models(tmp_path, request, mtp_family):
     return _tiny_independent_qwen3_models(tmp_path, target_path)
 
 
+def _conditioned_mtp_fusion(weight):
+    """Preserve target feature direction while retaining token conditioning."""
+    import torch
+
+    width = weight.shape[0]
+    assert weight.shape == (width, 2 * width)
+    identity = torch.eye(width, dtype=weight.dtype, device=weight.device)
+    with torch.no_grad():
+        weight.copy_(torch.cat((identity / 4, 3 * identity / 4), dim=1))
+
+
 def _two_candidate_head(weight):
     import torch
 
@@ -2354,6 +2936,38 @@ def test_remote_native_mtp_matches_native_and_target(
     )
 
 
+@pytest.mark.parametrize("ffn_layout", ["dense", "moe"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_remote_deepseek_mtp_matches_native_and_target(
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    request,
+    ffn_layout,
+    k,
+    tiny_deepseek_mtp_model,
+    record_property,
+):
+    """Preserve dense MLA KV, initialized MTP weights and repeated-head feedback."""
+    import json
+
+    model = tiny_deepseek_mtp_model
+    record_property(
+        "fixture", json.loads((Path(model).parent / "fixture.json").read_text())
+    )
+    _compare_native_and_remote_draft(
+        vllm_runner,
+        monkeypatch,
+        tmp_path,
+        request,
+        f"deepseek_v3_{ffn_layout}",
+        None,
+        k,
+        record_property,
+        target_model=model,
+    )
+
+
 @pytest.mark.parametrize("mtp_family", ["qwen3_next", "nemotron_h", "glm4_moe_lite"])
 @pytest.mark.parametrize("k", [1, 3])
 def test_remote_independent_draft_with_hybrid_or_mla_target(
@@ -2518,7 +3132,9 @@ def _compare_native_and_remote_draft(
             assert draft_config["architectures"] == ["NemotronHForCausalLM"]
             assert draft_config["num_nextn_predict_layers"] == 0
     eagle3 = eagle3_draft is not None
-    detailed = independent or eagle3
+    deepseek_mtp = mtp_family in ("deepseek_v3_dense", "deepseek_v3_moe")
+    mimo_v2_flash = mtp_family == "mimo_v2_flash"
+    detailed = independent or eagle3 or deepseek_mtp or mimo_v2_flash
     hybrid_target = mtp_family in ("qwen3_next", "nemotron_h")
     # GDN/Mamba backends do not implement batch-invariant kernels.
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if hybrid_target else "1")
@@ -2528,10 +3144,16 @@ def _compare_native_and_remote_draft(
     mtp_windows = {
         "exaone_two": (None, None),
         "exaone_three": (None, 16, 32),
-    }.get(mtp_family, (mtp_window,))
+    }.get(mtp_family, (128 if mimo_v2_flash else mtp_window,))
     num_modules = len(mtp_windows)
-    dense_mla = mtp_family == "glm4_moe_lite"
-    attention_backend = "TRITON_MLA" if dense_mla else "TRITON_ATTN"
+    dense_mla = mtp_family == "glm4_moe_lite" or deepseek_mtp
+    attention_backend = (
+        "TRITON_ATTN_DIFFKV"
+        if mimo_v2_flash
+        else "TRITON_MLA"
+        if dense_mla
+        else "TRITON_ATTN"
+    )
     attention_config: dict[str, Any] = {"backend": attention_backend}
     if dense_mla or mla_draft:
         attention_config["mla_prefill_backend"] = "FLASH_ATTN"
@@ -2549,7 +3171,7 @@ def _compare_native_and_remote_draft(
         trust_remote_code=False,
         skip_tokenizer_init=True,
         dtype="bfloat16",
-        max_model_len=128,
+        max_model_len=256 if mimo_v2_flash else 128,
         max_num_seqs=4,
         max_num_batched_tokens=32,
         enable_chunked_prefill=True,
@@ -2566,7 +3188,11 @@ def _compare_native_and_remote_draft(
         kwargs["tokenizer_mode"] = "hf"
     moe_backend = (
         None
-        if mtp_family.startswith("exaone") or eagle3 or mla_draft or recurrent_draft
+        if mtp_family.startswith("exaone")
+        or eagle3
+        or mla_draft
+        or recurrent_draft
+        or mtp_family == "deepseek_v3_dense"
         else "triton"
     )
     if moe_backend is not None:
@@ -2578,7 +3204,11 @@ def _compare_native_and_remote_draft(
         monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
     prompts = [
         {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
-        for length in (15, 16, 17, 31, 32, 33, 65)
+        for length in (
+            (31, 32, 33, 127, 128, 129, 193)
+            if mimo_v2_flash
+            else (15, 16, 17, 31, 32, 33, 65)
+        )
     ]
     batches = (
         prompts[:1],
@@ -2890,6 +3520,12 @@ def _compare_native_and_remote_draft(
             assert policy["attention_backends"] == [attention_backend] * (
                 1 if hybrid_target else 2
             )
+        if deepseek_mtp:
+            assert policy["model"] == "DeepseekV3ForCausalLM"
+            assert policy["attention_backends"] == ["TRITON_MLA"] * 2
+        if mimo_v2_flash:
+            assert policy["model"] == "MiMoV2FlashForCausalLM"
+            assert policy["attention_backends"] == ["TRITON_ATTN_DIFFKV"] * 2
         if hybrid_target:
             assert policy["state"] == "MambaHybridModelState"
             assert len(policy["layers"]) == 1
@@ -2964,6 +3600,53 @@ def _compare_native_and_remote_draft(
                 )
             )
         return policies
+
+    def deepseek_identity(worker):
+        from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
+        from vllm.model_executor.models.deepseek_v2 import (
+            DeepseekV2MLP,
+            DeepseekV2MoE,
+        )
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, MTPSpeculator)
+        draft = runner.get_draft_model()
+        assert isinstance(draft, DeepSeekMTP)
+        assert draft.model.num_mtp_layers == 1
+        assert draft.model.mtp_start_layer_idx == 2
+        assert not hasattr(draft.config, "index_topk")
+        dense = mtp_family == "deepseek_v3_dense"
+        assert draft.config.n_routed_experts == (0 if dense else 4)
+        assert draft.config.first_k_dense_replace == (3 if dense else 1)
+        block = draft.model.layers["2"].mtp_block
+        assert isinstance(block.mlp, DeepseekV2MLP if dense else DeepseekV2MoE)
+        return _check_deepseek_mtp_weights(runner.get_model(), draft, model)
+
+    def mimo_identity(worker):
+        from vllm.v1.attention.backends.triton_attn_diffkv import (
+            TritonAttentionDiffKVMetadataBuilder,
+        )
+        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+        runner = worker.model_runner
+        assert isinstance(runner.speculator, MTPSpeculator)
+        builders = [
+            group.get_metadata_builder()
+            for groups in runner.speculator.attn_groups
+            for group in groups
+        ]
+        assert builders and all(
+            isinstance(builder, TritonAttentionDiffKVMetadataBuilder)
+            for builder in builders
+        )
+        return dict(
+            weights=_check_mimo_v2_flash_mtp_weights(
+                runner.get_model(), runner.get_draft_model(), model
+            ),
+            metadata_builders=[type(builder).__name__ for builder in builders],
+            geometry=_mimo_v2_flash_gpu_geometry(runner.get_draft_model(), mtp=True),
+        )
 
     def independent_draft_identity(worker):
         from vllm.model_executor.layers.attention import Attention
@@ -3152,9 +3835,16 @@ def _compare_native_and_remote_draft(
     with vllm_runner(model, **kwargs) as baseline:
         windows = baseline.llm.apply_model(target_windows)
         assert windows == [
-            [None] * (4 if eagle3 else 1 if hybrid_target else max(2, num_modules))
+            [None, 128]
+            if mimo_v2_flash
+            else [None] * (4 if eagle3 else 1 if hybrid_target else max(2, num_modules))
         ]
         record_property("target.attention_windows", windows)
+        if mimo_v2_flash:
+            record_property(
+                "target.diffkv_geometry",
+                baseline.llm.apply_model(_mimo_v2_flash_gpu_geometry),
+            )
         if eagle3:
             record_property(
                 "target.eagle3", baseline.llm.collective_rpc(eagle_identity)
@@ -3203,6 +3893,15 @@ def _compare_native_and_remote_draft(
                 record_property(
                     "native.eagle3", native.llm.collective_rpc(eagle_identity)
                 )
+            if deepseek_mtp:
+                record_property(
+                    "native.deepseek_weights",
+                    native.llm.collective_rpc(deepseek_identity),
+                )
+            if mimo_v2_flash:
+                record_property(
+                    "native.mimo_identity", native.llm.collective_rpc(mimo_identity)
+                )
             if dense_mla and not independent:
                 layout = native.llm.collective_rpc(draft_mla_layout)
                 assert layout == [[expected_mla_layout]]
@@ -3213,6 +3912,8 @@ def _compare_native_and_remote_draft(
                 and not eagle3
                 and not mtp_family.startswith("exaone")
                 and mtp_family != "ernie"
+                and mtp_family != "deepseek_v3_dense"
+                and not mimo_v2_flash
             )
             assert backends == [["TRITON"] if draft_has_moe else []]
             record_property("native.moe_backends", backends)
@@ -3241,6 +3942,7 @@ def _compare_native_and_remote_draft(
         target_attention_backend=attention_backend,
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=128 if recurrent_draft else 32,
+        max_model_len=256 if mimo_v2_flash else 128,
         trust_remote_code=False,
         moe_backend=moe_backend,
         batch_invariant=False if recurrent_draft else None,

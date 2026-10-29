@@ -10,8 +10,18 @@ from tempfile import TemporaryDirectory
 
 import pytest
 import torch
+from huggingface_hub.errors import StrictDataclassFieldValidationError
 from safetensors.torch import load_file, save_file
-from transformers import AutoConfig, PreTrainedConfig, Qwen3Config
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    DeepseekV3Config,
+    PreTrainedConfig,
+    Qwen3Config,
+    TokenizersBackend,
+)
 
 from tests.v1.e2e.spec_decode.remote.test_remote_mtp import _separate_mtp_draft
 from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
@@ -24,7 +34,15 @@ from tests.v1.spec_decode.remote.runtime_fixtures import (
     cpu_parallel_state as cpu_parallel_state,
 )
 from tests.v1.spec_decode.remote.runtime_fixtures import make_config
-from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 from vllm.config.speculative import RemoteDraftConfig, SpeculativeExecutionConfig
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.weights import materialize_target_shell
@@ -291,6 +309,571 @@ def _config(
             target_windows,
         )[1]
     )
+
+
+def _deepseek_public_config(
+    tmp_path,
+    *,
+    k=3,
+    routed=False,
+    target_options=None,
+    draft_options=None,
+    wrong_target=False,
+    dtype="bfloat16",
+    target_tp=1,
+    draft_tp=1,
+    transport="inline",
+    endpoints=None,
+    cache_dtype="auto",
+    spec_options=None,
+    model_impl="auto",
+):
+    options = dict(
+        architectures=["DeepseekV3ForCausalLM"],
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        max_position_embeddings=64,
+        kv_lora_rank=512,
+        q_lora_rank=128,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+        n_routed_experts=4 if routed else 0,
+        n_shared_experts=1 if routed else 0,
+        first_k_dense_replace=1 if routed else 3,
+        num_experts_per_tok=2 if routed else 1,
+        n_group=1,
+        topk_group=1,
+        num_nextn_predict_layers=1,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    )
+
+    def checkpoint(path, hf):
+        hf.save_pretrained(path)
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(32)})),
+            bos_token="token0",
+            eos_token="token1",
+            pad_token="token2",
+        ).save_pretrained(path)
+        if getattr(hf, "quantization_config", None) is None:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                model = AutoModelForCausalLM.from_config(hf, dtype=torch.bfloat16)
+            embedding = model.get_input_embeddings().weight.detach()
+            save_file(
+                {"model.embed_tokens.weight": embedding},
+                path / "model.safetensors",
+            )
+
+    target_path = draft_path = tmp_path
+    if target_options or draft_options or wrong_target:
+        target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target_hf = (
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+        if wrong_target
+        else DeepseekV3Config(**(options | (target_options or {})))
+    )
+    checkpoint(target_path, target_hf)
+    if draft_path != target_path:
+        checkpoint(draft_path, DeepseekV3Config(**(options | (draft_options or {}))))
+    target = ModelConfig(
+        model=str(target_path),
+        dtype=dtype,
+        max_model_len=64,
+        skip_tokenizer_init=True,
+        model_impl=model_impl,
+    )
+    parallel = ParallelConfig(tensor_parallel_size=target_tp)
+    placement = (
+        dict(
+            execution=SpeculativeExecutionConfig(
+                placement="remote", endpoints=endpoints, transport=transport
+            )
+        )
+        if endpoints
+        else dict(
+            remote_draft=RemoteDraftConfig(
+                endpoint="unix:///tmp/deepseek-contract.sock", transport=transport
+            )
+        )
+    )
+    spec = SpeculativeConfig(
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=draft_tp,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        **placement,
+        **(spec_options or {}),
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False, cache_dtype=cache_dtype),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("routed", [False, True], ids=["dense", "moe"])
+def test_deepseek_v3_public_override_resolves_single_native_mtp_head(
+    tmp_path, k, routed
+):
+    config = _deepseek_public_config(tmp_path, k=k, routed=routed)
+    target = config.model_config
+    spec = config.speculative_config
+    assert spec is not None and spec.method == "mtp"
+    draft = spec.draft_model_config
+    assert draft is not None
+    assert target.hf_config.architectures == ["DeepseekV3ForCausalLM"]
+    assert draft.hf_config.architectures == ["DeepSeekMTPModel"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.dtype == draft.dtype == torch.bfloat16
+    assert target.quantization is None and draft.quantization is None
+    assert all(not hasattr(model.hf_config, "index_topk") for model in (target, draft))
+    assert all(
+        model.hf_config.first_k_dense_replace == (1 if routed else 3)
+        and model.hf_config.n_routed_experts == (4 if routed else 0)
+        and model.hf_config.n_shared_experts == (1 if routed else 0)
+        for model in (target, draft)
+    )
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[1].trailing_shape == ()
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (16,)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("index_topk", [0, 4])
+def test_deepseek_public_config_rejects_any_indexer_attribute(
+    tmp_path, role, index_topk
+):
+    config = _deepseek_public_config(
+        tmp_path, **{f"{role}_options": {"index_topk": index_topk}}
+    )
+    with pytest.raises(ValueError, match="sparse indexer"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_requires_one_checkpoint_head(tmp_path):
+    config = _deepseek_public_config(
+        tmp_path, k=2, draft_options={"num_nextn_predict_layers": 2}
+    )
+    with pytest.raises(ValueError, match="one checkpoint"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "target_options", [{"num_hidden_layers": 3}, {"num_nextn_predict_layers": 2}]
+)
+def test_deepseek_mtp_rejects_different_native_layer_layout(tmp_path, target_options):
+    """The native head's layer indices and count come from the target config."""
+    config = _deepseek_public_config(tmp_path, target_options=target_options)
+    with pytest.raises(ValueError, match="matching native configs"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_deepseek_public_config_rejects_multi_channel_features(tmp_path, role):
+    config = _deepseek_public_config(tmp_path, **{f"{role}_options": {"hc_mult": 2}})
+    with pytest.raises(ValueError, match="scalar positions"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_requires_its_actual_target_family(tmp_path):
+    config = _deepseek_public_config(tmp_path, wrong_target=True)
+    with pytest.raises(ValueError, match="matching target architecture"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_float32_execution(tmp_path):
+    config = _deepseek_public_config(tmp_path, dtype="float32")
+    with pytest.raises(ValueError, match="unquantized bfloat16"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_deepseek_public_config_preserves_rejected_fp8_metadata(tmp_path, role):
+    quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    with pytest.raises(ValueError, match="quant|fp8|bfloat16"):
+        config = _deepseek_public_config(
+            tmp_path, **{f"{role}_options": {"quantization_config": quantization}}
+        )
+        create_runtime_contract(config)
+    saved = json.loads((tmp_path / role / "config.json").read_text())
+    assert saved["quantization_config"] == quantization
+
+
+@pytest.mark.parametrize("target_tp,draft_tp", [(2, 1), (1, 2), (2, 2)])
+def test_deepseek_public_config_rejects_tensor_parallel_drafting(
+    tmp_path, target_tp, draft_tp
+):
+    with pytest.raises(ValueError, match="TP1|draft_tensor_parallel_size"):
+        config = _deepseek_public_config(
+            tmp_path, target_tp=target_tp, draft_tp=draft_tp
+        )
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_ipc(tmp_path):
+    config = _deepseek_public_config(tmp_path, transport="cuda_ipc")
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
+
+
+def test_deepseek_public_config_rejects_multiple_endpoints(tmp_path):
+    config = _deepseek_public_config(
+        tmp_path,
+        endpoints=("unix:///tmp/deepseek-a.sock", "unix:///tmp/deepseek-b.sock"),
+    )
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("draft_dtype", [None, "auto", "fp8"])
+def test_deepseek_public_config_rejects_fp8_target_or_draft_kv(tmp_path, draft_dtype):
+    options = {} if draft_dtype is None else {"kv_cache_dtype": draft_dtype}
+    config = _deepseek_public_config(
+        tmp_path,
+        cache_dtype="auto" if draft_dtype == "fp8" else "fp8",
+        spec_options=options,
+    )
+    with pytest.raises(ValueError, match="bfloat16 KV"):
+        create_runtime_contract(config)
+
+
+def _mimo_flash_public_config(
+    tmp_path,
+    *,
+    k=3,
+    target_options=None,
+    draft_options=None,
+    wrong_target=False,
+    identity=True,
+    transport="inline",
+):
+    options = dict(
+        architectures=["MiMoV2FlashForCausalLM"],
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=192,
+        v_head_dim=128,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=2,
+        swa_head_dim=192,
+        swa_v_head_dim=128,
+        hybrid_layer_pattern=[0, 1],
+        sliding_window=128,
+        sliding_window_size=128,
+        attention_chunk_size=128,
+        attention_bias=False,
+        add_swa_attention_sink_bias=True,
+        add_full_attention_sink_bias=False,
+        attention_value_scale=0.707,
+        partial_rotary_factor=0.334,
+        rope_theta=5000000,
+        swa_rope_theta=10000,
+        layernorm_epsilon=1e-5,
+        max_position_embeddings=256,
+        hidden_act="silu",
+        moe_layer_freq=[0, 1],
+        moe_intermediate_size=128,
+        n_routed_experts=4,
+        n_shared_experts=None,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        scoring_func="sigmoid",
+        n_group=1,
+        topk_group=1,
+        topk_method="noaux_tc",
+        routed_scaling_factor=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        torch_dtype="bfloat16",
+    )
+
+    def checkpoint(path, hf):
+        hf.save_pretrained(path)
+        TokenizersBackend(
+            tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+            bos_token="token1",
+            eos_token="token2",
+            pad_token="token0",
+        ).save_pretrained(path)
+        if identity:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                model = AutoModelForCausalLM.from_config(hf, dtype=torch.bfloat16)
+            embedding = model.get_input_embeddings().weight.detach()
+            save_file(
+                {"model.embed_tokens.weight": embedding}, path / "model.safetensors"
+            )
+
+    target_path = draft_path = tmp_path
+    if target_options or draft_options or wrong_target:
+        target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target_hf = (
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            vocab_size=128,
+            max_position_embeddings=256,
+        )
+        if wrong_target
+        else AutoConfig.for_model("mimo_v2_flash", **(options | (target_options or {})))
+    )
+    checkpoint(target_path, target_hf)
+    if draft_path != target_path:
+        checkpoint(
+            draft_path,
+            AutoConfig.for_model("mimo_v2_flash", **(options | (draft_options or {}))),
+        )
+    target = ModelConfig(
+        model=str(target_path),
+        dtype="bfloat16",
+        max_model_len=128,
+        skip_tokenizer_init=True,
+    )
+    parallel = ParallelConfig()
+    spec = SpeculativeConfig(
+        model=str(draft_path),
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=1,
+        target_model_config=target,
+        target_parallel_config=parallel,
+        remote_draft=RemoteDraftConfig(
+            endpoint="unix:///tmp/mimo-flash-contract.sock", transport=transport
+        ),
+    )
+    return VllmConfig(
+        model_config=target,
+        parallel_config=parallel,
+        speculative_config=spec,
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            async_scheduling=False,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig("cpu"),
+    )
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_mimo_flash_public_override_resolves_native_diffkv_mtp(tmp_path, k):
+    config = _mimo_flash_public_config(tmp_path, k=k)
+    target = config.model_config.hf_config
+    spec = config.speculative_config
+    assert spec is not None and spec.method == "mtp"
+    draft = spec.draft_model_config
+    assert draft is not None
+    assert type(target).__module__.startswith("transformers.models.mimo_v2_flash")
+    assert not getattr(target, "auto_map", None)
+    assert target.architectures == ["MiMoV2FlashForCausalLM"]
+    assert draft.hf_config.architectures == ["MiMoV2MTPModel"]
+    assert draft.hf_config.n_predict == draft.hf_config.num_nextn_predict_layers == 1
+    assert target.hybrid_layer_pattern == [0, 1]
+    assert (target.num_key_value_heads, target.swa_num_key_value_heads) == (1, 2)
+    assert (target.head_dim, target.v_head_dim) == (192, 128)
+    assert (target.swa_head_dim, target.swa_v_head_dim) == (192, 128)
+    assert target.add_swa_attention_sink_bias and target.n_routed_experts == 4
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.state_dependency == "own_kv"
+    assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
+    assert contract.schema.slots[2].kind == "last_hidden_states"
+    assert contract.schema.slots[2].trailing_shape == (64,)
+
+
+@pytest.mark.parametrize(
+    "role,field,width",
+    [
+        ("target", "head_dim", 128),
+        ("draft", "v_head_dim", 64),
+        ("draft", "swa_head_dim", 128),
+        ("target", "swa_v_head_dim", 64),
+    ],
+)
+def test_mimo_flash_public_config_rejects_incompatible_diffkv_widths(
+    tmp_path, role, field, width
+):
+    config = _mimo_flash_public_config(
+        tmp_path, identity=False, **{f"{role}_options": {field: width}}
+    )
+    with pytest.raises(ValueError, match="QK192/V128 DiffKV"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "role,heads",
+    [
+        ("target", {"num_attention_heads": 0}),
+        ("draft", {"swa_num_attention_heads": 3, "swa_num_key_value_heads": 2}),
+    ],
+)
+def test_mimo_flash_public_config_requires_valid_global_and_swa_heads(
+    tmp_path, role, heads
+):
+    config = _mimo_flash_public_config(
+        tmp_path, identity=False, **{f"{role}_options": heads}
+    )
+    with pytest.raises(ValueError, match="divisible Q/KV heads"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("window", [-1, 0])
+def test_mimo_flash_public_config_rejects_nonpositive_swa_window(tmp_path, window):
+    with pytest.raises(
+        (ValueError, StrictDataclassFieldValidationError),
+        match="positive SWA window|sliding_window",
+    ):
+        config = _mimo_flash_public_config(
+            tmp_path,
+            identity=False,
+            draft_options={"sliding_window": window, "sliding_window_size": window},
+        )
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_runtime_contract_rejects_nonpositive_swa_window(tmp_path):
+    """A zero-sized SWA history survives HF's query-inclusive window parsing."""
+    config = _mimo_flash_public_config(
+        tmp_path,
+        identity=False,
+        draft_options={"sliding_window": 1, "sliding_window_size": 0},
+    )
+    assert (
+        config.speculative_config.draft_model_config.hf_config.sliding_window_size == 0
+    )
+    with pytest.raises(ValueError, match="positive SWA window"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "draft_options",
+    [
+        {"sliding_window": 64, "sliding_window_size": 64},
+        {"swa_rope_theta": 20000},
+        {"swa_num_attention_heads": 4},
+        {"layernorm_epsilon": 1e-4},
+    ],
+)
+def test_mimo_flash_rejects_draft_settings_ignored_by_native_constructor(
+    tmp_path, draft_options
+):
+    """Equal hidden widths cannot validate a head built from target metadata."""
+    config = _mimo_flash_public_config(tmp_path, draft_options=draft_options)
+    with pytest.raises(ValueError, match="matching native configs"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("family", ["deepseek", "mimo_flash"])
+def test_native_mtp_accepts_independent_checkpoint_metadata(tmp_path, family):
+    factory = (
+        _deepseek_public_config if family == "deepseek" else _mimo_flash_public_config
+    )
+    options = {"checkpoint_notes": "separately published MTP head"}
+    if family == "deepseek":
+        # DeepSeek constructs the block's norms from the draft config itself.
+        options["rms_norm_eps"] = 1e-4
+    config = factory(tmp_path, draft_options=options)
+    assert (
+        config.model_config.model != config.speculative_config.draft_model_config.model
+    )
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.required_features == (
+        "token_ids",
+        "positions",
+        "last_hidden_states",
+    )
+
+
+@pytest.mark.parametrize("pattern", [[0], [0, 2]])
+def test_mimo_flash_public_config_requires_a_complete_layer_pattern(tmp_path, pattern):
+    with pytest.raises(ValueError, match="layer pattern|layer_types|length"):
+        config = _mimo_flash_public_config(
+            tmp_path, identity=False, target_options={"hybrid_layer_pattern": pattern}
+        )
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_public_config_requires_its_actual_target_family(tmp_path):
+    config = _mimo_flash_public_config(tmp_path, identity=False, wrong_target=True)
+    with pytest.raises(ValueError, match="matching target architecture"):
+        create_runtime_contract(config)
+
+
+def test_mimo_flash_public_override_preserves_rejected_fp8_metadata(tmp_path):
+    quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    with pytest.raises(ValueError, match="quant|fp8|bfloat16"):
+        config = _mimo_flash_public_config(
+            tmp_path,
+            identity=False,
+            draft_options={"quantization_config": quantization},
+        )
+        create_runtime_contract(config)
+    saved = json.loads((tmp_path / "draft/config.json").read_text())
+    assert saved["quantization_config"] == quantization
+
+
+def test_mimo_flash_public_config_rejects_ipc_placement(tmp_path):
+    config = _mimo_flash_public_config(tmp_path, identity=False, transport="cuda_ipc")
+    with pytest.raises(ValueError, match="one inline endpoint"):
+        create_runtime_contract(config)
 
 
 @pytest.mark.parametrize("draft_limit", [16, 64])
@@ -626,7 +1209,7 @@ def test_mtp_contract_does_not_accept_unrelated_target(kind):
 
 @pytest.mark.parametrize(
     "architecture",
-    ["MiMoMTP", "MiMoV2MTPModel", "Gemma4MTPModel", "Qwen3_5MTP", "DeepSeekV4MTPModel"],
+    ["MiMoMTP", "Gemma4MTPModel", "Qwen3_5MTP", "DeepSeekV4MTPModel"],
 )
 def test_unsupported_feature_and_state_families_remain_fail_closed(architecture):
     config = _config()
