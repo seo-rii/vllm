@@ -211,6 +211,8 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if not target_kv and num_workers > 1:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     if registration_oom or collection_oom:
         monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         monkeypatch.setenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
@@ -289,6 +291,26 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_config().transport == transport
             assert actual_config.get_remote_draft_endpoints() == endpoints
+            result_writes = []
+            if not target_kv and num_workers > 1:
+                import threading
+
+                import torch
+
+                index_copy = torch.Tensor.index_copy_
+
+                def delayed_result_copy(tensor, *args, **kwargs):
+                    if (
+                        tensor.is_cuda
+                        and tensor.dtype == torch.int32
+                        and tensor.ndim == 1
+                        and threading.current_thread().name.startswith("draft-feature-")
+                    ):
+                        torch.cuda._sleep(50_000_000)
+                        result_writes.append(threading.get_ident())
+                    return index_copy(tensor, *args, **kwargs)
+
+                monkeypatch.setattr(torch.Tensor, "index_copy_", delayed_result_copy)
             metric_names = (
                 "vllm:spec_decode_num_draft_tokens",
                 "vllm:spec_decode_num_accepted_tokens",
@@ -429,6 +451,8 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             metrics = remote.llm.get_metrics()
             for name in metric_names:
                 assert get_spec_decode_metric_value(metrics, name) > 0
+            if not target_kv and num_workers > 1:
+                assert result_writes, "the driver result delay was not exercised"
 
 
 @pytest.fixture

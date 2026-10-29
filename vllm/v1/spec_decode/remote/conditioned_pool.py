@@ -4,6 +4,7 @@
 
 import contextlib
 import time
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -330,7 +331,9 @@ class ConditionedDraftPool:
 
     @staticmethod
     def _cuda_tensors(batch, chunks):
-        tensors = (tensor for _, features, _ in chunks for tensor in features.slots)
+        tensors: Iterable[torch.Tensor | None] = (
+            tensor for _, features, _ in chunks for tensor in features.slots
+        )
         if batch is not None:
             tensors = chain(
                 tensors,
@@ -356,7 +359,17 @@ class ConditionedDraftPool:
                     session.open_reserved(reserved, deadline=deadline)
                 session.prefill_many(chunks, deadline=deadline)
                 if batch is not None:
-                    return session.collect(session.dispatch(batch, deadline=deadline))
+                    result = session.collect(session.dispatch(batch, deadline=deadline))
+                    completed = {}
+                    for tensor in (
+                        result.output.token_ids,
+                        result.output.valid_lengths,
+                    ):
+                        if tensor.is_cuda and tensor.device not in completed:
+                            event = torch.cuda.Event()
+                            event.record(torch.cuda.current_stream(tensor.device))
+                            completed[tensor.device] = event
+                    return result, completed
                 return None
         except BaseException:
             # A preparation exception must not leave a hidden RPC or lease.
@@ -448,8 +461,19 @@ class ConditionedDraftPool:
             error = None
             for rows, future in handle.jobs:
                 try:
-                    result = future.result()
-                    if result is not None:
+                    driver_result = future.result()
+                    if driver_result is not None:
+                        result, completed = driver_result
+                        for device, event in completed.items():
+                            torch.cuda.current_stream(device).wait_event(event)
+                        for tensor in (
+                            result.output.token_ids,
+                            result.output.valid_lengths,
+                        ):
+                            if tensor.is_cuda:
+                                tensor.record_stream(
+                                    torch.cuda.current_stream(tensor.device)
+                                )
                         tokens[list(rows)] = result.output.token_ids
                         lengths[list(rows)] = result.output.valid_lengths
                         for row, status in zip(rows, result.row_statuses):
