@@ -634,13 +634,15 @@ def socket_runtime(tmp_path, request):
 
 
 @pytest.mark.parametrize("socket_runtime", [1], indirect=True)
-def test_token_server_socket_close_error_releases_connection_admission(
-    socket_runtime, monkeypatch, caplog
+@pytest.mark.parametrize("closed_before_error", [False, True])
+def test_token_server_socket_close_error_retains_owner_and_requires_restart(
+    socket_runtime, monkeypatch, caplog, closed_before_error
 ):
-    import os
+    import errno
+    import socket
     import threading
 
-    state, oracle, server, session = socket_runtime
+    state, _, server, session = socket_runtime
     key = session.open_sequence(0, deadline=session.deadline())
     session.prefill(key, (1,), is_final=True, deadline=session.deadline())
     with server._connections_lock:
@@ -648,34 +650,107 @@ def test_token_server_socket_close_error_releases_connection_admission(
         worker = server._workers[0]
     thread_errors: list[threading.ExceptHookArgs] = []
     monkeypatch.setattr(threading, "excepthook", thread_errors.append)
-    os.close(connection._sock.fileno())
-    session.close()
-    worker.join(timeout=2)
-    assert not worker.is_alive()
-    with server._connections_lock:
-        assert not server._connections and not server._handshaking
-    assert not state.sequences and server.healthy
-    assert not thread_errors
-    assert "Token connection cleanup failed" in caplog.text
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected token socket close failure")
 
-    replacement = TokenOnlyRemoteSession(
-        session.endpoint, session.hello, request_timeout_ms=5000
-    )
+    def fail_close(sock):
+        if sock is connection._sock:
+            if closed_before_error:
+                close_socket(sock)
+            raise failure
+        close_socket(sock)
+
     try:
-        key = replacement.open_sequence(1, deadline=replacement.deadline())
-        replacement.prefill(key, (2,), is_final=True, deadline=replacement.deadline())
-        result = replacement.collect(
-            replacement.dispatch(
-                0,
-                (TokenAdvanceRow(key, 1, None, 0, 0, (3,)),),
-                1,
-                deadline=replacement.deadline(),
-            )
-        )
-        assert result.valid_lengths == (1,)
-        assert result.token_ids[0][0] == oracle.predict([2, 3])
+        with monkeypatch.context() as patch:
+            patch.setattr(socket.socket, "close", fail_close)
+            session.close()
+            worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert connection.closed
+        assert (connection._sock.fileno() == -1) is closed_before_error
+        with server._connections_lock:
+            assert connection in server._connections and not server._handshaking
+        assert not state.sequences and not server.healthy
+        assert server.wait(timeout=0) and server._lifecycle_error is failure
+        assert not thread_errors
+        assert "Token connection cleanup failed" in caplog.text
+        server.stop()
+        assert not server.healthy and server._lifecycle_error is failure
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            server.start(session.endpoint)
     finally:
-        replacement.close()
+        close_socket(connection._sock)
+
+
+def test_token_queue_full_socket_close_failure_is_supervised(
+    socket_runtime, monkeypatch
+):
+    import errno
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.transport import TransportError
+
+    state, _, server, session = socket_runtime
+    with server._connections_lock:
+        (connection,) = server._connections
+        worker = server._workers[0]
+    queue = server.work_queue
+    entered, release, closing = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    errors: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected overloaded socket close failure")
+
+    def blocked():
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def fail_close(sock):
+        if sock is connection._sock:
+            closing.set()
+            raise failure
+        close_socket(sock)
+
+    try:
+        for index in range(queue.max_jobs_per_owner):
+            queue.submit(
+                DraftWork(
+                    session.hello.verifier_instance_id,
+                    blocked if index == 0 else lambda: None,
+                )
+            )
+        assert entered.wait(timeout=3)
+        with (
+            monkeypatch.context() as patch,
+            ThreadPoolExecutor(max_workers=1) as requests,
+        ):
+            patch.setattr(socket.socket, "close", fail_close)
+            pending = requests.submit(
+                session.open_sequence, 1, deadline=session.deadline()
+            )
+            try:
+                assert closing.wait(timeout=3)
+            finally:
+                release.set()
+            with pytest.raises((RemoteDraftError, TransportError)):
+                pending.result(timeout=3)
+            worker.join(timeout=3)
+        assert not worker.is_alive() and not errors
+        assert not server.healthy and server.wait(timeout=0)
+        assert server._lifecycle_error is failure
+        assert connection in server._connections and not server._handshaking
+        server.stop()
+        assert not state.sequences and queue.depth == 0
+    finally:
+        release.set()
+        close_socket(connection._sock)
 
 
 @pytest.mark.parametrize("started", [False, True])

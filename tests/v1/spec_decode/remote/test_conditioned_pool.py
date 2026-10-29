@@ -412,11 +412,71 @@ def test_inline_cuda_features_wait_for_producer_in_driver_threads(
     assert len(records) == 1 and len(waited) == 2
 
 
+def test_cuda_results_wait_for_driver_and_retain_storage_on_caller(
+    conditioned_pool_runtime, monkeypatch
+):
+    """An accelerator double rejects reads before completion and lifetime handoff."""
+    caller = threading.get_ident()
+    completed, retained = set(), set()
+    events = []
+
+    class Stream:
+        def wait_event(self, event):
+            assert threading.get_ident() == caller
+            completed.add(event.producer)
+
+    class Event:
+        def record(self, stream):
+            self.producer = threading.get_ident()
+            assert self.producer != caller
+            events.append(self)
+
+    class CudaResult(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+        @property
+        def device(self):
+            return torch.device("cuda:0")
+
+        def record_stream(self, stream):
+            assert threading.get_ident() == caller
+            assert self.producer in completed
+            retained.add(id(self))
+
+        @classmethod
+        def __torch_function__(cls, func, types, args=(), kwargs=None):
+            if func.__name__ == "__setitem__" and isinstance(args[-1], cls):
+                source = args[-1]
+                assert source.producer in completed, "copy raced the driver"
+                assert id(source) in retained, "storage may be reused during copy"
+            return super().__torch_function__(func, types, args, kwargs or {})
+
+    zeros = torch.zeros
+
+    def driver_zeros(*args, **kwargs):
+        tensor = zeros(*args, **kwargs)
+        if threading.current_thread().name.startswith("draft-feature-"):
+            tensor = tensor.as_subclass(CudaResult)
+            tensor.producer = threading.get_ident()
+        return tensor
+
+    monkeypatch.setattr(torch, "zeros", driver_zeros)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: Stream())
+    client, _, _, _ = conditioned_pool_runtime
+    pool = client()
+    _, drafts = start_prompts(pool)
+    assert drafts == [digest_row([1, 2], 30), digest_row([7, 8], 30)]
+    assert len(events) == 2 and len(completed) == 2 and len(retained) == 4
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_inline_cuda_nondefault_stream_preserves_ragged_features(
-    conditioned_pool_runtime,
+    conditioned_pool_runtime, monkeypatch
 ):
-    """Real D2H/partition copies must observe the delayed producer's values."""
+    """Both driver input and caller output copies observe their CUDA producers."""
     client, _, _, _ = conditioned_pool_runtime
     pool = client()
     keys, drafts = start_prompts(pool)
@@ -432,9 +492,24 @@ def test_inline_cuda_nondefault_stream_preserves_ragged_features(
     chunk = features([11, 12, 13])
     producer = torch.cuda.Stream()
     pinned = []
+    result_writes = []
+    index_copy = torch.Tensor.index_copy_
+
+    def delayed_result_copy(tensor, *args, **kwargs):
+        if (
+            tensor.is_cuda
+            and tensor.dtype == torch.int32
+            and tensor.ndim == 1
+            and threading.current_thread().name.startswith("draft-feature-")
+        ):
+            torch.cuda._sleep(50_000_000)
+            result_writes.append(threading.get_ident())
+        return index_copy(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "index_copy_", delayed_result_copy)
 
     def delayed(source):
-        slots = []
+        slots: list[torch.Tensor | None] = []
         for slot in source.slots:
             if slot is None:
                 slots.append(None)
@@ -448,10 +523,18 @@ def test_inline_cuda_nondefault_stream_preserves_ragged_features(
 
     with torch.cuda.stream(producer):
         torch.cuda._sleep(10_000_000)
-        batch = replace(batch, features=delayed(batch.features))
+        batch = replace(
+            batch,
+            features=delayed(batch.features),
+            recovery_tokens=batch.recovery_tokens.to(producer.device),
+        )
         result = run(pool, batch, ((new_key, delayed(chunk), True),))
-    assert result.output.token_ids.tolist() == [
+        tokens = result.output.token_ids.cpu().tolist()
+        lengths = result.output.valid_lengths.cpu().tolist()
+    assert tokens == [
         digest_row([7, 8, 30, drafts[1][0]], 40),
         digest_row([11, 12, 13], 50),
         digest_row([1, 2, 30], 60),
     ]
+    assert lengths == [K, K, K]
+    assert len(set(result_writes)) == 2
