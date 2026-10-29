@@ -449,13 +449,15 @@ def socket_runtime(tmp_path, request):
 
 
 @pytest.mark.parametrize("socket_runtime", [1], indirect=True)
-def test_token_server_socket_close_error_releases_connection_admission(
-    socket_runtime, monkeypatch, caplog
+@pytest.mark.parametrize("closed_before_error", [False, True])
+def test_token_server_socket_close_error_retains_owner_and_requires_restart(
+    socket_runtime, monkeypatch, caplog, closed_before_error
 ):
-    import os
+    import errno
+    import socket
     import threading
 
-    state, oracle, server, session = socket_runtime
+    state, _, server, session = socket_runtime
     key = session.open_sequence(0, deadline=session.deadline())
     session.prefill(key, (1,), is_final=True, deadline=session.deadline())
     with server._connections_lock:
@@ -463,34 +465,36 @@ def test_token_server_socket_close_error_releases_connection_admission(
         worker = server._workers[0]
     thread_errors: list[threading.ExceptHookArgs] = []
     monkeypatch.setattr(threading, "excepthook", thread_errors.append)
-    os.close(connection._sock.fileno())
-    session.close()
-    worker.join(timeout=2)
-    assert not worker.is_alive()
-    with server._connections_lock:
-        assert not server._connections and not server._handshaking
-    assert not state.sequences and server.healthy
-    assert not thread_errors
-    assert "Token connection cleanup failed" in caplog.text
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected token socket close failure")
 
-    replacement = TokenOnlyRemoteSession(
-        session.endpoint, session.hello, request_timeout_ms=5000
-    )
+    def fail_close(sock):
+        if sock is connection._sock:
+            if closed_before_error:
+                close_socket(sock)
+            raise failure
+        close_socket(sock)
+
     try:
-        key = replacement.open_sequence(1, deadline=replacement.deadline())
-        replacement.prefill(key, (2,), is_final=True, deadline=replacement.deadline())
-        result = replacement.collect(
-            replacement.dispatch(
-                0,
-                (TokenAdvanceRow(key, 1, None, 0, 0, (3,)),),
-                1,
-                deadline=replacement.deadline(),
-            )
-        )
-        assert result.valid_lengths == (1,)
-        assert result.token_ids[0][0] == oracle.predict([2, 3])
+        with monkeypatch.context() as patch:
+            patch.setattr(socket.socket, "close", fail_close)
+            session.close()
+            worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert connection.closed
+        assert (connection._sock.fileno() == -1) is closed_before_error
+        with server._connections_lock:
+            assert connection in server._connections and not server._handshaking
+        assert not state.sequences and not server.healthy
+        assert server.wait(timeout=0) and server._lifecycle_error is failure
+        assert not thread_errors
+        assert "Token connection cleanup failed" in caplog.text
+        server.stop()
+        assert not server.healthy and server._lifecycle_error is failure
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            server.start(session.endpoint)
     finally:
-        replacement.close()
+        close_socket(connection._sock)
 
 
 @pytest.mark.parametrize("started", [False, True])
@@ -2645,8 +2649,9 @@ def test_prefix_replay_preserves_unsupported_state_and_topology_gates(
         )
     else:
         options["target_tp"] = 2
-    if unsupported == "pool":
-        with pytest.raises(ValueError, match="exactly one endpoint"):
+    if unsupported in ("pool", "tp2"):
+        reason = "exactly one endpoint" if unsupported == "pool" else "target TP1"
+        with pytest.raises(ValueError, match=reason):
             token_config(tmp_path, **options)
         return
     config = token_config(tmp_path, **options)
