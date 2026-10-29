@@ -2009,6 +2009,7 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
 
     from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits
     from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
     from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
     args = parser().parse_args(cli_args)
@@ -2063,7 +2064,20 @@ def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) ->
         pass
     finally:
         server.stop()
-    assert server.healthy
+    if Path(receipt_path).exists():
+        assert not server.healthy and server.wait(timeout=0)
+        with pytest.raises(ServerShutdownTimeout, match="process restart"):
+            server.start(args.endpoint)
+        receipt = dict(
+            healthy=server.healthy,
+            stopping=server.wait(timeout=0),
+            same_process_restart_rejected=True,
+        )
+        pending = Path(receipt_path).with_suffix(".fenced.tmp")
+        pending.write_text(json.dumps(receipt))
+        pending.replace(Path(receipt_path).with_suffix(".fenced.json"))
+    else:
+        assert server.healthy
 
 
 def _fail_token_session_during_socket_cleanup(worker, inject_close_error=True):
@@ -2371,13 +2385,30 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
                     assert report["connection_detached"]
                     assert report["terminal_sequences"] == report["sequence_count"] > 0
                     events["cleanup_failure"] = report
+                    if lifecycle == "server-cleanup-admission":
+                        fenced_receipt = close_fault_receipt.with_suffix(".fenced.json")
+                        async with asyncio.timeout(10):
+                            while not fenced_receipt.exists():
+                                assert owned_processes[0].poll() is None
+                                await asyncio.sleep(0.01)
+                        fenced = json.loads(fenced_receipt.read_text())
+                        assert not fenced["healthy"] and fenced["stopping"]
+                        assert fenced["same_process_restart_rejected"]
+                        events["server_restart_required"] = fenced
                     await engine.resume_generation()
                     fallback = await tasks[0]
                     assert fallback.outputs[0].finish_reason == "length"
                     assert list(fallback.outputs[0].token_ids) == expected[0]
                     assert len(fallback.outputs[0].token_ids) > partial_length
                     recovered = await collect("recovered", prompts[1], 32)
-                    assert_active(recovered, expected[1])
+                    if lifecycle == "server-cleanup-admission":
+                        assert recovered.outputs[0].finish_reason == "length"
+                        assert list(recovered.outputs[0].token_ids) == expected[1]
+                        metrics = recovered.outputs[0].spec_decode_metrics
+                        assert metrics is not None and metrics.num_draft_tokens == 0
+                        assert metrics.to_dict()["num_accepted_draft_tokens"] == 0
+                    else:
+                        assert_active(recovered, expected[1])
                     outputs.update(fallback=fallback, recovered=recovered)
                 else:
                     warm = await collect("warm", prompts[1], 32)
