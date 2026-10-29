@@ -2554,6 +2554,7 @@ def _run_token_outcome_cache_oracle(model, result_path):
 
     import torch
 
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.spec_decode.remote.protocol import RemoteServerLimits, SequenceKey
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
@@ -2640,6 +2641,47 @@ def _run_token_outcome_cache_oracle(model, result_path):
         )
         client = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
         try:
+            registration_error = MemoryError("branch registration metadata")
+            release_error = MemoryError("rollback release metadata")
+            faults = allocation_failures(
+                [
+                    (
+                        TokenOutcomeCache._start,
+                        "self._builds[source.key] = branch",
+                        registration_error,
+                    ),
+                    (DraftBlockPool.release, "references = [", release_error),
+                ]
+            )
+            triggered = server.work_queue.call("fault-arm", faults.__enter__)
+            try:
+                failed_key = client.open_sequence(1, deadline=client.deadline())
+                client.prefill(
+                    failed_key, prompt, is_final=True, deadline=client.deadline()
+                )
+                faulted = client.collect(
+                    client.dispatch(
+                        1,
+                        (TokenAdvanceRow(failed_key, 17, None, 0, 0, (4,)),),
+                        3,
+                        deadline=client.deadline(),
+                    )
+                )
+                deadline = time.monotonic() + 10
+                poll = threading.Event()
+                while not triggered and time.monotonic() < deadline:
+                    poll.wait(0.001)
+                assert triggered
+                server.work_queue.call("fault-drain", lambda: None)
+                assert triggered == [registration_error]
+            finally:
+                server.work_queue.call(
+                    "fault-disarm", lambda: faults.__exit__(None, None, None)
+                )
+            client.close_sequences((failed_key,))
+            assert server.healthy and not state.sequences and cache.branch_blocks == 0
+            assert pool.num_free_blocks == pool.num_blocks - 1
+
             key = client.open_sequence(0, deadline=client.deadline())
             client.prefill(key, prompt, is_final=True, deadline=client.deadline())
 
@@ -2667,6 +2709,7 @@ def _run_token_outcome_cache_oracle(model, result_path):
             assert source.valid_lengths == (3,)
             draft = source.token_ids[0][:3]
             assert draft == baseline.token_ids[:3]
+            assert faulted.valid_lengths == (3,) and faulted.token_ids[0][:3] == draft
             bonus = baseline.token_ids[3]
             deadline = time.monotonic() + 10
             poll = threading.Event()
@@ -2710,6 +2753,8 @@ def _run_token_outcome_cache_oracle(model, result_path):
         json.dumps(
             dict(
                 kind="same-checkpoint all-accepted native-KV control",
+                recovered_registration_failure=True,
+                faulted_source=list(faulted.token_ids[0][:3]),
                 source=list(draft),
                 bonus=bonus,
                 actual=list(actual.token_ids[0][:3]),

@@ -3406,6 +3406,58 @@ def test_outcome_cache_failed_tail_work_returns_private_pages_and_prefix_refs(fa
     assert state.block_pool.num_free_blocks == 32
 
 
+@pytest.mark.parametrize("failure", ["registration", "fork"])
+@pytest.mark.parametrize("use_monitoring", [False, True])
+def test_outcome_cache_failed_start_keeps_rollback_ownership(failure, use_monitoring):
+    """Cancellation must find every lease even if start and rollback both fail."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+
+    state, _, cache = outcome_machine()
+    key = SequenceKey("failed-start", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, (2, 5, 7), is_final=True)
+    cache.bind_epoch(key, 1)
+    result = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (3,)), 3),))[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    plan = result.prediction
+    pool = state.block_pool
+    free_blocks = pool.num_free_blocks
+    error, cleanup_error = (
+        MemoryError("start metadata"),
+        MemoryError("release metadata"),
+    )
+    method, fragment = (
+        (TokenOutcomeCache._start, "self._builds[source.key] = branch")
+        if failure == "registration"
+        else (DraftBlockPool.fork_prefix, "return private")
+    )
+    with allocation_failures(
+        [
+            (method, fragment, error),
+            (DraftBlockPool.release, "references = [", cleanup_error),
+        ],
+        use_monitoring=use_monitoring,
+    ) as triggered:
+        with pytest.raises(MemoryError) as caught:
+            cache.step(plan)
+        if failure == "registration":
+            assert caught.value is error and triggered == [error]
+        else:
+            assert caught.value is cleanup_error and triggered == [error, cleanup_error]
+            assert caught.value.__context__ is error
+            assert cache.branch_blocks > 0
+
+    cache.cancel(plan)
+    assert cache.branch_blocks == 0 and pool.num_free_blocks == free_blocks
+    while cache.step(plan):
+        pass
+    assert cache.counters["ready"] == 1
+    cache.close((key,))
+    state.close((key,))
+    assert pool.num_free_blocks == 32
+
+
 def test_outcome_cache_shared_prefix_stays_reserved_after_live_lease_closes():
     state, _, cache = outcome_machine(max_branch_blocks=2)
     key, other = SequenceKey("borrowed", 0, 0), SequenceKey("other", 0, 0)

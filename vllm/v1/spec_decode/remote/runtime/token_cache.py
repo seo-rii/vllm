@@ -353,7 +353,7 @@ class TokenOutcomeCache:
             return None
         old = self._builds.get(source.key)
         if old is not None:
-            if old.source == source:
+            if old.source == source and old.phase != "starting":
                 return old
             self._retire(source.key)
         committed = source.committed + len(source.tokens) + 1
@@ -378,12 +378,6 @@ class TokenOutcomeCache:
             return None
         progress = self._branches.sequences[source.key]
         try:
-            self.state.block_pool.fork_prefix(
-                self.state.sequences[source.key].req_index,
-                progress.req_index,
-                shared,
-                needed,
-            )
             progress = replace(
                 self.state.sequences[source.key],
                 req_index=progress.req_index,
@@ -392,15 +386,21 @@ class TokenOutcomeCache:
             branch = _Branch(
                 source,
                 progress,
-                phase=(
-                    "bonus"
-                    if shared == cdiv(source.written_end, block_size)
-                    else "copy"
-                ),
+                phase="starting",
                 copied=shared,
             )
             self._branches.sequences[source.key] = progress
+            # Register cleanup ownership before acquiring page references.
             self._builds[source.key] = branch
+            self.state.block_pool.fork_prefix(
+                self.state.sequences[source.key].req_index,
+                progress.req_index,
+                shared,
+                needed,
+            )
+            branch.phase = (
+                "bonus" if shared == cdiv(source.written_end, block_size) else "copy"
+            )
         except BaseException:
             self._branches.close((source.key,))
             self._builds.pop(source.key, None)
