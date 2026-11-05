@@ -392,6 +392,20 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
                 ),
                 torch.tensor(lengths, dtype=torch.int32, device=self.device),
             )
+        except BaseException as error:
+            if handle.rpc is not None and handle.rpc.active:
+                try:
+                    if isinstance(self._session, TargetKVDraftPool):
+                        self._session.cancel(handle.rpc)
+                    else:
+                        assert isinstance(handle.rpc, TargetKVProposalHandle)
+                        self._session.cancel(handle.rpc)
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "target-KV collection and cancellation failed",
+                        [error, cleanup_error],
+                    ) from error
+            raise
         finally:
             self._discard(handle)
 

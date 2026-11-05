@@ -164,6 +164,32 @@ def test_two_verifiers_reorder_ragged_snapshots_without_route_or_namespace_mixup
     assert all(len(server.registry) == 0 for server in servers)
 
 
+def test_collect_allocation_failure_drains_and_releases_pool_handle(pool_runtime):
+    """A failed output allocation cannot strand snapshot futures or a busy pool."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+
+    client, _, _ = pool_runtime
+    pool = client()
+    keys = pool.open_sequences((0, 1), deadline=pool.deadline())
+    handle = dispatch(pool, keys)
+    failure = MemoryError("pool result allocation")
+    with (
+        allocation_failures(
+            [(TargetKVDraftPool.collect_batch, "results = [TargetKVResult()", failure)]
+        ) as triggered,
+        pytest.raises(MemoryError) as caught,
+    ):
+        pool.collect_batch(handle)
+    assert caught.value is failure and triggered == [failure]
+    assert not handle.active and not handle.retained
+    assert pool._pending is None
+    assert all(future.done() for _, _, future in handle.jobs)
+    assert tuple(
+        result.valid_length
+        for result in pool.collect_batch(dispatch(pool, keys, round_id=1))
+    ) == (1, 1)
+
+
 def test_parallel_drivers_and_deferred_unrelated_close_preserve_pending_batch(
     pool_runtime,
 ):

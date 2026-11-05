@@ -353,8 +353,8 @@ class TargetKVDraftPool:
 
     def collect_batch(self, handle: ProposalHandle) -> tuple[TargetKVResult, ...]:
         handle = self._owned(handle)
-        results = [TargetKVResult() for _ in handle.keys]
         try:
+            results = [TargetKVResult() for _ in handle.keys]
             error = None
             for _, rows, future in handle.jobs:
                 try:

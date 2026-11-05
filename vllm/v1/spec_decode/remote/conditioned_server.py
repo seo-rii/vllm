@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bounded cross-verifier execution for target-conditioned own-KV drafts."""
 
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -12,7 +11,6 @@ from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQu
 from vllm.v1.spec_decode.remote.server import (
     AdapterError,
     RemoteDraftServer,
-    ServerShutdownTimeout,
     StandaloneProposalResult,
     _ProposalInput,
     _ServerSession,
@@ -58,6 +56,7 @@ class ConditionedDraftServer(RemoteDraftServer):
             max_batch_rows=self.limits.max_batch_size,
             max_batch_tokens=self.limits.max_feature_tokens,
             batch_wait_s=batch_wait_ms / 1000,
+            on_failure=self._lifecycle_failed,
         )
 
     @property
@@ -85,22 +84,10 @@ class ConditionedDraftServer(RemoteDraftServer):
         # Do not stop an already running owner's queue on a duplicate start.
         if self._listener is not None or not self.healthy:
             raise RuntimeError("conditioned runtime is already started or unhealthy")
-        try:
-            return super().start(endpoint)
-        except BaseException:
-            self.work_queue.stop(time.monotonic() + self.shutdown_timeout_s)
-            raise
+        return super().start(endpoint)
 
-    def stop(self) -> None:
-        deadline = time.monotonic() + self.shutdown_timeout_s
-        try:
-            super().stop()
-        finally:
-            try:
-                self.work_queue.stop(deadline)
-            except ServerShutdownTimeout:
-                self._shutdown_failed = True
-                raise
+    def stop(self, *, deadline: float | None = None) -> None:
+        self._stop_with_owner(self.work_queue.stop, deadline=deadline)
 
     def _execute_proposals(self, work: tuple[DraftWork, ...]) -> None:
         # Different K budgets must not share a native rollout: padding a K=0

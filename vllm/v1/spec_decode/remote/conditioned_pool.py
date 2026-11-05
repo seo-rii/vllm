@@ -4,8 +4,10 @@
 
 import contextlib
 import time
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from itertools import chain
 
 import torch
 
@@ -327,6 +329,19 @@ class ConditionedDraftPool:
             )
         return result
 
+    @staticmethod
+    def _cuda_tensors(batch, chunks):
+        tensors: Iterable[torch.Tensor | None] = (
+            tensor for _, features, _ in chunks for tensor in features.slots
+        )
+        if batch is not None:
+            tensors = chain(
+                tensors,
+                batch.features.slots,
+                (batch.accepted_counts, batch.recovery_tokens),
+            )
+        return (tensor for tensor in tensors if tensor is not None and tensor.is_cuda)
+
     def _run(self, index, batch, chunks, reserved, deadline, ready):
         session = self._sessions[index]
         stream = self._streams[index] if self._streams else None
@@ -336,21 +351,25 @@ class ConditionedDraftPool:
                 if stream is not None
                 else contextlib.nullcontext()
             ):
-                if ready is not None:
-                    assert stream is not None
-                    stream.wait_event(ready)
-                    features = [features for _, features, _ in chunks]
-                    if batch is not None:
-                        features.append(batch.features)
-                    for feature in features:
-                        for tensor in feature.slots:
-                            if tensor is not None and tensor.is_cuda:
-                                tensor.record_stream(stream)
+                for device, event in ready.items():
+                    torch.cuda.current_stream(device).wait_event(event)
+                for tensor in self._cuda_tensors(batch, chunks):
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
                 if reserved:
                     session.open_reserved(reserved, deadline=deadline)
                 session.prefill_many(chunks, deadline=deadline)
                 if batch is not None:
-                    return session.collect(session.dispatch(batch, deadline=deadline))
+                    result = session.collect(session.dispatch(batch, deadline=deadline))
+                    completed = {}
+                    for tensor in (
+                        result.output.token_ids,
+                        result.output.valid_lengths,
+                    ):
+                        if tensor.is_cuda and tensor.device not in completed:
+                            event = torch.cuda.Event()
+                            event.record(torch.cuda.current_stream(tensor.device))
+                            completed[tensor.device] = event
+                    return result, completed
                 return None
         except BaseException:
             # A preparation exception must not leave a hidden RPC or lease.
@@ -373,10 +392,12 @@ class ConditionedDraftPool:
             raise ValueError(
                 "reserved pool sequences require prefill in the same round"
             )
-        ready = None
-        if self._streams:
-            ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self._streams[0].device))
+        ready = {}
+        for tensor in self._cuda_tensors(batch, chunks):
+            if tensor.device not in ready:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                ready[tensor.device] = event
         handle = ConditionedPoolHandle(
             self._owner,
             batch,
@@ -440,8 +461,19 @@ class ConditionedDraftPool:
             error = None
             for rows, future in handle.jobs:
                 try:
-                    result = future.result()
-                    if result is not None:
+                    driver_result = future.result()
+                    if driver_result is not None:
+                        result, completed = driver_result
+                        for device, event in completed.items():
+                            torch.cuda.current_stream(device).wait_event(event)
+                        for tensor in (
+                            result.output.token_ids,
+                            result.output.valid_lengths,
+                        ):
+                            if tensor.is_cuda:
+                                tensor.record_stream(
+                                    torch.cuda.current_stream(tensor.device)
+                                )
                         tokens[list(rows)] = result.output.token_ids
                         lengths[list(rows)] = result.output.valid_lengths
                         for row, status in zip(rows, result.row_statuses):

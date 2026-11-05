@@ -156,6 +156,27 @@ def test_conditioned_clients_share_forward_without_sharing_kv_or_k(tmp_path, bud
         assert b.sequence_state(kb) is SequenceState.READY
 
 
+def test_conditioned_owner_failure_marks_server_unhealthy(tmp_path, monkeypatch):
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    error = MemoryError("conditioned owner batch allocation")
+
+    def fail(*args):
+        raise error
+
+    with (
+        pytest.raises(ServerShutdownTimeout, match="restart required"),
+        runtime(tmp_path) as (server, _, _),
+    ):
+        monkeypatch.setattr(module, "tuple", fail, raising=False)
+        work = server.work_queue.submit(DraftWork("a", None, num_rows=1, num_tokens=1))
+        assert work.done.wait(3)
+        assert work.error is error
+        assert server.wait(timeout=0) and not server.healthy
+        assert server.queue_depth == 0
+
+
 def test_conditioned_verifier_slot_credit_preserves_other_clients(tmp_path):
     with runtime(tmp_path, max_sequences_per_verifier=1) as (server, _, client):
         a, b = client("a"), client("b")

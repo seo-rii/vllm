@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Same-host v3 token server using the existing framed transport/lifecycle."""
 
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -53,7 +52,6 @@ from vllm.v1.spec_decode.remote.transport import (
     frame_to_ints,
     ints_to_frame,
     is_local_endpoint,
-    listen,
 )
 
 OK = SpeculatorStatusCode.OK
@@ -103,6 +101,7 @@ class TokenDraftServer(RemoteDraftServer):
             max_batch_rows=self.limits.max_batch_size,
             max_batch_tokens=self.limits.max_feature_tokens,
             batch_wait_s=batch_wait_ms / 1000,
+            on_failure=self._lifecycle_failed,
         )
 
     @property
@@ -139,16 +138,8 @@ class TokenDraftServer(RemoteDraftServer):
                 torch.accelerator.synchronize(device)
         self.adapter.warmup()
 
-    def stop(self) -> None:
-        deadline = time.monotonic() + self.shutdown_timeout_s
-        try:
-            super().stop()
-        finally:
-            try:
-                self.work_queue.stop(deadline)
-            except ServerShutdownTimeout:
-                self._shutdown_failed = True
-                raise
+    def stop(self, *, deadline: float | None = None) -> None:
+        self._stop_with_owner(self.work_queue.stop, deadline=deadline)
 
     def _execute_advances(self, work: tuple[DraftWork, ...]) -> None:
         with self.adapter_turn():
@@ -217,25 +208,21 @@ class TokenDraftServer(RemoteDraftServer):
         except Exception as error:
             self._adapter_failed(error)
             raise
-        try:
-            self._listener = listen(endpoint)
-        except BaseException:
-            self.work_queue.stop(time.monotonic() + self.shutdown_timeout_s)
-            raise
-        self._stopping.clear()
-        self._acceptor = threading.Thread(
-            target=self._accept_loop, name="token-draft-acceptor", daemon=True
-        )
-        self._acceptor.start()
-        return self._listener.endpoint
+        return self._start_listener(endpoint, name="token-draft-acceptor")
 
     def _serve_connection(self, conn: FramedConnection) -> None:
         session: _TokenServerSession | None = None
+        close_failed = False
         try:
             session = _TokenServerSession(self, conn)
             session.run()
         except AdapterQueueFull:
-            conn.close()
+            try:
+                conn.close()
+            except BaseException as error:
+                close_failed = True
+                self._lifecycle_failed(error)
+                logger.warning("Token connection cleanup failed: %s", error)
         except (
             TransportError,
             ProtocolError,
@@ -265,12 +252,17 @@ class TokenDraftServer(RemoteDraftServer):
                 )
             finally:
                 try:
-                    conn.close()
-                except OSError as error:
+                    if not close_failed:
+                        conn.close()
+                except BaseException as error:
+                    self._lifecycle_failed(error)
                     logger.warning("Token connection cleanup failed: %s", error)
+                else:
+                    if not close_failed:
+                        with self._connections_lock:
+                            self._connections.discard(conn)
                 finally:
                     with self._connections_lock:
-                        self._connections.discard(conn)
                         self._handshaking.discard(conn)
 
 

@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared real configuration and stateful external draft executor fixtures."""
 
+import inspect
+import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +37,88 @@ BLOCK_SIZE = 2
 STRIDE = 1 << 20
 
 
+@contextmanager
+def allocation_failures(faults, *, use_monitoring=True):
+    """Inject line faults; install in the executing thread on Python 3.11."""
+    pending = {}
+    for method, fragment, error in faults:
+        lines, first = inspect.getsourcelines(method)
+        matches = [first + i for i, line in enumerate(lines) if fragment in line]
+        assert len(matches) == 1, (method.__qualname__, fragment, matches)
+        pending[method.__code__, matches[0]] = error
+    codes = {code for code, _ in pending}
+    triggered = []
+
+    def fail(code, line):
+        error = pending.pop((code, line), None)
+        if error is not None:
+            triggered.append(error)
+            raise error
+
+    monitoring = getattr(sys, "monitoring", None) if use_monitoring else None
+    if monitoring is None:
+        previous_trace, previous_profile = sys.gettrace(), sys.getprofile()
+
+        def trace(frame, event, arg):
+            delegate = previous_trace(frame, event, arg) if previous_trace else None
+            if frame.f_code not in codes:
+                return delegate
+
+            def lines(frame, event, arg):
+                nonlocal delegate
+                if delegate is not None:
+                    delegate = delegate(frame, event, arg)
+                if event == "line":
+                    fail(frame.f_code, frame.f_lineno)
+                return lines
+
+            return lines
+
+        def profile(frame, event, arg):
+            if previous_profile is not None:
+                previous_profile(frame, event, arg)
+            # Python disables tracing when a callback raises. Re-arm at the
+            # next selected call so a rollback can fail independently.
+            if (
+                event == "call"
+                and frame.f_code in codes
+                and sys.gettrace() is not trace
+            ):
+                sys.settrace(trace)
+                frame.f_trace = trace(frame, event, arg)
+
+        sys.setprofile(profile)
+        sys.settrace(trace)
+        try:
+            yield triggered
+        finally:
+            sys.settrace(previous_trace)
+            sys.setprofile(previous_profile)
+        return
+
+    tool_id = next(index for index in range(6) if monitoring.get_tool(index) is None)
+    monitoring.use_tool_id(tool_id, "remote-allocation-faults")
+    try:
+        monitoring.register_callback(tool_id, monitoring.events.LINE, fail)
+        for code in codes:
+            monitoring.set_local_events(tool_id, code, monitoring.events.LINE)
+        yield triggered
+    finally:
+        for code in codes:
+            monitoring.set_local_events(tool_id, code, 0)
+        monitoring.register_callback(tool_id, monitoring.events.LINE, None)
+        monitoring.free_tool_id(tool_id)
+
+
+@contextmanager
+def cpu_accelerator_cleanup():
+    """CPU model loading has no accelerator allocator to empty."""
+    with pytest.MonkeyPatch.context() as patch:
+        if torch.accelerator.current_accelerator() is None:
+            patch.setattr(torch.accelerator, "empty_cache", lambda: None)
+        yield
+
+
 @pytest.fixture
 def cpu_parallel_state(tmp_path_factory):
     from vllm.distributed import (
@@ -44,7 +129,7 @@ def cpu_parallel_state(tmp_path_factory):
     )
 
     rendezvous = tmp_path_factory.mktemp("remote-dist") / "store"
-    with set_current_vllm_config(make_config()):
+    with cpu_accelerator_cleanup(), set_current_vllm_config(make_config()):
         init_distributed_environment(
             world_size=1,
             rank=0,

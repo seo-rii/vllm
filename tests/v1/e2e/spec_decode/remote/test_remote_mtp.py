@@ -182,16 +182,17 @@ def draft_server(
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv,num_workers,max_num_seqs,registration_oom",
+    "transport,target_kv,num_workers,max_num_seqs,registration_oom,collection_oom",
     [
-        ("inline", False, 1, 4, False),
-        ("cuda_ipc", False, 1, 4, False),
-        ("inline", False, 2, 4, False),
-        ("cuda_ipc", False, 2, 4, False),
-        ("inline", True, 1, 4, False),
-        ("inline", True, 2, 4, False),
-        ("inline", True, 1, 1, False),
-        ("inline", True, 1, 1, True),
+        ("inline", False, 1, 4, False, False),
+        ("cuda_ipc", False, 1, 4, False, False),
+        ("inline", False, 2, 4, False, False),
+        ("cuda_ipc", False, 2, 4, False, False),
+        ("inline", True, 1, 4, False, False),
+        ("inline", True, 2, 4, False, False),
+        ("inline", True, 1, 1, False, False),
+        ("inline", True, 1, 1, True, False),
+        ("inline", True, 1, 1, False, True),
     ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
@@ -203,13 +204,16 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     num_workers,
     max_num_seqs,
     registration_oom,
+    collection_oom,
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    if registration_oom:
+    if not target_kv and num_workers > 1:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if registration_oom or collection_oom:
         monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         monkeypatch.setenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
     elif max_num_seqs == 1:
@@ -270,7 +274,9 @@ def test_remote_mtp_matches_target_and_uses_drafts(
         )
         remote_options = dict(
             transport=transport,
-            failure_policy="target_only" if registration_oom else "error",
+            failure_policy=(
+                "target_only" if registration_oom or collection_oom else "error"
+            ),
             request_timeout_ms=5000,
             startup_timeout_ms=600000,
         )
@@ -285,6 +291,28 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             assert actual_config.use_remote_draft()
             assert actual_config.get_remote_draft_config().transport == transport
             assert actual_config.get_remote_draft_endpoints() == endpoints
+            result_writes = []
+            if not target_kv and num_workers > 1:
+                import threading
+
+                import torch
+
+                index_copy = torch.Tensor.index_copy_
+
+                def observe_result_copy(tensor, *args, **kwargs):
+                    if (
+                        tensor.dtype == torch.int32
+                        and tensor.ndim == 1
+                        and threading.current_thread().name.startswith("draft-feature-")
+                    ):
+                        # The model runner stages recovery tokens on CPU, so
+                        # its session results are CPU tensors too. The CUDA
+                        # result handoff is exercised by the pool stream test.
+                        assert tensor.device.type == "cpu"
+                        result_writes.append(threading.get_ident())
+                    return index_copy(tensor, *args, **kwargs)
+
+                monkeypatch.setattr(torch.Tensor, "index_copy_", observe_result_copy)
             metric_names = (
                 "vllm:spec_decode_num_draft_tokens",
                 "vllm:spec_decode_num_accepted_tokens",
@@ -324,8 +352,43 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                     name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
                     for name in metric_names
                 }
+            if collection_oom:
+                from tests.v1.spec_decode.remote.runtime_fixtures import (
+                    allocation_failures,
+                )
+                from vllm.v1.spec_decode.remote.target_kv_session import (
+                    TargetKVRemoteSession,
+                )
+
+                failure = MemoryError("target-KV result allocation")
+                with allocation_failures(
+                    [
+                        (
+                            TargetKVRemoteSession.collect_batch,
+                            "results = [TargetKVResult()",
+                            failure,
+                        )
+                    ]
+                ) as failures:
+                    recovered = remote.llm.generate(
+                        prompts[:1], sampling, use_tqdm=False
+                    )
+                assert failures == [failure]
+                assert list(recovered[0].outputs[0].token_ids) == list(
+                    expected[0].outputs[0].token_ids
+                )
+                remote.llm.llm_engine.do_log_stats()
+                before_recovery = {
+                    name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                    for name in metric_names
+                }
             sibling = None
-            if target_kv and max_num_seqs == 1 and not registration_oom:
+            if (
+                target_kv
+                and max_num_seqs == 1
+                and not registration_oom
+                and not collection_oom
+            ):
                 from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
                     create_target_kv_contract,
                 )
@@ -390,6 +453,8 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             metrics = remote.llm.get_metrics()
             for name in metric_names:
                 assert get_spec_decode_metric_value(metrics, name) > 0
+            if not target_kv and num_workers > 1:
+                assert len(set(result_writes)) == num_workers
 
 
 @pytest.fixture
