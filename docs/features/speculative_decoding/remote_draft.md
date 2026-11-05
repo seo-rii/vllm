@@ -42,6 +42,84 @@ before starting prefill or proposal computation.
 Socket cleanup errors encountered while handling a transport failure do not
 replace that failure or interrupt the configured fallback.
 
+## Metrics and OpenTelemetry
+
+Remote placement publishes host-side RPC measurements through the target's
+existing Prometheus `/metrics` endpoint, with its normal model and engine labels.
+These measurements do not synchronize CUDA or require a telemetry collector.
+The worker accumulates bounded CPU counters and exact histogram bins; existing
+engine statistics carry the deltas to the frontend that publishes them. This
+works with the default single API server and with multiprocess metric collection.
+The usual `--disable-log-stats` setting also disables these serving metrics.
+Counters aggregate sessions of the same backend (`conditioned` or `token`) per
+engine, without labeling individual requests or remote endpoints.
+
+| Metric | Meaning |
+| --- | --- |
+| `vllm:remote_draft_rpc_seconds` | Prefill/proposal wall time from the first socket write to receipt of its response, including result frames |
+| `vllm:remote_draft_server_seconds` | Server queue and execution wall time, distinguished by `stage`; execution includes existing device waits and does not measure kernel time |
+| `vllm:remote_draft_bytes_total` | Socket bytes by `direction`, including frame/control metadata; excludes CUDA IPC device copies and can undercount an interrupted partial write |
+| `vllm:remote_draft_rpc_failures_total` | RPC failures by bounded `reason`, including transport and timeout failures |
+| `vllm:remote_draft_failed_rows_total` | Rejected proposal rows by protocol status; the configured failure policy determines whether these fall back or raise |
+| `vllm:remote_draft_server_resources` | Latest reported active sequences, used KV blocks and usable block capacity per engine |
+
+Resource values are snapshots received with ordinary replies, not an independent
+server health check. KV counts exclude the reserved null block. A disconnected
+server's last report can be stale. The adapter reports KV only when it owns a
+block allocator; protocol test adapters do not invent a KV capacity. Repeated
+steps of an already terminal request do not count as new failed rows.
+Acknowledged cleanup is forwarded on an empty engine step, so the last request's
+resource release does not require another generation. Metrics follow the normal
+statistics cadence; an error that terminates the worker before its output is sent
+can lose the last deltas. They are not durable accounting records. Custom stat
+loggers receive the optional remote statistics. The built-in Prometheus logger
+publishes these metrics; Ray-native telemetry export is not supported.
+
+For example, the proposal round-trip p99 is:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le, backend) (
+    rate(vllm:remote_draft_rpc_seconds_bucket{operation="proposal"}[5m])
+  )
+)
+```
+
+Configure the target with the existing `--otlp-traces-endpoint` option to enable
+OpenTelemetry tracing. Configure the standalone draft process through
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and use the same exporter protocol on both
+processes. For HTTP/protobuf:
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://collector:4318/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+# Start the standalone draft process with its usual model and placement arguments.
+# Add --otlp-traces-endpoint="$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" to vllm serve.
+```
+
+The `remote_draft.prefill` and `remote_draft.proposal` client spans propagate
+bounded W3C trace context to corresponding `remote_draft.server.*` spans.
+Each prefill RPC uses its own request context as its parent. Proposal RPCs use
+only the requests they actually send: one request becomes the parent, while
+multiple traced requests use span links. Partial prefill and terminal rows that
+do not participate are excluded. The server records its
+queue and execution durations as span attributes. Request IDs, endpoints,
+prompts and token values are not metric labels or remote span attributes.
+Use the existing OpenTelemetry sampler to control span volume; exporting occurs
+through the existing batch span processor.
+
+Protocol v2.3 and token-only v3.2 negotiate `observability` during HELLO. The
+optional trace and server-observation envelope fields are omitted until both
+peers acknowledge support. Older peers retain RPC/socket measurements without
+receiving trace metadata or supplying server resource/timing observations.
+Without a configured tracer provider the client creates no remote spans and
+sends no trace context; metrics remain available.
+
+An OpenTelemetry Collector can scrape `/metrics` using its Prometheus receiver
+and receive spans through OTLP. This retains the existing vLLM metric names and
+avoids exporting every decode round synchronously. Execution policies consume
+their own in-process observations, independently of telemetry export or sampling.
+
 Feature schema and frame byte budgets are checked before tensor serialization.
 Connections, partial frames, pending bytes and adapter waiters have server-side
 bounds. A shutdown grace timeout does not authorize freeing GPU storage whose

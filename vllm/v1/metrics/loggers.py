@@ -36,6 +36,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
+from vllm.v1.spec_decode.remote.metrics import RemoteMetrics
 
 logger = init_logger(__name__)
 
@@ -511,6 +512,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             per_engine_labelvalues,
             is_diffusion=vllm_config.model_config.is_diffusion,
         )
+        self.remote_draft_prom: RemoteMetrics | None = None
         self.kv_connector_prom = self._kv_connector_cls(
             vllm_config, labelnames, per_engine_labelvalues
         )
@@ -1192,6 +1194,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx
+                )
+
+            if scheduler_stats.remote_draft_stats is not None:
+                if self.remote_draft_prom is None:
+                    self.remote_draft_prom = RemoteMetrics(
+                        ["model_name", "engine"], self.per_engine_labelvalues
+                    )
+                self.remote_draft_prom.observe(
+                    scheduler_stats.remote_draft_stats, engine_idx
                 )
 
             if scheduler_stats.kv_connector_stats is not None:
