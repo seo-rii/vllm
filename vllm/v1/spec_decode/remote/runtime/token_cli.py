@@ -23,6 +23,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--attention-backend")
     result.add_argument("--target-attention-backend")
     result.add_argument("--trust-remote-code", action="store_true")
+    result.add_argument(
+        "--allow-cross-node",
+        action="store_true",
+        help="Allow experimental token-only TCP peers on an isolated trusted network.",
+    )
     return result
 
 
@@ -79,6 +84,7 @@ def main() -> None:
     adapter = create_adapter(args)
     server = TokenDraftServer(
         adapter,
+        allow_remote_connections=args.allow_cross_node,
         limits=RemoteServerLimits(
             args.max_batch_size,
             args.max_feature_tokens,

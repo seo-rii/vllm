@@ -51,11 +51,19 @@ def draft_server(
     owned_processes: list[subprocess.Popen] | None = None,
     close_fault_receipt: Path | None = None,
     on_ready: Callable[[subprocess.Popen], None] | None = None,
+    cross_node: bool = False,
 ):
     if close_fault_receipt is not None and token_only_draft is None:
         raise ValueError("socket cleanup fault requires the token-only server")
+    if cross_node and (token_only_draft is None or close_fault_receipt is not None):
+        raise ValueError("cross-node helper requires the ordinary token-only server")
     with tempfile.TemporaryDirectory(prefix="vllm-remote-") as directory:
         path = Path(directory) / "draft.sock"
+        endpoint = f"unix://{path}"
+        if cross_node:
+            from vllm.utils.network_utils import get_open_port
+
+            endpoint = f"tcp://127.0.0.1:{get_open_port()}"
         command = [
             sys.executable,
             "-m",
@@ -63,7 +71,7 @@ def draft_server(
             "--adapter",
             "gpu",
             "--endpoint",
-            f"unix://{path}",
+            endpoint,
             "--target-model",
             model,
             "--draft-model",
@@ -105,7 +113,7 @@ def draft_server(
                 "-m",
                 "vllm.v1.spec_decode.remote.runtime.token_cli",
                 "--endpoint",
-                f"unix://{path}",
+                endpoint,
                 "--target-model",
                 model,
                 "--draft-model",
@@ -125,6 +133,8 @@ def draft_server(
                 "--target-attention-backend",
                 target_attention_backend or attention_backend,
             ]
+            if cross_node:
+                command.append("--allow-cross-node")
         if close_fault_receipt is not None:
             command = [
                 sys.executable,
@@ -155,8 +165,11 @@ def draft_server(
                         pytest.fail(
                             f"draft server exited {process.returncode}: {log_path}"
                         )
-                    with socket.socket(socket.AF_UNIX) as probe:
-                        if probe.connect_ex(str(path)) == 0:
+                    from vllm.v1.spec_decode.remote.transport import parse_endpoint
+
+                    family, address = parse_endpoint(endpoint)
+                    with socket.socket(family) as probe:
+                        if probe.connect_ex(address) == 0:
                             break
                     if time.monotonic() >= deadline:
                         pytest.fail(
@@ -167,7 +180,7 @@ def draft_server(
                     owned_processes.append(process)
                 if on_ready is not None:
                     on_ready(process)
-                yield f"unix://{path}"
+                yield endpoint
             finally:
                 if process.poll() is None:
                     # A fault-injection test may have stopped this owned child.
@@ -1590,9 +1603,14 @@ def _save_token_prefix_models(directory):
 
 
 @pytest.mark.parametrize(
-    "async_scheduling,prefix_caching",
-    [(False, True), (True, False), (True, True)],
-    ids=["sync-prefix-on", "async-prefix-off", "async-prefix-on"],
+    "async_scheduling,prefix_caching,cross_node",
+    [
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (False, False, True),
+    ],
+    ids=["sync-prefix-on", "async-prefix-off", "async-prefix-on", "cross-node-tcp"],
 )
 def test_remote_token_cached_prefix_matches_native_and_target(
     vllm_runner,
@@ -1601,6 +1619,7 @@ def test_remote_token_cached_prefix_matches_native_and_target(
     record_property,
     async_scheduling,
     prefix_caching,
+    cross_node,
 ):
     """Keep remote tokens exact with async scheduling and cached-prefix replay."""
     import hashlib
@@ -1747,6 +1766,7 @@ def test_remote_token_cached_prefix_matches_native_and_target(
         attention_backend="TRITON_ATTN",
         draft_kv_cache_gib=0.03125,
         max_feature_tokens=32,
+        cross_node=cross_node,
     ) as endpoint:
         run_mode(
             "remote",
@@ -1760,6 +1780,7 @@ def test_remote_token_cached_prefix_matches_native_and_target(
                     failure_policy="error",
                     request_timeout_ms=5000,
                     startup_timeout_ms=600000,
+                    allow_cross_node=cross_node,
                 ),
             ),
         )

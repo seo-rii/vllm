@@ -4,8 +4,10 @@ The native local speculator remains the default. An opt-in backend boundary
 adds local wrappers, same-step dispatch/collect and a token-only standalone
 draft. Full-attention token-only execution additionally supports bounded
 target-prefix replay and eager MRV2 async scheduling. Predictive caching, N:M
-pooling, stochastic remote sampling, general prefix reuse, cross-node transport
+pooling, stochastic remote sampling, general prefix reuse
 and draft TP expansion remain outside this implementation.
+An explicit token-only TCP experiment supports cross-node placement; it does
+not enable cross-node target-conditioned features or CUDA IPC.
 
 ## Native local execution
 
@@ -248,6 +250,70 @@ Same-GPU runs do not establish cross-GPU transfer or target TP2 behavior.
 Performance comparisons include TTFT, TPOT, tail latency, throughput, target
 and draft memory, and additional GPU cost. Dispatch/collect separation alone
 does not demonstrate compute overlap.
+
+## Cross-node token-only experiment
+
+An ordinary independent draft can run on another trusted host using one inline
+TCP endpoint. Both hosts must explicitly opt in. Start the existing token draft
+CLI on the draft host with `--endpoint tcp://192.0.2.10:5001 --allow-cross-node`,
+along with the target/draft model, immutable revisions and resource limits.
+Configure the verifier with:
+
+```json
+{
+  "method": "draft_model",
+  "model": "<draft-checkpoint>",
+  "num_speculative_tokens": 3,
+  "execution": {
+    "placement": "remote",
+    "endpoints": ["tcp://192.0.2.10:5001"],
+    "transport": "inline",
+    "allow_cross_node": true,
+    "request_timeout_ms": 1000
+  }
+}
+```
+
+Protocol v3.2 confirms cross-node support and identical native byte order before
+any token frames are sent. Older peers or peers with another byte order are
+rejected. Normal same-host handshakes omit the extension and retain their
+existing compatibility. Model and tokenizer identities are checked from their
+immutable revisions or artifact bytes, independently of host directory paths.
+
+The existing frame, sequence, token and deadline budgets still apply. All
+sampling and verification remain in the target's native speculative path;
+the wire carries token IDs and authoritative outcomes. This experiment retains
+greedy full-attention token-only models, target/draft TP1 and one endpoint.
+Target-conditioned MTP/EAGLE features, target-KV snapshots and CUDA IPC are
+outside this cross-node contract.
+
+The protocol provides no authentication or encryption. Follow the existing
+[inter-node network isolation requirements](../usage/security.md#inter-node-communication),
+or use a protected tunnel. Cross-node placement adds network round trips and
+does not establish a latency or throughput benefit. Compare target-only,
+co-located speculation and remote speculation with the same total GPU budget;
+include prefix upload, accepted tokens, queueing, target/draft memory and tail
+latency. A loopback TCP model test proves integration, not a two-host serving
+speedup.
+
+### Token-only RPC cost experiment
+
+Export a bounded JSON manifest from the real draft adapter using schema_version1, a matching TokenHello contract, string model/revision/content identities, and exact server source/native IDs. The server must opt in with `--allow-cross-node`. Keep its TCP listener on loopback when reaching it through an SSH tunnel.
+
+Run the same immutable client/server source and model artifacts over each path:
+
+```bash
+.venv/bin/python benchmarks/spec_decode/benchmark_remote_token_rpc.py \
+  --endpoint tcp://127.0.0.1:<port> --allow-cross-node \
+  --transport-label loopback --manifest /path/to/manifest.json \
+  --output-json /path/to/loopback-result.json \
+  --requests 8 --rounds-per-request 12 --warmup-requests 1 \
+  --accepted-prefix all --target-token-ms 1 5 10 20
+```
+
+For an owned trusted SSH forward, run the client on the second host against the forwarded local port with `--transport-label ssh-tunnel`. Record the physical hosts and tunnel configuration privately; public results should identify the path type and hardware without machine aliases. Repeat with `--accepted-prefix 0` to measure rejection/correction state updates. Defaults require enough context for16prompt tokens, twelve rounds and the requested rollout (K3 needs64 positions).
+
+The client runs open/prefill/advance/close through real sockets and the native drafter. It reports RPC/open/prefill/close distributions, raw valid proposals, tensor payload bytes, library/source/model identities and hypothetical break-even bounds. It does not execute a target model: accepted/emitted counts are explicitly synthetic and `target_verified_tokens` is null. RPC time combines serialization, transport, queue delay and native draft computation; it is not isolated network RTT. Payload bytes exclude control metadata, frame headers, TCP and SSH overhead. Break-even bounds exclude setup and assume serial draft RPC plus target verification. Positive remaining verification budget is necessary, not sufficient, for a serving speedup.
 
 ## Related work
 

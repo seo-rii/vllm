@@ -108,6 +108,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     failure_policy=remote.failure_policy,
                     request_timeout_ms=remote.request_timeout_ms,
                     startup_timeout_ms=remote.startup_timeout_ms,
+                    allow_cross_node=remote.allow_cross_node,
                 )
                 self._session.connect()
             except Exception as exc:
