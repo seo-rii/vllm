@@ -220,6 +220,7 @@ class Step3p5MTP(nn.Module):
         ]
 
         loaded_params: set[str] = set()
+        loaded_qkv_parts: dict[str, set[str]] = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -229,7 +230,7 @@ class Step3p5MTP(nn.Module):
             name = self._rewrite_spec_layer_name(spec_layer, name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if name in params_dict or weight_name not in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -249,6 +250,8 @@ class Step3p5MTP(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                if param_name == "qkv_proj" and name.endswith(".weight"):
+                    loaded_qkv_parts.setdefault(name, set()).add(weight_name)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -298,7 +301,19 @@ class Step3p5MTP(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    if name.endswith(".qkv_proj.weight"):
+                        loaded_qkv_parts[name] = {"q_proj", "k_proj", "v_proj"}
             loaded_params.add(name)
+        if is_mtp_completeness_check_enabled():
+            for name, parts in loaded_qkv_parts.items():
+                missing = {"q_proj", "k_proj", "v_proj"} - parts
+                if missing:
+                    prefix = name.removesuffix("qkv_proj.weight")
+                    names = sorted(f"{prefix}{part}.weight" for part in missing)
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {names}"
+                    )
         params_need_to_load = set(params_dict.keys())
         # Some KV cache scales are optional: checkpoints may omit them and vLLM
         # will fall back to default scales during initialization.

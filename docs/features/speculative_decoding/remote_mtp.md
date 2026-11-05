@@ -10,8 +10,8 @@ between target and draft computation.
 
 The runtime checks the resolved draft architecture and its matching target,
 including hidden width, vocabulary size and the native MTP module count.
-It accepts one MTP module, or the Exaone module chain described
-below. All supported paths use scalar token positions.
+It accepts one MTP module, the Exaone module chain, or the Step3.5 first-head
+configuration described below. All supported paths use scalar token positions.
 
 | Resolved draft architecture | Matching target | Draft cache | K restriction |
 | --- | --- | --- | --- |
@@ -25,6 +25,7 @@ below. All supported paths use scalar token positions.
 | `ExaoneMoeMTP` | `ExaoneMoeForCausalLM` / `ExaoneMoEForCausalLM` | Full attention or sliding window, including mixed module groups | One module: native sequential rollout; multiple modules: configured K equals checkpoint module count |
 | `NemotronHMTPModel` | `NemotronHForCausalLM` / `NemotronHPuzzleForCausalLM` | Attention/MoE-only MTP block | Native sequential rollout |
 | `HYV3MTPModel` | `HYV3ForCausalLM` | Full attention | Native sequential rollout |
+| `Step3p5MTP` | `Step3p5ForCausalLM` | Homogeneous full attention or sliding window | One module: native sequential rollout; multiple SWA modules: configured K=1 |
 
 These are explicit implementation contracts, not validation of every checkpoint
 or topology in each family. A target with hybrid attention or recurrent layers
@@ -112,6 +113,32 @@ do not establish support for published FP8 weights. Pro's fused checkpoint
 format, Omni, quantization, additional MTP heads, pooled placement and CUDA IPC
 require separate validation and remain excluded.
 
+### Step3.5 checkpoint-owned heads
+
+Step3.5 shares the target embedding and loads each MTP module's own LM head
+from its checkpoint. The standalone process does not load or allocate the
+unused target LM head. Missing MTP head weights fail native checkpoint
+completeness validation; the target head is not a replacement.
+Split attention checkpoints must also provide every Q/K/V projection weight;
+fused `qkv_proj.weight` checkpoints are supported.
+
+This contract requires native unquantized BF16 target/draft weights and KV,
+target TP1, draft TP1, one inline endpoint, GQA and dense MTP feed-forward
+layers. A single full-attention or sliding-window module can use native
+sequential rollout. Multiple modules require homogeneous sliding-window
+attention and configured K=1. That configuration uses the native single-head
+proposer: all checkpoint modules and their KV are allocated, but only the first
+module executes. It does not implement multi-module rollout or replay.
+
+Declare one MTP attention and MLP type per checkpoint module, with positive
+sliding-window and head settings where applicable. Full-attention MTP heads
+need native configuration geometry covering their absolute layer indices;
+homogeneous configurations may explicitly set `per_layer_config` to null.
+The public Step3.5 BF16 metadata has three sliding-window MTP modules.
+Small BF16 fixtures validate this contract, not the full published checkpoint's
+quality or resource requirements. Step3.7 multimodal wrappers, FP8 checkpoints,
+mixed MTP attention groups, CUDA IPC and pooling require separate contracts.
+
 ### Exaone module chains
 
 A checkpoint with `num_nextn_predict_layers=N`, where N is at least two, can use
@@ -155,8 +182,10 @@ sequential rollout behavior.
 
 ## Shared weights and execution
 
-The standalone process loads the target embedding and LM head without loading
-its transformer layers. Automatic checkpoint downloads use the resolved target
+The standalone process loads only the target embedding and LM head consumed
+by the native draft loader, without loading target transformer layers.
+Checkpoint-owned Step3.5 heads omit the target LM head. Automatic checkpoint
+downloads use the resolved target
 revision. Nemotron embedding names follow its native loader: `model` or
 `backbone` prefixes with `embeddings` or `embed_tokens`. Exactly one matching
 tensor must be present. Ambiguous aliases, incompatible shapes and quantized
@@ -172,7 +201,7 @@ and model loading, and throughout serving; hot reload is unsupported. Local
 tokenizer artifacts are likewise hashed independently of their directory path.
 
 An alternate `--shared-weights-source` must be a local directory. Its selected
-embedding and head tensors must match the target checkpoint in dtype, shape and
+consumed embedding and head tensors must match the target checkpoint in dtype, shape and
 contents before GPU materialization. Unpinned alternate repositories and shape-
 compatible replacement weights are rejected; this option stages identical shared
 weights rather than changing the model being advertised by the handshake.
