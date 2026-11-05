@@ -361,7 +361,6 @@ def test_sparse_pair_keeps_logical_blocks_and_native_byte_records_independent(
     bind_kv_cache_to_layers(
         {indexer.prefix: caches[indexer.prefix]},
         native_config.compilation_config.static_forward_context,
-        kv_cache_groups=config.kv_cache_groups,
     )
     assert indexer.kv_cache.shape == (4, 64, 132)
     assert indexer.kv_cache.data_ptr() == caches[indexer.prefix].data_ptr()
