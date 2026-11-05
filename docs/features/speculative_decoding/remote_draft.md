@@ -47,9 +47,11 @@ Connections, partial frames, pending bytes and adapter waiters have server-side
 bounds. A shutdown grace timeout does not authorize freeing GPU storage whose
 completion is unknown; the process must be restarted in that state.
 
-This placement does not provide predictive caching, cross-node execution or
-N:M routing. Moving a speculator to another GPU does not by itself overlap its
-computation with target verification or guarantee higher throughput.
+Same-host [shared draft workers](draft_pool.md) provide sticky N:M routing
+within their supported model and transport contracts. Predictive caching and
+cross-node execution remain unsupported. Moving a speculator to another GPU
+does not by itself overlap its computation with target verification or guarantee
+higher throughput.
 
 ## Standalone GPU example
 
