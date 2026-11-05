@@ -3,12 +3,11 @@
 """Token-only native model/attention execution, without a target shell or engine."""
 
 import inspect
-from dataclasses import replace
 
 import numpy as np
 import torch
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.spec_decode.remote.errors import CompletionUnknownError, runtime_unusable
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
