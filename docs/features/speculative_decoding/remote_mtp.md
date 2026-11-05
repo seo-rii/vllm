@@ -96,8 +96,10 @@ full-attention MTP head (`mtp_num_hidden_layers=1`). The target retains its nati
 Gated DeltaNet state and speculative rollback; the standalone head owns only
 attention KV and shares the target checkpoint's embedding and LM head.
 
-Use native unquantized BF16 target/draft weights and KV, target TP1, draft TP1,
-sequential greedy drafting and one inline endpoint. K controls sequential
+Use native BF16 activations and KV, target TP1, draft TP1, sequential greedy
+drafting and one inline endpoint. Dense and MoE checkpoints can use unquantized
+BF16 weights. Dense Qwen3.5 additionally accepts the serialized per-tensor FP8
+profile below. K controls sequential
 rollout of the single head. `transport="auto"` continues to select inline.
 Native weight-completeness checks include every split Q/K/V projection in
 dense and MoE BF16 MTP checkpoints, plus gate/up projections in dense checkpoints.
@@ -114,9 +116,38 @@ this contract accepts only the matching flat-text target; it does not transport
 image/video embeddings or arbitrary position axes.
 
 Conditional-generation wrappers, multimodal inputs, additional MTP heads,
-quantized checkpoints, CUDA IPC and pooled placement remain outside this
+other quantized checkpoints, CUDA IPC and pooled placement remain outside this
 contract. Small seeded model tests establish loading, state and placement
 correctness rather than trained quality or performance.
+
+#### Dense Qwen3.5 FP8 weights
+
+Use an actual serialized E4M3 checkpoint with native `quant_method="fp8"`,
+`activation_scheme="dynamic"`, per-tensor weight scales, and BF16 activations
+and KV. Target and draft must use matching native text/quantization configs.
+The runtime preserves native loading and kernel selection; the shared embedding
+and LM head must remain unquantized. On A100, native vLLM uses the Marlin W8A16
+path: FP8 stored weights with BF16 inputs. This is distinct from hardware FP8
+matrix multiplication. Keep `VLLM_BATCH_INVARIANT=0` for the Marlin path.
+
+The standalone loader enables native parameter-completeness tracking for this
+profile, including its weight scales. Use the native default checkpoint loader;
+explicitly disabling `enable_weights_track` is rejected. Tracking verifies every
+split Q/K/V and gate/up projection and its scale; complete fused projections
+remain supported. Before allocating draft KV or accepting requests, the runtime
+checks the loaded native projection kernels, weight storage, scale metadata and
+shared embedding/head dtype. It
+accepts native Marlin's packed storage and transformed scales rather than
+requiring the checkpoint's on-disk layout after loading. The startup log reports
+the resolved weight profile and kernel/storage types. These checks add no
+per-step tensor copies or GPU synchronization.
+
+This profile applies only to dense `Qwen3_5ForCausalLM` / `Qwen3_5MTP`, with the
+same single-head, TP1 and inline limits. MoE FP8, block-scaled or compressed
+weight formats, static activation scales, online quantization and FP8 KV remain
+excluded. Merely adding quantization metadata to BF16 tensors does not create
+an FP8 checkpoint. Seeded serialization and serving tests are separate from
+published quantized-checkpoint quality and performance evaluation.
 
 ### MiMo-V2 Flash
 
