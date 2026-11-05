@@ -232,10 +232,8 @@ def test_token_target_topology_is_checked_before_worker_creation(
     tmp_path, target_tp, entrypoint
 ):
     """Every public construction path must reject the worker's unsupported TP."""
-    from dataclasses import replace
-
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
-    from vllm.config import ParallelConfig
+    from vllm.config import ParallelConfig, replace
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.spec_decode.remote.protocol import FeatureSlot
     from vllm.v1.spec_decode.remote.runtime.token_schema import (
