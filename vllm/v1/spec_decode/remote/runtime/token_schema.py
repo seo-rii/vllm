@@ -77,8 +77,8 @@ def tokenizer_artifact_fingerprint(source: str, revision: str | None) -> str:
     return _fingerprint(artifacts)
 
 
-def _validate_token_model(model, role: str) -> int | None:
-    """Validate the token/KV contract and return its uniform attention window."""
+def _validate_token_model(model, role: str) -> tuple[int | None, ...]:
+    """Validate the token/KV contract and return each layer's attention window."""
     if (
         model.runner_type not in ("generate", "draft")
         or model.using_transformers_backend()
@@ -104,21 +104,32 @@ def _validate_token_model(model, role: str) -> int | None:
             f"token-only {role} requires a positive integer sliding window"
         )
     layers = getattr(model.hf_text_config, "layer_types", None)
+    num_layers = model.get_total_num_hidden_layers()
+    if num_layers < 1:
+        raise ValueError(f"token-only {role} requires at least one attention layer")
     if layers is None:
-        return window
-    if (
-        not isinstance(layers, (list, tuple))
-        or len(layers) != model.get_total_num_hidden_layers()
-    ):
+        return (window,) * num_layers
+    if not isinstance(layers, (list, tuple)) or len(layers) != num_layers:
         raise ValueError(f"token-only {role} requires one attention type per layer")
     if all(layer in ("attention", "full_attention") for layer in layers):
         # Match EngineArgs: an unused window must not override full layers.
-        return None
-    if all(layer == "sliding_attention" for layer in layers) and window is not None:
-        return window
-    raise ValueError(
-        f"token-only {role} requires homogeneous full or sliding-window attention"
-    )
+        return (None,) * num_layers
+    if window is None or any(
+        layer not in ("attention", "full_attention", "sliding_attention")
+        for layer in layers
+    ):
+        raise ValueError(
+            f"token-only {role} requires full or sliding-window attention "
+            "with a declared sliding window"
+        )
+    if not all(layer == "sliding_attention" for layer in layers) and (
+        model.architecture not in ("LlamaForCausalLM", "MistralForCausalLM")
+    ):
+        # Other native models may ignore layer_types or need extra state.
+        raise ValueError(
+            f"token-only {role} mixed attention requires native Llama or Mistral"
+        )
+    return tuple(window if layer == "sliding_attention" else None for layer in layers)
 
 
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:

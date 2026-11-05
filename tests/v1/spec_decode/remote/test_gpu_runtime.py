@@ -477,6 +477,51 @@ def test_standalone_capacity_reaches_flex_attention_metadata_builder(num_blocks)
     )
 
 
+def test_standalone_mixed_attention_keeps_per_layer_metadata_and_capacity():
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.flex_attention import (
+        FlexAttentionBackend,
+        FlexAttentionMetadataBuilder,
+    )
+    from vllm.v1.worker.gpu.attn_utils import init_attn_backend
+
+    config = make_config()
+    with set_current_vllm_config(config):
+        layers = [
+            Attention(
+                num_heads=2,
+                head_size=head_size,
+                num_kv_heads=kv_heads,
+                scale=head_size**-0.5,
+                per_layer_sliding_window=window,
+                cache_config=config.cache_config,
+                prefix=f"draft.layers.{i}.self_attn",
+                attn_backend=FlexAttentionBackend,
+            )
+            for i, (window, head_size, kv_heads) in enumerate(
+                [(16, 8, 1), (None, 16, 2), (32, 8, 1)]
+            )
+        ]
+        specs = [layer.get_kv_cache_spec(config) for layer in layers]
+        assert all(spec is not None for spec in specs)
+        page_bytes = sum(spec.page_size_bytes for spec in specs if spec is not None)
+        kv_config = initialize_standalone_kv_cache_config(config, 7 * page_bytes)
+        groups, _, _ = init_attn_backend(kv_config, config, torch.device("cpu"))
+
+    assert kv_config.num_blocks == 7
+    assert len(groups) == 3
+    for i, (group, expected) in enumerate(zip(groups, specs)):
+        assert len(group) == 1
+        assert group[0].layer_names == [f"draft.layers.{i}.self_attn"]
+        assert group[0].kv_cache_spec == expected
+        builder = group[0].metadata_builders[0]
+        assert isinstance(builder, FlexAttentionMetadataBuilder)
+        assert builder.cache_config.num_gpu_blocks == 7
+        assert builder.kv_cache_spec == expected
+    assert {tensor.size for tensor in kv_config.kv_cache_tensors} == {7 * page_bytes}
+
+
 def test_input_batch_preserves_reordered_request_slots_and_rejected_tail():
     planner = DraftStepPlanner(
         DraftBlockPool(32, 4),

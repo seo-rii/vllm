@@ -19,6 +19,8 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    group_standalone_kv_specs,
+    make_grouped_standalone_kv_config,
     make_standalone_kv_config,
     select_standalone_kv_spec,
 )
@@ -69,6 +71,98 @@ def test_dense_own_kv_layers_and_blocks_never_alias(kind, layout_name):
             assert torch.all(cache[block] == 10 * layer + block)
     assert len({cache.untyped_storage().data_ptr() for cache in caches.values()}) == 1
     assert page_group_bytes * 5 <= budget
+
+
+@pytest.mark.parametrize("layout_name", ["LBHNC", "LBNHC", "LHBNC"])
+@pytest.mark.parametrize("split_kernel_blocks", [False, True])
+def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
+    layout_name, split_kernel_blocks
+):
+    full = replace(_spec("full"), dtype=torch.bfloat16)
+    sliding = _spec("swa")
+    wider = replace(sliding, sliding_window=9, num_kv_heads=1, head_size=7)
+    specs = {"a": full, "b": sliding, "c": full, "d": wider, "e": sliding}
+    page_bytes = sum(spec.page_size_bytes for spec in specs.values())
+    budget = page_bytes * 6 - 1
+    layout = KVCacheLayout[layout_name]
+    config = make_grouped_standalone_kv_config(specs, budget, layout)
+    assert [group.layer_names for group in config.kv_cache_groups] == [
+        ["a", "c"],
+        ["b", "e"],
+        ["d"],
+    ]
+    assert [group.kv_cache_spec for group in config.kv_cache_groups] == [
+        full,
+        sliding,
+        wider,
+    ]
+    assert config.num_blocks == 5
+    kernel_sizes = [4, 2, 1] if split_kernel_blocks else [4, 4, 4]
+    if split_kernel_blocks and layout_name == "LHBNC":
+        # Native head-outermost storage cannot subdivide a multi-head page.
+        with pytest.raises(ValueError, match="does not store blocks as dense"):
+            allocate_kv_cache(config, torch.device("cpu"), layout, kernel_sizes)
+        kernel_sizes[1] = 4
+    caches = allocate_kv_cache(config, torch.device("cpu"), layout, kernel_sizes)
+    for group, kernel_size in zip(config.kv_cache_groups, kernel_sizes):
+        ratio = full.block_size // kernel_size
+        for name in group.layer_names:
+            cache = caches[name]
+            spec = specs[name]
+            assert cache.shape == (
+                5 * ratio,
+                spec.num_kv_heads,
+                kernel_size,
+                spec.head_size + spec.head_size_v,
+            )
+            for block in range(1, 5):
+                cache[block * ratio : (block + 1) * ratio].fill_(
+                    10 * list(specs).index(name) + block
+                )
+    for group, kernel_size in zip(config.kv_cache_groups, kernel_sizes):
+        ratio = full.block_size // kernel_size
+        for name in group.layer_names:
+            cache = caches[name]
+            assert not cache[:ratio].count_nonzero().item()
+            for block in range(1, 5):
+                assert torch.all(
+                    cache[block * ratio : (block + 1) * ratio]
+                    == 10 * list(specs).index(name) + block
+                )
+    storages = {
+        cache.untyped_storage().data_ptr(): cache.untyped_storage().nbytes()
+        for cache in caches.values()
+    }
+    assert list(storages.values()) == [5 * page_bytes]
+    assert sum(storages.values()) <= budget
+    with pytest.raises(ValueError, match="null block plus one block"):
+        make_grouped_standalone_kv_config(specs, 2 * page_bytes - 1, layout)
+
+
+@pytest.mark.parametrize(
+    "other, message",
+    [
+        (replace(_spec("swa"), block_size=8), "common block size and dtype"),
+        (_spec("full"), "common block size and dtype"),
+        (_spec("mla"), "cannot mix MLA and dense"),
+        (replace(_spec("swa"), tokens_per_state=2), "dense unquantized"),
+        (replace(_spec("swa"), page_size_padded=256), "dense unquantized"),
+        (
+            replace(_spec("full"), dtype=torch.bfloat16, non_causal=True),
+            "causal token-addressed",
+        ),
+    ],
+)
+def test_mixed_groups_do_not_bypass_per_layer_or_shared_planner_contract(
+    other, message
+):
+    with pytest.raises(ValueError, match=message):
+        group_standalone_kv_specs({"a": _spec("swa"), "b": other})
+
+
+def test_grouped_cache_requires_at_least_one_attention_layer():
+    with pytest.raises(ValueError, match="no attention KV layers"):
+        make_grouped_standalone_kv_config({}, 4096, KVCacheLayout.LBNHC)
 
 
 @pytest.mark.parametrize("kind", ["full", "mla", "swa"])
