@@ -5,13 +5,15 @@
 import inspect
 import sys
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
+from tests.v1.spec_decode.remote.runtime_fixtures import (
+    cpu_parallel_state as cpu_parallel_state,
+)
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.token_gpu import TokenGPUStepExecutor
 from vllm.v1.worker.gpu.input_batch import InputBuffers
@@ -92,50 +94,30 @@ def test_token_cli_target_attention_uses_native_normalization(
     assert captured["speculative_config"]["attention_backend"] is None
 
 
-def test_native_independent_loader_never_needs_target_weights(monkeypatch):
-    import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
+@pytest.mark.usefixtures("cpu_parallel_state")
+def test_native_independent_loader_never_needs_target_weights(tmp_path):
+    from safetensors.torch import load_file
 
-    @dataclass
-    class Config:
-        speculative_config: object
-        cache_config: object
-        parallel_config: object
-        model_config: object
-        quant_config: object
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.config import set_current_vllm_config
 
-    @dataclass
-    class Parallel:
-        rank: int = 0
-
-    draft = object()
-    config = Config(
-        SimpleNamespace(kv_cache_dtype=None, draft_parallel_config=Parallel()),
-        object(),
-        Parallel(),
-        object(),
-        object(),
+    config = token_config(tmp_path)
+    draft = config.speculative_config.draft_model_config
+    expected = load_file(Path(draft.model) / "model.safetensors")
+    (Path(config.model_config.model) / "model.safetensors").unlink()
+    with set_current_vllm_config(config), torch.device("cpu"):
+        speculator = StandaloneARSpeculator(config, torch.device("cpu"))
+        speculator.load_standalone_model()
+    assert torch.equal(
+        speculator.model.model.embed_tokens.weight,
+        expected["model.embed_tokens.weight"],
     )
-    speculator = object.__new__(StandaloneARSpeculator)
-    speculator.speculative_config = config.speculative_config
-    speculator.vllm_config = config
-    speculator.draft_model_config = draft
-    calls = []
-    model = object()
-
-    def get_model(**kwargs):
-        calls.append(kwargs)
-        return model
-
-    monkeypatch.setattr(native, "get_model", get_model)
-    monkeypatch.setattr(native, "set_model_tag", lambda tag: nullcontext())
-    finalized: list[set[str]] = []
-    monkeypatch.setattr(speculator, "_finalize_model_load", finalized.append)
-    speculator.load_standalone_model()
-    assert speculator.model is model and finalized == [set()]
-    assert len(calls) == 1
-    assert calls[0]["prefix"] == "draft_model"
-    assert calls[0]["vllm_config"].model_config is draft
-    assert calls[0]["vllm_config"].quant_config is None
+    assert torch.equal(speculator.model.lm_head.weight, expected["lm_head.weight"])
+    assert speculator.draft_attn_layer_names
+    assert all(
+        config.compilation_config.static_forward_context[name].is_draft_layer
+        for name in speculator.draft_attn_layer_names
+    )
 
 
 @pytest.fixture
@@ -144,10 +126,6 @@ def token_executor(monkeypatch):
     import vllm.v1.worker.gpu.buffer_utils as buffers
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
     from vllm.v1.worker.gpu.block_table import BlockTables
-
-    class CpuPool:
-        def copy_to_uva(self, values):
-            return torch.tensor(values, dtype=torch.int32)
 
     class Kernel:
         def __getitem__(self, grid):
@@ -163,10 +141,7 @@ def token_executor(monkeypatch):
 
             return apply
 
-    monkeypatch.setattr(buffers, "UvaBufferPool", lambda *a, **kw: CpuPool())
-    monkeypatch.setattr(
-        buffers, "async_tensor_h2d", lambda values, **kw: torch.tensor(values, **kw)
-    )
+    monkeypatch.setattr(buffers, "is_uva_available", lambda: False)
     monkeypatch.setattr(buffers, "_apply_write_kernel", Kernel())
 
     executor = object.__new__(TokenGPUStepExecutor)
@@ -185,12 +160,14 @@ def token_executor(monkeypatch):
         kv_cache_groups=[SimpleNamespace(layer_names=["draft"])]
     )
     calls, synced, metadata = [], [], []
-    tables = executor.block_tables = object.__new__(BlockTables)
-    staged = buffers.StagedWriteTensor((4, 16), torch.int32, executor.device)
-    tables.block_tables, tables.num_kv_cache_groups = [staged], 1
-    tables.num_blocks = SimpleNamespace(
-        np=np.zeros((1, 4), dtype=np.int32), copy_to_uva=lambda: None
+    tables = executor.block_tables = BlockTables(
+        block_sizes=[executor.block_size],
+        max_num_reqs=4,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[16],
+        device=executor.device,
     )
+    staged = tables.block_tables[0]
 
     def slots(indices, qsl, positions, n):
         values: list[int] = []
@@ -276,11 +253,13 @@ def test_token_executor_packs_ragged_rows_into_one_native_forward(token_executor
 
 @pytest.mark.parametrize("failure", [None, "stage", "upload"])
 def test_token_forward_discards_failed_writes_before_request_slot_reuse(
-    token_executor, monkeypatch, failure
+    token_executor, failure
 ):
     import vllm.v1.worker.gpu.buffer_utils as buffers
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
     from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
+
+    from .runtime_fixtures import allocation_failures
 
     executor, calls, _, _ = token_executor
     executor.block_size = 1
@@ -293,20 +272,24 @@ def test_token_forward_discards_failed_writes_before_request_slot_reuse(
     old_slot = state.sequences[old].req_index
     staged = executor.block_tables.block_tables[0]
 
-    def fail_upload(*args, **kwargs):
-        raise torch.OutOfMemoryError("injected upload failure")
-
-    with monkeypatch.context() as patch:
-        if failure == "stage":
-
-            class PartialContents(list):
-                def extend(self, values):
-                    super().extend(values)
-                    raise MemoryError("injected staging failure")
-
-            patch.setattr(staged, "_staged_write_contents", PartialContents())
-        elif failure == "upload":
-            patch.setattr(buffers, "async_tensor_h2d", fail_upload)
+    faults = []
+    if failure == "stage":
+        faults.append(
+            (
+                buffers.StagedWriteTensor.stage_write,
+                "self._staged_write_len += n",
+                MemoryError("injected staging failure"),
+            )
+        )
+    elif failure == "upload":
+        faults.append(
+            (
+                buffers.StagedWriteTensor.apply_write,
+                "write_contents = self.write_contents.copy_chunks_to_uva(",
+                torch.OutOfMemoryError("injected upload failure"),
+            )
+        )
+    with allocation_failures(faults):
         if failure is None:
             state.prefill(old, 0, (1, 2), is_final=True)
         else:
