@@ -8,6 +8,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.v1.spec_decode.test_custom_speculator import (
+    DummySpeculator,
+    DummySpeculatorConfig,
+)
+from tests.v1.spec_decode.test_custom_speculator import (
+    register as register,
+)
+from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config.speculative import SpeculativeExecutionConfig
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.proposal import SpeculatorOutput
 from vllm.v1.worker.gpu.spec_decode.local_backend import LocalDraftBackend
@@ -151,24 +160,22 @@ def test_local_close_discards_uncollected_result_and_rejects_new_dispatch():
         backend.dispatch(step, context)
 
 
-def test_native_factory_is_unchanged_until_local_execution_opt_in(monkeypatch):
+@pytest.mark.usefixtures("register")
+def test_native_factory_is_unchanged_until_local_execution_opt_in():
     from vllm.v1.worker.gpu.spec_decode import init_draft_backend, init_speculator
-    from vllm.v1.worker.gpu.spec_decode.mtp import speculator as mtp
-
-    native = Mock()
-    monkeypatch.setattr(mtp, "MTPSpeculator", lambda *args: native)
-    spec = SimpleNamespace(
-        use_remote_draft=lambda: False,
-        use_gemma4_mtp=lambda: False,
-        use_multi_module_mtp=lambda: False,
-        method="mtp",
-        execution=None,
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import (
+        register_speculative_method,
     )
-    config = SimpleNamespace(speculative_config=spec)
-    assert init_speculator(config, torch.device("cpu"), None) is native
+
+    register_speculative_method("dummy", DummySpeculatorConfig)
+    spec = SpeculativeConfig(method="dummy", num_speculative_tokens=3)
+    config = VllmConfig()
+    config.speculative_config = spec
+    native = init_speculator(config, torch.device("cpu"), None)
+    assert type(native) is DummySpeculator
+    assert native.vllm_config is config
     assert init_draft_backend(config, native) is None
-    native.propose.assert_not_called()
-    spec.execution = SimpleNamespace(placement="local")
+    spec.execution = SpeculativeExecutionConfig(placement="local")
     backend = init_draft_backend(config, native)
     assert isinstance(backend, LocalDraftBackend)
     assert backend.speculator is native
