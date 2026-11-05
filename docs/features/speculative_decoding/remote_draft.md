@@ -18,6 +18,11 @@ remote sequences; `error` propagates the allocation failure.
 The same single-endpoint TP1 combination has an experimental eager MRV2
 [async verifier scheduling mode](../../design/unified_speculation_runtime.md#async-verifier-scheduling).
 Other remote backends retain their synchronous scheduling requirement.
+For dense full-attention token-only models, an explicit draft TP2 mode uses two
+native distributed draft ranks with target TP1, BF16 weights/KV, eager
+synchronous execution and one inline endpoint. Its prefix caching and async
+scheduling remain disabled. See the
+[token-only topology and launch contract](../../design/unified_speculation_runtime.md#token-only-state-contract).
 
 ## Configuration and lifecycle
 

@@ -148,6 +148,96 @@ def supports_token_async_scheduling(config: "VllmConfig") -> bool:
     )
 
 
+def _validate_token_draft_topology(config: "VllmConfig") -> int:
+    spec = config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    parallel = spec.draft_parallel_config
+    assert parallel is not None
+    tp = parallel.tensor_parallel_size
+    if tp == 1:
+        return tp
+    if tp != 2:
+        raise ValueError("token-only draft supports tensor parallel size 1 or 2")
+    if config.parallel_config.tensor_parallel_size != 1 or any(
+        getattr(parallel, name) != 1
+        for name in (
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    ):
+        raise ValueError("tensor-parallel draft requires target TP1 and draft TP2 only")
+    if (
+        config.scheduler_config.async_scheduling
+        or config.cache_config.enable_prefix_caching
+        or not config.model_config.enforce_eager
+    ):
+        raise ValueError(
+            "tensor-parallel draft requires eager synchronous execution "
+            "without prefix caching"
+        )
+    remote = spec.get_remote_draft_config()
+    if (
+        remote is None
+        or remote.transport not in ("auto", "inline")
+        or spec.execution is None
+        or len(spec.execution.endpoints) != 1
+    ):
+        raise ValueError("tensor-parallel draft requires one inline endpoint")
+    for model, role in (
+        (config.model_config, "target"),
+        (spec.draft_model_config, "draft"),
+    ):
+        if model.is_moe or model.is_hybrid or model.has_inner_state or model.use_mla:
+            raise ValueError(
+                "tensor-parallel draft requires dense full-attention target "
+                "and draft models"
+            )
+        try:
+            _validate_token_model(model, role)
+        except ValueError as error:
+            raise ValueError(
+                "tensor-parallel draft requires dense full-attention target "
+                "and draft models"
+            ) from error
+        if model.quantization is not None or str(model.dtype) != "torch.bfloat16":
+            raise ValueError("tensor-parallel draft requires unquantized bfloat16")
+    if config.cache_config.sliding_window is not None:
+        raise ValueError("tensor-parallel draft requires full-attention KV")
+    if (spec.kv_cache_dtype or config.cache_config.cache_dtype) not in (
+        "auto",
+        "bfloat16",
+    ):
+        raise ValueError("tensor-parallel draft requires bfloat16 KV")
+    draft = spec.draft_model_config
+    draft.verify_with_parallel_config(parallel)
+    for layer in range(draft.get_total_num_hidden_layers()):
+        geometry = draft.model_arch_config[layer]
+        if geometry.total_num_attention_heads % tp:
+            raise ValueError(
+                f"draft attention heads in layer {layer} must be divisible by TP"
+            )
+        kv_heads = geometry.total_num_kv_heads
+        if (
+            type(kv_heads) is not int
+            or kv_heads < 1
+            or (kv_heads >= tp and kv_heads % tp)
+            or (kv_heads < tp and tp % kv_heads)
+        ):
+            raise ValueError(
+                "draft KV heads must shard or replicate evenly across TP ranks"
+            )
+    if draft.get_hidden_size() % tp:
+        raise ValueError("draft hidden size must be divisible by tensor parallel size")
+    intermediate = getattr(draft.hf_text_config, "intermediate_size", None)
+    if isinstance(intermediate, int) and intermediate % tp:
+        raise ValueError(
+            "draft intermediate size must be divisible by tensor parallel size"
+        )
+    return tp
+
+
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
@@ -185,6 +275,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
         raise ValueError(
             "token-only runtime requires the built-in HF tokenizer implementation"
         )
+    draft_tp = _validate_token_draft_topology(config)
     _validate_token_model(target, "target")
     _validate_token_model(draft, "draft")
     if target.get_vocab_size() != draft.get_vocab_size():
@@ -227,6 +318,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
                 "model": _model_identity(draft),
                 "method": "draft_model",
                 "k": spec.num_speculative_tokens,
+                **({"tensor_parallel_size": draft_tp} if draft_tp != 1 else {}),
             }
         ),
     )

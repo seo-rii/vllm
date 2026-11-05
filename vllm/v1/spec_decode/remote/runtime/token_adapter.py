@@ -29,6 +29,9 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
     def warmup(self) -> None:
         self.state.executor.warmup()
 
+    def close(self) -> None:
+        self.state.executor.close()
+
     def open_sequence(self, key: SequenceKey) -> None:
         self.state.open(key)
 

@@ -148,7 +148,7 @@ def test_legacy_and_new_placement_cannot_be_combined_before_model_loading():
     "override,reason",
     [
         ({}, None),
-        ({"draft_tensor_parallel_size": 2}, "draft_tensor_parallel_size"),
+        ({"draft_tensor_parallel_size": 3}, "draft_tensor_parallel_size"),
         ({"draft_sample_method": "probabilistic"}, "greedy"),
         ({"parallel_drafting": True}, "parallel_drafting"),
         ({"use_heterogeneous_vocab": True}, "heterogeneous"),
