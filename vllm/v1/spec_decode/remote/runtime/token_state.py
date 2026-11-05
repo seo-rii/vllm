@@ -70,6 +70,9 @@ class TokenStepExecutor(ABC):
     def warmup(self) -> None:  # noqa: B027
         """Finish device initialization before the listener becomes ready."""
 
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:  # noqa: B027
+        """Retire executor-owned state before request slots are reused."""
+
     @abstractmethod
     def forward(
         self,
@@ -152,6 +155,7 @@ class TokenStateMachine:
         for key in keys:
             state = self.sequences.get(key)
             if state is not None:
+                self.executor.close_sequences((key,))
                 returned = self._num_free + 1
                 self._free[self._num_free] = state.req_index
                 self.block_pool.release(state.req_index)
