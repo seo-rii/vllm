@@ -2004,6 +2004,113 @@ def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
     record_property("dynamic_k.request_timing", timing)
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_remote_token_cost_policy_retires_without_changing_target_tokens(
+    vllm_runner, monkeypatch, tmp_path, record_property, async_scheduling
+):
+    """Calibrate real RPCs, exercise positive K, then stop unprofitable drafts."""
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        str(tmp_path),
+    ]
+    with (tmp_path / "cost-fixture.log").open("w") as log:
+        subprocess.run(
+            command,
+            check=True,
+            timeout=180,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
+        )
+    target = str(tmp_path / "prefix-target")
+    draft = str(tmp_path / "independent-qwen3")
+    options = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=1,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=async_scheduling,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompt = {"prompt_token_ids": [3] * 17}
+    sampling = SamplingParams(
+        temperature=0,
+        max_tokens=96,
+        ignore_eos=True,
+        detokenize=False,
+    )
+    with vllm_runner(target, **options) as reference:
+        expected = reference.llm.generate([prompt], sampling, use_tqdm=False)
+        expected_tokens = list(expected[0].outputs[0].token_ids)
+    with draft_server(
+        target,
+        tmp_path / "cost-draft.log",
+        token_only_draft=draft,
+        revision=None,
+        num_speculative_tokens=3,
+        attention_backend="TRITON_ATTN",
+        draft_kv_cache_gib=0.03125,
+        max_feature_tokens=64,
+    ) as endpoint:
+        speculative = dict(
+            method="draft_model",
+            model=draft,
+            num_speculative_tokens=3,
+            draft_tensor_parallel_size=1,
+            draft_sample_method="greedy",
+            attention_backend="TRITON_ATTN",
+            execution=dict(
+                placement="remote",
+                endpoints=[endpoint],
+                transport="inline",
+                failure_policy="error",
+                request_timeout_ms=5000,
+                startup_timeout_ms=600000,
+                # Require a deliberately unattainable gain to exercise retirement.
+                cost_aware=dict(min_samples=1, min_speedup=1000),
+            ),
+        )
+        with vllm_runner(target, speculative_config=speculative, **options) as runner:
+            outputs = runner.llm.generate([prompt], sampling, use_tqdm=False)
+            actual_tokens = list(outputs[0].outputs[0].token_ids)
+            runner.llm.llm_engine.do_log_stats()
+            accepted = get_spec_decode_metric_value(
+                runner.llm.get_metrics(), "vllm:spec_decode_num_accepted_tokens"
+            )
+            reports = runner.llm.collective_rpc(
+                lambda worker: worker.model_runner.speculator.get_cost_stats()
+            )
+    assert len(reports) == 1
+    stats = reports[0]
+    record_property("remote_cost.async_scheduling", async_scheduling)
+    record_property("remote_cost.stats", stats)
+    record_property("remote_cost.accepted_tokens", accepted)
+    record_property("remote_cost.output_token_ids", actual_tokens)
+    assert actual_tokens == expected_tokens and len(actual_tokens) == 96
+    assert accepted > 0
+    assert stats["observations"] >= 4
+    assert stats["target_only_transitions"] == 1
+    assert all(count > 0 for count in stats["chosen_k_counts"])
+    assert sum(stats["chosen_k_counts"]) < 32
+
+
 def _serve_token_socket_cleanup_fault(receipt_path: str, cli_args: list[str]) -> None:
     import json
 
