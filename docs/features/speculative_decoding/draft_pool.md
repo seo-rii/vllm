@@ -126,10 +126,38 @@ The pool does not multiply that budget by the number of workers.
 
 ## Routing and failure
 
-The client chooses the eligible worker with the fewest locally assigned
+By default, the client chooses the eligible worker with the fewest locally assigned
 sequences and rotates ties. Server admission independently enforces actual
 sequence, KV and queue capacity. Routing does not use GPU utilization or claim
 knowledge of assignments made by other verifiers.
+
+For a token-only pool with two or more endpoints, set
+`execution.routing_policy="load_aware"` to incorporate worker load when opening
+new sequences. The default is `"least_sequences"`. Load-aware routing is currently
+unavailable for target-conditioned and target-KV snapshot workers.
+
+Token protocol v3.2 explicitly negotiates optional load reports. They describe
+global and per-verifier sequence headroom, free KV blocks, executing/queued jobs,
+queued bytes and runtime health. The client first avoids exhausted workers, then
+compares sequence/KV pressure plus queue pressure, measured probe round-trip time
+and its local assignment count. Reservations made since a report reduce its
+reported headroom conservatively. The server still makes the final admission
+decision; a report neither reserves capacity nor guarantees an open will succeed.
+
+Reports use client-monotonic receipt times. If a candidate lacks a report or a
+report is over one second old, the selection uses the default local-count policy.
+An older peer without load-report negotiation remains usable under that policy.
+Only new-request selection schedules refreshes, at most once per 100 milliseconds
+per worker, using its existing socket driver. Each probe has a 20-millisecond
+sub-budget inside the round deadline; proposal replies also carry fresh reports.
+The probes do not add a decode-step RPC or query GPU utilization. A probe transport
+failure fences that socket under the existing session rules. All routing state is
+local to the process and does not depend on a metrics exporter or collector.
+
+Existing sequences keep their worker when its reported load changes. This policy
+does not migrate KV, revive terminal identities, or provide a global optimizer.
+Compare admitted requests, per-verifier queue latency and goodput under the actual
+workload before selecting it for serving.
 
 Proposal rows are partitioned by assignment and their results are restored to
 the original verifier order. Each worker has one socket driver. Drivers progress

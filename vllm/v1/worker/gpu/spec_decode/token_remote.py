@@ -101,7 +101,13 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     startup_timeout_ms=remote.startup_timeout_ms,
                 )
                 if len(endpoints) > 1:
-                    self._session = TokenDraftPool(endpoints, hello, **options)
+                    assert spec.execution is not None
+                    self._session = TokenDraftPool(
+                        endpoints,
+                        hello,
+                        routing_policy=spec.execution.routing_policy,
+                        **options,
+                    )
                 else:
                     self._session = TokenOnlyRemoteSession(
                         remote.endpoint, hello, **options
@@ -113,6 +119,11 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         error = self._tp.broadcast_object(error, src=0)
         if error is not None:
             raise RuntimeError(f"token drafter startup failed: {error}")
+
+    def get_routing_stats(self) -> dict[str, int | tuple[int, ...]]:
+        if isinstance(self._session, TokenDraftPool):
+            return self._session.get_routing_stats()
+        return {}
 
     def init_cudagraph_manager(self, cudagraph_mode) -> None:
         pass
