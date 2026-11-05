@@ -23,9 +23,11 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    group_standalone_kv_specs,
     make_grouped_standalone_kv_config,
     select_standalone_kv_spec,
 )
+from vllm.v1.spec_decode.remote.runtime.multi_module import MultiModuleReplay
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.step import (
     DraftStepPlan,
@@ -196,6 +198,12 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         from vllm.v1.worker.workspace import init_workspace_manager
 
         self.contract = self._create_contract(vllm_config)
+        spec = vllm_config.speculative_config
+        self._mtp_replay = (
+            MultiModuleReplay(self.contract.schema)
+            if spec is not None and spec.use_multi_module_mtp()
+            else None
+        )
         self.vllm_config = vllm_config
         self.device = device
         parallel = vllm_config.parallel_config
@@ -311,6 +319,22 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.num_blocks,
             self.block_size,
         )
+        if self._mtp_replay is not None:
+            logger.info(
+                "Standalone multi-module single-verifier floating payload bounds: %s; "
+                "max_num_seqs=%d max_num_tokens=%d max_model_len=%d modules=%d. "
+                "These bounds exclude weights, KV, native buffers, IPC arenas "
+                "and allocator overhead; draft_kv is a separate budget.",
+                self._mtp_replay.feature_memory_bounds(
+                    max_num_reqs=scheduler.max_num_seqs,
+                    max_num_tokens=self.max_num_tokens,
+                    max_model_len=vllm_config.model_config.max_model_len,
+                ),
+                scheduler.max_num_seqs,
+                self.max_num_tokens,
+                vllm_config.model_config.max_model_len,
+                spec.num_speculative_tokens,
+            )
 
     def _create_contract(self, config):
         return create_runtime_contract(config)
@@ -319,16 +343,27 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+        from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+            MultiModuleMTPSpeculator,
+        )
+        from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
         target_shell = materialize_target_shell(
             config.model_config, device, shared_weights_source=shared_weights_source
         )
         spec = config.speculative_config
         assert spec is not None
-        speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
+        speculator_cls: type[DraftModelSpeculator]
+        if spec.use_multi_module_mtp():
+            speculator_cls = MultiModuleMTPSpeculator
+        else:
+            speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
         speculator = speculator_cls(config, device)
         speculator.load_model(target_shell)
-        select_standalone_kv_spec(get_kv_cache_spec(config))
+        if spec.use_multi_module_mtp():
+            group_standalone_kv_specs(get_kv_cache_spec(config))
+        else:
+            select_standalone_kv_spec(get_kv_cache_spec(config))
         return speculator
 
     def _init_sampling_buffers(self, max_num_reqs: int) -> None:
@@ -338,7 +373,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         # Match MRV2 RequestState: its Triton prefill kernel merges this value
         # with a sampled token explicitly cast to int32, regardless of wire dtype.
         self.lookahead = torch.zeros(
-            1, max_num_reqs, dtype=torch.int32, device=self.device
+            max(1, self.contract.capabilities.num_prefill_lookahead),
+            max_num_reqs,
+            dtype=torch.int32,
+            device=self.device,
         )
         self.temperature = torch.zeros(
             max_num_reqs, dtype=torch.float32, device=self.device
@@ -348,6 +386,17 @@ class GPUDraftStepExecutor(DraftStepExecutor):
     @property
     def max_num_tokens(self) -> int:
         return self.input_buffers.max_num_tokens
+
+    def prepare_row(
+        self, row: DraftStepRow, features: Features
+    ) -> tuple[DraftStepRow, Features]:
+        if self._mtp_replay is None:
+            return row, features
+        return self._mtp_replay.prepare_row(row, features)
+
+    def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        if self._mtp_replay is not None:
+            self._mtp_replay.close_sequences(keys)
 
     @torch.inference_mode()
     def warmup(self) -> None:
@@ -362,14 +411,30 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             max_num_reqs=1,
             max_model_len=config.model_config.max_model_len,
             num_speculative_tokens=spec.num_speculative_tokens,
+            num_prefill_lookahead=self.contract.capabilities.num_prefill_lookahead,
+            multi_module=spec.use_multi_module_mtp(),
         )
         key = SequenceKey("warmup", 0, 0)
         planner.open(key)
         failure: BaseException | None = None
+        replayed_rows = 0
         try:
-            for prefill in (True, False):
+            phases: tuple[bool, ...] = (True, False)
+            if self._mtp_replay is not None and (
+                self.max_num_tokens >= spec.num_speculative_tokens
+            ):
+                # Only the second decode reads speculative history. Use one
+                # new row so its replay suffix fits the configured token budget.
+                phases += (False,)
+            for step, prefill in enumerate(phases):
                 num_tokens = min(
-                    self.block_size + 1 if prefill else spec.num_speculative_tokens + 1,
+                    1
+                    if step == 2
+                    else (
+                        self.block_size + 1
+                        if prefill
+                        else spec.num_speculative_tokens + 1
+                    ),
                     self.max_num_tokens,
                     config.model_config.max_model_len,
                 )
@@ -379,8 +444,29 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                         num_tokens,
                         num_sampled=0 if prefill else 1,
                         num_rejected=0 if prefill else num_tokens - 1,
-                        next_prefill_tokens=(0,) if prefill else (),
+                        next_prefill_tokens=(0,) * planner.num_prefill_lookahead
+                        if prefill
+                        else (),
                     )
+                    features: Features = []
+                    for slot in self.contract.schema.slots:
+                        if slot.kind == "positions":
+                            start = planner.num_computed(key)
+                            tensor = torch.arange(start, start + num_tokens)
+                        else:
+                            count = 1 if slot.per_sequence else num_tokens
+                            dtype = getattr(torch, slot.dtype)
+                            tensor = torch.zeros(
+                                (count, *slot.trailing_shape),
+                                dtype=dtype,
+                                device=self.device
+                                if self._mtp_replay is not None
+                                and dtype.is_floating_point
+                                and not slot.per_sequence
+                                else "cpu",
+                            )
+                        features.append(tensor)
+                    row, features = self.prepare_row(row, features)
                     plan, failures = planner.plan([row])
                     if not failures:
                         break
@@ -390,30 +476,30 @@ class GPUDraftStepExecutor(DraftStepExecutor):
                         num_tokens = max(1, num_tokens // 2)
                     elif not prefill and planner.num_computed(key):
                         planner.close(key)
+                        self.close_sequences((key,))
                         planner.open(key)
                     else:
                         raise ValueError(
                             "draft KV budget cannot hold a warmup step: "
                             f"{failures[0][1]}"
                         )
-                features: Features = []
-                for slot in self.contract.schema.slots:
-                    if slot.kind == "positions":
-                        tensor = torch.from_numpy(plan.positions)
-                    else:
-                        count = plan.num_reqs if slot.per_sequence else num_tokens
-                        tensor = torch.zeros(
-                            (count, *slot.trailing_shape),
-                            dtype=getattr(torch, slot.dtype),
-                        )
-                    features.append(tensor)
                 self.execute(plan, features)
                 planner.commit(plan)
+                replayed_rows += row.num_replayed
+            if self._mtp_replay is not None:
+                logger.info(
+                    "Standalone multi-module warmup: steps=%d replayed_rows=%d "
+                    "floating_feature_device=%s",
+                    len(phases),
+                    replayed_rows,
+                    self.device,
+                )
         except BaseException as exc:
             failure = exc
             raise
         finally:
             planner.close(key)
+            self.close_sequences((key,))
             if failure is None or not runtime_unusable(failure):
                 try:
                     self.last_sampled.zero_()
@@ -485,6 +571,14 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         )
         if np.any((next_tokens < 0) | (next_tokens >= vocab)):
             raise ValueError("target next input token is outside the vocabulary")
+        prefill_tokens = plan.next_prefill_tokens[plan.num_sampled == 0]
+        if np.any((prefill_tokens < 0) | (prefill_tokens >= vocab)):
+            raise ValueError("target prefill lookahead token is outside the vocabulary")
+        history_updates = (
+            self._mtp_replay.stage_history(plan, features)
+            if self._mtp_replay is not None
+            else ()
+        )
         torch.accelerator.set_device_index(self.device)
         with set_current_vllm_config(self.vllm_config):
             self.prepare_block_tables(plan)
@@ -509,8 +603,8 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.last_sampled[batch.idx_mapping] = torch.from_numpy(
                 plan.last_sampled
             ).to(self.device)
-            self.lookahead[0, batch.idx_mapping] = torch.from_numpy(
-                plan.next_prefill_tokens[:, 0]
+            self.lookahead[:, batch.idx_mapping] = torch.from_numpy(
+                plan.next_prefill_tokens.T
             ).to(self.lookahead)
             aux = values.get("aux_hidden_states")
             hidden = values.get("last_hidden_states")
@@ -541,7 +635,10 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             )
             # The return copy completes the step before another client uses
             # the shared runner buffers or acknowledges committed KV.
-            return drafts.cpu()
+            result = drafts.cpu()
+            if self._mtp_replay is not None:
+                self._mtp_replay.commit_history(history_updates)
+            return result
 
 
 def make_gpu_adapter(
@@ -564,6 +661,8 @@ def make_gpu_adapter(
         max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
         max_model_len=vllm_config.model_config.max_model_len,
         num_speculative_tokens=spec.num_speculative_tokens,
+        num_prefill_lookahead=executor.contract.capabilities.num_prefill_lookahead,
+        multi_module=spec.use_multi_module_mtp(),
     )
     return TargetConditionedDraftAdapter(
         executor,

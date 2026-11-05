@@ -24,7 +24,8 @@ from tests.v1.spec_decode.remote.runtime_fixtures import (
     cpu_parallel_state as cpu_parallel_state,
 )
 from tests.v1.spec_decode.remote.runtime_fixtures import make_config
-from vllm.config import ModelConfig, SpeculativeConfig
+from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config.speculative import RemoteDraftConfig, SpeculativeExecutionConfig
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
 from vllm.v1.spec_decode.remote.runtime.weights import materialize_target_shell
 
@@ -198,19 +199,38 @@ def test_native_mtp_uses_separate_draft_checkpoint_settings(
 
 
 @cache
-def _template(model_type, architecture, k):
+def _template(
+    model_type,
+    architecture,
+    k,
+    num_modules=1,
+    module_layers=None,
+    module_windows=None,
+    num_target_layers=2,
+    target_windows=None,
+):
     kwargs = dict(
         architectures=[architecture],
         hidden_size=16,
         vocab_size=32,
-        num_hidden_layers=2,
+        num_hidden_layers=num_target_layers,
         num_attention_heads=2,
         num_key_value_heads=2,
-        num_nextn_predict_layers=1,
+        num_nextn_predict_layers=num_modules,
         max_position_embeddings=64,
     )
     if model_type == "nemotron_h":
         kwargs["mtp_hybrid_override_pattern"] = "*E"
+    if model_type == "exaone_moe":
+        kwargs.update(
+            layer_types=["full_attention"] * num_target_layers,
+            mtp_layer_types=list(module_layers)
+            if module_layers is not None
+            else ["full_attention"] * num_modules,
+            sliding_window=16,
+            mtp_sliding_windows=module_windows,
+            sliding_windows=target_windows,
+        )
     hf_config = (
         PreTrainedConfig(model_type=model_type, **kwargs)
         if model_type == "mimo"
@@ -249,8 +269,28 @@ def _template(model_type, architecture, k):
     return directory, config
 
 
-def _config(model_type="ernie4_5_moe", architecture="Ernie4_5_MoeForCausalLM", k=1):
-    return copy.deepcopy(_template(model_type, architecture, k)[1])
+def _config(
+    model_type="ernie4_5_moe",
+    architecture="Ernie4_5_MoeForCausalLM",
+    k=1,
+    num_modules=1,
+    module_layers=None,
+    module_windows=None,
+    num_target_layers=2,
+    target_windows=None,
+):
+    return copy.deepcopy(
+        _template(
+            model_type,
+            architecture,
+            k,
+            num_modules,
+            module_layers,
+            module_windows,
+            num_target_layers,
+            target_windows,
+        )[1]
+    )
 
 
 @pytest.mark.parametrize("draft_limit", [16, 64])
@@ -291,9 +331,255 @@ def test_native_mtp_config_override_resolves_own_kv_contract(
     contract = create_runtime_contract(config)
     assert contract.capabilities.state_dependency == "own_kv"
     assert contract.capabilities.num_prefill_lookahead == 1
+    assert not contract.capabilities.supports_multi_module
     assert contract.schema.slots[1].trailing_shape == ()
     assert contract.schema.slots[2].kind == "last_hidden_states"
     assert contract.schema.slots[2].trailing_shape == (16,)
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_checkpoint_depth_determines_prefill_lookahead(depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == depth
+    assert contract.capabilities.supports_multi_module
+    lookahead = next(
+        slot for slot in contract.schema.slots if slot.kind == "next_prefill_tokens"
+    )
+    assert lookahead.per_sequence and lookahead.trailing_shape == (depth,)
+    assert contract.schema.slots[2].trailing_shape == (16,)
+    config.speculative_config.remote_draft = RemoteDraftConfig(
+        endpoint="unix:///tmp/unused-multi-module.sock"
+    )
+    assert config.speculative_config.use_remote_draft()
+    assert config.speculative_config.use_multi_module_mtp()
+    assert config.num_prefill_lookahead_tokens == depth
+
+
+@pytest.mark.parametrize(
+    "target_windows,draft_windows",
+    [((32,), (16,)), ((None,), (16,)), ((32, 32), (None, 16))],
+)
+def test_exaone_native_mtp_uses_separate_draft_attention_policy(
+    tmp_path, target_windows, draft_windows
+):
+    from tests.v1.e2e.spec_decode.remote.test_remote_mtp import (
+        _tiny_exaone_mtp_model,
+    )
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import destroy_model_parallel, initialize_model_parallel
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    target_path = _tiny_exaone_mtp_model(tmp_path / "target", target_windows)
+    draft_path = _tiny_exaone_mtp_model(tmp_path / "draft", draft_windows)
+    config = EngineArgs(
+        model=target_path,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        enforce_eager=True,
+        async_scheduling=False,
+        speculative_config={
+            "method": "mtp",
+            "model": draft_path,
+            "num_speculative_tokens": len(draft_windows),
+        },
+    ).create_engine_config()
+    assert config.speculative_config is not None
+    draft = config.speculative_config.draft_model_config
+    assert draft is not None
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == len(draft_windows)
+    loader = get_model_loader(config.load_config)
+    with (
+        set_current_vllm_config(config),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cpu"),
+    ):
+        destroy_model_parallel()
+        initialize_model_parallel(backend="gloo")
+        model = loader.create_model(config, draft)
+        loader.load_weights(model, draft)
+        assert (
+            tuple(layer.self_attn.sliding_window_size for layer in model.model.layers)
+            == draft_windows
+        )
+        assert config.model_config.hf_config.mtp_layer_types == [
+            "full_attention" if window is None else "sliding_attention"
+            for window in target_windows
+        ]
+        assert config.model_config.hf_config.mtp_sliding_windows == [
+            window or 32 for window in target_windows
+        ]
+
+
+@pytest.mark.parametrize("transport", ["auto", "inline"])
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_accepts_single_inline_endpoint(transport, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///tmp/unused-multi-module.sock",),
+        transport=transport,
+    )
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.supports_multi_module
+    assert contract.capabilities.num_prefill_lookahead == depth
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+def test_exaone_module_chain_accepts_single_ipc_endpoint(depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    native = create_runtime_contract(config)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///tmp/unused-multi-module.sock",),
+        transport="cuda_ipc",
+    )
+    contract = create_runtime_contract(config)
+    assert contract == native
+    assert contract.capabilities.supports_multi_module
+    assert contract.capabilities.num_prefill_lookahead == depth
+
+
+@pytest.mark.parametrize("transport", ["inline", "cuda_ipc"])
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_rejects_target_tensor_parallelism(transport, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///tmp/unused-multi-module.sock",),
+        transport=transport,
+    )
+    config.parallel_config = ParallelConfig(tensor_parallel_size=2)
+    with pytest.raises(ValueError, match="target TP1"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("transport", ["inline", "cuda_ipc"])
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_exaone_module_chain_rejects_pooling(transport, depth):
+    config = _config("exaone_moe", "ExaoneMoeForCausalLM", depth, num_modules=depth)
+    config.speculative_config.execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=(
+            "unix:///tmp/unused-worker-a.sock",
+            "unix:///tmp/unused-worker-b.sock",
+        ),
+        transport=transport,
+    )
+    with pytest.raises(ValueError, match="one (?:inline )?endpoint"):
+        create_runtime_contract(config)
+
+
+def test_exaone_module_count_changes_state_and_feature_contract_identity():
+    single = create_runtime_contract(_config("exaone_moe", "ExaoneMoeForCausalLM", 2))
+    multi = create_runtime_contract(
+        _config("exaone_moe", "ExaoneMoeForCausalLM", 2, num_modules=2)
+    )
+    assert single.target_fingerprint != multi.target_fingerprint
+    assert single.draft_fingerprint != multi.draft_fingerprint
+    assert single.tokenizer_fingerprint == multi.tokenizer_fingerprint
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4])
+@pytest.mark.parametrize("difference", [-1, 1])
+def test_exaone_module_chain_requires_configured_depth(depth, difference):
+    config = _config(
+        "exaone_moe", "ExaoneMoeForCausalLM", depth + difference, num_modules=depth
+    )
+    with pytest.raises(ValueError, match="configured K"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "module_layers,module_windows",
+    [
+        (("sliding_attention", "sliding_attention"), None),
+        (("full_attention", "sliding_attention"), None),
+        (("sliding_attention", "full_attention"), None),
+        (("full_attention", "sliding_attention", "sliding_attention"), (0, 16, 32)),
+        (("full_attention", "sliding_attention") * 2, (0, 16, 0, 32)),
+    ],
+)
+def test_exaone_module_chain_accepts_dense_full_and_sliding_groups(
+    module_layers, module_windows
+):
+    depth = len(module_layers)
+    config = _config(
+        "exaone_moe",
+        "ExaoneMoeForCausalLM",
+        depth,
+        num_modules=depth,
+        module_layers=module_layers,
+        module_windows=module_windows,
+    )
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == depth
+    assert contract.capabilities.supports_multi_module
+
+
+@pytest.mark.parametrize("module_windows", [None, ()])
+@pytest.mark.parametrize(
+    "module_layers,target_windows",
+    [
+        (
+            ("full_attention", "sliding_attention", "sliding_attention"),
+            (0, 16, 32, 64, 128),
+        ),
+        (("sliding_attention", "full_attention", "full_attention"), (16,)),
+        (("full_attention",) * 3, ()),
+    ],
+)
+def test_exaone_module_windows_inherit_only_used_target_indexes(
+    module_windows, module_layers, target_windows
+):
+    config = _config(
+        "exaone_moe",
+        "ExaoneMoeForCausalLM",
+        3,
+        num_modules=3,
+        module_layers=module_layers,
+        module_windows=module_windows,
+        num_target_layers=5,
+        target_windows=target_windows,
+    )
+    assert config.model_config.hf_config.num_hidden_layers == 5
+    draft = config.speculative_config.draft_model_config.hf_config
+    resolved = draft.mtp_sliding_windows or draft.sliding_windows
+    assert resolved == target_windows
+    contract = create_runtime_contract(config)
+    assert contract.capabilities.num_prefill_lookahead == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("mtp_layer_types", ["full_attention"]),
+        (
+            "mtp_layer_types",
+            ["full_attention", "compressed_attention", "full_attention"],
+        ),
+        ("mtp_sliding_windows", [0, 16]),
+        ("mtp_sliding_windows", [0, 0, 32]),
+        ("mtp_sliding_windows", [0, -1, 32]),
+        ("mtp_sliding_windows", [0, True, 32]),
+    ],
+)
+def test_exaone_module_chain_rejects_incomplete_or_invalid_layout(field, value):
+    config = _config(
+        "exaone_moe",
+        "ExaoneMoeForCausalLM",
+        3,
+        num_modules=3,
+        module_layers=("full_attention", "sliding_attention", "sliding_attention"),
+        module_windows=(0, 16, 32),
+    )
+    setattr(config.speculative_config.draft_model_config.hf_config, field, value)
+    with pytest.raises(ValueError, match="MTP.*(layer|window)"):
+        create_runtime_contract(config)
 
 
 @pytest.mark.parametrize("model_type,target_arch,draft_arch,k", MODELS[:2])
@@ -307,11 +593,19 @@ def test_non_recurrent_mtp_models_keep_k_one(model_type, target_arch, draft_arch
 def test_mtp_contract_rejects_missing_or_multiple_checkpoint_modules(
     model_type, target_arch, draft_arch, k
 ):
-    config = _config(model_type, target_arch, k)
-    draft = config.speculative_config.draft_model_config.hf_config
-    for count in (0, 2):
-        draft.num_nextn_predict_layers = count
-        with pytest.raises(ValueError, match="exactly one checkpoint MTP module"):
+    for count in (0,) if model_type == "exaone_moe" else (0, 2):
+        config = _config(model_type, target_arch, k, num_modules=count)
+        if model_type == "nemotron_h" and count == 0:
+            # The native override does not select an MTP architecture without
+            # checkpoint MTP layers, so admission rejects that architecture.
+            assert (
+                config.speculative_config.draft_model_config.hf_config.architectures
+                == [target_arch]
+            )
+            message = "unsupported standalone MTP architecture"
+        else:
+            message = "checkpoint MTP module"
+        with pytest.raises(ValueError, match=message):
             create_runtime_contract(config)
 
 
