@@ -4,13 +4,12 @@
 
 import inspect
 from collections.abc import Mapping
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.remote.errors import CompletionUnknownError, runtime_unusable
