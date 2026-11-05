@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit v3 token-only messages; the target-conditioned v2 codec is unchanged."""
 
+from typing import Literal
+
 import msgspec
 
 from vllm.v1.spec_decode.remote.protocol import (
@@ -22,7 +24,7 @@ from vllm.v1.spec_decode.remote.protocol import (
 )
 
 TOKEN_PROTOCOL_MAJOR = 3
-TOKEN_PROTOCOL_MINOR = 1
+TOKEN_PROTOCOL_MINOR = 2
 
 
 class TokenHello(msgspec.Struct):
@@ -37,6 +39,7 @@ class TokenHello(msgspec.Struct):
     max_model_len: PositiveInt
     method: str = "draft_model"
     transport: str = "inline"
+    policy: Literal["on_demand", "outcome_cache"] = "on_demand"
 
 
 class TokenHelloAck(msgspec.Struct):
@@ -44,6 +47,7 @@ class TokenHelloAck(msgspec.Struct):
     session_epoch: PositiveInt
     tokenizer_fingerprint: str
     limits: RemoteServerLimits
+    policy: Literal["on_demand", "outcome_cache"] = "on_demand"
 
 
 class TokenPrefill(msgspec.Struct):
@@ -75,6 +79,7 @@ class TokenProposal(msgspec.Struct):
     batch_id: NonNegativeInt
     result_slot: NonNegativeInt | None = None
     status: SpeculatorStatusCode = SpeculatorStatusCode.OK
+    origins: tuple[Literal["on_demand", "cache"], ...] = ()
 
 
 _TYPES = {

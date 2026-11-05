@@ -32,6 +32,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--attention-backend")
     result.add_argument("--target-attention-backend")
     result.add_argument("--trust-remote-code", action="store_true")
+    result.add_argument(
+        "--policy", choices=("on_demand", "outcome_cache"), default="on_demand"
+    )
+    result.add_argument("--cache-max-branches", type=int, default=1)
+    result.add_argument("--cache-kv-budget-mib", type=int, default=64)
+    result.add_argument("--cache-copy-chunk-blocks", type=int, default=1)
     return result
 
 
@@ -41,7 +47,24 @@ def create_adapter(args):
     from vllm.config import AttentionConfig
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenCacheOptions
     from vllm.v1.spec_decode.remote.runtime.token_gpu import make_token_gpu_adapter
+
+    cache = None
+    if args.policy == "outcome_cache":
+        if args.draft_tensor_parallel_size != 1:
+            raise ValueError("outcome cache requires draft TP1")
+        cache = TokenCacheOptions(
+            max_branches=args.cache_max_branches,
+            kv_budget_bytes=args.cache_kv_budget_mib << 20,
+            copy_chunk_blocks=args.cache_copy_chunk_blocks,
+        )
+    elif (
+        args.cache_max_branches,
+        args.cache_kv_budget_mib,
+        args.cache_copy_chunk_blocks,
+    ) != (1, 64, 1):
+        raise ValueError("cache budgets require --policy outcome_cache")
 
     devices = None
     if args.devices is not None:
@@ -106,6 +129,7 @@ def create_adapter(args):
         device=device,
         devices=devices,
         kv_cache_bytes=int(args.draft_kv_cache_gib * 1024**3),
+        outcome_cache=cache,
     )
 
 

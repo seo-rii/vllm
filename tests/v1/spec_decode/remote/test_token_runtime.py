@@ -45,6 +45,95 @@ from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 from vllm.v1.spec_decode.remote.token_session import TokenOnlyRemoteSession
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_cached_token_acceptor_start_rolls_back_gpu_owner(
+    tmp_path, monkeypatch, started
+):
+    import threading
+
+    state, _, cache = outcome_machine()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, token_oracle_contract(), cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+    )
+    path = tmp_path / "cache.sock"
+    endpoint = f"unix://{path}"
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            if self.name == "token-draft-acceptor":
+                if started:
+                    super().start()
+                raise RuntimeError("injected cached acceptor startup failure")
+            return super().start()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "Thread", FailingThread)
+            with pytest.raises(RuntimeError, match="injected cached acceptor"):
+                server.start(endpoint)
+        assert not path.exists()
+        assert server.work_queue._thread is not None
+        assert not server.work_queue._thread.is_alive()
+        assert server.healthy
+        server.start(endpoint)
+        assert server.work_queue.call("check", lambda: 7) == 7
+    finally:
+        server.stop()
+
+
+def test_cached_token_shutdown_preserves_socket_and_owner_failures(
+    tmp_path, monkeypatch
+):
+    import errno
+    import socket
+    import threading
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    fail_close = False
+    socket_error = OSError(errno.EIO, "injected cache listener cleanup failure")
+
+    class FailingSocket(socket.socket):
+        def close(self):
+            nonlocal fail_close
+            super().close()
+            if fail_close:
+                fail_close = False
+                raise socket_error
+
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    state, _, cache = outcome_machine()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, token_oracle_contract(), cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+        shutdown_timeout_s=0.1,
+    )
+    server.start(f"unix://{tmp_path}/cache.sock")
+    entered, release = threading.Event(), threading.Event()
+
+    def hold():
+        entered.set()
+        assert release.wait(3)
+
+    work = server.work_queue.submit(DraftWork("held", hold))
+    try:
+        assert entered.wait(2)
+        fail_close = True
+        with pytest.raises(ServerShutdownTimeout) as caught:
+            server.stop()
+        failures = caught.value.__cause__.exceptions
+        assert len(failures) == 2
+        assert socket_error in failures[0].__cause__.exceptions
+        assert isinstance(failures[1], ServerShutdownTimeout)
+        assert not server.healthy
+    finally:
+        release.set()
+        work.wait()
+        server.stop()
+
+
 @pytest.mark.parametrize("handshake", [False, True])
 def test_token_client_rejects_oversized_header_before_waiting_for_body(
     socket_runtime, handshake
@@ -497,6 +586,77 @@ def test_token_server_socket_close_error_retains_owner_and_requires_restart(
         close_socket(connection._sock)
 
 
+def test_token_queue_full_socket_close_failure_is_supervised(
+    socket_runtime, monkeypatch
+):
+    import errno
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.transport import TransportError
+
+    state, _, server, session = socket_runtime
+    with server._connections_lock:
+        (connection,) = server._connections
+        worker = server._workers[0]
+    queue = server.work_queue
+    entered, release, closing = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    errors: list[threading.ExceptHookArgs] = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    close_socket = socket.socket.close
+    failure = OSError(errno.EIO, "injected overloaded socket close failure")
+
+    def blocked():
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def fail_close(sock):
+        if sock is connection._sock:
+            closing.set()
+            raise failure
+        close_socket(sock)
+
+    try:
+        for index in range(queue.max_jobs_per_owner):
+            queue.submit(
+                DraftWork(
+                    session.hello.verifier_instance_id,
+                    blocked if index == 0 else lambda: None,
+                )
+            )
+        assert entered.wait(timeout=3)
+        with (
+            monkeypatch.context() as patch,
+            ThreadPoolExecutor(max_workers=1) as requests,
+        ):
+            patch.setattr(socket.socket, "close", fail_close)
+            pending = requests.submit(
+                session.open_sequence, 1, deadline=session.deadline()
+            )
+            try:
+                assert closing.wait(timeout=3)
+            finally:
+                release.set()
+            with pytest.raises((RemoteDraftError, TransportError)):
+                pending.result(timeout=3)
+            worker.join(timeout=3)
+        assert not worker.is_alive() and not errors
+        assert not server.healthy and server.wait(timeout=0)
+        assert server._lifecycle_error is failure
+        assert connection in server._connections and not server._handshaking
+        server.stop()
+        assert not state.sequences and queue.depth == 0
+    finally:
+        release.set()
+        close_socket(connection._sock)
+
+
 @pytest.mark.parametrize("started", [False, True])
 def test_token_acceptor_start_failure_rolls_back_and_allows_restart(
     socket_runtime, monkeypatch, tmp_path, started
@@ -651,7 +811,7 @@ def test_protocol_majors_are_explicit_and_v2_unchanged():
     v3 = encode_token_message(Ping(1))
     assert decode_envelope(v2).protocol_major == 2
     assert decode_token_message(v3)[0].protocol_major == 3
-    assert decode_token_message(v3)[0].protocol_minor == 1
+    assert decode_token_message(v3)[0].protocol_minor == 2
     with pytest.raises(ProtocolVersionError):
         decode_token_message(v2)
     with pytest.raises(ProtocolVersionError):
@@ -2732,6 +2892,13 @@ def test_worker_registered_prefix_replays_bounded_chunks_before_remaining_prompt
                 expected.append(drafts[-1])
             assert result.valid_lengths.tolist() == [3]
             assert result.token_ids.tolist() == [drafts]
+            stats = worker.get_cache_stats()
+            assert stats["last_valid_lengths"] == (3,)
+            assert stats["last_origins"] == ("on_demand",)
+            assert stats["cache_hits"] == stats["received_cache_hits"] == 0
+            assert (
+                stats["cache_verified_proposals"] == stats["cache_accepted_tokens"] == 0
+            )
             assert [
                 (start, tokens, sample) for _, start, tokens, sample in oracle.calls[:4]
             ] == [
@@ -2874,6 +3041,705 @@ def test_prefix_allocation_failure_isolates_request_until_finish(
             worker.close()
     finally:
         server.stop()
+
+
+class BlockKVOracle(TokenStepExecutor):
+    """Actual CPU storage makes writable page ownership visible to the oracle."""
+
+    def __init__(self, num_blocks=33, block_size=4):
+        import torch
+
+        self.storage = torch.full((num_blocks, block_size), -777, dtype=torch.int64)
+        self.block_size = block_size
+        self.calls = []
+
+    @property
+    def max_num_reqs(self):
+        return 4
+
+    def copy_blocks(self, copies):
+        for source, destination in copies:
+            self.storage[destination].copy_(self.storage[source])
+
+    def forward(self, key, req_index, start, tokens, blocks, *, sample):
+        for position, token in enumerate(tokens, start):
+            self.storage[
+                blocks[position // self.block_size], position % self.block_size
+            ] = token
+        prefix = [
+            int(
+                self.storage[
+                    blocks[position // self.block_size], position % self.block_size
+                ]
+            )
+            for position in range(start + len(tokens))
+        ]
+        assert all(token >= 0 for token in prefix)
+        self.calls.append((req_index, start, tokens, sample))
+        return KVOracle.predict(prefix) if sample else None
+
+
+def outcome_machine(num_blocks=33, max_branch_blocks=None, executor=None):
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+
+    if executor is None:
+        executor = BlockKVOracle(num_blocks=num_blocks)
+    state = TokenStateMachine(
+        executor,
+        DraftBlockPool(num_blocks, 4),
+        max_num_reqs=2,
+        max_model_len=64,
+        vocab_size=128,
+        max_k=3,
+    )
+    cache = TokenOutcomeCache(
+        state,
+        live_slots=2,
+        max_branches=2,
+        max_branch_blocks=(
+            min(16, num_blocks - 1) if max_branch_blocks is None else max_branch_blocks
+        ),
+        copy_chunk_blocks=1,
+        contract_id=("target", "draft", "tokenizer", "greedy"),
+    )
+    return state, executor, cache
+
+
+@pytest.mark.parametrize(
+    "committed,k,copied,shared,private",
+    [
+        (4, 1, 0, 1, 1),
+        (7, 1, 1, 1, 2),
+        (8, 1, 0, 2, 1),
+        (4, 3, 1, 1, 2),
+        (7, 3, 2, 1, 3),
+        (8, 3, 1, 2, 2),
+        (16, 3, 1, 4, 2),
+        (32, 3, 1, 8, 2),
+    ],
+)
+def test_outcome_cache_copies_only_mutable_tail_and_charges_physical_pages(
+    committed, k, copied, shared, private
+):
+    state, executor, cache = outcome_machine(max_branch_blocks=private)
+    key = SequenceKey("prefix", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, tuple(range(1, committed)), is_final=True)
+    cache.bind_epoch(key, 1)
+    result = cache.advance_many(
+        ((7, TokenAdvanceRow(key, committed - 1, None, 0, 0, (3,)), k),)
+    )[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    before = state.block_pool.num_free_blocks
+    storage_before = executor.storage.clone()
+    for _ in range(16):
+        if not cache.step(result.prediction):
+            break
+    assert cache.counters["ready"] == 1
+    assert cache.counters["copied_blocks"] == copied
+    assert cache.counters["shared_blocks"] == shared
+    assert cache.branch_blocks == private
+    assert state.block_pool.num_free_blocks == before - private
+    for page in result.prediction.source_blocks:
+        assert executor.storage[page].equal(storage_before[page])
+    cache.close((key,))
+    assert state.block_pool.num_free_blocks == before
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
+
+
+def token_oracle_contract():
+    return RuntimeContract(
+        TargetFeatureSchema(3, (FeatureSlot("token_ids", "int32", ()),)),
+        SpeculatorPlacementCapabilities(
+            state_dependency="own_kv",
+            required_features=("token_ids",),
+            standalone_weights="complete",
+        ),
+        "target",
+        "tokenizer",
+        "draft",
+    )
+
+
+@pytest.mark.parametrize("policy", ["on_demand", "outcome_cache"])
+def test_outcome_cache_socket_negotiates_policy_and_consumes_post_send_prediction(
+    tmp_path,
+    policy,
+):
+    import threading
+    import time
+
+    state, _, cache = outcome_machine()
+    contract = token_oracle_contract()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, contract, cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+    )
+    endpoint = server.start(f"unix://{tmp_path}/cache.sock")
+    hello = TokenHello(
+        "verifier",
+        "target",
+        "draft",
+        "tokenizer",
+        3,
+        128,
+        2,
+        64,
+        64,
+        policy=policy,
+    )
+    client = TokenOnlyRemoteSession(endpoint, hello, request_timeout_ms=5000)
+    try:
+        client.connect()
+        key = client.open_sequence(0, deadline=client.deadline())
+        client.prefill(key, (2, 5, 7), is_final=True, deadline=client.deadline())
+        source = client.collect(
+            client.dispatch(
+                7,
+                (TokenAdvanceRow(key, 3, None, 0, 0, (3,)),),
+                3,
+                deadline=client.deadline(),
+            )
+        )
+        assert source.origins == ("on_demand",) and source.valid_lengths == (3,)
+        if policy == "outcome_cache":
+            deadline = time.monotonic() + 5
+            poll = threading.Event()
+            while cache.counters["ready"] == 0 and time.monotonic() < deadline:
+                poll.wait(0.001)
+            assert cache.counters["ready"] == 1
+        else:
+            assert cache.counters["planned"] == cache.counters["ready"] == 0
+        draft = source.token_ids[0]
+        bonus = KVOracle.predict((2, 5, 7, 3) + draft)
+        actual = client.collect(
+            client.dispatch(
+                19,
+                (TokenAdvanceRow(key, 4, 7, 3, 3, draft + (bonus,)),),
+                3,
+                deadline=client.deadline(),
+            )
+        )
+        prefix = (2, 5, 7, 3) + draft + (bonus,)
+        expected = ()
+        for _ in range(3):
+            token = KVOracle.predict(prefix + expected)
+            expected += (token,)
+        assert actual.origins == (
+            "cache" if policy == "outcome_cache" else "on_demand",
+        )
+        assert actual.token_ids == (expected,)
+        assert (
+            client.cache_hits == cache.counters["hits"] == (policy == "outcome_cache")
+        )
+        assert client.active(key)
+        client.close_sequences((key,))
+    finally:
+        client.close()
+        server.stop()
+    assert not state.sequences and cache.branch_blocks == 0
+    assert state.block_pool.num_free_blocks == 32 and server.work_queue.depth == 0
+
+
+def test_outcome_cache_client_rejects_legacy_policy_ack_before_sending_data(tmp_path):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import msgspec
+
+    from vllm.v1.spec_decode.remote.protocol import MessageEnvelope
+    from vllm.v1.spec_decode.remote.token_protocol import TokenHelloAck
+    from vllm.v1.spec_decode.remote.transport import ConnectionClosed, listen
+
+    listener = listen(f"unix://{tmp_path}/legacy.sock")
+
+    def legacy_peer():
+        connection = listener.accept(timeout=5)
+        try:
+            envelope, hello = decode_token_message(connection.recv(timeout=5).body)
+            assert isinstance(hello, TokenHello) and hello.policy == "outcome_cache"
+            ack = TokenHelloAck(
+                "legacy", 1, "tokenizer", RemoteServerLimits(2, 64, 2, 64)
+            )
+            fields = msgspec.structs.asdict(ack)
+            del fields["policy"]
+            connection.send_control(
+                msgspec.msgpack.encode(
+                    MessageEnvelope(
+                        3,
+                        1,
+                        "hello_ack",
+                        "legacy",
+                        envelope.request_id,
+                        msgspec.msgpack.encode(fields),
+                    )
+                ),
+                deadline=time.monotonic() + 5,
+            )
+            with pytest.raises(ConnectionClosed):
+                connection.recv(timeout=5)
+        finally:
+            connection.close()
+
+    hello = TokenHello(
+        "v", "target", "draft", "tokenizer", 3, 128, 2, 64, 64, policy="outcome_cache"
+    )
+    client = TokenOnlyRemoteSession(listener.endpoint, hello)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(legacy_peer)
+            with pytest.raises(Exception, match="hello acknowledgment"):
+                client.connect()
+            future.result(timeout=5)
+    finally:
+        client.close()
+        listener.close()
+
+
+@pytest.mark.parametrize("outcome", ["hit", "reject", "bonus", "short", "k0", "k1"])
+def test_outcome_cache_consumption_matches_live_token_state(outcome):
+    cached, executor, cache = outcome_machine()
+    reference, _, _ = outcome_machine()
+    key = SequenceKey("cache", 1, 0)
+    for state in (cached, reference):
+        state.open(key)
+        state.prefill(key, 0, (2, 5, 7), is_final=True)
+    cache.bind_epoch(key, 3)
+    first = TokenAdvanceRow(key, 3, None, 0, 0, (3,))
+    source = cache.advance_many(((7, first, 3),))[0]
+    assert not isinstance(source, Exception)
+    assert source.token_ids == reference.advance(7, first, 3).token_ids
+    plan = source.prediction
+    assert plan is not None
+    # A poisoned partial page tail is copied too, but its bytes are never
+    # interpreted as part of a materialized attention prefix.
+    tail = plan.written_end
+    block = plan.source_blocks[tail // 4]
+    executor.storage[block, tail % 4 :] = 999
+    for _ in range(16):
+        if not cache.step(plan):
+            break
+    else:
+        pytest.fail("bounded all-accepted build did not finish")
+    assert cache.counters["ready"] == 1
+    bonus = KVOracle.predict((2, 5, 7, 3) + source.token_ids)
+    offered = accepted = 3
+    k = 3
+    delta = source.token_ids + (bonus,)
+    if outcome == "reject":
+        accepted = 1
+        delta = source.token_ids[:1] + ((source.token_ids[1] + 1) % 127,)
+    elif outcome == "bonus":
+        delta = source.token_ids + ((bonus + 1) % 127,)
+    elif outcome == "short":
+        offered = accepted = 2
+        delta = source.token_ids[:2] + (bonus,)
+    elif outcome == "k0":
+        k = 0
+    elif outcome == "k1":
+        k = 1
+    row = TokenAdvanceRow(key, 4, 7, offered, accepted, delta)
+    before = len(executor.calls)
+    actual = cache.advance_many(((19, row, k),))[0]
+    expected = reference.advance(19, row, k)
+    assert not isinstance(actual, Exception)
+    assert actual.token_ids == expected.token_ids
+    assert actual.committed == expected.committed and actual.proposal_id == 19
+    assert actual.origin == ("cache" if outcome == "hit" else "on_demand")
+    assert (len(executor.calls) == before) == (outcome == "hit")
+    assert cached.sequences[key].ready
+    assert cache.branch_blocks == 0
+    assert cache.counters["hits"] == (outcome == "hit")
+    cache.close((key,))
+    cached.close((key,))
+    assert cached.block_pool.num_free_blocks == 32
+
+
+@pytest.mark.parametrize("phases", range(7))
+def test_outcome_cache_close_at_each_phase_fences_reused_generation(phases):
+    state, _, cache = outcome_machine()
+    old, new = SequenceKey("reuse", 1, 0), SequenceKey("reuse", 1, 1)
+    state.open(old)
+    state.prefill(old, 0, (1, 2, 3), is_final=True)
+    cache.bind_epoch(old, 3)
+    result = cache.advance_many(((7, TokenAdvanceRow(old, 3, None, 0, 0, (4,)), 3),))[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    for _ in range(phases):
+        cache.step(result.prediction)
+    cache.close((old,))
+    state.close((old,))
+    state.open(new)
+    state.prefill(new, 0, (9, 10), is_final=True)
+    cache.bind_epoch(new, 4)
+    assert not cache.step(result.prediction)
+    assert cache.branch_blocks == 0 and state.sequences[new].committed == 2
+    assert state.sequences[new].ready
+    cache.close((new,))
+    state.close((new,))
+    assert state.block_pool.num_free_blocks == 32
+
+
+def test_outcome_cache_evicts_prediction_before_feasible_live_allocation():
+    state, _, cache = outcome_machine(num_blocks=8)
+    key, other = SequenceKey("pressure", 0, 0), SequenceKey("pressure", 1, 0)
+    state.open(key)
+    state.prefill(key, 0, (1, 2, 3), is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (4,)), 3),))[0]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    for _ in range(16):
+        if not cache.step(source.prediction):
+            break
+    assert cache.branch_blocks == 2
+    state.open(other)
+    state.prefill(other, 0, (2, 3, 4, 5), is_final=True)
+    row = TokenAdvanceRow(other, 4, None, 0, 0, (6,) * 16)
+    result = cache.advance_many(((19, row, 0),))[0]
+    assert not isinstance(result, Exception) and result.committed == 20
+    assert result.token_ids == () and state.sequences[other].ready
+    assert cache.branch_blocks == state.block_pool.num_free_blocks == 0
+    assert len(state.block_pool.blocks(state.sequences[key].req_index)) == 2
+    cache.close((key, other))
+    state.close((key, other))
+    assert state.block_pool.num_free_blocks == 7
+
+
+def test_outcome_cache_evicts_prediction_before_feasible_live_prefill():
+    from vllm.v1.spec_decode.remote.server import PrefillInputs
+    from vllm.v1.spec_decode.remote.transport import ints_to_frame
+
+    state, _, cache = outcome_machine(num_blocks=8)
+    adapter = TokenOnlyDraftAdapter(state, token_oracle_contract(), cache)
+    key, other = SequenceKey("prefill", 0, 0), SequenceKey("prefill", 1, 0)
+    state.open(key)
+    state.prefill(key, 0, (1, 2, 3), is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (4,)), 3),))[0]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    for _ in range(16):
+        if not cache.step(source.prediction):
+            break
+    assert cache.branch_blocks == 2 and state.block_pool.num_free_blocks == 3
+    adapter.open_sequence(other)
+    adapter.prefill(other, PrefillInputs(0, 16, True, (ints_to_frame(0, (2,) * 16),)))
+    assert state.sequences[other].committed == 16 and state.sequences[other].ready
+    assert cache.branch_blocks == 0 and state.block_pool.num_free_blocks == 1
+    adapter.close_sequences((key, other))
+    assert state.block_pool.num_free_blocks == 7
+
+
+@pytest.mark.parametrize("failure", ["copy", "forward"])
+def test_outcome_cache_failed_tail_work_returns_private_pages_and_prefix_refs(failure):
+    class FaultingOracle(BlockKVOracle):
+        def copy_blocks(self, copies):
+            super().copy_blocks(copies)
+            if failure == "copy":
+                raise MemoryError("tail copy failed")
+
+        def forward(self, key, req_index, start, tokens, blocks, *, sample):
+            token = super().forward(
+                key, req_index, start, tokens, blocks, sample=sample
+            )
+            if failure == "forward" and req_index >= 2:
+                raise MemoryError("branch forward failed")
+            return token
+
+    state, executor, cache = outcome_machine(executor=FaultingOracle())
+    key = SequenceKey("failed-tail", 0, 0)
+    state.open(key)
+    prefix = tuple(range(1, 32))
+    state.prefill(key, 0, prefix, is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 31, None, 0, 0, (3,)), 3),))[
+        0
+    ]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    before = state.block_pool.num_free_blocks
+    storage_before = executor.storage.clone()
+    for _ in range(8):
+        if not cache.step(source.prediction):
+            break
+    assert cache.counters["failed"] == 1 and cache.branch_blocks == 0
+    assert state.block_pool.num_free_blocks == before
+    for page in source.prediction.source_blocks:
+        assert executor.storage[page].equal(storage_before[page])
+    bonus = KVOracle.predict(prefix + (3,) + source.token_ids)
+    result = cache.advance_many(
+        ((19, TokenAdvanceRow(key, 32, 7, 3, 3, source.token_ids + (bonus,)), 3),)
+    )[0]
+    assert not isinstance(result, Exception) and result.origin == "on_demand"
+    assert result.token_ids[0] == KVOracle.predict(
+        prefix + (3,) + source.token_ids + (bonus,)
+    )
+    cache.close((key,))
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
+
+
+@pytest.mark.parametrize("failure", ["registration", "fork"])
+@pytest.mark.parametrize("use_monitoring", [False, True])
+def test_outcome_cache_failed_start_keeps_rollback_ownership(failure, use_monitoring):
+    """Cancellation must find every lease even if start and rollback both fail."""
+    from tests.v1.spec_decode.remote.runtime_fixtures import allocation_failures
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+
+    state, _, cache = outcome_machine()
+    key = SequenceKey("failed-start", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, (2, 5, 7), is_final=True)
+    cache.bind_epoch(key, 1)
+    result = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (3,)), 3),))[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    plan = result.prediction
+    pool = state.block_pool
+    free_blocks = pool.num_free_blocks
+    error, cleanup_error = (
+        MemoryError("start metadata"),
+        MemoryError("release metadata"),
+    )
+    method, fragment = (
+        (TokenOutcomeCache._start, "self._builds[source.key] = branch")
+        if failure == "registration"
+        else (DraftBlockPool.fork_prefix, "return private")
+    )
+    with allocation_failures(
+        [
+            (method, fragment, error),
+            (DraftBlockPool.release, "references = [", cleanup_error),
+        ],
+        use_monitoring=use_monitoring,
+    ) as triggered:
+        with pytest.raises(MemoryError) as caught:
+            cache.step(plan)
+        if failure == "registration":
+            assert caught.value is error and triggered == [error]
+        else:
+            assert caught.value is cleanup_error and triggered == [error, cleanup_error]
+            assert caught.value.__context__ is error
+            assert cache.branch_blocks > 0
+
+    cache.cancel(plan)
+    assert cache.branch_blocks == 0 and pool.num_free_blocks == free_blocks
+    while cache.step(plan):
+        pass
+    assert cache.counters["ready"] == 1
+    cache.close((key,))
+    state.close((key,))
+    assert pool.num_free_blocks == 32
+
+
+def test_outcome_cache_shared_prefix_stays_reserved_after_live_lease_closes():
+    state, _, cache = outcome_machine(max_branch_blocks=2)
+    key, other = SequenceKey("borrowed", 0, 0), SequenceKey("other", 0, 0)
+    state.open(key)
+    state.prefill(key, 0, tuple(range(1, 32)), is_final=True)
+    cache.bind_epoch(key, 1)
+    source = cache.advance_many(((7, TokenAdvanceRow(key, 31, None, 0, 0, (3,)), 3),))[
+        0
+    ]
+    assert not isinstance(source, Exception) and source.prediction is not None
+    for _ in range(8):
+        if not cache.step(source.prediction):
+            break
+    assert cache.counters["ready"] == 1 and cache.branch_blocks == 2
+    shared = source.prediction.source_blocks[:8]
+    state.close((key,))
+    assert cache.branch_blocks == 10
+    state.open(other)
+    state.prefill(other, 0, (4,) * 64, is_final=True)
+    assert set(shared).isdisjoint(
+        state.block_pool.blocks(state.sequences[other].req_index)
+    )
+    cache.close((key,))
+    state.close((other,))
+    assert state.block_pool.num_free_blocks == 32
+
+
+@pytest.mark.parametrize("fp8_source", ["target", "draft"])
+def test_public_outcome_cache_rejects_fp8_kv(tmp_path, fp8_source):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    assets = token_config(tmp_path, dtype="bfloat16", enforce_eager=True)
+    assert assets.speculative_config is not None
+    assert assets.speculative_config.draft_model_config is not None
+    spec: dict[str, Any] = {
+        "method": "draft_model",
+        "model": assets.speculative_config.draft_model_config.model,
+        "num_speculative_tokens": 3,
+        "execution": {
+            "placement": "remote",
+            "policy": "outcome_cache",
+            "endpoints": ["unix:///tmp/cache.sock"],
+            "transport": "inline",
+        },
+    }
+    if fp8_source == "draft":
+        spec["kv_cache_dtype"] = "fp8"
+    # Use public configuration construction: this does not override the CPU
+    # platform's MRV2 restriction or instantiate a CUDA executor.
+    with pytest.raises(ValueError, match="outcome cache requires bfloat16 KV"):
+        config = EngineArgs(
+            model=assets.model_config.model,
+            tokenizer_mode="hf",
+            dtype="bfloat16",
+            kv_cache_dtype="fp8" if fp8_source == "target" else "auto",
+            skip_tokenizer_init=True,
+            max_model_len=64,
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            enforce_eager=True,
+            speculative_config=spec,
+        ).create_engine_config()
+        create_token_runtime_contract(config)
+
+
+def test_prediction_phases_keep_one_credit_and_yield_to_foreground():
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+
+    entered, release = threading.Event(), threading.Event()
+    order = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=16,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=8,
+        max_background_jobs=1,
+        max_background_bytes=8,
+    )
+    queue.start(lambda: None)
+
+    def phase():
+        order.append("prediction")
+        if len(order) == 1:
+            entered.set()
+            assert release.wait(3)
+            return True
+        return False
+
+    prediction = DraftWork("a", phase, background=True, num_bytes=8)
+    try:
+        assert queue.submit_background(prediction)
+        assert entered.wait(3)
+        assert not queue.submit_background(
+            DraftWork("a", phase, background=True, num_bytes=1)
+        )
+        foreground = queue.submit(
+            DraftWork("a", lambda: order.append("foreground"), num_bytes=4)
+        )
+        release.set()
+        foreground.wait()
+        assert prediction.done.wait(3)
+        assert prediction.error is None
+        assert order == ["prediction", "foreground", "prediction"]
+        assert queue.depth == queue.pending_bytes == 0
+    finally:
+        release.set()
+        queue.stop(time.monotonic() + 3)
+
+
+@pytest.mark.parametrize("phase", ["copy", "bonus", "draft"])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_prediction_requeue_failure_retires_branch_outside_queue_lock(
+    monkeypatch, phase, cancel_fails
+):
+    import time
+    from collections import deque
+
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    state, _, cache = outcome_machine()
+    key = SequenceKey("cache", 1, 0)
+    state.open(key)
+    state.prefill(key, 0, (2, 5, 7), is_final=True)
+    cache.bind_epoch(key, 3)
+    result = cache.advance_many(((7, TokenAdvanceRow(key, 3, None, 0, 0, (3,)), 3),))[0]
+    assert not isinstance(result, Exception) and result.prediction is not None
+    plan = result.prediction
+    free_blocks = state.block_pool.num_free_blocks
+    error = MemoryError("prediction requeue")
+    cleanup_error = CompletionUnknownError("prediction cancel completion")
+    fail_requeue = False
+    cancellations: list[str] = []
+    failures: list[BaseException] = []
+
+    class RequeueFailure(deque):
+        def append(self, value):
+            if fail_requeue:
+                raise error
+            return super().append(value)
+
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=16,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=8,
+        max_background_jobs=1,
+        max_background_bytes=8,
+        on_failure=failures.append,
+    )
+    monkeypatch.setattr(queue, "_background", RequeueFailure())
+
+    def step():
+        nonlocal fail_requeue
+        branch = cache._builds.get(key)
+        current = "copy" if branch is None else branch.phase
+        more = cache.step(plan)
+        fail_requeue = current == phase
+        return more
+
+    def cancel():
+        # CPython exposes this probe without a public type declaration.
+        is_owned = getattr(queue._condition, "_is_owned")  # noqa: B009
+        assert not is_owned()
+        cancellations.append(phase)
+        if cancel_fails:
+            raise cleanup_error
+        cache.cancel(plan)
+
+    queue.start(lambda: None)
+    work = DraftWork("a", step, background=True, num_bytes=8, on_cancel=cancel)
+    assert queue.submit_background(work)
+    assert work.done.wait(3)
+    assert cancellations == [phase]
+    assert queue.depth == queue.pending_bytes == 0
+    if cancel_fails:
+        assert isinstance(work.error, BaseExceptionGroup)
+        assert work.error.exceptions == (error, cleanup_error)
+        assert failures == [work.error]
+        assert cache.branch_blocks > 0
+        with pytest.raises(ServerShutdownTimeout, match="restart required"):
+            queue.stop(time.monotonic() + 3)
+    else:
+        assert work.error is error
+        assert not failures
+        assert not cache._builds and not cache._branches.sequences
+        assert cache.branch_blocks == 0
+        assert state.block_pool.num_free_blocks == free_blocks
+        assert queue.call("a", lambda: 7) == 7
+        queue.stop(time.monotonic() + 3)
+    # The CPU oracle can be reclaimed after the failed owner has exited.
+    cache.close((key,))
+    state.close((key,))
+    assert state.block_pool.num_free_blocks == 32
 
 
 @pytest.mark.parametrize("family", ["qwen3", "llama", "mistral"])
@@ -3067,3 +3933,270 @@ def test_token_cli_rejects_ambiguous_draft_rank_devices(arguments):
     )
     with pytest.raises(ValueError, match="draft TP2|draft TP2 requires"):
         create_adapter(args)
+
+
+def test_token_cli_rejects_outcome_cache_with_draft_tp_before_loading():
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+
+    args = parser().parse_args(
+        [
+            "--endpoint",
+            "unix:///tmp/cache-tp.sock",
+            "--target-model",
+            "not-loaded",
+            "--draft-model",
+            "not-loaded",
+            "--policy",
+            "outcome_cache",
+            "--draft-tensor-parallel-size",
+            "2",
+            "--devices",
+            "cuda:0",
+            "cuda:1",
+        ]
+    )
+    with pytest.raises(ValueError, match="outcome cache requires draft TP1"):
+        create_adapter(args)
+
+
+def test_public_outcome_cache_rejects_draft_tp2(tmp_path):
+    from vllm.v1.spec_decode.remote.runtime.token_schema import (
+        create_token_runtime_contract,
+    )
+
+    with pytest.raises(ValueError, match="outcome cache requires.*TP1"):
+        config = token_config(
+            tmp_path,
+            dtype="bfloat16",
+            enforce_eager=True,
+            spec_options={
+                "draft_tensor_parallel_size": 2,
+                "execution": {
+                    "placement": "remote",
+                    "policy": "outcome_cache",
+                    "endpoints": ["unix:///tmp/cache-tp.sock"],
+                    "transport": "inline",
+                },
+            },
+        )
+        create_token_runtime_contract(config)
+
+
+@pytest.mark.parametrize("fault", ["dequeue", "batch", "execute", "credit"])
+def test_queue_owner_failure_completes_all_admitted_work(monkeypatch, fault):
+    """Allocation failures cannot strand dequeued work or its waiting callers."""
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    class Completion(threading.Event):
+        count = 0
+
+        def set(self):
+            self.count += 1
+            super().set()
+
+    entered, release = threading.Event(), threading.Event()
+    failures: list[BaseException] = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=4,
+        max_bytes=16,
+        max_jobs_per_owner=4,
+        max_bytes_per_owner=16,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+        on_failure=failures.append,
+    )
+    queue.start(lambda: None)
+
+    def hold():
+        entered.set()
+        assert release.wait(3)
+
+    held = queue.submit(DraftWork("hold", hold))
+    assert entered.wait(3)
+    jobs = [
+        queue.submit(
+            DraftWork(
+                "a", None, num_rows=1, num_tokens=1, num_bytes=4, done=Completion()
+            )
+        )
+        for _ in range(3)
+    ]
+    error = MemoryError(f"injected {fault}")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    if fault == "dequeue":
+        original = queue._pop
+
+        def dequeue():
+            original()
+            raise error
+
+        monkeypatch.setattr(queue, "_pop", dequeue)
+    elif fault == "batch":
+        monkeypatch.setattr(module, "tuple", fail, raising=False)
+    elif fault == "execute":
+        monkeypatch.setattr(queue, "_execute", fail)
+    else:
+
+        class BrokenCredits(dict):
+            def __getitem__(self, key):
+                if key == "a":
+                    raise error
+                return super().__getitem__(key)
+
+        monkeypatch.setattr(queue, "_credits", BrokenCredits(queue._credits))
+    release.set()
+    held.wait()
+    assert all(work.done.wait(3) for work in jobs)
+    assert all(
+        isinstance(work.done, Completion) and work.done.count == 1 for work in jobs
+    )
+    for work in jobs:
+        with pytest.raises(MemoryError, match=f"injected {fault}"):
+            work.wait()
+    assert queue.depth == queue.pending_bytes == 0
+    assert failures == [error]
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.stop(time.monotonic() + 3)
+    with pytest.raises(ServerShutdownTimeout):
+        queue.submit(DraftWork("new", lambda: None))
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        queue.start(lambda: pytest.fail("failed GPU owner was restarted"))
+
+
+@pytest.mark.parametrize("fault", ["before", "uncertain", "after"])
+def test_queue_start_failure_retains_uncertain_thread_ownership(monkeypatch, fault):
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+    )
+    start = threading.Thread.start
+    error = RuntimeError("start refused") if fault == "before" else MemoryError("start")
+
+    def fail(thread):
+        if fault == "after":
+            start(thread)
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail)
+        with pytest.raises(type(error)) as caught:
+            queue.start(lambda: None)
+        assert caught.value is error
+    if fault == "before":
+        queue.stop(time.monotonic() + 3)
+        queue.start(lambda: None)
+        assert queue.call("a", lambda: 7) == 7
+        queue.stop(time.monotonic() + 3)
+    else:
+        for _ in range(2):
+            with pytest.raises(ServerShutdownTimeout, match="restart required"):
+                queue.stop(time.monotonic() + 3)
+        with pytest.raises(ServerShutdownTimeout, match="restart required"):
+            queue.start(lambda: None)
+
+
+def test_token_owner_failure_marks_server_unhealthy_and_wakes_stop(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.spec_decode.remote.runtime import work_queue as module
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    state, _, cache = outcome_machine()
+    server = TokenDraftServer(
+        TokenOnlyDraftAdapter(state, token_oracle_contract(), cache),
+        limits=RemoteServerLimits(2, 64, 2, 64),
+    )
+    server.start(f"unix://{tmp_path}/failed-owner.sock")
+    error = MemoryError("owner batch allocation")
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(module, "tuple", fail, raising=False)
+    work = server.work_queue.submit(DraftWork("a", None, num_rows=1, num_tokens=1))
+    assert work.done.wait(3)
+    assert work.error is error
+    assert server.wait(timeout=0) and not server.healthy
+    assert server.queue_depth == 0
+    with pytest.raises(ServerShutdownTimeout, match="restart required"):
+        server.stop()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_queue_rejects_admission_until_initializer_completes(fails):
+    import threading
+    import time
+
+    from vllm.v1.spec_decode.remote.runtime.work_queue import DraftWork, DraftWorkQueue
+    from vllm.v1.spec_decode.remote.server import ServerShutdownTimeout
+
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    queue = DraftWorkQueue(
+        lambda _: None,
+        max_jobs=1,
+        max_bytes=8,
+        max_jobs_per_owner=1,
+        max_bytes_per_owner=8,
+        max_cleanup_jobs=1,
+        max_batch_rows=1,
+        max_batch_tokens=1,
+        max_background_jobs=1,
+        max_background_bytes=8,
+    )
+
+    def initialize():
+        entered.set()
+        assert release.wait(3)
+        if fails:
+            raise MemoryError("initialization")
+
+    def start():
+        try:
+            queue.start(initialize)
+        except BaseException as error:
+            errors.append(error)
+
+    startup = threading.Thread(target=start)
+    startup.start()
+    try:
+        assert entered.wait(3)
+        with pytest.raises(ServerShutdownTimeout):
+            queue.submit(DraftWork("a", lambda: 7, num_bytes=8))
+        assert not queue.submit_background(
+            DraftWork("a", lambda: False, background=True, num_bytes=8)
+        )
+        assert queue.depth == queue.pending_bytes == 0
+    finally:
+        release.set()
+        startup.join(3)
+        assert not startup.is_alive()
+    assert len(errors) == int(fails)
+    if fails:
+        assert isinstance(errors[0], MemoryError)
+        queue.start(lambda: None)
+    assert queue.call("a", lambda: 7) == 7
+    queue.stop(time.monotonic() + 3)

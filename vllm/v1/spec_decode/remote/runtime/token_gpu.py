@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.remote.runtime.token_cache import TokenCacheOptions
     from vllm.v1.spec_decode.remote.runtime.tp_executor import TokenTPExecutor
 
 
@@ -54,7 +55,10 @@ def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> N
 
 
 def create_token_executor_config(
-    config: VllmConfig, *, parallel_context: StandaloneParallelContext | None = None
+    config: VllmConfig,
+    *,
+    parallel_context: StandaloneParallelContext | None = None,
+    branch_slots: int = 0,
 ) -> VllmConfig:
     """Give the standalone model its own geometry and rank-specific topology."""
     spec = config.speculative_config
@@ -78,6 +82,22 @@ def create_token_executor_config(
                 resource.parallel_config, rank=parallel_context.rank
             ),
         )
+    if type(branch_slots) is not int or branch_slots < 0:
+        raise ValueError("branch slots must be a nonnegative integer")
+    if branch_slots:
+        resident_slots = resource.scheduler_config.max_num_seqs + branch_slots
+        resource = replace(
+            resource,
+            scheduler_config=replace(
+                resource.scheduler_config,
+                max_num_seqs=resident_slots,
+                max_num_batched_tokens=max(
+                    resource.scheduler_config.max_num_batched_tokens, resident_slots
+                ),
+                max_model_len=resource.model_config.max_model_len,
+                is_encoder_decoder=resource.model_config.is_encoder_decoder,
+            ),
+        )
     return resource
 
 
@@ -89,6 +109,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         device: torch.device,
         kv_cache_bytes: int,
         parallel_context: StandaloneParallelContext | None = None,
+        branch_slots: int = 0,
     ):
         self._token_contract = create_token_runtime_contract(config)
         spec = config.speculative_config
@@ -106,7 +127,7 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
                 "token-only first runtime requires unquantized draft weights"
             )
         resource = create_token_executor_config(
-            config, parallel_context=parallel_context
+            config, parallel_context=parallel_context, branch_slots=branch_slots
         )
         super().__init__(
             resource,
@@ -142,6 +163,42 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
     @property
     def max_num_reqs(self) -> int:
         return self.input_buffers.max_num_reqs
+
+    @torch.inference_mode()
+    def copy_blocks(self, copies: tuple[tuple[int, int], ...]) -> None:
+        from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+        from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
+
+        if not copies:
+            return
+        torch.accelerator.set_device_index(self.device)
+        failure: BaseException | None = None
+        try:
+            copy_kv_cache_blocks_inplace(
+                self.kv_caches.values(),
+                self.num_blocks,
+                [
+                    KVCacheBlockCopy(source, destination)
+                    for source, destination in copies
+                ],
+            )
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            if failure is None or not runtime_unusable(failure):
+                try:
+                    torch.accelerator.synchronize(self.device)
+                except BaseException as completion_error:
+                    unknown = CompletionUnknownError(
+                        "outcome cache copy completion is unknown"
+                    )
+                    if failure is not None:
+                        failure.add_note(
+                            f"copy completion also failed: {completion_error}"
+                        )
+                        raise unknown from failure
+                    raise unknown from completion_error
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
         """TokenStateMachine owns the dense executor's request KV and slots."""
@@ -331,11 +388,19 @@ def make_token_gpu_adapter(
     device: torch.device,
     kv_cache_bytes: int,
     devices: tuple[torch.device, ...] | None = None,
+    outcome_cache: "TokenCacheOptions | None" = None,
 ) -> TokenOnlyDraftAdapter:
     spec = config.speculative_config
     assert spec is not None
     draft = spec.draft_model_config
     assert draft is not None
+    if outcome_cache is not None:
+        from vllm.v1.spec_decode.remote.runtime.token_schema import (
+            supports_token_outcome_cache,
+        )
+
+        if not supports_token_outcome_cache(config, require_remote=False):
+            raise ValueError("outcome cache requires ordinary full-attention Qwen3 TP1")
     executor: TokenGPUStepExecutor | TokenTPExecutor
     if spec.draft_parallel_config.tensor_parallel_size > 1:
         from vllm.v1.spec_decode.remote.runtime.tp_executor import (
@@ -349,7 +414,10 @@ def make_token_gpu_adapter(
         raise ValueError("multiple draft devices require draft TP2")
     else:
         executor = TokenGPUStepExecutor(
-            config, device=device, kv_cache_bytes=kv_cache_bytes
+            config,
+            device=device,
+            kv_cache_bytes=kv_cache_bytes,
+            branch_slots=0 if outcome_cache is None else outcome_cache.max_branches,
         )
     try:
         state = TokenStateMachine(
@@ -360,10 +428,44 @@ def make_token_gpu_adapter(
             vocab_size=config.model_config.get_vocab_size(),
             max_k=spec.num_speculative_tokens,
         )
+        cache = None
+        if outcome_cache is not None:
+            assert isinstance(executor, TokenGPUStepExecutor)
+            from vllm.v1.kv_cache_interface import AttentionSpec
+            from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
+
+            if any(
+                not isinstance(group.kv_cache_spec, AttentionSpec)
+                or group.kv_cache_spec.dtype != torch.bfloat16
+                for group in executor.kv_config.kv_cache_groups
+            ):
+                raise ValueError("loaded outcome cache requires bfloat16 KV")
+            page_bytes = sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in executor.kv_config.kv_cache_groups
+            )
+            blocks = outcome_cache.kv_budget_bytes // page_bytes
+            if not 1 <= blocks <= executor.num_blocks - 1:
+                raise ValueError(
+                    "outcome cache KV budget must fit the physical draft arena"
+                )
+            cache = TokenOutcomeCache(
+                state,
+                live_slots=config.scheduler_config.max_num_seqs,
+                max_branches=outcome_cache.max_branches,
+                max_branch_blocks=blocks,
+                copy_chunk_blocks=outcome_cache.copy_chunk_blocks,
+                contract_id=(
+                    executor.contract.target_fingerprint,
+                    executor.contract.draft_fingerprint,
+                    executor.contract.tokenizer_fingerprint,
+                    "greedy",
+                ),
+            )
     except BaseException as error:
         try:
             executor.close()
         except BaseException as cleanup_error:
             error.add_note(f"token executor cleanup failed: {cleanup_error}")
         raise
-    return TokenOnlyDraftAdapter(state, executor.contract)
+    return TokenOnlyDraftAdapter(state, executor.contract, cache)
