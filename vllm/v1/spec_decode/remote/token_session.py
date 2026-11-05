@@ -276,16 +276,28 @@ class TokenOnlyRemoteSession:
             return
         state = self.records[key]
         try:
-            frame = ints_to_frame(0, tokens)
-            message = TokenPrefill(
-                key, state.committed, len(tokens), 0, frame_checksum([frame]), is_final
-            )
-            request_id = next(self._ids)
-            self._send(message, request_id, deadline, (frame,))
-            ack, frames = self._recv(request_id, deadline)
-            self._ack(ack, frames, key)
-            if not state.terminal:
-                state.committed += len(tokens)
+            if not tokens:
+                raise ValueError("token prefill must not be empty")
+            capacity = self.hello.max_num_batched_tokens
+            for start in range(0, len(tokens), capacity):
+                end = min(start + capacity, len(tokens))
+                check_data_frame_size(0, "int32", (end - start,))
+                frame = ints_to_frame(0, tokens[start:end])
+                message = TokenPrefill(
+                    key,
+                    state.committed,
+                    end - start,
+                    0,
+                    frame_checksum([frame]),
+                    is_final and end == len(tokens),
+                )
+                request_id = next(self._ids)
+                self._send(message, request_id, deadline, (frame,))
+                ack, frames = self._recv(request_id, deadline)
+                self._ack(ack, frames, key)
+                if state.terminal:
+                    return
+                state.committed += end - start
         except Exception as error:
             self.fail(f"token prefill failed: {error}")
 

@@ -9,6 +9,16 @@ The standalone GPU runtime provides same-host target-conditioned execution with
 independent draft KV. It supports greedy, eager MRV2 execution, target TP1 or TP2
 and draft TP1. The protocol test adapter is for development only.
 
+For existing full-attention token-only target/draft combinations, target prefix
+caching can replay cached tokens into a fresh draft sequence; see
+[cached target prefixes](../../design/unified_speculation_runtime.md#cached-target-prefixes).
+If preparing a cached prefix runs out of host memory, `target_only` disables
+remote drafting for that request until it finishes. Other requests keep their
+remote sequences; `error` propagates the allocation failure.
+The same single-endpoint TP1 combination has an experimental eager MRV2
+[async verifier scheduling mode](../../design/unified_speculation_runtime.md#async-verifier-scheduling).
+Other remote backends retain their synchronous scheduling requirement.
+
 ## Configuration and lifecycle
 
 `speculative_config.remote_draft` takes a single `endpoint`, a `transport`

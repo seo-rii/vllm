@@ -108,6 +108,46 @@ def _validate_token_model(model, role: str) -> None:
         raise ValueError(f"token-only {role} requires homogeneous full attention")
 
 
+def supports_token_prefix_replay(config: "VllmConfig") -> bool:
+    """Whether cached target tokens can bootstrap an ordinary draft prefix."""
+    spec = config.speculative_config
+    if (
+        spec is None
+        or spec.method != "draft_model"
+        or not spec.use_remote_draft()
+        or spec.draft_model_config is None
+        or spec.draft_parallel_config is None
+        or config.parallel_config.tensor_parallel_size != 1
+        or spec.draft_parallel_config.tensor_parallel_size != 1
+        or (spec.execution is not None and len(spec.execution.endpoints) != 1)
+        or config.cache_config.sliding_window is not None
+    ):
+        return False
+    remote = spec.get_remote_draft_config()
+    if remote is None or remote.transport not in ("auto", "inline"):
+        return False
+    for model, role in (
+        (config.model_config, "target"),
+        (spec.draft_model_config, "draft"),
+    ):
+        if model.is_hybrid or model.has_inner_state or model.use_mla:
+            return False
+        try:
+            _validate_token_model(model, role)
+        except ValueError:
+            return False
+    return True
+
+
+def supports_token_async_scheduling(config: "VllmConfig") -> bool:
+    """Whether the verifier can use async scheduling with same-step token RPCs."""
+    return (
+        supports_token_prefix_replay(config)
+        and config.use_v2_model_runner
+        and config.model_config.enforce_eager
+    )
+
+
 def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     spec = config.speculative_config
     if spec is None or spec.method != "draft_model" or spec.draft_model_config is None:
@@ -121,6 +161,20 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
     ):
         raise ValueError(
             "token-only runtime requires sequential same-tokenizer greedy drafting"
+        )
+    if config.cache_config.enable_prefix_caching and not supports_token_prefix_replay(
+        config
+    ):
+        raise ValueError(
+            "remote prefix caching requires full-attention token-only target and "
+            "draft models, TP1 and one inline endpoint"
+        )
+    if config.scheduler_config.async_scheduling and not supports_token_async_scheduling(
+        config
+    ):
+        raise ValueError(
+            "remote async scheduling requires eager MRV2, full-attention token-only "
+            "target and draft models, TP1 and one inline endpoint"
         )
     target, draft = config.model_config, spec.draft_model_config
     if (
