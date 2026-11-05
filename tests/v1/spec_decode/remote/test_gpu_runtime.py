@@ -4,6 +4,7 @@
 
 import json
 import shutil
+from typing import Any
 
 import pytest
 import torch
@@ -45,6 +46,9 @@ def _config(*, use_aux=False):
     target.model_arch_config = target.get_model_arch_config()
     draft.model, draft.revision = "draft", "b" * 40
     draft.hf_config.eagle_config = {"use_aux_hidden_state": use_aux}
+    if use_aux:
+        # Native defaults (2, 1, -1) do not describe three valid captures here.
+        draft.hf_config.eagle_config["layer_ids"] = [0, 1, 2]
     return config
 
 
@@ -104,6 +108,342 @@ def test_eagle_contract_rejects_projection_and_selected_layer_count_mismatch(
     setattr(draft, count_field, 3)
     with pytest.raises(ValueError, match="auxiliary.*count"):
         create_runtime_contract(config)
+
+
+def _llama_eagle_config(
+    tmp_path,
+    *,
+    target_kind="llama",
+    target_layers=4,
+    draft_options=None,
+    target_options=None,
+    spec_options=None,
+    target_tp=1,
+    load_model=False,
+    cache_options=None,
+):
+    """Construct actual HF/native models and the public speculative config."""
+    from transformers import (
+        LlamaConfig,
+        LlamaForCausalLM,
+        MistralConfig,
+        MistralForCausalLM,
+        Qwen2Config,
+        Qwen2ForCausalLM,
+    )
+
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        SpeculativeConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+
+    common: dict[str, Any] = dict(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=128,
+        max_position_embeddings=128,
+    )
+    target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target_config_cls, target_model_cls = {
+        "llama": (LlamaConfig, LlamaForCausalLM),
+        "qwen2": (Qwen2Config, Qwen2ForCausalLM),
+        "mistral": (MistralConfig, MistralForCausalLM),
+    }[target_kind]
+    target_config = target_config_cls(
+        **(
+            common
+            | {
+                "architectures": [target_model_cls.__name__],
+                "num_hidden_layers": target_layers,
+                "sliding_window": None,
+            }
+            | (target_options or {})
+        )
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        target_model_cls(target_config).save_pretrained(target_path)
+    (target_path / "tokenizer.json").write_text('{"model":{"vocab":{"a":0}}}')
+    options = dict(
+        num_hidden_layers=1,
+        eagle_aux_hidden_state_layer_ids=[1, 2, 4],
+        num_aux_hidden_states=3,
+        target_hidden_size=64,
+        eagle_config={"use_aux_hidden_state": True},
+    )
+    LlamaConfig(**(common | options | (draft_options or {}))).save_pretrained(
+        draft_path
+    )
+
+    def make_config():
+        target = ModelConfig(
+            model=str(target_path),
+            dtype="float32",
+            max_model_len=128,
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+        )
+        parallel = ParallelConfig(tensor_parallel_size=target_tp)
+        spec = SpeculativeConfig(
+            model=str(draft_path),
+            method="eagle3",
+            target_model_config=target,
+            target_parallel_config=parallel,
+            draft_tensor_parallel_size=1,
+            **({"num_speculative_tokens": 3} | (spec_options or {})),
+        )
+        return VllmConfig(
+            model_config=target,
+            parallel_config=parallel,
+            speculative_config=spec,
+            device_config=DeviceConfig("cpu"),
+            cache_config=CacheConfig(
+                **({"enable_prefix_caching": False} | (cache_options or {}))
+            ),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                async_scheduling=False,
+                is_encoder_decoder=False,
+            ),
+        )
+
+    config = make_config()
+    with set_current_vllm_config(config):
+        model = Eagle3LlamaForCausalLM(vllm_config=config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.01)
+    save_file(
+        {
+            name.removeprefix("model."): value.detach().contiguous()
+            for name, value in model.named_parameters()
+        },
+        draft_path / "model.safetensors",
+    )
+    if load_model:
+        from vllm.model_executor.model_loader import get_model
+
+        config = make_config()
+        assert config.speculative_config is not None
+        with set_current_vllm_config(config):
+            model = get_model(
+                vllm_config=config,
+                model_config=config.speculative_config.draft_model_config,
+            )
+    return config, model
+
+
+@pytest.mark.parametrize(
+    "target_layers,options,selected",
+    [
+        (4, {}, (1, 2, 4)),
+        (4, {"eagle_aux_hidden_state_layer_ids": [4, 1, 2, 2]}, (1, 2, 4)),
+        (8, {"eagle_aux_hidden_state_layer_ids": None}, (2, 4, 5)),
+        (
+            4,
+            {"eagle_aux_hidden_state_layer_ids": None, "target_layer_ids": [0, 1, 3]},
+            (1, 2, 4),
+        ),
+        (4, {"eagle_config": {"use_aux_hidden_state": False}}, None),
+    ],
+)
+def test_llama_eagle_contract_matches_actual_native_projection(
+    tmp_path, target_layers, options, selected
+):
+    """Canonical captures match the loaded projection, including LAST_HIDDEN."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.llama import LlamaForCausalLM
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        set_eagle3_aux_hidden_state_layers,
+    )
+
+    config, model = _llama_eagle_config(
+        tmp_path, target_layers=target_layers, draft_options=options, load_model=True
+    )
+    contract = create_runtime_contract(config)
+    feature = contract.eagle3_features
+    assert feature is not None and feature.aux_layer_ids == selected
+    feature.validate_model(model)
+    assert feature.output_width == 64
+    if selected is not None:
+        with set_current_vllm_config(config):
+            target = LlamaForCausalLM(vllm_config=config)
+        set_eagle3_aux_hidden_state_layers(target, config.speculative_config)
+        assert target.model.aux_hidden_state_layers == selected
+    expected_width = 64 * (len(selected) if selected is not None else 1)
+    assert contract.schema.slots[2].trailing_shape == (expected_width,)
+    inputs = torch.arange(5 * expected_width, dtype=torch.float32).reshape(
+        5, expected_width
+    )
+    actual = model.combine_hidden_states(inputs)
+    if selected is None:
+        assert not hasattr(model.model, "fc")
+        assert actual is inputs
+    else:
+        assert model.model.fc_input_size == expected_width
+        assert torch.equal(
+            actual, torch.nn.functional.linear(inputs, model.model.fc.weight)
+        )
+
+
+@pytest.mark.parametrize("target_kind", ["qwen2", "mistral"])
+@pytest.mark.parametrize("use_aux", [False, True])
+def test_full_attention_eagle_contract_matches_native_target(
+    tmp_path, target_kind, use_aux
+):
+    """Real target captures and the loaded Llama draft agree on feature shape."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.mistral import MistralForCausalLM
+    from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        set_eagle3_aux_hidden_state_layers,
+    )
+
+    config, model = _llama_eagle_config(
+        tmp_path,
+        target_kind=target_kind,
+        draft_options={"eagle_config": {"use_aux_hidden_state": use_aux}},
+        load_model=True,
+    )
+    assert config.model_config.hf_config.model_type == target_kind
+    assert config.model_config.get_sliding_window() is None
+    assert config.cache_config.sliding_window is None
+    contract = create_runtime_contract(config)
+    feature = contract.eagle3_features
+    assert feature is not None
+    assert feature.aux_layer_ids == ((1, 2, 4) if use_aux else None)
+    feature.validate_model(model)
+    target_cls = {"qwen2": Qwen2ForCausalLM, "mistral": MistralForCausalLM}[target_kind]
+    with set_current_vllm_config(config):
+        target = target_cls(vllm_config=config)
+    if use_aux:
+        set_eagle3_aux_hidden_state_layers(target, config.speculative_config)
+        assert target.model.aux_hidden_state_layers == (1, 2, 4)
+    width = 192 if use_aux else 64
+    assert contract.schema.slots[2].trailing_shape == (width,)
+    inputs = torch.arange(3 * width, dtype=torch.float32).reshape(3, width)
+    actual = model.combine_hidden_states(inputs)
+    if use_aux:
+        assert torch.equal(
+            actual, torch.nn.functional.linear(inputs, model.model.fc.weight)
+        )
+    else:
+        assert not hasattr(model.model, "fc")
+        assert actual is inputs
+
+
+@pytest.mark.parametrize(
+    "target_kind,options,match",
+    [
+        (
+            "qwen2",
+            {"target_options": {"use_sliding_window": True, "sliding_window": 16}},
+            "full attention",
+        ),
+        ("mistral", {"target_options": {"sliding_window": 16}}, "full attention"),
+        ("qwen2", {"cache_options": {"sliding_window": 16}}, "full attention"),
+        ("mistral", {"draft_options": {"sliding_window": 16}}, "full attention"),
+        (
+            "qwen2",
+            {"target_options": {"dual_chunk_attention_config": {"chunk_size": 16}}},
+            "dual-chunk",
+        ),
+        (
+            "mistral",
+            {"target_options": {"ada_rms_norm_t_cond": True}},
+            "conditional",
+        ),
+    ],
+)
+def test_full_attention_eagle_contract_rejects_unsupported_attention(
+    tmp_path, target_kind, options, match
+):
+    config, _ = _llama_eagle_config(tmp_path, target_kind=target_kind, **options)
+    with pytest.raises(ValueError, match=match):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        ({"eagle_aux_hidden_state_layer_ids": [1, 2, 5]}, "capture.*range"),
+        ({"eagle_aux_hidden_state_layer_ids": [1, 2, -1]}, "capture.*range"),
+        ({"eagle_aux_hidden_state_layer_ids": [True, 2, 4]}, "capture.*integer"),
+        ({"eagle_aux_hidden_state_layer_ids": [1, 2, 2]}, "projection.*count"),
+        ({"target_hidden_size": 32}, "projection.*width"),
+        (
+            {
+                "num_aux_hidden_states": None,
+                "num_aux_layers": 2,
+                "eagle_aux_hidden_state_layer_ids": [1, 2],
+            },
+            "projection.*count",
+        ),
+        (
+            {"hidden_size": 32, "eagle_config": {"use_aux_hidden_state": False}},
+            "hidden.*width",
+        ),
+    ],
+)
+def test_llama_eagle_contract_rejects_unusable_target_features(
+    tmp_path, options, match
+):
+    config, _ = _llama_eagle_config(tmp_path, draft_options=options)
+    with pytest.raises(ValueError, match=match):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("target_kind", ["llama", "qwen2", "mistral"])
+@pytest.mark.parametrize("placement", ["tp2", "ipc", "pool"])
+def test_llama_eagle_contract_rejects_unvalidated_placement(
+    tmp_path, placement, target_kind
+):
+    from vllm.config.speculative import SpeculativeExecutionConfig
+
+    execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=["unix:///tmp/eagle-a.sock"]
+        + (["unix:///tmp/eagle-b.sock"] if placement == "pool" else []),
+        transport="cuda_ipc" if placement == "ipc" else "inline",
+    )
+    config, _ = _llama_eagle_config(
+        tmp_path,
+        target_kind=target_kind,
+        target_tp=2 if placement == "tp2" else 1,
+        spec_options={"execution": execution},
+    )
+    with pytest.raises(ValueError, match="EAGLE3 requires.*TP1|one inline"):
+        create_runtime_contract(config)
+
+
+@pytest.mark.parametrize("use_aux", [False, True])
+def test_llama_eagle_contract_rejects_different_loaded_projection(tmp_path, use_aux):
+    config, _ = _llama_eagle_config(tmp_path / "contract")
+    _, different = _llama_eagle_config(
+        tmp_path / "loaded",
+        draft_options={
+            "eagle_config": {"use_aux_hidden_state": use_aux},
+            "eagle_aux_hidden_state_layer_ids": [1, 2],
+            "num_aux_hidden_states": 2,
+        },
+    )
+    contract = create_runtime_contract(config)
+    assert contract.eagle3_features is not None
+    with pytest.raises(ValueError, match="loaded EAGLE3.*differs"):
+        contract.eagle3_features.validate_model(different)
 
 
 def test_contract_fingerprint_changes_with_weights_precision_and_feature_policy():

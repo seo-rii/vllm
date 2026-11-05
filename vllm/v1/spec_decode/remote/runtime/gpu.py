@@ -245,6 +245,16 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             self.speculator = self._load_speculator(
                 vllm_config, device, shared_weights_source
             )
+            if features := self.contract.eagle3_features:
+                features.validate_model(self.speculator.model)
+                logger.info(
+                    "Standalone EAGLE3 features: model=%s target_layers=%s "
+                    "input_width=%d output_width=%d",
+                    type(self.speculator.model).__name__,
+                    features.aux_layer_ids,
+                    features.input_width,
+                    features.output_width,
+                )
             self.speculator.model.eval()
 
             self.kv_config = initialize_standalone_kv_cache_config(

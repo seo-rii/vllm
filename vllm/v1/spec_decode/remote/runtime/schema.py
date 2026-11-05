@@ -4,7 +4,7 @@
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,12 +22,41 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class Eagle3FeatureContract:
+    aux_layer_ids: tuple[int, ...] | None
+    input_width: int
+    output_width: int
+
+    def validate_model(self, model: Any) -> None:
+        """Check the loaded native projection before allocating its KV cache."""
+        inner = model.model
+        use_aux = self.aux_layer_ids is not None
+        if bool(getattr(inner, "use_aux_hidden_state", True)) != use_aux:
+            raise ValueError(
+                "loaded EAGLE3 hidden-state mode differs from its contract"
+            )
+        if inner.config.hidden_size != self.output_width:
+            raise ValueError("loaded EAGLE3 hidden width differs from its contract")
+        if use_aux:
+            if (
+                inner.fc.input_size != self.input_width
+                or inner.fc.output_size != self.output_width
+            ):
+                raise ValueError(
+                    "loaded EAGLE3 projection width differs from its contract"
+                )
+        elif hasattr(inner, "fc") or self.input_width != self.output_width:
+            raise ValueError("loaded single-state EAGLE3 requires equal hidden widths")
+
+
+@dataclass(frozen=True)
 class RuntimeContract:
     schema: TargetFeatureSchema
     capabilities: SpeculatorPlacementCapabilities
     target_fingerprint: str
     tokenizer_fingerprint: str
     draft_fingerprint: str
+    eagle3_features: Eagle3FeatureContract | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +294,144 @@ def _tokenizer_identity(target: Any) -> dict[str, Any]:
     }
 
 
+def _resolve_eagle3_features(vllm_config: "VllmConfig") -> Eagle3FeatureContract:
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        get_eagle3_aux_layers_from_config,
+    )
+
+    spec = vllm_config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    target = vllm_config.model_config
+    draft = spec.draft_model_config
+    config = draft.hf_config
+    target_type = target.hf_config.model_type
+    architectures = config.architectures or []
+    native_target = {
+        "llama": "LlamaForCausalLM",
+        "qwen2": "Qwen2ForCausalLM",
+        "mistral": "MistralForCausalLM",
+    }.get(target_type)
+    if native_target is not None:
+        name = native_target.removesuffix("ForCausalLM")
+        if target.hf_config.architectures != [native_target] or architectures not in (
+            ["Eagle3LlamaForCausalLM"],
+            ["LlamaForCausalLMEagle3"],
+        ):
+            raise ValueError(
+                f"standalone {name} EAGLE3 requires native {name} "
+                "and Llama EAGLE3 models"
+            )
+        if any(
+            model.using_transformers_backend()
+            or model.is_multimodal_model
+            or model.is_encoder_decoder
+            or model.uses_mrope
+            or not getattr(model.hf_text_config, "is_causal", True)
+            or model.quantization is not None
+            for model in (target, draft)
+        ):
+            raise ValueError(
+                f"standalone {name} EAGLE3 requires unquantized causal text models"
+            )
+        if target.get_vocab_size() != draft.get_vocab_size():
+            raise ValueError(
+                f"standalone {name} EAGLE3 requires equal target/draft vocabularies"
+            )
+        if target.get_hidden_size() != draft.get_hidden_size():
+            raise ValueError(
+                f"standalone {name} EAGLE3 requires equal target/draft hidden widths"
+            )
+        if vllm_config.parallel_config.tensor_parallel_size != 1:
+            raise ValueError(f"standalone {name} EAGLE3 requires target TP1")
+        remote = spec.get_remote_draft_config()
+        if remote is not None and (
+            remote.transport not in ("auto", "inline")
+            or len(spec.get_remote_draft_endpoints()) != 1
+        ):
+            raise ValueError(f"standalone {name} EAGLE3 requires one inline endpoint")
+        if target_type in ("qwen2", "mistral"):
+            for model in (target, draft):
+                layers = getattr(model.hf_text_config, "layer_types", None)
+                if (
+                    model.get_sliding_window() is not None
+                    or vllm_config.cache_config.sliding_window is not None
+                    or model.attention_chunk_size is not None
+                    or (
+                        layers is not None
+                        and (
+                            not isinstance(layers, (list, tuple))
+                            or len(layers) != model.get_total_num_hidden_layers()
+                            or any(layer != "full_attention" for layer in layers)
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 requires full attention "
+                        "without a target, draft or global sliding window"
+                    )
+                if getattr(model.hf_text_config, "dual_chunk_attention_config", None):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 does not support "
+                        "dual-chunk attention"
+                    )
+                if getattr(model.hf_text_config, "ada_rms_norm_t_cond", False):
+                    raise ValueError(
+                        f"standalone {name} EAGLE3 does not support conditional state"
+                    )
+    elif target_type not in ("gpt_oss", "qwen3"):
+        raise ValueError(
+            "standalone EAGLE3 supports GPT-OSS, Qwen3, Llama, Qwen2 "
+            "and Mistral targets"
+        )
+
+    target_width, draft_width = target.get_hidden_size(), draft.get_hidden_size()
+    eagle = getattr(config, "eagle_config", None) or {}
+    if not eagle.get("use_aux_hidden_state", True):
+        if target_width != draft_width:
+            raise ValueError(
+                "single-state EAGLE3 requires equal target/draft hidden widths"
+            )
+        return Eagle3FeatureContract(None, target_width, draft_width)
+
+    layer_ids = get_eagle3_aux_layers_from_config(spec)
+    num_layers = target.get_total_num_hidden_layers()
+    if layer_ids is None:
+        # The admitted native target classes inherit this SupportsEagle3 default.
+        layer_ids = (2, num_layers // 2, num_layers - 3)
+    if any(type(layer) is not int for layer in layer_ids):
+        raise ValueError("EAGLE3 capture positions must be integers")
+    if any(not 0 <= layer <= num_layers for layer in layer_ids):
+        raise ValueError("EAGLE3 capture position is outside the target layer range")
+    # EagleModelMixin emits captures in traversal order and removes duplicates.
+    layer_ids = tuple(sorted(set(layer_ids)))
+
+    # Match the native draft's projection, which has a separate count contract
+    # from the target capture selector above.
+    if architectures in (["Eagle3Qwen3ForCausalLM"], ["PeagleQwen3ForCausalLM"]):
+        count = getattr(config, "num_aux_layers", None)
+        if count is None:
+            count = getattr(config, "num_aux_hidden_states", None)
+        projected_ids = getattr(
+            config, "eagle_aux_hidden_state_layer_ids", None
+        ) or eagle.get("eagle_aux_hidden_state_layer_ids")
+    else:
+        count = getattr(config, "num_aux_hidden_states", None)
+        projected_ids = eagle.get("eagle_aux_hidden_state_layer_ids")
+    if count is None:
+        count = len(projected_ids) if projected_ids else 3
+    if type(count) is not int or count != len(layer_ids):
+        raise ValueError(
+            "EAGLE3 auxiliary projection count does not match selected "
+            f"target layers: {count} != {len(layer_ids)}"
+        )
+    projected_width = getattr(config, "target_hidden_size", draft_width)
+    if type(projected_width) is not int or projected_width != target_width:
+        raise ValueError(
+            "EAGLE3 projection target hidden width differs from the target"
+        )
+    return Eagle3FeatureContract(layer_ids, target_width * count, draft_width)
+
+
 def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     """Resolve the supported feature layout without loading any model weights."""
     spec = vllm_config.speculative_config
@@ -272,10 +439,9 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         raise ValueError("standalone drafting requires a resolved speculative config")
     target = vllm_config.model_config
     draft = spec.draft_model_config
-    target_type = target.hf_config.model_type
+    eagle3_features = None
     if spec.method == "eagle3":
-        if target_type not in ("gpt_oss", "qwen3"):
-            raise ValueError("standalone EAGLE3 currently supports GPT-OSS and Qwen3")
+        eagle3_features = _resolve_eagle3_features(vllm_config)
     elif spec.method == "mtp":
         _validate_mtp_contract(target, spec)
     else:
@@ -294,31 +460,18 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
 
     hidden_size = target.get_hidden_size()
     dtype = str(target.dtype).removeprefix("torch.")
-    eagle = getattr(draft.hf_config, "eagle_config", None) or {}
-    use_aux = spec.method == "eagle3" and eagle.get("use_aux_hidden_state", True)
+    use_aux = eagle3_features is not None and eagle3_features.aux_layer_ids is not None
     slots = [
         FeatureSlot(TargetFeatureKind.TOKEN_IDS.value, "int32", ()),
         FeatureSlot(TargetFeatureKind.POSITIONS.value, "int64", ()),
     ]
     if use_aux:
-        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
-            get_eagle3_aux_layers_from_config,
-        )
-
-        layer_ids = get_eagle3_aux_layers_from_config(spec)
-        # Both supported target families capture three layers by default.
-        count = len(layer_ids) if layer_ids else 3
-        projection_count = getattr(draft.hf_config, "num_aux_layers", None)
-        if projection_count is None:
-            projection_count = getattr(draft.hf_config, "num_aux_hidden_states", None)
-        if projection_count is not None and projection_count != count:
-            raise ValueError(
-                "EAGLE3 auxiliary projection count does not match selected "
-                f"target layers: {projection_count} != {count}"
-            )
+        assert eagle3_features is not None
         slots.append(
             FeatureSlot(
-                TargetFeatureKind.AUX_HIDDEN_STATES.value, dtype, (hidden_size * count,)
+                TargetFeatureKind.AUX_HIDDEN_STATES.value,
+                dtype,
+                (eagle3_features.input_width,),
             )
         )
     else:
@@ -339,9 +492,15 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
     )
     schema = TargetFeatureSchema(schema_id=1, slots=tuple(slots))
     layout = [(s.kind, s.dtype, s.trailing_shape) for s in slots]
+    feature_identity = (
+        {"eagle3_features": asdict(eagle3_features)}
+        if eagle3_features is not None
+        else {}
+    )
     target_identity = _model_identity(target)
     return RuntimeContract(
         schema=schema,
+        eagle3_features=eagle3_features,
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),
@@ -349,7 +508,9 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
             supports_multi_module=spec.use_multi_module_mtp(),
             standalone_weights="materializable",
         ),
-        target_fingerprint=_fingerprint({"target": target_identity, "layout": layout}),
+        target_fingerprint=_fingerprint(
+            {"target": target_identity, "layout": layout, **feature_identity}
+        ),
         tokenizer_fingerprint=_fingerprint(
             {
                 "identity": _tokenizer_identity(target),
@@ -367,6 +528,7 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
                 "layout": layout,
                 "method": spec.method,
                 "num_speculative_tokens": spec.num_speculative_tokens,
+                **feature_identity,
             }
         ),
     )
