@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native entrypoint/metadata CPU controls; model, attention and CUDA are doubles."""
 
-from contextlib import nullcontext
-from dataclasses import dataclass
+import inspect
+import sys
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
+from tests.v1.spec_decode.remote.runtime_fixtures import (
+    cpu_parallel_state as cpu_parallel_state,
+)
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.token_gpu import TokenGPUStepExecutor
 from vllm.v1.worker.gpu.input_batch import InputBuffers
@@ -42,50 +46,30 @@ def test_token_native_input_contract_rejects_unsupported_dependencies(tmp_path, 
         validate_token_model_inputs(config, model)
 
 
-def test_native_independent_loader_never_needs_target_weights(monkeypatch):
-    import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
+@pytest.mark.usefixtures("cpu_parallel_state")
+def test_native_independent_loader_never_needs_target_weights(tmp_path):
+    from safetensors.torch import load_file
 
-    @dataclass
-    class Config:
-        speculative_config: object
-        cache_config: object
-        parallel_config: object
-        model_config: object
-        quant_config: object
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.config import set_current_vllm_config
 
-    @dataclass
-    class Parallel:
-        rank: int = 0
-
-    draft = object()
-    config = Config(
-        SimpleNamespace(kv_cache_dtype=None, draft_parallel_config=Parallel()),
-        object(),
-        Parallel(),
-        object(),
-        object(),
+    config = token_config(tmp_path)
+    draft = config.speculative_config.draft_model_config
+    expected = load_file(Path(draft.model) / "model.safetensors")
+    (Path(config.model_config.model) / "model.safetensors").unlink()
+    with set_current_vllm_config(config), torch.device("cpu"):
+        speculator = StandaloneARSpeculator(config, torch.device("cpu"))
+        speculator.load_standalone_model()
+    assert torch.equal(
+        speculator.model.model.embed_tokens.weight,
+        expected["model.embed_tokens.weight"],
     )
-    speculator = object.__new__(StandaloneARSpeculator)
-    speculator.speculative_config = config.speculative_config
-    speculator.vllm_config = config
-    speculator.draft_model_config = draft
-    calls = []
-    model = object()
-
-    def get_model(**kwargs):
-        calls.append(kwargs)
-        return model
-
-    monkeypatch.setattr(native, "get_model", get_model)
-    monkeypatch.setattr(native, "set_model_tag", lambda tag: nullcontext())
-    finalized: list[set[str]] = []
-    monkeypatch.setattr(speculator, "_finalize_model_load", finalized.append)
-    speculator.load_standalone_model()
-    assert speculator.model is model and finalized == [set()]
-    assert len(calls) == 1
-    assert calls[0]["prefix"] == "draft_model"
-    assert calls[0]["vllm_config"].model_config is draft
-    assert calls[0]["vllm_config"].quant_config is None
+    assert torch.equal(speculator.model.lm_head.weight, expected["lm_head.weight"])
+    assert speculator.draft_attn_layer_names
+    assert all(
+        config.compilation_config.static_forward_context[name].is_draft_layer
+        for name in speculator.draft_attn_layer_names
+    )
 
 
 @pytest.fixture
@@ -94,10 +78,6 @@ def token_executor(monkeypatch):
     import vllm.v1.worker.gpu.buffer_utils as buffers
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
     from vllm.v1.worker.gpu.block_table import BlockTables
-
-    class CpuPool:
-        def copy_to_uva(self, values):
-            return torch.tensor(values, dtype=torch.int32)
 
     class Kernel:
         def __getitem__(self, grid):
@@ -113,10 +93,7 @@ def token_executor(monkeypatch):
 
             return apply
 
-    monkeypatch.setattr(buffers, "UvaBufferPool", lambda *a, **kw: CpuPool())
-    monkeypatch.setattr(
-        buffers, "async_tensor_h2d", lambda values, **kw: torch.tensor(values, **kw)
-    )
+    monkeypatch.setattr(buffers, "is_uva_available", lambda: False)
     monkeypatch.setattr(buffers, "_apply_write_kernel", Kernel())
 
     executor = object.__new__(TokenGPUStepExecutor)
@@ -135,15 +112,17 @@ def token_executor(monkeypatch):
         kv_cache_groups=[SimpleNamespace(layer_names=["draft"])]
     )
     calls, synced, metadata = [], [], []
-    tables = executor.block_tables = object.__new__(BlockTables)
-    staged = buffers.StagedWriteTensor((4, 16), torch.int32, executor.device)
-    tables.block_tables, tables.num_kv_cache_groups = [staged], 1
-    tables.num_blocks = SimpleNamespace(
-        np=np.zeros((1, 4), dtype=np.int32), copy_to_uva=lambda: None
+    tables = executor.block_tables = BlockTables(
+        block_sizes=[executor.block_size],
+        max_num_reqs=4,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[16],
+        device=executor.device,
     )
+    staged = tables.block_tables[0]
 
     def slots(indices, qsl, positions, n):
-        values = []
+        values: list[int] = []
         for row, index in enumerate(indices.tolist()):
             blocks = staged.gpu[index].tolist()
             block_size = executor.block_size
@@ -226,11 +205,13 @@ def test_token_executor_packs_ragged_rows_into_one_native_forward(token_executor
 
 @pytest.mark.parametrize("failure", [None, "stage", "upload"])
 def test_token_forward_discards_failed_writes_before_request_slot_reuse(
-    token_executor, monkeypatch, failure
+    token_executor, failure
 ):
     import vllm.v1.worker.gpu.buffer_utils as buffers
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
     from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
+
+    from .runtime_fixtures import allocation_failures
 
     executor, calls, _, _ = token_executor
     executor.block_size = 1
@@ -243,20 +224,24 @@ def test_token_forward_discards_failed_writes_before_request_slot_reuse(
     old_slot = state.sequences[old].req_index
     staged = executor.block_tables.block_tables[0]
 
-    def fail_upload(*args, **kwargs):
-        raise torch.OutOfMemoryError("injected upload failure")
-
-    with monkeypatch.context() as patch:
-        if failure == "stage":
-
-            class PartialContents(list):
-                def extend(self, values):
-                    super().extend(values)
-                    raise MemoryError("injected staging failure")
-
-            patch.setattr(staged, "_staged_write_contents", PartialContents())
-        elif failure == "upload":
-            patch.setattr(buffers, "async_tensor_h2d", fail_upload)
+    faults = []
+    if failure == "stage":
+        faults.append(
+            (
+                buffers.StagedWriteTensor.stage_write,
+                "self._staged_write_len += n",
+                MemoryError("injected staging failure"),
+            )
+        )
+    elif failure == "upload":
+        faults.append(
+            (
+                buffers.StagedWriteTensor.apply_write,
+                "write_contents = self.write_contents.copy_chunks_to_uva(",
+                torch.OutOfMemoryError("injected upload failure"),
+            )
+        )
+    with allocation_failures(faults):
         if failure is None:
             state.prefill(old, 0, (1, 2), is_final=True)
         else:
@@ -419,3 +404,244 @@ def test_token_server_fences_unusable_warmup_cleanup(
     assert calls == ["input_ids", "positions", "sync"][: calls.index(cleanup_phase) + 1]
     with pytest.raises(RuntimeError, match="unhealthy"):
         server.start(f"unix://{tmp_path}/not-listening.sock")
+
+
+@contextmanager
+def _fail_token_forward_at(executor, boundary, failure, before_raise=None):
+    """Inject host failure around real model/logits/D2H submission boundaries."""
+    name, phase = boundary.split("_")
+    code = {
+        "model": inspect.unwrap(executor.speculator._run_model).__code__,
+        "logits": inspect.unwrap(executor.speculator.model.compute_logits).__code__,
+        "copy": inspect.unwrap(executor.forward_batch).__code__,
+    }.get(name)
+
+    def inject(frame, event, called):
+        if name == "copy":
+            matches = (
+                frame.f_code is code
+                and event == f"c_{phase}"
+                and getattr(called, "__name__", None) == "cpu"
+                and isinstance(getattr(called, "__self__", None), torch.Tensor)
+            )
+        else:
+            matches = frame.f_code is code and event == phase
+        if matches:
+            if before_raise is not None:
+                before_raise()
+            raise failure
+
+    previous = sys.getprofile()
+    sys.setprofile(inject)
+    try:
+        yield
+    finally:
+        sys.setprofile(previous)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "model_call",
+        "model_return",
+        "logits_call",
+        "logits_return",
+        "copy_call",
+        "copy_return",
+    ],
+)
+@pytest.mark.parametrize("completion_fails", [False, True])
+def test_token_forward_failure_waits_before_reusing_request_storage(
+    token_executor, monkeypatch, boundary, completion_fails
+):
+    from vllm.v1.spec_decode.remote.errors import (
+        CompletionUnknownError,
+        runtime_unusable,
+    )
+    from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
+    from vllm.v1.spec_decode.remote.runtime.token_state import (
+        TokenAdvanceRow,
+        TokenStateMachine,
+    )
+
+    executor, _, synced, _ = token_executor
+    pool = DraftBlockPool(9, 4)
+    state = TokenStateMachine(
+        executor, pool, max_num_reqs=1, max_model_len=16, vocab_size=128, max_k=1
+    )
+    old, new = SequenceKey("completion", 0, 0), SequenceKey("completion", 0, 1)
+    state.open(old)
+    state.prefill(old, 0, (1, 2), is_final=True)
+    slot = state.sequences[old].req_index
+    blocks = pool.blocks(slot)
+    synced.clear()
+    failure = MemoryError("injected host metadata allocation")
+    completion = RuntimeError("injected completion failure")
+
+    def synchronize(device):
+        synced.append(True)
+        if completion_fails:
+            raise completion
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    expected = CompletionUnknownError if completion_fails else MemoryError
+    with (
+        pytest.raises(expected) as raised,
+        _fail_token_forward_at(executor, boundary, failure),
+    ):
+        state.advance(0, TokenAdvanceRow(old, 2, None, 0, 0, (3,)), 1)
+    assert synced == [True]
+    assert not state.sequences[old].ready
+    if completion_fails:
+        assert runtime_unusable(raised.value)
+        assert raised.value.__cause__ is completion
+        assert completion.__context__ is failure
+        assert pool.blocks(slot) == blocks
+    else:
+        assert raised.value is failure
+        assert not runtime_unusable(failure)
+        state.close((old,))
+        assert pool.num_free_blocks == 8
+        state.open(new)
+        assert state.sequences[new].req_index == slot
+        state.prefill(new, 0, (7, 8), is_final=True)
+        assert state.advance(
+            1, TokenAdvanceRow(new, 2, None, 0, 0, (9,)), 1
+        ).token_ids == (1,)
+
+
+def test_token_forward_fatal_cuda_failure_does_not_submit_completion_work(
+    token_executor,
+):
+    from vllm.v1.spec_decode.remote.errors import CudaRuntimeError, runtime_unusable
+
+    executor, _, synced, _ = token_executor
+    failure = CudaRuntimeError("injected failed CUDA context", cuda_error_code=700)
+    with (
+        pytest.raises(CudaRuntimeError) as raised,
+        _fail_token_forward_at(executor, "model_return", failure),
+    ):
+        executor.forward(SequenceKey("fatal", 0, 0), 0, 0, (1,), (1,), sample=True)
+    assert raised.value is failure and runtime_unusable(raised.value)
+    assert not synced
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_token_cuda_forward_failure_completes_before_native_kv_reuse(tmp_path):
+    """Exercise all host failure boundaries with native weights, KV and kernels."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import Qwen3Config, Qwen3ForCausalLM, TokenizersBackend
+
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.v1.spec_decode.remote.runtime.token_cli import create_adapter, parser
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+
+    path = tmp_path / "qwen3"
+    config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=128,
+        head_dim=64,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=128,
+        max_position_embeddings=64,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        Qwen3ForCausalLM(config).save_pretrained(path)
+    TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    ).save_pretrained(path)
+    args = parser().parse_args(
+        [
+            "--endpoint",
+            f"unix://{tmp_path}/unused.sock",
+            "--target-model",
+            str(path),
+            "--draft-model",
+            str(path),
+            "--device",
+            "cuda:0",
+            "--dtype",
+            "bfloat16",
+            "--attention-backend",
+            "TRITON_ATTN",
+            "--target-attention-backend",
+            "TRITON_ATTN",
+            "--max-model-len",
+            "64",
+            "--max-feature-tokens",
+            "64",
+            "--max-batch-size",
+            "1",
+            "--num-speculative-tokens",
+            "1",
+            "--block-size",
+            "16",
+            "--draft-kv-cache-gib",
+            "0.01",
+        ]
+    )
+    try:
+        adapter = create_adapter(args)
+        adapter.warmup()
+        state = adapter.state
+        executor = state.executor
+        baseline = SequenceKey("cuda-completion", 0, 0)
+        state.open(baseline)
+        state.prefill(baseline, 0, (1, 2), is_final=True)
+        expected = state.advance(0, TokenAdvanceRow(baseline, 2, None, 0, 0, (3,)), 1)
+        state.close((baseline,))
+        for generation, boundary in enumerate(
+            (
+                "model_call",
+                "model_return",
+                "logits_call",
+                "logits_return",
+                "copy_call",
+                "copy_return",
+            ),
+            start=1,
+        ):
+            key = SequenceKey("cuda-completion", 0, generation)
+            state.open(key)
+            state.prefill(key, 0, (1, 2), is_final=True)
+            slot = state.sequences[key].req_index
+            blocks = state.block_pool.blocks(slot)
+            completion = torch.cuda.Event()
+
+            def submit_marker(completion=completion):
+                torch.cuda._sleep(100_000_000)
+                completion.record()
+
+            failure = MemoryError(f"injected {boundary} failure")
+            with (
+                pytest.raises(MemoryError) as raised,
+                _fail_token_forward_at(executor, boundary, failure, submit_marker),
+            ):
+                state.advance(0, TokenAdvanceRow(key, 2, None, 0, 0, (3,)), 1)
+            assert raised.value is failure
+            assert completion.query(), "failed forward returned with GPU work pending"
+            state.close((key,))
+            assert state.block_pool.num_free_blocks == executor.num_blocks - 1
+            replacement = SequenceKey("cuda-reuse", 0, generation)
+            state.open(replacement)
+            assert state.sequences[replacement].req_index == slot
+            state.prefill(replacement, 0, (1, 2), is_final=True)
+            assert state.block_pool.blocks(slot) == blocks
+            actual = state.advance(
+                0, TokenAdvanceRow(replacement, 2, None, 0, 0, (3,)), 1
+            )
+            assert actual.token_ids == expected.token_ids
+            state.close((replacement,))
+    finally:
+        cleanup_dist_env_and_memory()

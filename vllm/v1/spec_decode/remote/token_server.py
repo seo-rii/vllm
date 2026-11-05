@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Same-host v3 token server using the existing framed transport/lifecycle."""
 
-import threading
 import time
 import uuid
 
@@ -56,7 +55,6 @@ from vllm.v1.spec_decode.remote.transport import (
     frame_to_ints,
     ints_to_frame,
     is_local_endpoint,
-    listen,
 )
 
 OK = SpeculatorStatusCode.OK
@@ -77,13 +75,7 @@ class TokenDraftServer(RemoteDraftServer):
         except Exception as error:
             self._adapter_failed(error)
             raise
-        self._listener = listen(endpoint)
-        self._stopping.clear()
-        self._acceptor = threading.Thread(
-            target=self._accept_loop, name="token-draft-acceptor", daemon=True
-        )
-        self._acceptor.start()
-        return self._listener.endpoint
+        return self._start_listener(endpoint, name="token-draft-acceptor")
 
     def _serve_connection(self, conn: FramedConnection) -> None:
         session = _TokenServerSession(self, conn)
@@ -115,11 +107,14 @@ class TokenDraftServer(RemoteDraftServer):
             finally:
                 try:
                     conn.close()
-                except OSError as error:
+                except BaseException as error:
+                    self._lifecycle_failed(error)
                     logger.warning("Token connection cleanup failed: %s", error)
-                finally:
+                else:
                     with self._connections_lock:
                         self._connections.discard(conn)
+                finally:
+                    with self._connections_lock:
                         self._handshaking.discard(conn)
 
 
