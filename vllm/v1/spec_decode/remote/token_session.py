@@ -241,11 +241,18 @@ class TokenOnlyRemoteSession:
             and key not in self._deferred_closes
         )
 
-    def open_sequence(self, sequence_id: int, *, deadline: float) -> SequenceKey:
+    def reserve_sequence(self, sequence_id: int) -> SequenceKey:
+        if self._closed or self._pending is not None:
+            raise RuntimeError("token session is closed or busy")
         key = SequenceKey(
             self.hello.verifier_instance_id, sequence_id, next(self._generations)
         )
         self.records[key] = TokenClientProgress()
+        return key
+
+    def open_reserved(self, key: SequenceKey, *, deadline: float) -> None:
+        if not self.active(key):
+            return
         try:
             self.connect(deadline=deadline)
             request_id = next(self._ids)
@@ -254,6 +261,10 @@ class TokenOnlyRemoteSession:
             self._ack(message, frames, key)
         except Exception as error:
             self.fail(f"token open failed: {error}")
+
+    def open_sequence(self, sequence_id: int, *, deadline: float) -> SequenceKey:
+        key = self.reserve_sequence(sequence_id)
+        self.open_reserved(key, deadline=deadline)
         return key
 
     def _ack(self, message, frames, key):

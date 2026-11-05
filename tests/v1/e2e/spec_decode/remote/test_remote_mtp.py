@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Real model coverage of process-separated MTP on one NVIDIA GPU."""
+"""Real model coverage of process-separated drafting on one NVIDIA GPU."""
 
 import os
 import signal
@@ -10,8 +10,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,8 @@ def draft_server(
     log_path: Path,
     *,
     target_kv: bool = False,
+    token_only_draft: str | None = None,
+    max_num_seqs: int = 4,
     revision: str | None = REVISION,
     num_speculative_tokens: int = 1,
     attention_backend: str = "FLASH_ATTN",
@@ -109,12 +112,40 @@ def draft_server(
                 "--device",
                 "cuda:0",
                 "--max-num-seqs",
-                "4",
+                str(max_num_seqs),
+                "--max-connections",
+                "2",
                 "--max-model-len",
                 "128",
                 "--max-feature-tokens",
                 "64",
                 "--language-model-only",
+            ]
+        elif token_only_draft is not None:
+            command = [
+                sys.executable,
+                "-m",
+                "vllm.v1.spec_decode.remote.runtime.token_cli",
+                "--endpoint",
+                f"unix://{path}",
+                "--target-model",
+                model,
+                "--draft-model",
+                token_only_draft,
+                "--num-speculative-tokens",
+                "3",
+                "--max-batch-size",
+                "4",
+                "--max-model-len",
+                "128",
+                "--max-feature-tokens",
+                "64",
+                "--draft-kv-cache-gib",
+                "0.03125",
+                "--attention-backend",
+                "TRITON_ATTN",
+                "--target-attention-backend",
+                "TRITON_ATTN",
             ]
         with log_path.open("w") as log:
             process = subprocess.Popen(
@@ -151,24 +182,42 @@ def draft_server(
 
 
 @pytest.mark.parametrize(
-    "transport,target_kv,collection_oom",
+    "transport,target_kv,num_workers,max_num_seqs,registration_oom,collection_oom",
     [
-        ("inline", False, False),
-        ("cuda_ipc", False, False),
-        ("inline", True, False),
-        ("inline", True, True),
+        ("inline", False, 1, 4, False, False),
+        ("cuda_ipc", False, 1, 4, False, False),
+        ("inline", False, 2, 4, False, False),
+        ("cuda_ipc", False, 2, 4, False, False),
+        ("inline", True, 1, 4, False, False),
+        ("inline", True, 2, 4, False, False),
+        ("inline", True, 1, 1, False, False),
+        ("inline", True, 1, 1, True, False),
+        ("inline", True, 1, 1, False, True),
     ],
 )
 def test_remote_mtp_matches_target_and_uses_drafts(
-    vllm_runner, monkeypatch, tmp_path, transport, target_kv, collection_oom
+    vllm_runner,
+    monkeypatch,
+    tmp_path,
+    transport,
+    target_kv,
+    num_workers,
+    max_num_seqs,
+    registration_oom,
+    collection_oom,
 ):
     """Exercise real chunked prefill, verification and completed-request reuse."""
     assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    if collection_oom:
+    if not target_kv and num_workers > 1:
         monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if registration_oom or collection_oom:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        monkeypatch.setenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
+    elif max_num_seqs == 1:
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     model = maybe_model_redirect(GEMMA_MODEL if target_kv else MODEL)
     revision = GEMMA_REVISION if target_kv else REVISION
     backend = "TRITON_ATTN" if target_kv else "FLASH_ATTN"
@@ -179,7 +228,7 @@ def test_remote_mtp_matches_target_and_uses_drafts(
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
-        max_num_seqs=4,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=64,
         enable_chunked_prefill=True,
         enable_prefix_caching=False,
@@ -202,7 +251,18 @@ def test_remote_mtp_matches_target_and_uses_drafts(
     )
     with vllm_runner(model, **kwargs) as baseline:
         expected = baseline.llm.generate(prompts, sampling, use_tqdm=False)
-    with draft_server(model, tmp_path / "draft.log", target_kv=target_kv) as endpoint:
+    with ExitStack() as servers:
+        endpoints = tuple(
+            servers.enter_context(
+                draft_server(
+                    model,
+                    tmp_path / f"draft-{i}.log",
+                    target_kv=target_kv,
+                    max_num_seqs=max_num_seqs,
+                )
+            )
+            for i in range(num_workers)
+        )
         config = dict(
             method="mtp",
             model=maybe_model_redirect(GEMMA_DRAFT) if target_kv else model,
@@ -211,23 +271,87 @@ def test_remote_mtp_matches_target_and_uses_drafts(
             draft_tensor_parallel_size=1,
             draft_sample_method="greedy",
             attention_backend=backend,
-            remote_draft=dict(
-                endpoint=endpoint,
-                transport=transport,
-                failure_policy="target_only" if collection_oom else "error",
-                request_timeout_ms=5000,
-                startup_timeout_ms=600000,
-            ),
         )
+        remote_options = dict(
+            transport=transport,
+            failure_policy=(
+                "target_only" if registration_oom or collection_oom else "error"
+            ),
+            request_timeout_ms=5000,
+            startup_timeout_ms=600000,
+        )
+        if num_workers == 1:
+            config["remote_draft"] = dict(endpoint=endpoints[0], **remote_options)
+        else:
+            config["execution"] = dict(
+                placement="remote", endpoints=endpoints, **remote_options
+            )
         with vllm_runner(model, speculative_config=config, **kwargs) as remote:
             actual_config = remote.llm.llm_engine.vllm_config.speculative_config
             assert actual_config.use_remote_draft()
-            assert actual_config.remote_draft.transport == transport
+            assert actual_config.get_remote_draft_config().transport == transport
+            assert actual_config.get_remote_draft_endpoints() == endpoints
+            result_writes = []
+            if not target_kv and num_workers > 1:
+                import threading
+
+                import torch
+
+                index_copy = torch.Tensor.index_copy_
+
+                def observe_result_copy(tensor, *args, **kwargs):
+                    if (
+                        tensor.dtype == torch.int32
+                        and tensor.ndim == 1
+                        and threading.current_thread().name.startswith("draft-feature-")
+                    ):
+                        # The model runner stages recovery tokens on CPU, so
+                        # its session results are CPU tensors too. The CUDA
+                        # result handoff is exercised by the pool stream test.
+                        assert tensor.device.type == "cpu"
+                        result_writes.append(threading.get_ident())
+                    return index_copy(tensor, *args, **kwargs)
+
+                monkeypatch.setattr(torch.Tensor, "index_copy_", observe_result_copy)
             metric_names = (
                 "vllm:spec_decode_num_draft_tokens",
                 "vllm:spec_decode_num_accepted_tokens",
             )
             before_recovery = None
+            if registration_oom:
+
+                class RegistrationRequestId(str):
+                    injected = False
+
+                    def __hash__(self):
+                        frame = sys._getframe(1)
+                        if (
+                            not self.injected
+                            and frame.f_code.co_name == "_dispatch_snapshot"
+                            and frame.f_locals.get("keys")
+                        ):
+                            self.injected = True
+                            raise MemoryError("target-KV request map insertion")
+                        return super().__hash__()
+
+                engine = remote.llm.llm_engine
+                request_id = RegistrationRequestId("registration-oom")
+                engine.add_request(request_id, prompts[0], sampling)
+                completed: list[Any] = []
+                while engine.has_unfinished_requests():
+                    completed.extend(
+                        output for output in engine.step() if output.finished
+                    )
+                assert request_id.injected
+                assert len(completed) == 1
+                assert list(completed[0].outputs[0].token_ids) == list(
+                    expected[0].outputs[0].token_ids
+                )
+                engine.do_log_stats()
+                before_recovery = {
+                    name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                    for name in metric_names
+                }
             if collection_oom:
                 from tests.v1.spec_decode.remote.runtime_fixtures import (
                     allocation_failures,
@@ -258,6 +382,43 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                     name: get_spec_decode_metric_value(remote.llm.get_metrics(), name)
                     for name in metric_names
                 }
+            sibling = None
+            if (
+                target_kv
+                and max_num_seqs == 1
+                and not registration_oom
+                and not collection_oom
+            ):
+                from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
+                    create_target_kv_contract,
+                )
+                from vllm.v1.spec_decode.remote.target_kv_protocol import TargetKVHello
+                from vllm.v1.spec_decode.remote.target_kv_session import (
+                    TargetKVRemoteSession,
+                )
+
+                contract = create_target_kv_contract(remote.llm.llm_engine.vllm_config)
+                budget = contract.snapshot_budget
+                sibling = servers.enter_context(
+                    closing(
+                        TargetKVRemoteSession(
+                            endpoints[0],
+                            TargetKVHello(
+                                "completed-request-credit",
+                                contract.fingerprint,
+                                contract.hidden_size,
+                                contract.vocab_size,
+                                budget.max_model_len,
+                                budget.max_pages,
+                                budget.max_bytes,
+                                max_num_seqs=contract.max_num_seqs,
+                            ),
+                            expected_specs=contract.expected_specs,
+                            request_timeout_ms=5000,
+                            startup_timeout_ms=600000,
+                        )
+                    )
+                )
             for inputs, reference in (
                 (prompts, expected),
                 (list(reversed(prompts)), list(reversed(expected))),
@@ -270,19 +431,172 @@ def test_remote_mtp_matches_target_and_uses_drafts(
                 assert all(len(x.outputs[0].token_ids) == 16 for x in outputs)
                 if before_recovery is not None:
                     remote.llm.llm_engine.do_log_stats()
+                    metrics = remote.llm.get_metrics()
                     for name in metric_names:
                         assert (
-                            get_spec_decode_metric_value(remote.llm.get_metrics(), name)
+                            get_spec_decode_metric_value(metrics, name)
                             > before_recovery[name]
                         )
                     before_recovery = None
+                if sibling is not None:
+                    # Drain finished-request cleanup without closing the engine's
+                    # draft connection or changing its GPU allocations.
+                    remote.llm.sleep(level=0, mode="wait")
+                    try:
+                        key = sibling.open_sequence(0, deadline=sibling.deadline())
+                        assert sibling.active(key)
+                        sibling.close_sequences((key,))
+                        assert not sibling.records
+                    finally:
+                        remote.llm.wake_up(tags=["scheduling"])
             remote.llm.llm_engine.do_log_stats()
             metrics = remote.llm.get_metrics()
-            for name in (
-                "vllm:spec_decode_num_draft_tokens",
-                "vllm:spec_decode_num_accepted_tokens",
-            ):
+            for name in metric_names:
                 assert get_spec_decode_metric_value(metrics, name) > 0
+            if not target_kv and num_workers > 1:
+                assert len(set(result_writes)) == num_workers
+
+
+@pytest.fixture
+def sliding_window_models(tmp_path):
+    """Equal real weights with different target/draft attention windows."""
+    import torch
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import MistralConfig, MistralForCausalLM, TokenizersBackend
+
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({f"token{i}": i for i in range(128)})),
+        bos_token="token0",
+        eos_token="token1",
+        pad_token="token2",
+    )
+    config = MistralConfig(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        sliding_window=32,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = MistralForCausalLM(config)
+    paths = (tmp_path / "target", tmp_path / "draft")
+    for path, window in zip(paths, (32, 16)):
+        model.config.sliding_window = window
+        model.save_pretrained(path)
+        tokenizer.save_pretrained(path)
+    return tuple(str(path) for path in paths)
+
+
+def test_remote_sliding_window_draft_matches_native_and_target(
+    vllm_runner, monkeypatch, tmp_path, sliding_window_models, record_property
+):
+    """Retain old KV positions while native attention applies the draft window."""
+    assert current_platform.is_cuda(), "this test belongs to the NVIDIA CI step"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    target, draft = sliding_window_models
+    kwargs = dict(
+        tokenizer_mode="hf",
+        trust_remote_code=False,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        block_size=16,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.2,
+        attention_config={"backend": "TRITON_ATTN"},
+        disable_log_stats=False,
+    )
+    prompts = [
+        {"prompt_token_ids": [3 + (i * 7) % 125 for i in range(length)]}
+        for length in (15, 17, 33, 65)
+    ]
+    batches = (prompts[:1], [prompts[i] for i in (2, 0, 3, 1)])
+    sampling = SamplingParams(
+        temperature=0, max_tokens=8, ignore_eos=True, detokenize=False
+    )
+
+    def generate(runner):
+        return [
+            [
+                list(output.outputs[0].token_ids)
+                for output in runner.llm.generate(batch, sampling, use_tqdm=False)
+            ]
+            for batch in batches
+        ]
+
+    def assert_speculation(runner, mode):
+        runner.llm.llm_engine.do_log_stats()
+        metrics = runner.llm.get_metrics()
+        for name in (
+            "vllm:spec_decode_num_draft_tokens",
+            "vllm:spec_decode_num_accepted_tokens",
+        ):
+            value = get_spec_decode_metric_value(metrics, name)
+            record_property(f"{mode}.{name}", value)
+            assert value > 0
+
+    config = dict(
+        method="draft_model",
+        model=draft,
+        num_speculative_tokens=3,
+        draft_tensor_parallel_size=1,
+        draft_sample_method="greedy",
+        attention_backend="TRITON_ATTN",
+    )
+    with vllm_runner(target, **kwargs) as baseline:
+        expected = generate(baseline)
+    assert all(len(tokens) == 8 for batch in expected for tokens in batch)
+    with vllm_runner(target, speculative_config=config, **kwargs) as native:
+        assert generate(native) == expected
+        assert_speculation(native, "native")
+    for num_workers in (1, 2):
+        with ExitStack() as servers:
+            endpoints = tuple(
+                servers.enter_context(
+                    draft_server(
+                        target,
+                        tmp_path / f"token-{num_workers}-{i}.log",
+                        token_only_draft=draft,
+                    )
+                )
+                for i in range(num_workers)
+            )
+            remote_config = dict(
+                config,
+                execution=dict(
+                    placement="remote",
+                    endpoints=endpoints,
+                    transport="inline",
+                    failure_policy="error",
+                    request_timeout_ms=5000,
+                    startup_timeout_ms=600000,
+                ),
+            )
+            with vllm_runner(
+                target, speculative_config=remote_config, **kwargs
+            ) as remote:
+                actual_config = remote.llm.llm_engine.vllm_config.speculative_config
+                assert actual_config.use_remote_draft()
+                assert actual_config.get_remote_draft_endpoints() == endpoints
+                assert generate(remote) == expected
+                assert_speculation(remote, f"remote-{num_workers}")
 
 
 @contextmanager
