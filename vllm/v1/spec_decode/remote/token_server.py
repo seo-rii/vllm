@@ -71,8 +71,9 @@ class TokenDraftServer(RemoteDraftServer):
         return self._start_listener(endpoint, name="token-draft-acceptor")
 
     def _serve_connection(self, conn: FramedConnection) -> None:
-        session = _TokenServerSession(self, conn)
+        session: _TokenServerSession | None = None
         try:
+            session = _TokenServerSession(self, conn)
             session.run()
         except (
             TransportError,
@@ -84,18 +85,23 @@ class TokenDraftServer(RemoteDraftServer):
             pass
         except Exception:
             logger.exception(
-                "Remote token draft session %s crashed", session.session_id
+                "Remote token draft session %s crashed",
+                getattr(session, "session_id", "<initializing>"),
             )
         finally:
             try:
-                if not self._shutdown_failed and not self._cleanup_failed:
+                if (
+                    session is not None
+                    and not self._shutdown_failed
+                    and not self._cleanup_failed
+                ):
                     session.cleanup()
             except SequenceCleanupFailed:
                 pass
             except Exception:
                 logger.exception(
                     "Failed to clean up remote token draft session %s",
-                    session.session_id,
+                    getattr(session, "session_id", "<initializing>"),
                 )
             finally:
                 try:

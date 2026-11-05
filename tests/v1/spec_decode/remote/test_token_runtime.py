@@ -84,6 +84,73 @@ def test_token_server_releases_handshake_admission_and_bounds_data(socket_runtim
         session._conn.recv(timeout=2)
 
 
+def test_token_session_construction_failure_releases_admission(
+    socket_runtime, monkeypatch
+):
+    import threading
+
+    from vllm.v1.spec_decode.remote import token_server
+    from vllm.v1.spec_decode.remote.transport import ConnectionClosed, connect
+
+    _, _, server, sibling = socket_runtime
+    baseline = sibling.open_sequence(99, deadline=sibling.deadline())
+    sibling.close_sequences((baseline,))
+    server.max_handshakes = 1
+    construct = token_server._TokenServerSession
+    attempted = threading.Event()
+    failed_workers: list[threading.Thread] = []
+    failed_connections = []
+    thread_errors: list[threading.ExceptHookArgs] = []
+
+    def fail_once(owner, conn):
+        if not failed_workers:
+            failed_workers.append(threading.current_thread())
+            failed_connections.append(conn)
+            attempted.set()
+            raise MemoryError("injected token session construction failure")
+        return construct(owner, conn)
+
+    replacement = TokenOnlyRemoteSession(
+        sibling.endpoint, sibling.hello, request_timeout_ms=5000
+    )
+    failed_peer = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "excepthook", thread_errors.append)
+            patch.setattr(token_server, "_TokenServerSession", fail_once)
+            failed_peer = connect(sibling.endpoint, timeout=2)
+            assert attempted.wait(2)
+            failed_workers[0].join(timeout=2)
+            assert not failed_workers[0].is_alive()
+            assert not thread_errors
+            assert failed_connections[0].closed
+            with pytest.raises(ConnectionClosed):
+                failed_peer.recv(timeout=2)
+            assert len(server._connections) == 1
+            assert not server._handshaking
+            assert server.healthy
+
+            replacement.connect()
+            for sequence_id, client in enumerate((sibling, replacement)):
+                key = client.open_sequence(sequence_id, deadline=client.deadline())
+                client.prefill(key, (1,), is_final=True, deadline=client.deadline())
+                result = client.collect(
+                    client.dispatch(
+                        0,
+                        (TokenAdvanceRow(key, 1, None, 0, 0, (2,)),),
+                        1,
+                        deadline=client.deadline(),
+                    )
+                )
+                assert result.valid_lengths == (1,)
+                client.close_sequences((key,))
+            assert not thread_errors
+    finally:
+        if failed_peer is not None:
+            failed_peer.close()
+        replacement.close()
+
+
 @pytest.mark.parametrize("operation", ["close", "disconnect"])
 @pytest.mark.parametrize("failure", [False, True])
 def test_token_server_cleanup_fence_retains_owners_without_thread_errors(

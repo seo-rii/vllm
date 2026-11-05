@@ -31,7 +31,6 @@ def create_adapter(args):
 
     from vllm.config import AttentionConfig
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.spec_decode.remote.runtime.token_gpu import make_token_gpu_adapter
 
     config = EngineArgs(
@@ -49,11 +48,7 @@ def create_adapter(args):
         async_scheduling=False,
         enable_prefix_caching=False,
         enable_chunked_prefill=True,
-        attention_config=AttentionConfig(
-            backend=AttentionBackendEnum[args.target_attention_backend]
-            if args.target_attention_backend
-            else None
-        ),
+        attention_config=AttentionConfig(backend=args.target_attention_backend),
         block_size=args.block_size,
         speculative_config={
             "model": args.draft_model,

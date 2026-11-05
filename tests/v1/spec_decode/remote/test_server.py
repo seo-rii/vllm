@@ -2161,6 +2161,62 @@ def test_registry_counts_track_open_sequences():
     assert registry.count("other") == 0
 
 
+@pytest.mark.parametrize(
+    ("initial", "failure"),
+    [
+        (initial, failure)
+        for initial in ("empty", "sibling", "replacement")
+        for failure in ("entry", "publication", "count", "outcome")
+        if (initial, failure) != ("replacement", "count")
+    ],
+)
+def test_registry_failed_open_preserves_counts_and_ownership(
+    monkeypatch, initial, failure
+):
+    registry = SequenceRegistry()
+    previous = key(1)
+    if initial != "empty":
+        registry.open(previous, owner="original")
+    previous_entry = registry.get(previous)
+    previous_count = registry.count(VERIFIER)
+    attempted = key(1, generation=1) if initial == "replacement" else key(2)
+
+    def fail_allocation(*args, **kwargs):
+        raise MemoryError("injected registry allocation failure")
+
+    class RejectInsert(dict):
+        __setitem__ = fail_allocation
+
+    with monkeypatch.context() as patch:
+        if failure == "entry":
+            patch.setattr(server_module, "SequenceEntry", fail_allocation)
+        elif failure == "outcome":
+            patch.setattr(server_module, "OpenOutcome", fail_allocation)
+        else:
+            field = "_entries" if failure == "publication" else "_counts"
+            patch.setattr(registry, field, RejectInsert(getattr(registry, field)))
+        with pytest.raises(MemoryError, match="registry allocation"):
+            registry.open(attempted, owner="attempt")
+        assert registry.get(attempted) is None
+        assert registry.get(previous) is previous_entry
+        assert len(registry) == registry.count(VERIFIER) == previous_count
+        assert registry.close_all("attempt") == ()
+        assert registry.count(VERIFIER) == previous_count
+
+    # A later successful open and both owners' cleanup must balance the count.
+    outcome = registry.open(attempted, owner="attempt")
+    assert outcome.created
+    assert outcome.replaced == (previous if initial == "replacement" else None)
+    assert (
+        len(registry)
+        == registry.count(VERIFIER)
+        == (1 if initial == "replacement" else previous_count + 1)
+    )
+    assert registry.close_all("attempt") == (attempted,)
+    registry.close_all("original")
+    assert len(registry) == registry.count(VERIFIER) == 0
+
+
 def test_registry_close_all_releases_only_owned_entries():
     registry = SequenceRegistry()
     registry.open(key(1), owner="s1")
@@ -2289,6 +2345,203 @@ def test_connection_admission_is_bounded_and_recovers(adapter, saturated):
         if replacement is not None:
             replacement.close()
         server.stop()
+
+
+@pytest.mark.parametrize("failure", ["construct", "start"])
+def test_session_thread_failure_releases_admission_and_preserves_sibling(
+    adapter, monkeypatch, failure
+):
+    server = RemoteDraftServer(adapter, max_connections=2, max_handshakes=1)
+    endpoint = server.start("tcp://127.0.0.1:0")
+    sibling = RawClient(endpoint)
+    rejected = replacement = None
+    injected = threading.Event()
+    thread_errors: list[threading.ExceptHookArgs] = []
+    thread_type, start_thread = threading.Thread, threading.Thread.start
+    stopped = False
+
+    def construct(*args, **kwargs):
+        if kwargs.get("name") == "remote-draft-session" and not injected.is_set():
+            injected.set()
+            raise MemoryError("injected session thread allocation failure")
+        return thread_type(*args, **kwargs)
+
+    def start(worker):
+        if worker.name == "remote-draft-session" and not injected.is_set():
+            injected.set()
+            raise RuntimeError("can't start new thread")
+        return start_thread(worker)
+
+    def admission_returned():
+        with server._connections_lock:
+            return len(server._connections) == 1 and not server._handshaking
+
+    try:
+        assert isinstance(sibling.hello(), HelloAck)
+        sibling.ready(key(1))
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "excepthook", thread_errors.append)
+            if failure == "construct":
+                patch.setattr(threading, "Thread", construct)
+            else:
+                patch.setattr(threading.Thread, "start", start)
+            rejected = connect(endpoint, timeout=1)
+            assert injected.wait(1)
+            assert wait_until(lambda: thread_errors or admission_returned(), timeout=1)
+            assert not thread_errors, [error.exc_value for error in thread_errors]
+            with pytest.raises(ConnectionClosed):
+                rejected.recv(timeout=1)
+            assert admission_returned()
+            assert len(server._workers) == 1
+
+        pong = sibling.call(Ping(nonce=42))
+        assert pong.healthy and pong.active_sequences == 1
+        assert sibling.result(sibling.propose(0, [key(1)], [4])) == (
+            [expected_row(4)],
+            [NUM_SPEC_TOKENS],
+            [OK],
+        )
+        replacement = RawClient(endpoint)
+        assert isinstance(
+            replacement.hello(verifier_instance_id="replacement"), HelloAck
+        )
+        assert sibling.call(Ping(nonce=43)).healthy
+        sibling.close()
+        replacement.close()
+        server.stop()
+        stopped = True
+        assert not server._workers and not server._connections
+        assert not server._handshaking and not len(server.registry)
+    finally:
+        sibling.close()
+        if rejected is not None:
+            rejected.close()
+        if replacement is not None:
+            replacement.close()
+        if not stopped:
+            try:
+                server.stop()
+            except RuntimeError as error:
+                # Keep a pre-fix failure from stranding real socket workers:
+                # stop() cannot join the failed, never-started worker.
+                if "cannot join thread before it is started" not in str(error):
+                    raise
+                for worker in server._workers:
+                    if worker.ident is not None:
+                        worker.join(timeout=2)
+                        assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("failure", ["construct", "start"])
+def test_session_thread_failure_preserves_connection_cleanup_error(
+    adapter, monkeypatch, failure
+):
+    original = (
+        MemoryError("injected session thread allocation failure")
+        if failure == "construct"
+        else RuntimeError("can't start new thread")
+    )
+    cleanup_error = OSError(errno.EIO, "injected accepted socket cleanup failure")
+    accepted = []
+
+    class FailingThread(threading.Thread):
+        def __init__(self, *args, **kwargs):
+            if kwargs.get("name") == "remote-draft-session" and failure == "construct":
+                raise original
+            super().__init__(*args, **kwargs)
+
+        def start(self):
+            if self.name == "remote-draft-session":
+                raise original
+            return super().start()
+
+    class FailingSocket(socket.socket):
+        fail_close = False
+
+        def accept(self):
+            conn, address = super().accept()
+            conn.fail_close = True
+            accepted.append(conn)
+            return conn, address
+
+        def close(self):
+            super().close()
+            if self.fail_close:
+                self.fail_close = False
+                raise cleanup_error
+
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+    monkeypatch.setattr(socket, "socket", FailingSocket)
+    server = RemoteDraftServer(adapter)
+    endpoint = server.start("tcp://127.0.0.1:0")
+    client = connect(endpoint, timeout=1)
+    try:
+        assert server.wait(2)
+        assert not server.healthy
+        assert isinstance(server._lifecycle_error, BaseExceptionGroup)
+        assert server._lifecycle_error.exceptions == (original, cleanup_error)
+        with pytest.raises(ConnectionClosed):
+            client.recv(timeout=1)
+        assert len(accepted) == 1 and accepted[0].fileno() == -1
+        server.stop()
+        with pytest.raises(server_module.ServerShutdownTimeout, match="restart"):
+            server.start(endpoint)
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_session_construction_failure_releases_admission_and_preserves_sibling(
+    adapter, monkeypatch, caplog
+):
+    server = RemoteDraftServer(adapter, max_connections=2, max_handshakes=1)
+    endpoint = server.start("tcp://127.0.0.1:0")
+    sibling = RawClient(endpoint)
+    failed = replacement = None
+    injected = threading.Event()
+    thread_errors: list[threading.ExceptHookArgs] = []
+
+    def fail_construction(*args, **kwargs):
+        injected.set()
+        raise MemoryError("injected session construction failure")
+
+    def admission_returned():
+        with server._connections_lock:
+            return len(server._connections) == 1 and not server._handshaking
+
+    try:
+        assert isinstance(sibling.hello(), HelloAck)
+        sibling.ready(key(1))
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "excepthook", thread_errors.append)
+            patch.setattr(server_module, "_ServerSession", fail_construction)
+            failed = connect(endpoint, timeout=1)
+            assert injected.wait(1)
+            assert wait_until(lambda: thread_errors or admission_returned(), timeout=1)
+            assert not thread_errors, [error.exc_value for error in thread_errors]
+            with pytest.raises(ConnectionClosed):
+                failed.recv(timeout=1)
+            assert admission_returned()
+        assert "injected session construction failure" in caplog.text
+        assert sibling.call(Ping(nonce=42)).healthy
+        assert sibling.result(sibling.propose(0, [key(1)], [4])) == (
+            [expected_row(4)],
+            [NUM_SPEC_TOKENS],
+            [OK],
+        )
+        replacement = RawClient(endpoint)
+        assert isinstance(
+            replacement.hello(verifier_instance_id="replacement"), HelloAck
+        )
+    finally:
+        sibling.close()
+        if failed is not None:
+            failed.close()
+        if replacement is not None:
+            replacement.close()
+        server.stop()
+    assert not server._workers and not server._connections
+    assert not server._handshaking and not len(server.registry)
 
 
 @pytest.mark.parametrize("partial", [b"\x01", b"\x02\x00\x00\x00\x08x"])

@@ -34,6 +34,12 @@ def init_speculator(
         getattr(getattr(speculative_config, "execution", None), "placement", None)
         == "remote"
     ):
+        if speculative_config.use_gemma4_mtp():
+            from vllm.v1.worker.gpu.spec_decode.target_kv_remote import (
+                TargetKVRemoteSpeculator,
+            )
+
+            return TargetKVRemoteSpeculator(vllm_config, device)
         if speculative_config.method == "draft_model":
             from vllm.v1.worker.gpu.spec_decode.token_remote import (
                 TokenOnlyRemoteSpeculator,
