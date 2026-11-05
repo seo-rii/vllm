@@ -254,7 +254,10 @@ def _validate_mtp_contract(target: Any, spec: Any) -> _MTPModelContract:
                 "standalone MTP requires scalar positions and text features"
             )
     if contract.canonical_text_mrope:
-        if spec.use_multi_module_mtp():
+        legacy_num_modules = getattr(config, "num_nextn_predict_layers", None)
+        if spec.use_multi_module_mtp() or (
+            legacy_num_modules is not None and legacy_num_modules != num_modules
+        ):
             raise ValueError("standalone Qwen3.5 requires one checkpoint MTP head")
         if target.uses_mrope:
             raise ValueError("standalone Qwen3.5 requires native flat-text positions")

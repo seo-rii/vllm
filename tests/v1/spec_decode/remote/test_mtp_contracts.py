@@ -1204,13 +1204,15 @@ def test_qwen35_native_target_config_must_match_the_draft_attention_geometry(tmp
 
 
 def test_qwen35_native_single_head_rejects_conflicting_module_count_metadata(tmp_path):
+    """Canonical native selection must not hide conflicting remote metadata."""
     config = _qwen35_public_config(
         tmp_path, k=2, options={"num_nextn_predict_layers": 2}
     )
     spec = config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
     assert spec.draft_model_config.hf_config.mtp_num_hidden_layers == 1
-    assert spec.use_multi_module_mtp()
+    assert spec.num_mtp_modules() == 1
+    assert not spec.use_multi_module_mtp()
     with pytest.raises(ValueError, match="one checkpoint MTP head"):
         create_runtime_contract(config)
 
