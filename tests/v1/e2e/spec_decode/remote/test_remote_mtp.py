@@ -1350,9 +1350,11 @@ def _tiny_qwen35_mtp_model(tmp_path, *, routed):
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_qwen35_mtp_model; "
-        "_save_qwen35_mtp_model(sys.argv[1], routed=sys.argv[2] == 'moe')",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_qwen35_mtp_model; "
+            "_save_qwen35_mtp_model(sys.argv[1], routed=sys.argv[2] == 'moe')"
+        ),
         str(tmp_path),
         "moe" if routed else "dense",
     ]
