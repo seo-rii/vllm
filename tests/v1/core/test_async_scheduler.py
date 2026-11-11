@@ -24,7 +24,6 @@ def _make_model_runner_output(
     req_ids = list(scheduler_output.num_scheduled_tokens.keys())
     return ModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         sampled_token_ids=[[i] for i in range(len(req_ids))],
         logprobs=None,
         prompt_logprobs_dict={},
@@ -60,7 +59,6 @@ def test_worker_invalid_drafts_follow_queued_step_and_grammar_union(tmp_path):
         reversed_ids = ids[::-1]
         output = ModelRunnerOutput(
             req_ids=reversed_ids,
-            req_id_to_index={req_id: i for i, req_id in enumerate(reversed_ids)},
             sampled_token_ids=[tokens[req_id] for req_id in reversed_ids],
             num_invalid_spec_tokens=invalid,
         )
@@ -424,7 +422,6 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     )
     model_runner_output = ModelRunnerOutput(
         req_ids=[request.request_id],
-        req_id_to_index={request.request_id: 0},
         sampled_token_ids=[[123]],
         logprobs=None,
         prompt_logprobs_dict={},
@@ -541,7 +538,6 @@ class PipelinedEngine:
                 self.emitted_position[token] = view[0] - len(tokens) + offset
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
             sampled_token_ids=sampled_token_ids,
             logprobs=None,
             prompt_logprobs_dict={},
@@ -579,7 +575,6 @@ def _create_async_pp_scheduler(
         async_scheduling=True,
         num_speculative_tokens=num_spec or None,
         speculative_method="ngram_gpu" if num_spec else None,
-        use_v2_model_runner=True,
         num_blocks=num_blocks,
         block_size=16,
         max_num_batched_tokens=512,
@@ -627,7 +622,7 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
 
     Regression for the num_output_placeholders underflow EngineCore crash:
     with the fix reverted, the num_spec=3 variant fails with exactly
-    ``assert request.num_output_placeholders >= 0`` when a stale spec output
+    `assert request.num_output_placeholders >= 0` when a stale spec output
     returns after the preempted request was resumed and sampled.
     """
     max_tokens = 24
@@ -850,10 +845,7 @@ def test_resumable_request_handoff():
     """New streaming input resumes with the correct context and stale results
     are ignored.
     """
-    scheduler = create_scheduler(
-        async_scheduling=True,
-        use_v2_model_runner=True,
-    )
+    scheduler = create_scheduler(async_scheduling=True)
     engine = PipelinedEngine(scheduler, queue_size=3)
     engine._next_token = EOS_TOKEN_ID
 

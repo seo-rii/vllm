@@ -141,11 +141,7 @@ def supports_token_prefix_replay(config: "VllmConfig") -> bool:
 
 def supports_token_async_scheduling(config: "VllmConfig") -> bool:
     """Whether the verifier can use async scheduling with same-step token RPCs."""
-    return (
-        supports_token_prefix_replay(config)
-        and config.use_v2_model_runner
-        and config.model_config.enforce_eager
-    )
+    return supports_token_prefix_replay(config) and config.model_config.enforce_eager
 
 
 def _validate_token_draft_topology(config: "VllmConfig") -> int:
@@ -244,11 +240,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
         raise ValueError("token-only runtime requires an independent draft_model")
     if config.parallel_config.tensor_parallel_size != 1:
         raise ValueError("token-only remote drafting requires target TP1")
-    if (
-        spec.parallel_drafting
-        or spec.draft_sample_method != "greedy"
-        or spec.use_heterogeneous_vocab
-    ):
+    if spec.parallel_drafting or spec.draft_sample_method != "greedy":
         raise ValueError(
             "token-only runtime requires sequential same-tokenizer greedy drafting"
         )

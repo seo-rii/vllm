@@ -2585,21 +2585,21 @@ def test_public_engine_args_admit_full_attention_prefix_replay(tmp_path, family)
 
 
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_token_async_capability_requires_mrv2(tmp_path, monkeypatch, prefix_caching):
-    """MRV1 cannot enable remote async capability, independently of prefix caching."""
-    from vllm.platforms import current_platform
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_token_async_capability_requires_eager_execution(
+    tmp_path, prefix_caching, enforce_eager
+):
+    """Async token RPCs require eager execution regardless of prefix caching."""
     from vllm.v1.spec_decode.remote.runtime.token_schema import (
         supports_token_async_scheduling,
         supports_token_prefix_replay,
     )
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     config = token_config(
         tmp_path,
         dtype="bfloat16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         cache_options={"enable_prefix_caching": prefix_caching},
-        scheduler_options={"async_scheduling": True},
         spec_options={
             "execution": {
                 "placement": "remote",
@@ -2609,12 +2609,9 @@ def test_token_async_capability_requires_mrv2(tmp_path, monkeypatch, prefix_cach
             }
         },
     )
-    assert config.model_config.enforce_eager
-    if current_platform.is_cpu():
-        assert not config.scheduler_config.async_scheduling
-    assert not config.use_v2_model_runner
+    assert config.model_config.enforce_eager is enforce_eager
     assert supports_token_prefix_replay(config)
-    assert not supports_token_async_scheduling(config)
+    assert supports_token_async_scheduling(config) is enforce_eager
 
 
 @pytest.mark.parametrize("unsupported", ["window", "recurrent", "mla", "pool", "tp2"])
