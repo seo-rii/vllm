@@ -120,7 +120,11 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
             get_supported_kv_cache_layouts,
             resolve_kv_cache_layout,
         )
-        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MambaSpec,
+            get_block_table_width,
+        )
         from vllm.v1.spec_decode.remote.runtime.recurrent_kv import (
             make_recurrent_kv_config,
         )
@@ -128,7 +132,6 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
             create_token_runtime_contract,
         )
         from vllm.v1.spec_decode.remote.runtime.weights import model_weight_bytes
-        from vllm.v1.worker.block_table import get_block_table_width
         from vllm.v1.worker.gpu.attn_utils import (
             get_kv_cache_spec,
             init_attn_backend,
