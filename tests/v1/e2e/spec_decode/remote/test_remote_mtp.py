@@ -2785,7 +2785,6 @@ def _run_token_outcome_cache_oracle(model, result_path):
                     draft_tp=config.speculative_config.draft_parallel_config.tensor_parallel_size,
                     enforce_eager=config.model_config.enforce_eager,
                     async_scheduling=config.scheduler_config.async_scheduling,
-                    use_v2_model_runner=config.use_v2_model_runner,
                     primitive_max_k=4,
                     source_requested_k=3,
                     executor_request_slots=executor.max_num_reqs,
@@ -2852,8 +2851,10 @@ def test_remote_token_outcome_cache_matches_native_and_target(
             [
                 sys.executable,
                 "-c",
-                f"import sys; from {module} import "
-                "_save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+                (
+                    f"import sys; from {module} import "
+                    "_save_token_prefix_models; _save_token_prefix_models(sys.argv[1])"
+                ),
                 str(tmp_path),
             ],
             env=dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_TARGET_DEVICE="cpu"),
@@ -2877,9 +2878,11 @@ def test_remote_token_outcome_cache_matches_native_and_target(
             [
                 sys.executable,
                 "-c",
-                f"import sys; from {module} import "
-                "_run_token_outcome_cache_oracle; "
-                "_run_token_outcome_cache_oracle(*sys.argv[1:])",
+                (
+                    f"import sys; from {module} import "
+                    "_run_token_outcome_cache_oracle; "
+                    "_run_token_outcome_cache_oracle(*sys.argv[1:])"
+                ),
                 target,
                 str(result),
             ],
@@ -2927,7 +2930,7 @@ def test_remote_token_outcome_cache_matches_native_and_target(
         ) as runner:
             assert isinstance(runner.llm.llm_engine.engine_core, InprocClient)
             config = runner.llm.llm_engine.vllm_config
-            assert config.model_config.enforce_eager and config.use_v2_model_runner
+            assert config.model_config.enforce_eager
             assert not config.scheduler_config.async_scheduling
             assert config.parallel_config.tensor_parallel_size == 1
             policy = None
@@ -2944,7 +2947,6 @@ def test_remote_token_outcome_cache_matches_native_and_target(
                 draft_tp=None if speculative is None else 1,
                 enforce_eager=config.model_config.enforce_eager,
                 async_scheduling=config.scheduler_config.async_scheduling,
-                use_v2_model_runner=config.use_v2_model_runner,
             )
             prompt = {"prompt_token_ids": [3] * 17}
             sampling = SamplingParams(
