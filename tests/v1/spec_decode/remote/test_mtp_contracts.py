@@ -937,7 +937,9 @@ def test_step35_native_load_requires_each_packed_attention_source(
     ):
         model = loader.create_model(config, draft)
         if omitted is not None:
-            with pytest.raises(ValueError, match=rf"{omitted}_proj\.weight"):
+            with pytest.raises(
+                ValueError, match=rf"self_attn\.qkv_proj\.weight\.{omitted}"
+            ):
                 loader.load_weights(model, draft)
         else:
             loader.load_weights(model, draft)

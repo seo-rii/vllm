@@ -15,9 +15,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.mtp_validation import (
-    is_mtp_completeness_check_enabled,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
@@ -220,7 +217,6 @@ class Step3p5MTP(nn.Module):
         ]
 
         loaded_params: set[str] = set()
-        loaded_qkv_parts: dict[str, set[str]] = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -250,8 +246,6 @@ class Step3p5MTP(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                if param_name == "qkv_proj" and name.endswith(".weight"):
-                    loaded_qkv_parts.setdefault(name, set()).add(weight_name)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -301,38 +295,7 @@ class Step3p5MTP(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    if name.endswith(".qkv_proj.weight"):
-                        loaded_qkv_parts[name] = {"q_proj", "k_proj", "v_proj"}
             loaded_params.add(name)
-        if is_mtp_completeness_check_enabled():
-            for name, parts in loaded_qkv_parts.items():
-                missing = {"q_proj", "k_proj", "v_proj"} - parts
-                if missing:
-                    prefix = name.removesuffix("qkv_proj.weight")
-                    names = sorted(f"{prefix}{part}.weight" for part in missing)
-                    raise ValueError(
-                        "Following weights were not initialized from "
-                        f"checkpoint: {names}"
-                    )
-        params_need_to_load = set(params_dict.keys())
-        # Some KV cache scales are optional: checkpoints may omit them and vLLM
-        # will fall back to default scales during initialization.
-        optional_params = {
-            name
-            for name, param in params_dict.items()
-            if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale"))
-            and getattr(param, "numel", lambda: 0)() == 1
-            and getattr(param, "requires_grad", False) is False
-        }
-        params_need_to_load -= optional_params
-        if params_need_to_load != loaded_params and is_mtp_completeness_check_enabled():
-            missing_params = list(params_need_to_load - loaded_params)
-            param_name_example = missing_params[0]
-            raise RuntimeError(
-                "Some parameters like "
-                f"{param_name_example} are not in the checkpoint and will falsely "
-                "use random initialization"
-            )
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int | None, name: str) -> str:

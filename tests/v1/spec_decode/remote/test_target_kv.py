@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     compute_layout_strides,
+    get_block_table_width,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.remote import target_kv
@@ -36,7 +37,6 @@ from vllm.v1.spec_decode.remote.target_kv import (
     select_draft_position,
     snapshot_target_kv,
 )
-from vllm.v1.worker.block_table import get_block_table_width
 
 IDENTITY = SnapshotIdentity(SequenceKey("verifier", 8, 3), 2, 7)
 BUDGET = SnapshotBudget(max_pages=100, max_bytes=1 << 20, max_model_len=128)
