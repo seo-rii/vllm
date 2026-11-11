@@ -9,7 +9,7 @@ imports own separate storage; neither retains an alias to target KV.
 The caller must fence target writes/reallocation while snapshotting and order
 them on the current CUDA stream. Copies complete before either API returns.
 An imported cache must remain alive until its consumer completes; consumers on
-another CUDA stream must also call ``record_stream``. Cancellation is not a
+another CUDA stream must also call `record_stream`. Cancellation is not a
 completion event and does not authorize reuse of an export or imported cache.
 Recoverable copy failures are fenced before propagation. A context-fatal CUDA
 error or unknown copy completion requires abandoning the runtime; callers must
@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVQuantMode,
     SlidingWindowSpec,
+    get_block_table_width,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.remote.errors import (
@@ -33,7 +34,6 @@ from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
 )
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
-from vllm.v1.worker.block_table import get_block_table_width
 
 AttentionSpec = FullAttentionSpec | SlidingWindowSpec
 
@@ -376,7 +376,7 @@ def snapshot_target_kv(
         plans.append((source, start, first, blocks))
 
     layers = []
-    for source, start, first, blocks in plans:
+    for source, _start, first, blocks in plans:
         pages = torch.zeros(
             (len(blocks), *_page_shape(source.spec)),
             dtype=source.spec.dtype,
