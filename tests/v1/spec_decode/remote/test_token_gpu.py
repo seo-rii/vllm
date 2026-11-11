@@ -121,13 +121,15 @@ def test_native_independent_loader_never_needs_target_weights(tmp_path):
 
 
 @pytest.fixture
-def token_executor(monkeypatch, tmp_path):
+def token_executor(monkeypatch, tmp_path, request):
     import vllm.v1.spec_decode.remote.runtime.token_gpu as runtime
     import vllm.v1.worker.gpu.buffer_utils as buffers
     import vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator as native
+    from tests.v1.spec_decode.remote.test_token_runtime import token_config
+    from vllm.config import set_current_vllm_config
     from vllm.v1.worker.gpu.block_table import BlockTables
 
-    from .test_token_runtime import token_config
+    request.getfixturevalue("cpu_parallel_state")
 
     class Kernel:
         def __getitem__(self, grid):
@@ -202,12 +204,9 @@ def token_executor(monkeypatch, tmp_path):
         def compute_logits(self, hidden):
             return torch.cat((hidden, hidden + 1), dim=1)
 
-    speculator = object.__new__(StandaloneARSpeculator)
+    with set_current_vllm_config(executor.vllm_config):
+        speculator = StandaloneARSpeculator(executor.vllm_config, executor.device)
     speculator.model = Model()
-    speculator.vllm_config = executor.vllm_config
-    speculator.current_draft_step = torch.tensor(0)
-    speculator.use_local_argmax_reduction = False
-    speculator.acceptance_estimator = None
     executor.speculator = speculator
     monkeypatch.setattr(
         runtime, "set_current_vllm_config", lambda config: nullcontext()
