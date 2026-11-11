@@ -2677,6 +2677,7 @@ def test_token_mla_draft_rejects_unvalidated_combinations(tmp_path, options, rea
         (None, None),
         ({"head_size": 575}, "MLA KV geometry"),
         ({"dtype": "float16"}, "MLA KV geometry"),
+        ("block_size", "MLA KV geometry"),
         ({"topk_buffer_width": 8}, "dense MLA without an indexer"),
         ({"is_index_group_leader": True}, "dense MLA without an indexer"),
         ("full", "requires MLA KV"),
@@ -2699,7 +2700,7 @@ def test_token_mla_kv_checks_contract_geometry(tmp_path, change, reason):
         token_config(tmp_path, draft_type="deepseek_v2", dtype="bfloat16")
     )
     layout = MLAAttentionSpec(
-        block_size=16,
+        block_size=config.cache_config.block_size,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
@@ -2709,8 +2710,10 @@ def test_token_mla_kv_checks_contract_geometry(tmp_path, change, reason):
         if "dtype" in change:
             change = change | {"dtype": getattr(torch, change["dtype"])}
         layout = replace(layout, **change)
+    elif change == "block_size":
+        layout = replace(layout, block_size=2 * config.cache_config.block_size)
     full = FullAttentionSpec(
-        block_size=16,
+        block_size=config.cache_config.block_size,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
