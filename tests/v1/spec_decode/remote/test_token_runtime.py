@@ -939,9 +939,11 @@ def test_token_otlp_context_links_across_real_socket(tmp_path):
             sys.executable,
             "-B",
             "-c",
-            "from tests.v1.spec_decode.remote.test_token_runtime import "
-            "_check_token_otlp_trace_links; import sys; "
-            "_check_token_otlp_trace_links(sys.argv[1])",
+            (
+                "from tests.v1.spec_decode.remote.test_token_runtime import "
+                "_check_token_otlp_trace_links; import sys; "
+                "_check_token_otlp_trace_links(sys.argv[1])"
+            ),
             str(tmp_path),
         ],
         capture_output=True,

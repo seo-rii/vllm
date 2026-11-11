@@ -251,11 +251,12 @@ def test_remote_mtp_observability_through_openai_server(
                 if tracing:
                     with changed:
                         assert changed.wait_for(
-                            lambda: any(
-                                s.name == "remote_draft.proposal" for s in spans
-                            )
-                            and any(
-                                s.name == "remote_draft.server.proposal" for s in spans
+                            lambda: (
+                                any(s.name == "remote_draft.proposal" for s in spans)
+                                and any(
+                                    s.name == "remote_draft.server.proposal"
+                                    for s in spans
+                                )
                             ),
                             timeout=30,
                         ), "target and standalone draft did not export their spans"
