@@ -2545,7 +2545,7 @@ def test_open_many_reconnect_uses_remaining_preparation_budget(
     def reconnect(*, timeout_s):
         budgets.append(timeout_s)
         connect(timeout_s=timeout_s)
-        clock.advance(0.06)
+        clock.now = deadline
 
     monkeypatch.setattr(session, "connect", reconnect)
     keys = session.open_sequences((1, 2), deadline=deadline)
