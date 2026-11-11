@@ -30,7 +30,6 @@ def test_model_runner_invalid_draft_metadata_round_trip(invalid):
 
     output = ModelRunnerOutput(
         req_ids=["second", "first"],
-        req_id_to_index={"second": 0, "first": 1},
         sampled_token_ids=[[7], [8, 9]],
         num_invalid_spec_tokens=invalid,
     )
@@ -44,10 +43,7 @@ def test_model_runner_invalid_draft_metadata_round_trip(invalid):
     assert decoded.req_ids == output.req_ids
     assert decoded.sampled_token_ids == [[7], [8, 9]]
     assert decoded.num_invalid_spec_tokens == invalid
-    assert (
-        ModelRunnerOutput(req_ids=[], req_id_to_index={}).num_invalid_spec_tokens
-        is None
-    )
+    assert ModelRunnerOutput(req_ids=[]).num_invalid_spec_tokens is None
 
 
 class UnrecognizedType(UserDict):
