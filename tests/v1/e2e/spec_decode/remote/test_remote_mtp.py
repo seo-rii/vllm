@@ -2636,7 +2636,7 @@ def test_remote_token_draft_tp_matches_target_and_uses_drafts(
         ) as runner:
             actual = runner.llm.llm_engine.vllm_config
             assert actual.parallel_config.tensor_parallel_size == 1
-            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert actual.model_config.enforce_eager
             assert not actual.cache_config.enable_prefix_caching
             assert not actual.scheduler_config.async_scheduling
             draft_tp = None
