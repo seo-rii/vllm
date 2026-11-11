@@ -359,11 +359,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         limitations=[
             "No target executes; acceptance and emitted tokens are synthetic.",
-            "RPC timing includes native draft, serialization, network and queue delay; "
-            "it is not isolated network latency.",
+            (
+                "RPC timing includes native draft, serialization, network and "
+                "queue delay; it is not isolated network latency."
+            ),
             "Tensor payload bytes exclude control metadata, framing, TCP and SSH.",
-            "Break-even excludes connection/open/prefill/close setup. It does not "
-            "establish serving throughput, overlap or GPU cost efficiency.",
+            (
+                "Break-even excludes connection/open/prefill/close setup. It does not "
+                "establish serving throughput, overlap or GPU cost efficiency."
+            ),
         ],
         request_records=requests,
         round_records=rounds,
