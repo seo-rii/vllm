@@ -370,9 +370,11 @@ def test_recurrent_allocation_accepts_loaded_native_checkpoint_capability(tmp_pa
                 [
                     sys.executable,
                     "-c",
-                    "import sys; from tests.v1.spec_decode.remote.test_token_gpu "
-                    "import _run_recurrent_native_cache_allocation; "
-                    "_run_recurrent_native_cache_allocation(sys.argv[1])",
+                    (
+                        "import sys; from tests.v1.spec_decode.remote.test_token_gpu "
+                        "import _run_recurrent_native_cache_allocation; "
+                        "_run_recurrent_native_cache_allocation(sys.argv[1])"
+                    ),
                     str(tmp_path),
                 ],
                 cwd=Path(__file__).resolve().parents[4],
