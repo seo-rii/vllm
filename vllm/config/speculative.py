@@ -1670,8 +1670,6 @@ class SpeculativeConfig:
                 unsupported.append("draft_sample_method must be greedy")
             if self.parallel_drafting:
                 unsupported.append("parallel_drafting is unsupported")
-            if self.use_heterogeneous_vocab:
-                unsupported.append("heterogeneous vocabularies are unsupported")
             if unsupported:
                 raise ValueError("remote token-only draft: " + "; ".join(unsupported))
             return
