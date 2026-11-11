@@ -341,18 +341,19 @@ def session(make_session):
 
 
 def test_manual_clock_round_uses_simulated_elapsed_time(session, clock, monkeypatch):
-    send = transport_module.FramedConnection.send_control
+    send = session._conn.send_control
     monotonic = time.monotonic
 
-    def preempted_send(conn, payload, **kwargs):
+    def preempted_send(payload, **kwargs):
         # Model host descheduling after the wire deadline was calculated.
         with monkeypatch.context() as patch:
             patch.setattr(time, "monotonic", lambda: monotonic() + 1.0)
-            return send(conn, payload, **kwargs)
+            return send(payload, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(transport_module.FramedConnection, "send_control", preempted_send)
+        patch.setattr(session._conn, "send_control", preempted_send)
         key = ready(session, 1)
+    assert time.monotonic is monotonic
     assert session.sequence_state(key) is SequenceState.READY
     handle = session.dispatch(batch(0, [key], recovery=[4]))
     clock.advance(0.101)
