@@ -1216,9 +1216,11 @@ def tiny_deepseek_mtp_model(tmp_path, ffn_layout):
     command = [
         sys.executable,
         "-c",
-        "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_deepseek_mtp_model; "
-        "import sys; _save_deepseek_mtp_model(*sys.argv[1:])",
+        (
+            "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_deepseek_mtp_model; "
+            "import sys; _save_deepseek_mtp_model(*sys.argv[1:])"
+        ),
         str(root),
         ffn_layout,
     ]
