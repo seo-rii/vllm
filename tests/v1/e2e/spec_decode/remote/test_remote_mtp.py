@@ -2564,8 +2564,10 @@ def test_remote_token_draft_tp_matches_target_and_uses_drafts(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])"
+        ),
         str(tmp_path),
     ]
     with (tmp_path / "tp-fixture.log").open("w") as log:
