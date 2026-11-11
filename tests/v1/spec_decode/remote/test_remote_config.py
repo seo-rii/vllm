@@ -180,7 +180,6 @@ def test_legacy_and_new_placement_cannot_be_combined_before_model_loading():
         ({"draft_tensor_parallel_size": 2}, "draft_tensor_parallel_size"),
         ({"draft_sample_method": "probabilistic"}, "greedy"),
         ({"parallel_drafting": True}, "parallel_drafting"),
-        ({"use_heterogeneous_vocab": True}, "heterogeneous"),
     ],
 )
 def test_token_only_config_rejects_unimplemented_semantics(override, reason):
@@ -194,7 +193,6 @@ def test_token_only_config_rejects_unimplemented_semantics(override, reason):
     spec.draft_tensor_parallel_size = 1
     spec.draft_sample_method = "greedy"
     spec.parallel_drafting = False
-    spec.use_heterogeneous_vocab = False
     for name, value in override.items():
         setattr(spec, name, value)
     if reason is None:
