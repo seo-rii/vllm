@@ -19,6 +19,7 @@ import torch
 
 from vllm.config.speculative import RemoteDraftConfig
 from vllm.v1.spec_decode.remote import cuda_ipc as ipc_module
+from vllm.v1.spec_decode.remote import server as server_module
 from vllm.v1.spec_decode.remote import session as session_module
 from vllm.v1.spec_decode.remote import transport as transport_module
 from vllm.v1.spec_decode.remote.capabilities import (
@@ -307,8 +308,14 @@ def server(adapter):
 
 
 @pytest.fixture
-def clock():
-    return FakeClock()
+def clock(monkeypatch):
+    clock = FakeClock()
+    # Session, wire and peer execution deadlines must share simulated time.
+    # Socket waits remain bounded; host scheduling does not spend this budget.
+    simulated_time = SimpleNamespace(monotonic=lambda: clock.now)
+    for module in (session_module, transport_module, server_module, ipc_module):
+        monkeypatch.setattr(module, "time", simulated_time)
+    return clock
 
 
 @pytest.fixture
@@ -331,6 +338,26 @@ def make_session(server, clock):
 @pytest.fixture
 def session(make_session):
     return make_session()
+
+
+def test_manual_clock_round_uses_simulated_elapsed_time(session, clock, monkeypatch):
+    send = transport_module.FramedConnection.send_control
+    monotonic = time.monotonic
+
+    def preempted_send(conn, payload, **kwargs):
+        # Model host descheduling after the wire deadline was calculated.
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "monotonic", lambda: monotonic() + 1.0)
+            return send(conn, payload, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport_module.FramedConnection, "send_control", preempted_send)
+        key = ready(session, 1)
+    assert session.sequence_state(key) is SequenceState.READY
+    handle = session.dispatch(batch(0, [key], recovery=[4]))
+    clock.advance(0.101)
+    assert session.collect(handle).row_statuses == (SpeculatorStatusCode.TIMEOUT,)
+    assert session.sequence_state(key) is SequenceState.TARGET_ONLY
 
 
 class _CudaFeature:
@@ -555,10 +582,10 @@ def test_adapter_cannot_exceed_the_requested_round_budget(
 @pytest.mark.parametrize("policy", ["target_only", "error"])
 @pytest.mark.parametrize("pending_ipc", [False, True])
 def test_local_failure_is_terminal_before_policy_or_ipc_cleanup(
-    make_session, make_ipc_session, policy, pending_ipc
+    make_session, make_ipc_session, clock, policy, pending_ipc
 ):
     if pending_ipc:
-        session, adapter, _, _ = make_ipc_session(failure_policy=policy)
+        session, adapter, _, _ = make_ipc_session(failure_policy=policy, clock=clock)
         key = ipc_ready(session, 1)
         exporter = session._ipc_exporter
         adapter.hold_batches.add(0)
@@ -774,7 +801,7 @@ def test_prefill_failure_retires_with_only_the_remaining_ack_budget(
 
     def retire_with_budget(conn, deadline):
         if session._retiring:
-            budgets.append(deadline - time.monotonic())
+            budgets.append(deadline - clock.now)
         return retire(conn, deadline)
 
     def close_and_notify(keys):
