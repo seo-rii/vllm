@@ -143,9 +143,11 @@ def draft_server(
             command = [
                 sys.executable,
                 "-c",
-                "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-                "import _serve_token_socket_cleanup_fault; "
-                "_serve_token_socket_cleanup_fault(sys.argv[1], sys.argv[2:])",
+                (
+                    "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+                    "import _serve_token_socket_cleanup_fault; "
+                    "_serve_token_socket_cleanup_fault(sys.argv[1], sys.argv[2:])"
+                ),
                 str(close_fault_receipt),
                 *command[3:],
             ]
@@ -1626,8 +1628,10 @@ def test_remote_token_cached_prefix_matches_native_and_target(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])"
+        ),
         str(tmp_path),
     ]
     with (tmp_path / "prefix-fixture.log").open("w") as log:
@@ -1711,7 +1715,7 @@ def test_remote_token_cached_prefix_matches_native_and_target(
             actual = runner.llm.llm_engine.vllm_config
             assert actual.scheduler_config.async_scheduling is async_scheduling
             assert actual.cache_config.enable_prefix_caching is prefix_caching
-            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert actual.model_config.enforce_eager
             assert actual.parallel_config.tensor_parallel_size == 1
             draft_tp = None
             if actual.speculative_config is not None:
@@ -1723,7 +1727,6 @@ def test_remote_token_cached_prefix_matches_native_and_target(
                 async_scheduling=actual.scheduler_config.async_scheduling,
                 prefix_caching=actual.cache_config.enable_prefix_caching,
                 enforce_eager=actual.model_config.enforce_eager,
-                use_v2_model_runner=actual.use_v2_model_runner,
                 target_tp=actual.parallel_config.tensor_parallel_size,
                 draft_tp=draft_tp,
             )
@@ -1814,8 +1817,10 @@ def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])"
+        ),
         str(tmp_path),
     ]
     with (tmp_path / "dynamic-k-fixture.log").open("w") as log:
@@ -1905,7 +1910,7 @@ def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
         ) as runner:
             actual = runner.llm.llm_engine.vllm_config
             assert actual.scheduler_config.async_scheduling
-            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert actual.model_config.enforce_eager
             assert not actual.cache_config.enable_prefix_caching
             assert actual.parallel_config.tensor_parallel_size == 1
             draft_tp = None
@@ -1922,7 +1927,6 @@ def test_remote_token_async_dynamic_k_preserves_concurrent_requests(
                 async_scheduling=actual.scheduler_config.async_scheduling,
                 prefix_caching=actual.cache_config.enable_prefix_caching,
                 enforce_eager=actual.model_config.enforce_eager,
-                use_v2_model_runner=actual.use_v2_model_runner,
                 target_tp=actual.parallel_config.tensor_parallel_size,
                 draft_tp=draft_tp,
                 k_schedule=(
@@ -2156,8 +2160,10 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_token_prefix_models; _save_token_prefix_models(sys.argv[1])"
+        ),
         str(tmp_path),
     ]
     with (tmp_path / "lifecycle-fixture.log").open("w") as log:
@@ -2299,7 +2305,7 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
         try:
             actual = engine.vllm_config
             assert actual.scheduler_config.async_scheduling
-            assert actual.model_config.enforce_eager and actual.use_v2_model_runner
+            assert actual.model_config.enforce_eager
             assert not actual.cache_config.enable_prefix_caching
             assert actual.parallel_config.tensor_parallel_size == 1
             assert actual.speculative_config is not None
@@ -2315,7 +2321,6 @@ async def test_remote_token_async_lifecycle_preserves_healthy_requests(
                     async_scheduling=actual.scheduler_config.async_scheduling,
                     prefix_caching=actual.cache_config.enable_prefix_caching,
                     enforce_eager=actual.model_config.enforce_eager,
-                    use_v2_model_runner=actual.use_v2_model_runner,
                     target_tp=actual.parallel_config.tensor_parallel_size,
                     draft_tp=actual.speculative_config.draft_parallel_config.tensor_parallel_size,
                     execution=spec["execution"],
