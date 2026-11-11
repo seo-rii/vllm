@@ -8,20 +8,6 @@ from safetensors.torch import load_file, save_file
 from tests.v1.spec_decode.remote.runtime_fixtures import (
     cpu_parallel_state as cpu_parallel_state,
 )
-from vllm.model_executor.model_loader.mtp_validation import (
-    disable_mtp_completeness_check,
-    is_mtp_completeness_check_enabled,
-)
-
-
-def test_disable_mtp_completeness_check_is_scoped():
-    assert is_mtp_completeness_check_enabled()
-
-    with pytest.raises(RuntimeError), disable_mtp_completeness_check():
-        assert not is_mtp_completeness_check_enabled()
-        raise RuntimeError
-
-    assert is_mtp_completeness_check_enabled()
 
 
 @pytest.mark.parametrize("omitted", [None, "q_proj", "k_proj", "v_proj"])
@@ -70,7 +56,9 @@ def test_qwen35_moe_mtp_requires_every_attention_projection(
         with torch.no_grad():
             projection.weight.fill_(-2)
         if omitted is not None and tracking is not False:
-            with pytest.raises(ValueError, match=missing):
+            with pytest.raises(
+                ValueError, match=rf"self_attn\.qkv_proj\.weight\.{omitted[0]}"
+            ):
                 loader.load_weights(model, draft)
             return
         loader.load_weights(model, draft)
