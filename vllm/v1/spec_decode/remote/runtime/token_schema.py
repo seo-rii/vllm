@@ -141,11 +141,7 @@ def supports_token_prefix_replay(config: "VllmConfig") -> bool:
 
 def supports_token_async_scheduling(config: "VllmConfig") -> bool:
     """Whether the verifier can use async scheduling with same-step token RPCs."""
-    return (
-        supports_token_prefix_replay(config)
-        and config.use_v2_model_runner
-        and config.model_config.enforce_eager
-    )
+    return supports_token_prefix_replay(config) and config.model_config.enforce_eager
 
 
 def supports_token_outcome_cache(
@@ -161,7 +157,6 @@ def supports_token_outcome_cache(
         or spec.draft_parallel_config.tensor_parallel_size != 1
         or config.scheduler_config.async_scheduling
         or not config.model_config.enforce_eager
-        or not config.use_v2_model_runner
         or config.cache_config.sliding_window is not None
         or (spec.kv_cache_dtype or config.cache_config.cache_dtype)
         not in ("auto", "bfloat16")
@@ -297,11 +292,7 @@ def create_token_runtime_contract(config: "VllmConfig") -> RuntimeContract:
                 "outcome cache requires eager MRV2 full-attention Qwen3 TP1, "
                 "synchronous scheduling and one inline endpoint"
             )
-    if (
-        spec.parallel_drafting
-        or spec.draft_sample_method != "greedy"
-        or spec.use_heterogeneous_vocab
-    ):
+    if spec.parallel_drafting or spec.draft_sample_method != "greedy":
         raise ValueError(
             "token-only runtime requires sequential same-tokenizer greedy drafting"
         )

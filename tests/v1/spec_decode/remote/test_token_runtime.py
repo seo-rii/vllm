@@ -2745,21 +2745,21 @@ def test_public_engine_args_admit_full_attention_prefix_replay(tmp_path, family)
 
 
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_token_async_capability_requires_mrv2(tmp_path, monkeypatch, prefix_caching):
-    """MRV1 cannot enable remote async capability, independently of prefix caching."""
-    from vllm.platforms import current_platform
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_token_async_capability_requires_eager_execution(
+    tmp_path, prefix_caching, enforce_eager
+):
+    """Async token RPCs require eager execution regardless of prefix caching."""
     from vllm.v1.spec_decode.remote.runtime.token_schema import (
         supports_token_async_scheduling,
         supports_token_prefix_replay,
     )
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     config = token_config(
         tmp_path,
         dtype="bfloat16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         cache_options={"enable_prefix_caching": prefix_caching},
-        scheduler_options={"async_scheduling": True},
         spec_options={
             "execution": {
                 "placement": "remote",
@@ -2769,12 +2769,9 @@ def test_token_async_capability_requires_mrv2(tmp_path, monkeypatch, prefix_cach
             }
         },
     )
-    assert config.model_config.enforce_eager
-    if current_platform.is_cpu():
-        assert not config.scheduler_config.async_scheduling
-    assert not config.use_v2_model_runner
+    assert config.model_config.enforce_eager is enforce_eager
     assert supports_token_prefix_replay(config)
-    assert not supports_token_async_scheduling(config)
+    assert supports_token_async_scheduling(config) is enforce_eager
 
 
 @pytest.mark.parametrize("unsupported", ["window", "recurrent", "mla", "pool", "tp2"])
@@ -3556,8 +3553,10 @@ def test_outcome_cache_shared_prefix_stays_reserved_after_live_lease_closes():
     assert state.block_pool.num_free_blocks == 32
 
 
-@pytest.mark.parametrize("fp8_source", ["target", "draft"])
-def test_public_outcome_cache_rejects_fp8_kv(tmp_path, fp8_source):
+@pytest.mark.parametrize("fp8_source", [None, "target", "draft"])
+def test_public_outcome_cache_validates_kv_dtype(tmp_path, fp8_source):
+    from contextlib import nullcontext
+
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.spec_decode.remote.runtime.token_schema import (
         create_token_runtime_contract,
@@ -3581,7 +3580,12 @@ def test_public_outcome_cache_rejects_fp8_kv(tmp_path, fp8_source):
         spec["kv_cache_dtype"] = "fp8"
     # Use public configuration construction: this does not override the CPU
     # platform's MRV2 restriction or instantiate a CUDA executor.
-    with pytest.raises(ValueError, match="outcome cache requires bfloat16 KV"):
+    expectation = (
+        pytest.raises(ValueError, match="outcome cache requires bfloat16 KV")
+        if fp8_source is not None
+        else nullcontext()
+    )
+    with expectation:
         config = EngineArgs(
             model=assets.model_config.model,
             tokenizer_mode="hf",
@@ -3596,7 +3600,8 @@ def test_public_outcome_cache_rejects_fp8_kv(tmp_path, fp8_source):
             enforce_eager=True,
             speculative_config=spec,
         ).create_engine_config()
-        create_token_runtime_contract(config)
+        contract = create_token_runtime_contract(config)
+        assert contract.schema.slots == (FeatureSlot("token_ids", "int32", ()),)
 
 
 def test_prediction_phases_keep_one_credit_and_yield_to_foreground():
