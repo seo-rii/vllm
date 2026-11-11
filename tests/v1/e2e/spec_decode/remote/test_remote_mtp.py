@@ -1751,10 +1751,12 @@ def _tiny_eagle3_models(tmp_path, target_family):
     command = [
         sys.executable,
         "-c",
-        "import pathlib,sys; import vllm; "
-        "assert pathlib.Path(vllm.__file__).resolve().is_relative_to(sys.argv[1]); "
-        "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _save_eagle3_models; _save_eagle3_models(*sys.argv[2:])",
+        (
+            "import pathlib,sys; import vllm; "
+            "assert pathlib.Path(vllm.__file__).resolve().is_relative_to(sys.argv[1]); "
+            "from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _save_eagle3_models; _save_eagle3_models(*sys.argv[2:])"
+        ),
         str(source),
         str(root),
         target_family,
@@ -4489,9 +4491,11 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _run_independent_mla_oracle; "
-        "_run_independent_mla_oracle(*sys.argv[1:])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _run_independent_mla_oracle; "
+            "_run_independent_mla_oracle(*sys.argv[1:])"
+        ),
         target,
         draft,
         str(result),
@@ -5346,8 +5350,10 @@ def test_remote_multi_module_mtp_dynamic_k_matches_full_prefix(
     command = [
         sys.executable,
         "-c",
-        "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
-        "import _run_multi_module_oracle; _run_multi_module_oracle(*sys.argv[1:])",
+        (
+            "import sys; from tests.v1.e2e.spec_decode.remote.test_remote_mtp "
+            "import _run_multi_module_oracle; _run_multi_module_oracle(*sys.argv[1:])"
+        ),
         model,
         str(result),
         transport,
