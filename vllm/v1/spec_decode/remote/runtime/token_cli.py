@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Launch the v3 independent draft runtime on one explicitly selected GPU."""
+"""Launch the v3 independent draft runtime on explicitly selected GPUs."""
 
 import argparse
 
@@ -13,8 +13,17 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--draft-model", required=True)
     result.add_argument("--draft-revision")
     result.add_argument("--num-speculative-tokens", type=int, default=3)
-    result.add_argument("--device", default="cuda:0")
-    result.add_argument("--draft-kv-cache-gib", type=float, default=0.25)
+    result.add_argument(
+        "--draft-tensor-parallel-size", type=int, choices=(1, 2), default=1
+    )
+    devices = result.add_mutually_exclusive_group()
+    devices.add_argument("--device", help="TP1 device; defaults to cuda:0")
+    devices.add_argument(
+        "--devices", nargs="+", help="Ordered indexed CUDA devices for draft TP2"
+    )
+    result.add_argument(
+        "--draft-kv-cache-gib", type=float, default=0.25, help="KV budget per draft GPU"
+    )
     result.add_argument("--max-model-len", type=int, default=256)
     result.add_argument("--max-batch-size", type=int, default=4)
     result.add_argument("--max-feature-tokens", type=int, default=256)
@@ -34,6 +43,33 @@ def create_adapter(args):
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.spec_decode.remote.runtime.token_gpu import make_token_gpu_adapter
 
+    devices = None
+    if args.devices is not None:
+        devices = tuple(torch.device(device) for device in args.devices)
+        if (
+            args.draft_tensor_parallel_size != 2
+            or len(devices) != args.draft_tensor_parallel_size
+            or any(device.type != "cuda" or device.index is None for device in devices)
+            or len(set(devices)) != len(devices)
+        ):
+            raise ValueError(
+                "--devices requires draft TP2 and two distinct indexed CUDA devices"
+            )
+    elif args.draft_tensor_parallel_size != 1:
+        raise ValueError("draft TP2 requires --devices cuda:<index> cuda:<index>")
+    device = devices[0] if devices else torch.device(args.device or "cuda:0")
+    execution = (
+        {
+            "execution": {
+                "placement": "remote",
+                "policy": "on_demand",
+                "endpoints": [args.endpoint],
+                "transport": "inline",
+            }
+        }
+        if devices
+        else {}
+    )
     config = EngineArgs(
         model=args.target_model,
         revision=args.target_revision,
@@ -60,13 +96,15 @@ def create_adapter(args):
             "revision": args.draft_revision,
             "method": "draft_model",
             "num_speculative_tokens": args.num_speculative_tokens,
-            "draft_tensor_parallel_size": 1,
+            "draft_tensor_parallel_size": args.draft_tensor_parallel_size,
             "attention_backend": args.attention_backend,
+            **execution,
         },
     ).create_engine_config()
     return make_token_gpu_adapter(
         config,
-        device=torch.device(args.device),
+        device=device,
+        devices=devices,
         kv_cache_bytes=int(args.draft_kv_cache_gib * 1024**3),
     )
 
@@ -77,25 +115,45 @@ def main() -> None:
     from vllm.v1.spec_decode.remote.token_server import TokenDraftServer
 
     adapter = create_adapter(args)
-    server = TokenDraftServer(
-        adapter,
-        limits=RemoteServerLimits(
-            args.max_batch_size,
-            args.max_feature_tokens,
-            args.max_batch_size,
-            args.max_model_len,
-        ),
-    )
+    server = None
+    failure: BaseException | None = None
     try:
-        endpoint = server.start(args.endpoint)
-        print(f"TOKEN_DRAFT_READY {endpoint}", flush=True)
-        server.wait()
-    except KeyboardInterrupt:
-        pass
+        server = TokenDraftServer(
+            adapter,
+            limits=RemoteServerLimits(
+                args.max_batch_size,
+                args.max_feature_tokens,
+                args.max_batch_size,
+                args.max_model_len,
+            ),
+        )
+        try:
+            endpoint = server.start(args.endpoint)
+            print(f"TOKEN_DRAFT_READY {endpoint}", flush=True)
+            server.wait()
+        except KeyboardInterrupt:
+            pass
+        if not server.healthy:
+            raise RuntimeError("token draft runtime requires a process restart")
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        server.stop()
-    if not server.healthy:
-        raise RuntimeError("token draft runtime requires a process restart")
+        try:
+            if server is not None:
+                server.stop()
+        except BaseException as cleanup_error:
+            if failure is None:
+                failure = cleanup_error
+                raise
+            failure.add_note(f"token server shutdown failed: {cleanup_error}")
+        finally:
+            try:
+                adapter.close()
+            except BaseException as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(f"token adapter shutdown failed: {cleanup_error}")
 
 
 if __name__ == "__main__":

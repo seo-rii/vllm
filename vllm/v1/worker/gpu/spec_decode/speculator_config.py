@@ -245,7 +245,13 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
             )
 
         spec.draft_tensor_parallel_size = SpeculativeConfig._verify_and_get_draft_tp(
-            spec.target_parallel_config, spec.draft_tensor_parallel_size
+            spec.target_parallel_config,
+            spec.draft_tensor_parallel_size,
+            remote_token_only=(
+                spec.method == "draft_model"
+                and spec.execution is not None
+                and spec.use_remote_draft()
+            ),
         )
         if spec.draft_decode_context_parallel_size is None:
             spec.draft_decode_context_parallel_size = (

@@ -1669,8 +1669,8 @@ class SpeculativeConfig:
                 unsupported.append("token-only remote drafting requires target TP1")
             if remote.transport not in ("auto", "inline"):
                 unsupported.append("token-only execution supports inline transport")
-            if self.draft_tensor_parallel_size not in (None, 1):
-                unsupported.append("draft_tensor_parallel_size must be 1")
+            if self.draft_tensor_parallel_size not in (None, 1, 2):
+                unsupported.append("draft_tensor_parallel_size must be 1 or 2")
             if self.draft_sample_method != "greedy":
                 unsupported.append("draft_sample_method must be greedy")
             if self.parallel_drafting:
@@ -1812,6 +1812,8 @@ class SpeculativeConfig:
     def _verify_and_get_draft_tp(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int | None,
+        *,
+        remote_token_only: bool = False,
     ) -> int:
         """Verifies and adjusts the tensor parallel size for a draft model
         specified using speculative_draft_tensor_parallel_size.
@@ -1822,7 +1824,9 @@ class SpeculativeConfig:
             speculative_draft_tensor_parallel_size = (
                 target_parallel_config.tensor_parallel_size
             )
-        elif speculative_draft_tensor_parallel_size not in (
+        elif not (
+            remote_token_only and speculative_draft_tensor_parallel_size == 2
+        ) and speculative_draft_tensor_parallel_size not in (
             1,
             target_parallel_config.tensor_parallel_size,
         ):

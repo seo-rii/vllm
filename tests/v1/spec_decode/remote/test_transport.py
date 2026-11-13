@@ -4,12 +4,17 @@
 integer frame helpers."""
 
 import errno
+import json
+import multiprocessing
+import os
+import signal
 import socket
 import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
+from multiprocessing.connection import Connection
 from unittest.mock import Mock, call
 
 import msgspec
@@ -35,6 +40,324 @@ from vllm.v1.spec_decode.remote.transport import (
     parse_endpoint,
     validate_frame,
 )
+
+
+def _draft_tp_gloo_worker(channel, rank, init_method, failure):
+    """Exercise the real group channel and collectives without CUDA models."""
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as distributed
+
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import (
+        TPFailure,
+        TPGeometry,
+        TPReply,
+    )
+
+    torch.set_num_threads(1)
+    distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=30),
+    )
+    channel.send(
+        TPReply(0, rank, "ready", geometry=TPGeometry(8, 4, 2, 8, 2, "cpu")),
+        time.monotonic() + 30,
+    )
+    forwards = 0
+    previous = 0
+    while True:
+        command = channel.receive_command()
+        assert command.command_id == previous + 1
+        previous = command.command_id
+        tokens = ()
+        if command.operation == "forward":
+            forwards += 1
+            if rank == 1 and forwards == 2:
+                if failure == "exit":
+                    return
+                if failure == "stall":
+                    threading.Event().wait()
+                if failure == "error":
+                    channel.send(
+                        TPReply(
+                            command.command_id,
+                            rank,
+                            command.operation,
+                            error=TPFailure(
+                                "RuntimeError", "injected ordinary rank failure", ""
+                            ),
+                        ),
+                        time.monotonic() + 30,
+                    )
+                    threading.Event().wait()
+            value = torch.tensor([row.tokens[-1] + rank for row in command.rows])
+            distributed.all_reduce(value)
+            tokens = tuple(value.tolist())
+        elif command.operation == "close":
+            distributed.destroy_process_group()
+        else:
+            distributed.barrier()
+        command_id = command.command_id
+        if rank == 1 and forwards == 2 and failure == "reply":
+            command_id += 1
+        channel.send(
+            TPReply(command_id, rank, command.operation, tokens=tokens),
+            time.monotonic() + 30,
+        )
+        if command.operation == "close":
+            return
+
+
+@pytest.mark.parametrize("failure", [None, "exit", "stall", "reply"])
+def test_draft_tp_process_group_collectives_and_failure_retirement(tmp_path, failure):
+    """All-rank completion is required; an uncertain group cannot be reused."""
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenForwardRow
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=((tmp_path / "gloo-store").as_uri(), failure),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    rows = tuple(
+        TokenForwardRow(SequenceKey("gloo", index, 0), index, 0, (token,), (1,), True)
+        for index, token in enumerate((3, 5))
+    )
+    try:
+        assert [reply.rank for reply in group.ready] == [0, 1]
+        group.execute("warmup")
+        replies = group.execute("forward", rows=rows)
+        assert [reply.command_id for reply in replies] == [2, 2]
+        assert [reply.tokens for reply in replies] == [(7, 11), (7, 11)]
+        if failure is None:
+            group.execute("release", keys=tuple(row.key for row in rows))
+        else:
+            with pytest.raises(CompletionUnknownError, match="command failed"):
+                group.execute("forward", rows=rows)
+            with pytest.raises(CompletionUnknownError, match="unavailable"):
+                group.execute("warmup")
+    finally:
+        group.close()
+    receipt = group.worker_status()
+    assert len(receipt) == 2 and all(not worker["alive"] for worker in receipt)
+    if failure is None:
+        assert all(worker["exitcode"] == 0 for worker in receipt)
+
+
+@pytest.mark.parametrize("operation", ["abort", "forward"])
+def test_draft_tp_socket_cleanup_failure_still_reaps_every_rank(
+    tmp_path, monkeypatch, operation
+):
+    """A failed channel close cannot defer rank retirement to another caller."""
+    import errno
+
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.protocol import SequenceKey
+    from vllm.v1.spec_decode.remote.runtime.token_state import TokenForwardRow
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    class CleanupErrorSocket(socket.socket):
+        fail_close = False
+
+        def close(self):
+            super().close()
+            if self.fail_close:
+                self.fail_close = False
+                raise OSError(errno.EIO, "injected socket cleanup failure")
+
+    socketpair = socket.socketpair
+    parents = []
+
+    def channels(*args, **kwargs):
+        parent, child = socketpair(*args, **kwargs)
+        parent = CleanupErrorSocket(fileno=parent.detach())
+        parents.append(parent)
+        return parent, child
+
+    monkeypatch.setattr(socket, "socketpair", channels)
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=((tmp_path / "gloo-store").as_uri(), "error"),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    rows = (TokenForwardRow(SequenceKey("cleanup", 0, 0), 0, 0, (3,), (1,), True),)
+    try:
+        group.execute("warmup")
+        group.execute("forward", rows=rows)
+        parents[0].fail_close = True
+        failure = None
+        try:
+            if operation == "abort":
+                group.abort()
+            else:
+                group.execute("forward", rows=rows)
+        except BaseException as error:
+            failure = error
+        receipt = group.worker_status()
+        assert len(receipt) == 2 and all(not worker["alive"] for worker in receipt)
+        assert all(worker["exitcode"] is not None for worker in receipt)
+        if operation == "abort":
+            assert isinstance(failure, OSError)
+            assert "injected socket cleanup failure" in str(failure)
+        else:
+            assert isinstance(failure, CompletionUnknownError)
+            assert isinstance(failure.__cause__, RuntimeError)
+            assert "injected ordinary rank failure" in str(failure.__cause__)
+            assert any(
+                "injected socket cleanup failure" in note
+                for note in failure.__cause__.__notes__
+            )
+    finally:
+        group.close()
+
+
+@pytest.mark.parametrize("stage", ["pipe", "process"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_draft_tp_startup_closes_unregistered_descriptors(
+    monkeypatch, stage, cleanup_failure
+):
+    """Retained startup errors must not retain open pre-registration channels."""
+    from vllm.v1.spec_decode.remote.errors import CompletionUnknownError
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    context = multiprocessing.get_context("spawn")
+    socketpair, pipe = socket.socketpair, context.Pipe
+    opened: list[socket.socket | Connection] = []
+    failure = OSError(errno.EMFILE, f"{stage} descriptor exhaustion")
+    close_error = OSError(errno.EIO, "startup socket cleanup")
+
+    class CleanupSocket(socket.socket):
+        def close(self):
+            live = self.fileno() >= 0
+            super().close()
+            if live and cleanup_failure:
+                raise close_error
+
+    def channels():
+        parent, child = socketpair()
+        parent = CleanupSocket(fileno=parent.detach())
+        opened.extend((parent, child))
+        return parent, child
+
+    def death_pipe(*args, **kwargs):
+        if stage == "pipe":
+            raise failure
+        pair = pipe(*args, **kwargs)
+        opened.extend(pair)
+        return pair
+
+    def process(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(socket, "socketpair", channels)
+    monkeypatch.setattr(context, "Pipe", death_pipe)
+    monkeypatch.setattr(context, "Process", process)
+    try:
+        with pytest.raises(CompletionUnknownError) as caught:
+            TPProcessGroup(2, _draft_tp_gloo_worker)
+        assert len(opened) == (2 if stage == "pipe" else 4)
+        assert all(
+            resource.fileno() == -1
+            if isinstance(resource, socket.socket)
+            else resource.closed
+            for resource in opened
+        )
+        pending, errors = [caught.value], set()
+        while pending:
+            error = pending.pop()
+            if error in errors:
+                continue
+            errors.add(error)
+            if error.__cause__ is not None:
+                pending.append(error.__cause__)
+            if error.__context__ is not None:
+                pending.append(error.__context__)
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+        assert failure in errors
+        if cleanup_failure:
+            assert close_error in errors
+    finally:
+        for resource in opened:
+            with suppress(OSError):
+                resource.close()
+
+
+def _draft_tp_sigint_owner(connection, init_method):
+    from vllm.v1.spec_decode.remote.runtime.tp_executor import TPProcessGroup
+
+    os.setsid()
+    group = TPProcessGroup(
+        2,
+        _draft_tp_gloo_worker,
+        worker_args=(init_method, None),
+        timeout_s=3,
+        startup_timeout_s=60,
+    )
+    try:
+        group.execute("warmup")
+        try:
+            connection.send(("ready", group.worker_status()))
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+    finally:
+        group.close()
+    connection.send(("closed", group.worker_status()))
+    connection.close()
+
+
+def test_draft_tp_process_group_sigint_closes_through_owner(tmp_path, record_property):
+    """Group SIGINT must leave ranks available for the owner's typed close."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_draft_tp_sigint_owner,
+        args=(child, (tmp_path / "gloo-store").as_uri()),
+    )
+    try:
+        process.start()
+        child.close()
+        assert parent.poll(60), "draft TP owner did not become ready"
+        state, workers = parent.recv()
+        assert state == "ready"
+        assert len(workers) == 2
+        assert all(os.getpgid(worker["pid"]) == process.pid for worker in workers)
+        record_property("draft_tp_sigint_owner_pid", process.pid)
+        os.killpg(process.pid, signal.SIGINT)
+        assert parent.poll(15), "draft TP owner did not finish shutdown"
+        state, workers = parent.recv()
+        assert state == "closed"
+        process.join(timeout=5)
+        assert process.exitcode == 0
+        assert all(
+            not worker["alive"] and worker["exitcode"] == 0 for worker in workers
+        )
+        record_property("draft_tp_sigint_closed_workers", json.dumps(workers))
+    finally:
+        try:
+            if process.pid is not None:
+                if process.is_alive():
+                    if os.getpgid(process.pid) == process.pid:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                process.join(timeout=5)
+                assert not process.is_alive()
+                process.close()
+        finally:
+            parent.close()
+            child.close()
 
 
 def ipc_descriptor(**overrides):
