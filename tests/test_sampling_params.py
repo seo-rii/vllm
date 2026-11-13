@@ -117,6 +117,22 @@ def test_non_remote_requests_keep_probabilistic_sampling(speculative):
     SamplingParams(temperature=0.7).verify(MockModelConfig(), speculative, None, None)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_p": 0.1},
+        {"logit_bias": {0: 1.0}},
+        {"min_p": 0.05, "logit_bias": {1: -1.0}},
+    ],
+)
+def test_spec_decode_accepts_min_p_and_logit_bias(kwargs: dict):
+    """min_p and logit_bias are applied to target logits before rejection
+    sampling, so a speculative config must not reject the request."""
+    params = SamplingParams(**kwargs)
+    spec = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    params.verify(MockModelConfig(), spec, None, None)
+
+
 def test_verify_leaves_logits_processors_to_admission():
     """verify() is runner-agnostic; LP validation lives in the admission
     layer, so an unimportable FQCN must not fail verify()."""
