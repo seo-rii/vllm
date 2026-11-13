@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU KV oracle and actual framed socket checks; no CUDA/model assertions."""
 
+import logging
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any
@@ -163,6 +164,7 @@ def test_token_server_cleanup_fence_retains_owners_without_thread_errors(
 ):
     import threading
 
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     state, _, server, session = socket_runtime
     owner_thread = server._workers[0]
     key = session.open_sequence(0, deadline=session.deadline())
@@ -525,6 +527,7 @@ def test_token_server_socket_close_error_retains_owner_and_requires_restart(
     import socket
     import threading
 
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     state, _, server, session = socket_runtime
     key = session.open_sequence(0, deadline=session.deadline())
     session.prefill(key, (1,), is_final=True, deadline=session.deadline())
@@ -2371,7 +2374,8 @@ def test_token_mla_kv_checks_contract_geometry(tmp_path, change, reason):
     """Real KV spec constructors exercise validation; GPU tests inspect loaded specs."""
     import torch
 
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
     from vllm.v1.spec_decode.remote.runtime.token_gpu import (
         create_token_executor_config,
         validate_token_model_kv_specs,
@@ -2393,14 +2397,21 @@ def test_token_mla_kv_checks_contract_geometry(tmp_path, change, reason):
         layout = replace(layout, **change)
     elif change == "block_size":
         layout = replace(layout, block_size=2 * config.cache_config.block_size)
-    full = FullAttentionSpec(
-        block_size=config.cache_config.block_size,
-        num_kv_heads=1,
-        head_size=576,
-        dtype=torch.bfloat16,
+    full = FullAttentionManager.layer_config(
+        AttentionSpec(
+            block_size=config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        )
     )
     # Reversed insertion order must remain valid; indices define layer identity.
-    specs = {f"draft.model.layers.{i}.self_attn.attn": layout for i in (1, 0)}
+    specs = {
+        f"draft.model.layers.{i}.self_attn.attn": FullAttentionManager.layer_config(
+            layout
+        )
+        for i in (1, 0)
+    }
     if change == "full":
         specs = dict.fromkeys(specs, full)
     elif change == "mixed":
@@ -2678,7 +2689,11 @@ def test_loaded_token_kv_matches_attention_by_layer_not_group_counts(
 ):
     import torch
 
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.runtime.token_gpu import (
         create_token_executor_config,
         validate_token_model_kv_specs,
@@ -2699,9 +2714,11 @@ def test_loaded_token_kv_matches_attention_by_layer_not_group_counts(
         name += f".{'self_attn' if n == 0 else 'other_attn'}.attn"
         geometry = dict(block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float32)
         specs[name] = (
-            FullAttentionSpec(**geometry)
+            FullAttentionManager.layer_config(AttentionSpec(**geometry))
             if window is None
-            else SlidingWindowSpec(**geometry, sliding_window=window)
+            else SlidingWindowManager.layer_config(
+                AttentionSpec(**geometry), sliding_window=window
+            )
         )
     if error is None:
         validate_token_model_kv_specs(config, specs)
