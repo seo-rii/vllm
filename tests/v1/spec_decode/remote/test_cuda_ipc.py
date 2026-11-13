@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """IPC metadata, ACK ownership, and failure isolation without requiring CUDA.
 
-The two optional CUDA cases additionally check cross-process GPU tensor copies.
+The optional CUDA cases check cross-process copies and owned MTP replay history.
 """
 
 import contextlib
@@ -639,16 +639,80 @@ def test_cuda_cross_process_copy_preserves_previous_generation(destination):
         receiver = ipc.CudaIpcReceiver(f"cuda:{destination}", max_bytes=1 << 20)
         cleanup.callback(receiver.close)
         retained = []
-        for _ in range(3):
+        previous = None
+        for step in range(3):
             assert parent.poll(60), "CUDA exporter did not produce a descriptor"
             descriptor = msgspec.msgpack.decode(
                 parent.recv_bytes(), type=ipc.CudaIpcDescriptor
             )
+            if previous is not None:
+                assert descriptor.buffer_id == previous.buffer_id
+                assert descriptor.offset_bytes == previous.offset_bytes
+                assert descriptor.memory_handle == previous.memory_handle
+                assert descriptor.generation > previous.generation
+            previous = descriptor
             retained.append(receiver.receive(descriptor, "float32", (1024,)))
+            if destination == 0 and step == 0:
+                from tests.v1.spec_decode.remote.test_runtime import (
+                    multi_module_features,
+                    multi_module_planner,
+                    multi_module_schema,
+                )
+                from vllm.v1.spec_decode.remote.protocol import SequenceKey
+                from vllm.v1.spec_decode.remote.runtime.multi_module import (
+                    MultiModuleReplay,
+                )
+                from vllm.v1.spec_decode.remote.runtime.step import DraftStepRow
+
+                replay = MultiModuleReplay(multi_module_schema(depth=3))
+                planner = multi_module_planner(max_num_reqs=1, depth=3)
+                key = SequenceKey("ipc-history", 0, 0)
+                assert planner.open(key)
+                cleanup.callback(planner.close, key)
+                cleanup.callback(replay.close_sequences, (key,))
+                features = multi_module_features(0, [11, 12, 13, 14])
+                features[2] = retained[0][:8].view(4, 2)
+                row, features = replay.prepare_row(
+                    DraftStepRow(key, 4, num_sampled=1), features
+                )
+                plan, failures = planner.plan([row])
+                assert not failures
+                staged = replay.stage_history(plan, features)
+                torch.accelerator.synchronize(destination)
+                replay.commit_history(staged)
+                planner.commit(plan)
+                del staged, features
             parent.send("ack")
         receiver.close()
         parent.send("closed")
         for step, tensor in enumerate(retained):
             torch.testing.assert_close(tensor.cpu(), torch.arange(1024).float() + step)
+        if destination == 0:
+            # History predates both exporter reuse and mutation of the receiver's
+            # independent copy; neither owner may change the committed suffix.
+            retained[0][:8].fill_(-1000)
+            features = multi_module_features(4, [21])
+            hidden = features[2]
+            assert hidden is not None
+            features[2] = hidden.to("cuda:0")
+            row, prepared = replay.prepare_row(
+                DraftStepRow(key, 1, num_sampled=1), features
+            )
+            assert row.num_replayed == 2 and row.num_tokens == 3
+            tokens, positions, hidden, _ = prepared
+            assert tokens is not None and positions is not None and hidden is not None
+            assert tokens.tolist() == [13, 14, 21]
+            assert positions.tolist() == [2, 3, 4]
+            assert hidden.is_cuda
+            assert torch.equal(
+                hidden.cpu(),
+                torch.tensor([[4.0, 5.0], [6.0, 7.0], [4.0, 21.0]]),
+            )
+            replay.close_sequences((key,))
+            planner.close(key)
+            assert replay.num_sequences == planner.num_open == 0
+            assert (
+                planner.block_pool.num_free_blocks == planner.block_pool.num_blocks - 1
+            )
         process.join(30)
         assert process.exitcode == 0

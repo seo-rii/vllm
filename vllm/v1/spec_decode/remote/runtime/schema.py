@@ -77,8 +77,52 @@ def _validate_mtp_contract(target: Any, spec: Any) -> None:
             f"({draft.max_model_len}) to cover target max_model_len "
             f"({target.max_model_len}); reduce the target context limit"
         )
-    if getattr(config, "num_nextn_predict_layers", None) != 1:
-        raise ValueError("standalone MTP requires exactly one checkpoint MTP module")
+    num_modules = getattr(config, "num_nextn_predict_layers", None)
+    if type(num_modules) is not int or num_modules < 1:
+        raise ValueError(
+            "standalone MTP requires a positive checkpoint MTP module count"
+        )
+    if architecture == "ExaoneMoeMTP" and num_modules > 1:
+        if spec.num_speculative_tokens != num_modules:
+            raise ValueError(
+                "Exaone checkpoint MTP modules require configured K "
+                f"to equal the module count ({num_modules})"
+            )
+        layers = getattr(config, "mtp_layer_types", None)
+        if (
+            not isinstance(layers, (list, tuple))
+            or len(layers) != num_modules
+            or any(
+                layer not in ("full_attention", "sliding_attention") for layer in layers
+            )
+        ):
+            raise ValueError("Exaone MTP layers require one full/SWA type per module")
+        module_windows = getattr(config, "mtp_sliding_windows", None)
+        windows = module_windows or getattr(config, "sliding_windows", None)
+        if module_windows and (
+            not isinstance(module_windows, (list, tuple))
+            or len(module_windows) != num_modules
+        ):
+            raise ValueError("Exaone MTP windows require one entry per module")
+        if windows is not None and not isinstance(windows, (list, tuple)):
+            raise ValueError("Exaone MTP windows require an array of per-layer values")
+        for index, layer in enumerate(layers):
+            if layer != "sliding_attention":
+                continue
+            if windows is not None and index >= len(windows):
+                raise ValueError("Exaone MTP windows do not cover every sliding layer")
+            window = (
+                windows[index]
+                if windows is not None
+                else getattr(config, "sliding_window", None)
+            )
+            if type(window) is not int or window <= 0:
+                raise ValueError("Exaone MTP sliding layers require positive windows")
+    elif num_modules != 1:
+        raise ValueError(
+            "standalone MTP requires one checkpoint MTP module, "
+            "or an Exaone module chain"
+        )
     if (
         contract.max_speculative_tokens is not None
         and spec.num_speculative_tokens > contract.max_speculative_tokens
@@ -238,6 +282,15 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         raise ValueError(f"unsupported standalone method: {spec.method}")
     if spec.parallel_drafting or spec.draft_sample_method != "greedy":
         raise ValueError("standalone runtime requires sequential greedy drafting")
+    if spec.use_multi_module_mtp():
+        if vllm_config.parallel_config.tensor_parallel_size != 1:
+            raise ValueError("standalone multi-module MTP requires target TP1")
+        remote = spec.get_remote_draft_config()
+        if remote is not None and (
+            remote.transport not in ("auto", "inline", "cuda_ipc")
+            or len(spec.get_remote_draft_endpoints()) != 1
+        ):
+            raise ValueError("standalone multi-module MTP requires one endpoint")
 
     hidden_size = target.get_hidden_size()
     dtype = str(target.dtype).removeprefix("torch.")
@@ -274,11 +327,12 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
                 TargetFeatureKind.LAST_HIDDEN_STATES.value, dtype, (hidden_size,)
             )
         )
+    num_lookahead = vllm_config.num_prefill_lookahead_tokens
     slots.append(
         FeatureSlot(
             TargetFeatureKind.NEXT_PREFILL_TOKENS.value,
             "int64",
-            (1,),
+            (num_lookahead,),
             optional=True,
             per_sequence=True,
         )
@@ -291,7 +345,8 @@ def create_runtime_contract(vllm_config: "VllmConfig") -> RuntimeContract:
         capabilities=SpeculatorPlacementCapabilities(
             state_dependency="own_kv",
             required_features=tuple(s.kind for s in slots if not s.optional),
-            num_prefill_lookahead=1,
+            num_prefill_lookahead=num_lookahead,
+            supports_multi_module=spec.use_multi_module_mtp(),
             standalone_weights="materializable",
         ),
         target_fingerprint=_fingerprint({"target": target_identity, "layout": layout}),
