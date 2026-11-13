@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import msgspec
 
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     ErrorReply,
@@ -23,7 +24,6 @@ from vllm.v1.spec_decode.remote.protocol import (
     SpeculatorStatusCode,
 )
 from vllm.v1.spec_decode.remote.target_kv import (
-    AttentionSpec,
     SnapshotBudget,
     _page_shape,
     _range,
@@ -139,14 +139,14 @@ def decode_target_kv_message(data: bytes):
 @dataclass(frozen=True)
 class LayerWirePlan:
     name: str
-    spec: AttentionSpec
+    layer_config: KVCacheLayerConfig
     logical_pages: tuple[int, ...]
     shape: tuple[int, ...]
     nbytes: int
 
 
 def snapshot_wire_plan(
-    specs: Mapping[str, AttentionSpec],
+    specs: Mapping[str, KVCacheLayerConfig],
     length: int,
     budget: SnapshotBudget,
     receiver_budget: SnapshotBudget | None = None,
@@ -157,9 +157,9 @@ def snapshot_wire_plan(
         raise ValueError("target-KV requires between one and 32 source layers")
     plans = []
     pages = nbytes = receiver_pages = receiver_bytes = 0
-    for name, spec in sorted(specs.items()):
-        _validate_spec(spec)
-        _, first, end = _range(spec, length)
+    for name, layer_config in sorted(specs.items()):
+        spec = _validate_spec(layer_config)
+        _, first, end = _range(layer_config, length)
         count = end - first
         size = count * spec.unpadded_page_size_bytes
         pages += count
@@ -167,19 +167,23 @@ def snapshot_wire_plan(
         budget.check(length, pages, nbytes)
         receiver_pages += count + 1
         receiver_bytes += (count + 1) * spec.unpadded_page_size_bytes
-        receiver_bytes += _table_width(spec, end) * 4
+        receiver_bytes += _table_width(layer_config, end) * 4
         if receiver_budget is not None:
             receiver_budget.check(length, receiver_pages, receiver_bytes)
         plans.append(
             LayerWirePlan(
-                name, spec, tuple(range(first, end)), (count, *_page_shape(spec)), size
+                name,
+                layer_config,
+                tuple(range(first, end)),
+                (count, *_page_shape(layer_config)),
+                size,
             )
         )
     return tuple(plans)
 
 
 def snapshot_batch_wire_plan(
-    specs: Mapping[str, AttentionSpec],
+    specs: Mapping[str, KVCacheLayerConfig],
     lengths: tuple[int, ...],
     budget: SnapshotBudget,
     receiver_budget: SnapshotBudget | None = None,
@@ -193,10 +197,12 @@ def snapshot_batch_wire_plan(
     budget.check(max(lengths), pages, nbytes)
     if receiver_budget is not None:
         receiver_bytes = nbytes
-        for i, spec in enumerate(specs[name] for name in sorted(specs)):
+        for i, layer_config in enumerate(specs[name] for name in sorted(specs)):
             width = max(
-                _table_width(spec, row[i].logical_pages[-1] + 1) for row in plans
+                _table_width(layer_config, row[i].logical_pages[-1] + 1)
+                for row in plans
             )
+            spec = _validate_spec(layer_config)
             receiver_bytes += spec.unpadded_page_size_bytes + len(lengths) * width * 4
         receiver_budget.check(max(lengths), pages + len(specs), receiver_bytes)
     return plans

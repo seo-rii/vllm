@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     OpenSequence,
@@ -31,7 +32,6 @@ from vllm.v1.spec_decode.remote.server import (
 from vllm.v1.spec_decode.remote.session import frame_to_tensor
 from vllm.v1.spec_decode.remote.state import SequenceState
 from vllm.v1.spec_decode.remote.target_kv import (
-    AttentionSpec,
     SnapshotBudget,
     SnapshotCompletionError,
     SnapshotIdentity,
@@ -87,7 +87,7 @@ class TargetKVDraftServer(RemoteDraftServer):
         contract_fingerprint: str,
         hidden_size: int,
         vocab_size: int,
-        expected_specs: Mapping[str, AttentionSpec],
+        expected_specs: Mapping[str, KVCacheLayerConfig],
         snapshot_budget: SnapshotBudget,
         receiver_budget: SnapshotBudget,
         max_num_seqs: int = 1,
@@ -625,7 +625,7 @@ class _TargetKVServerSession:
                     layers.append(
                         SnapshotLayer(
                             plan.name,
-                            plan.spec,
+                            plan.layer_config,
                             plan.logical_pages,
                             self._data(slot, plan.shape, plan.nbytes, deadline),
                         )
