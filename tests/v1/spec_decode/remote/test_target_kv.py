@@ -12,14 +12,18 @@ from dataclasses import replace
 import pytest
 import torch
 
+from vllm.v1.core.single_type_kv_cache_manager import (
+    ChunkedLocalAttentionManager,
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
     KVCacheTensor,
     KVQuantMode,
     MLAAttentionSpec,
-    SlidingWindowSpec,
     compute_layout_strides,
     get_block_table_width,
 )
@@ -58,10 +62,11 @@ def _source(
         head_size=head_size,
         dtype=torch.bfloat16,
     )
-    spec = (
-        FullAttentionSpec(**args)
+    spec = AttentionSpec(**args)
+    layer_config = (
+        FullAttentionManager.layer_config(spec)
         if window is None
-        else SlidingWindowSpec(**args, sliding_window=window)
+        else SlidingWindowManager.layer_config(spec, sliding_window=window)
     )
     cache = torch.full(
         (6, num_kv_heads, block_size, 2 * head_size),
@@ -75,7 +80,7 @@ def _source(
             cache[physical, :, token] = logical * block_size + token + 1
     if layout == KVCacheLayout.LBNHC:
         cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
-    return TargetKVSource(name, spec, cache, table, layout)
+    return TargetKVSource(name, layer_config, cache, table, layout)
 
 
 def _import(snapshot, source, **kwargs):
@@ -85,7 +90,7 @@ def _import(snapshot, source, **kwargs):
         expected_materialized_length=kwargs.pop(
             "expected_materialized_length", snapshot.materialized_length
         ),
-        expected_specs={source.layer_name: source.spec},
+        expected_specs={source.layer_name: source.layer_config},
         budget=kwargs.pop("budget", BUDGET),
         device=kwargs.pop("device", torch.device("cpu")),
         **kwargs,
@@ -111,7 +116,9 @@ def test_batch_import_preserves_ragged_rows_and_disjoint_page_ownership(lengths)
         snapshots,
         expected_identities=tuple(snapshot.identity for snapshot in snapshots),
         expected_materialized_lengths=lengths,
-        expected_specs={source.layer_name: source.spec for source in sources[0]},
+        expected_specs={
+            source.layer_name: source.layer_config for source in sources[0]
+        },
         budget=BUDGET,
         device=torch.device("cpu"),
     )
@@ -122,13 +129,15 @@ def test_batch_import_preserves_ragged_rows_and_disjoint_page_ownership(lengths)
         owned: set[int] = set()
         for row, length in enumerate(lengths):
             source = sources[row][layer_index]
-            start = max(0, length - source.spec.sliding_window) if layer_index else 0
+            start = target_kv._range(source.layer_config, length)[0]
             table = layer.block_table[row]
             live = set(table[table > 0].tolist())
             assert not owned.intersection(live)
             owned.update(live)
             for position in range(length):
-                actual = _token(layer.cache, table, position, source.spec.block_size)
+                actual = _token(
+                    layer.cache, table, position, source.layer_config.spec.block_size
+                )
                 if position < start:
                     assert not actual.count_nonzero()
                 else:
@@ -138,13 +147,15 @@ def test_batch_import_preserves_ragged_rows_and_disjoint_page_ownership(lengths)
                             source.cache,
                             source.block_table,
                             position,
-                            source.spec.block_size,
+                            source.layer_config.spec.block_size,
                         ),
                         rtol=0,
                         atol=0,
                     )
-            last_page = layer.cache[int(table[(length - 1) // source.spec.block_size])]
-            tail = length % source.spec.block_size
+            last_page = layer.cache[
+                int(table[(length - 1) // source.layer_config.spec.block_size])
+            ]
+            tail = length % source.layer_config.spec.block_size
             if tail:
                 assert not last_page[:, tail:].count_nonzero()
         assert owned == set(range(1, layer.cache.shape[0]))
@@ -168,14 +179,14 @@ def test_batch_import_budget_includes_all_rows_and_padded_block_tables():
     kwargs = dict(
         expected_identities=identities,
         expected_materialized_lengths=lengths,
-        expected_specs={source.layer_name: source.spec},
+        expected_specs={source.layer_name: source.layer_config},
         device=torch.device("cpu"),
     )
     imported = import_target_kv_batch(snapshots, budget=BUDGET, **kwargs)
     assert imported.num_pages == 1 + 1 + 5
     assert imported.nbytes == (
-        imported.num_pages * source.spec.unpadded_page_size_bytes
-        + 2 * get_block_table_width(5, source.spec.block_size) * 4
+        imported.num_pages * source.layer_config.spec.unpadded_page_size_bytes
+        + 2 * get_block_table_width(5, source.layer_config.spec.block_size) * 4
     )
     exact = SnapshotBudget(imported.num_pages, imported.nbytes, 128)
     assert (
@@ -196,7 +207,7 @@ def test_batch_import_rejects_duplicate_identity_or_stale_sibling():
     snapshot = snapshot_target_kv(identity, 7, (source,), budget=BUDGET)
     kwargs = dict(
         expected_materialized_lengths=(7, 7),
-        expected_specs={source.layer_name: source.spec},
+        expected_specs={source.layer_name: source.layer_config},
         budget=BUDGET,
         device=torch.device("cpu"),
     )
@@ -365,7 +376,7 @@ def test_import_rejects_changed_prefix_length_even_with_identical_page_count(
 def test_snapshot_and_receiver_budgets_include_different_owned_allocations():
     source = _source(window=3)
     snapshot = snapshot_target_kv(IDENTITY, 12, [source], budget=BUDGET)
-    assert snapshot.nbytes == source.spec.unpadded_page_size_bytes
+    assert snapshot.nbytes == source.layer_config.spec.unpadded_page_size_bytes
     exact = SnapshotBudget(1, snapshot.nbytes, 12)
     snapshot_target_kv(IDENTITY, 12, [source], budget=exact)
     with pytest.raises(ValueError, match="budget"):
@@ -427,7 +438,7 @@ def test_native_allocator_nonzero_layer_view_is_snapshotted_without_other_layers
 
     source = _source(block_size=16, head_size=256, window=window, layout=layout)
     names = ["owner.0", "owner.1"]
-    spec = source.spec
+    spec = source.layer_config.spec
     layer_stride, block_stride, *_ = compute_layout_strides(spec, 6, 2, layout)
     config = KVCacheConfig(
         num_blocks=6,
@@ -439,7 +450,9 @@ def test_native_allocator_nonzero_layer_view_is_snapshotted_without_other_layers
                 block_stride=block_stride,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+        kv_cache_groups=[
+            KVCacheGroup.from_layers(dict.fromkeys(names, source.layer_config))
+        ],
         kv_cache_layout=layout.name,
     )
     caches = allocate_kv_cache(config, torch.device("cpu"), layout)
@@ -472,7 +485,7 @@ def _copy_operation(phase, sources, snapshot):
         snapshot,
         expected_identity=IDENTITY,
         expected_materialized_length=7,
-        expected_specs={s.layer_name: s.spec for s in sources},
+        expected_specs={s.layer_name: s.layer_config for s in sources},
         budget=BUDGET,
         device=torch.device("cpu"),
     )
@@ -552,7 +565,7 @@ def test_multilayer_budget_is_total_and_import_requires_exact_layer_contract():
         snapshot,
         expected_identity=IDENTITY,
         expected_materialized_length=7,
-        expected_specs={s.layer_name: s.spec for s in (full, window)},
+        expected_specs={s.layer_name: s.layer_config for s in (full, window)},
         budget=BUDGET,
         device=torch.device("cpu"),
     )
@@ -605,8 +618,6 @@ def test_source_contract_mismatches_fail_closed(mutation):
         dict(tokens_per_state=2),
         dict(state_content_bytes=16),
         dict(page_size_padded=1024),
-        dict(non_causal=True),
-        dict(attention_chunk_size=4),
     ],
 )
 def test_unsupported_attention_specs_are_not_treated_as_dense_bf16(changes):
@@ -615,9 +626,36 @@ def test_unsupported_attention_specs_are_not_treated_as_dense_bf16(changes):
         snapshot_target_kv(
             IDENTITY,
             1,
-            [replace(source, spec=replace(source.spec, **changes))],
+            [
+                replace(
+                    source,
+                    layer_config=replace(
+                        source.layer_config,
+                        spec=replace(source.layer_config.spec, **changes),
+                    ),
+                )
+            ],
             budget=BUDGET,
         )
+
+
+@pytest.mark.parametrize(
+    "manager_config",
+    [
+        ChunkedLocalAttentionManager.config(attention_chunk_size=4),
+        SlidingWindowManager.config(sliding_window=0),
+        SlidingWindowManager.config(sliding_window=4, extra_retained_tokens=1),
+        SlidingWindowManager.config(sliding_window=4, bounded_replay=True),
+    ],
+)
+def test_snapshot_rejects_unsupported_allocation_policies(manager_config):
+    source = _source()
+    source = replace(
+        source,
+        layer_config=replace(source.layer_config, manager_config=manager_config),
+    )
+    with pytest.raises(ValueError, match="plain full or sliding"):
+        snapshot_target_kv(IDENTITY, 1, (source,), budget=BUDGET)
 
 
 def test_mla_subclass_is_not_accepted_as_full_attention():
@@ -626,7 +664,12 @@ def test_mla_subclass_is_not_accepted_as_full_attention():
         block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
     )
     with pytest.raises(ValueError, match="plain full or sliding"):
-        snapshot_target_kv(IDENTITY, 1, [replace(source, spec=mla)], budget=BUDGET)
+        snapshot_target_kv(
+            IDENTITY,
+            1,
+            [replace(source, layer_config=FullAttentionManager.layer_config(mla))],
+            budget=BUDGET,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["indices", "shape", "dtype", "spec"])
@@ -641,7 +684,12 @@ def test_import_validates_payload_before_allocating(monkeypatch, mutation):
     elif mutation == "dtype":
         layer = replace(layer, pages=layer.pages.float())
     else:
-        layer = replace(layer, spec=replace(layer.spec, sliding_window=4))
+        layer = replace(
+            layer,
+            layer_config=SlidingWindowManager.layer_config(
+                layer.layer_config.spec, sliding_window=4
+            ),
+        )
     snapshot = replace(snapshot, layers=(layer,))
     monkeypatch.setattr(
         torch, "zeros", lambda *a, **k: pytest.fail("allocated before validation")
@@ -682,8 +730,8 @@ def test_cuda_triton_q_only_attention_matches_native_query_after_rejection(
     source = _source(window=window, block_size=16, head_size=head_size, device="cuda")
     table_width = get_block_table_width(
         source.block_table.numel(),
-        source.spec.block_size,
-        token_alignment=source.spec.block_table_token_alignment,
+        source.layer_config.spec.block_size,
+        token_alignment=source.layer_config.manager_cls.block_table_token_alignment,
     )
     native_table = torch.zeros(table_width, dtype=torch.int32, device="cuda")
     native_table[: source.block_table.numel()].copy_(source.block_table)

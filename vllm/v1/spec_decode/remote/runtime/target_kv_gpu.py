@@ -22,6 +22,8 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotIdentity,
     SnapshotLayer,
     TargetKVSnapshot,
+    _range,
+    _validate_spec,
     import_target_kv_batch,
 )
 
@@ -132,7 +134,7 @@ class Gemma4SnapshotExecutor:
                 raise ValueError("loaded assistant layer count differs from contract")
             self._empty_caches = tuple(attn.kv_cache for attn in self._attentions)
             for attn, source in zip(self._attentions, self.contract.draft_source_names):
-                spec = self.contract.expected_specs[source]
+                spec = _validate_spec(self.contract.expected_specs[source])
                 if (
                     attn.head_size != spec.head_size
                     or attn.num_kv_heads != spec.num_kv_heads
@@ -341,24 +343,17 @@ class Gemma4SnapshotExecutor:
 
     def warmup(self) -> None:
         """Compile and synchronize real assistant forwards before listening."""
-        from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
         identity = SnapshotIdentity(SequenceKey("warmup", 0, 0), 1, 0)
         for length in dict.fromkeys((1, self.contract.snapshot_budget.max_model_len)):
             layers = []
-            for name, spec in self.contract.expected_specs.items():
-                start = (
-                    max(0, length - spec.sliding_window)
-                    if isinstance(spec, SlidingWindowSpec)
-                    else 0
-                )
-                logical = tuple(
-                    range(start // spec.block_size, (length - 1) // spec.block_size + 1)
-                )
+            for name, layer_config in self.contract.expected_specs.items():
+                spec = _validate_spec(layer_config)
+                _, first, end = _range(layer_config, length)
+                logical = tuple(range(first, end))
                 layers.append(
                     SnapshotLayer(
                         name,
-                        spec,
+                        layer_config,
                         logical,
                         torch.zeros(
                             (

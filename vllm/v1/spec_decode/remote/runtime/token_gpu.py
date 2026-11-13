@@ -98,21 +98,30 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
         validate_token_model_inputs(config, speculator.model)
-        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
-        from vllm.v1.spec_decode.remote.runtime.kv_layout import (
-            select_standalone_kv_spec,
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            SlidingWindowManager,
         )
-        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+        from vllm.v1.kv_cache_interface import AttentionSpec
+        from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+            select_standalone_kv_layer_config,
+        )
+        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
-        actual = select_standalone_kv_spec(get_kv_cache_spec(config))
-        if type(actual) not in (FullAttentionSpec, SlidingWindowSpec):
+        actual = select_standalone_kv_layer_config(get_kv_cache_layer_configs(config))
+        if type(actual.spec) is not AttentionSpec or actual.manager_cls not in (
+            FullAttentionManager,
+            SlidingWindowManager,
+        ):
             raise ValueError(
                 "token-only loaded draft requires homogeneous full or "
                 "sliding-window attention KV"
             )
-        window = (
-            actual.sliding_window if isinstance(actual, SlidingWindowSpec) else None
-        )
+        window = None
+        if actual.manager_cls is SlidingWindowManager:
+            params = actual.manager_config.params
+            assert isinstance(params, SlidingWindowManager.Params)
+            window = params.sliding_window
         if window != config.cache_config.sliding_window:
             raise ValueError("loaded draft attention window differs from its contract")
         return speculator
