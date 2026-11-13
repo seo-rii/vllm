@@ -39,7 +39,7 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_cache_interface import KVCacheSpec
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 
 def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> None:
@@ -79,15 +79,12 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
 
 
 def validate_token_model_kv_specs(
-    config: VllmConfig, specs: Mapping[str, "KVCacheSpec"]
+    config: VllmConfig, specs: Mapping[str, "KVCacheLayerConfig"]
 ) -> None:
     """Verify loaded attention semantics by layer index, not group counts."""
     from vllm.model_executor.models.utils import extract_layer_index
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        MLAAttentionSpec,
-        SlidingWindowSpec,
-    )
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
     from vllm.v1.spec_decode.remote.runtime.kv_layout import (
         group_standalone_kv_specs,
     )
@@ -96,7 +93,7 @@ def validate_token_model_kv_specs(
     groups = group_standalone_kv_specs(specs)
     if config.model_config.use_mla:
         for group in groups:
-            layout = group.kv_cache_spec
+            (layout,) = group.distinct_specs
             if type(layout) is not MLAAttentionSpec:
                 raise ValueError("token-only loaded draft requires MLA KV")
             if layout.topk_buffer_width is not None or layout.alignment is not None:
@@ -110,14 +107,14 @@ def validate_token_model_kv_specs(
             ):
                 raise ValueError("token-only loaded MLA KV geometry differs from model")
     elif any(
-        type(group.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
+        any(type(layout) is not AttentionSpec for layout in group.distinct_specs)
         for group in groups
     ):
         raise ValueError("token-only loaded draft requires dense attention KV")
     if len(specs) != len(expected):
         raise ValueError("token-only draft requires one attention KV per model layer")
     seen: set[int] = set()
-    for name, spec in specs.items():
+    for name, layer_config in specs.items():
         try:
             index = extract_layer_index(name)
         except (AssertionError, ValueError) as error:
@@ -127,7 +124,11 @@ def validate_token_model_kv_specs(
                 "loaded draft KV layer indices must be unique and complete"
             )
         seen.add(index)
-        actual = spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
+        actual = None
+        if layer_config.manager_cls is SlidingWindowManager:
+            params = layer_config.manager_config.params
+            assert isinstance(params, SlidingWindowManager.Params)
+            actual = params.sliding_window
         if actual != expected[index]:
             raise ValueError(
                 f"loaded draft attention window for layer {index} "
@@ -156,19 +157,24 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         resource = create_token_executor_config(config)
         super().__init__(resource, device=device, kv_cache_bytes=kv_cache_bytes)
 
+        from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
         from vllm.v1.kv_cache_interface import AttentionSpec
 
         layouts = []
         for group in self.kv_config.kv_cache_groups:
-            layout = group.kv_cache_spec
+            (layout,) = group.distinct_specs
             assert isinstance(layout, AttentionSpec)
+            params = group.manager_config.params
             layouts.append(
                 dict(
                     kind=type(layout).__name__,
+                    manager=group.manager_cls.__name__,
                     layers=len(group.layer_names),
                     kv_heads=layout.num_kv_heads,
                     head_size=layout.head_size,
-                    window=getattr(layout, "sliding_window", None),
+                    window=params.sliding_window
+                    if isinstance(params, SlidingWindowManager.Params)
+                    else None,
                     dtype=str(layout.dtype),
                 )
             )
@@ -199,9 +205,9 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
         validate_token_model_inputs(config, speculator.model)
-        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
-        validate_token_model_kv_specs(config, get_kv_cache_spec(config))
+        validate_token_model_kv_specs(config, get_kv_cache_layer_configs(config))
         return speculator
 
     @property

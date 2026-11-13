@@ -2243,7 +2243,9 @@ def _compare_native_and_remote_draft(
         for layer in runner.get_model().modules():
             if not isinstance(layer, MambaBase):
                 continue
-            spec = layer.get_kv_cache_spec(worker.vllm_config)
+            layer_config = layer.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
+            spec = layer_config.spec
             assert isinstance(spec, MambaSpec)
             shapes = tuple(layer.get_state_shape())
             assert spec.shapes == shapes
@@ -2366,12 +2368,14 @@ def _compare_native_and_remote_draft(
         for attention in draft.modules():
             if not isinstance(attention, (Attention, MLAAttention)):
                 continue
-            spec = attention.get_kv_cache_spec(worker.vllm_config)
+            layer_config = attention.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
             policies.append(
                 (
                     attention.sliding_window,
-                    type(spec).__name__,
-                    getattr(spec, "sliding_window", None),
+                    type(layer_config.spec).__name__,
+                    layer_config.manager_cls.__name__,
+                    getattr(layer_config.manager_config.params, "sliding_window", None),
                 )
             )
         return policies
@@ -2595,9 +2599,10 @@ def _compare_native_and_remote_draft(
                         window,
                         "MLAAttentionSpec"
                         if mla_draft or (dense_mla and not independent)
-                        else "FullAttentionSpec"
+                        else "AttentionSpec",
+                        "FullAttentionManager"
                         if window is None
-                        else "SlidingWindowSpec",
+                        else "SlidingWindowManager",
                         window,
                     )
                     for window in ((None, None) if independent else mtp_windows)
@@ -2765,7 +2770,8 @@ def _compare_native_and_remote_draft(
         layouts = ast.literal_eval(layout_text)
         assert layouts and sum(layout["layers"] for layout in layouts) == 2
         assert all(
-            layout["kind"] == ("MLAAttentionSpec" if mla_draft else "FullAttentionSpec")
+            layout["kind"] == ("MLAAttentionSpec" if mla_draft else "AttentionSpec")
+            and layout["manager"] == "FullAttentionManager"
             and layout["kv_heads"] == 1
             and layout["head_size"] == (576 if mla_draft else 32)
             and layout["window"] is None
@@ -2797,6 +2803,7 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
         MLACommonMetadata,
     )
     from vllm.v1.attention.backends.mla.triton_mla import TritonMLAMetadataBuilder
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
@@ -2866,7 +2873,9 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
     assert len(layers) == 2
     layout, ranges = [], []
     for layer in layers:
-        spec = layer.get_kv_cache_spec(executor.vllm_config)
+        layer_config = layer.get_kv_cache_config(executor.vllm_config)
+        assert layer_config.manager_cls is FullAttentionManager
+        spec = layer_config.spec
         assert type(spec) is MLAAttentionSpec
         assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
         assert spec.block_size == 16 and spec.dtype == torch.bfloat16
@@ -3263,6 +3272,7 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
         from vllm.v1.attention.backends.mla.triton_mla import (
             TritonMLAMetadataBuilder,
         )
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         config, runner = worker.vllm_config, worker.model_runner
@@ -3278,7 +3288,9 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
         layers = [m for m in model.modules() if isinstance(m, MLAAttention)]
         assert len(layers) == 2
         for layer in layers:
-            spec = layer.get_kv_cache_spec(config)
+            layer_config = layer.get_kv_cache_config(config)
+            assert layer_config.manager_cls is FullAttentionManager
+            spec = layer_config.spec
             assert isinstance(spec, MLAAttentionSpec)
             assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
             assert spec.dtype == torch.bfloat16 and spec.block_size == 16
@@ -3558,7 +3570,11 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
 
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.layers.attention import Attention
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.gpu import (
         GPUDraftStepExecutor,
@@ -3616,7 +3632,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
     assert len(layers) == depth
     assert [layer.sliding_window for layer in layers] == expected_windows
     assert all(layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers)
-    # Both dense spec types use this backend's token-major page representation.
+    # Both allocation policies use this backend's token-major page representation.
     assert all(layer.kv_cache.shape[1:] == (2, 16, 64) for layer in layers)
     assert all(layer.kv_cache.dtype == torch.bfloat16 for layer in layers)
     modules = executor.speculator.model.model.layers
@@ -3639,12 +3655,15 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
         ]
         assert len(matches) == 1
         group_id, group = matches[0]
-        spec = group.kv_cache_spec
-        assert isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
-        assert type(spec).__name__ == (
-            "FullAttentionSpec" if window is None else "SlidingWindowSpec"
+        spec = group.kv_cache_specs[layer.layer_name]
+        assert type(spec) is AttentionSpec
+        assert group.manager_cls is (
+            FullAttentionManager if window is None else SlidingWindowManager
         )
-        assert getattr(spec, "sliding_window", None) == window
+        assert getattr(group.manager_config.params, "sliding_window", None) == window
+        native_config = layer.get_kv_cache_config(config)
+        assert native_config is not None
+        assert group.manager_config == native_config.manager_config
         assert spec.block_size == 16 and spec.dtype == torch.bfloat16
         cache = layer.kv_cache
         size = (
@@ -3657,6 +3676,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
                 "window": window,
                 "group": group_id,
                 "spec": type(spec).__name__,
+                "manager": group.manager_cls.__name__,
                 "cache_shape": list(cache.shape),
                 "cache_strides": list(cache.stride()),
             }

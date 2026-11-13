@@ -22,10 +22,14 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
+    KVCacheLayerConfig,
     KVQuantMode,
-    SlidingWindowSpec,
     get_block_table_width,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -34,8 +38,6 @@ from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
 )
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
-
-AttentionSpec = FullAttentionSpec | SlidingWindowSpec
 
 
 class SnapshotCompletionError(CompletionUnknownError):
@@ -141,7 +143,7 @@ def gemma4_source_layers(
 @dataclass(frozen=True)
 class TargetKVSource:
     layer_name: str
-    spec: AttentionSpec
+    layer_config: KVCacheLayerConfig
     cache: torch.Tensor
     block_table: torch.Tensor
     layout: KVCacheLayout
@@ -150,7 +152,7 @@ class TargetKVSource:
 @dataclass(frozen=True)
 class SnapshotLayer:
     layer_name: str
-    spec: AttentionSpec
+    layer_config: KVCacheLayerConfig
     logical_pages: tuple[int, ...]
     pages: torch.Tensor
 
@@ -175,7 +177,7 @@ class TargetKVSnapshot:
 @dataclass(frozen=True)
 class ImportedLayer:
     layer_name: str
-    spec: AttentionSpec
+    layer_config: KVCacheLayerConfig
     cache: torch.Tensor
     block_table: torch.Tensor
 
@@ -232,10 +234,28 @@ class ImportedTargetKVBatch:
             layer.block_table.record_stream(stream)
 
 
-def _validate_spec(spec: AttentionSpec) -> None:
+def _sliding_window(layer_config: KVCacheLayerConfig) -> int | None:
+    manager = layer_config.manager_config
+    if manager == FullAttentionManager.config():
+        return None
+    if manager.manager_cls is SlidingWindowManager:
+        params = manager.params
+        if (
+            isinstance(params, SlidingWindowManager.Params)
+            and params.sliding_window > 0
+            and params.extra_retained_tokens == 0
+            and not params.bounded_replay
+        ):
+            return params.sliding_window
+    raise ValueError("target-KV snapshots require plain full or sliding attention")
+
+
+def _validate_spec(layer_config: KVCacheLayerConfig) -> AttentionSpec:
+    spec = layer_config.spec
     # Subclasses may represent MLA, sinks, R-SWA, or another state contract.
-    if type(spec) not in (FullAttentionSpec, SlidingWindowSpec):
+    if type(spec) is not AttentionSpec:
         raise ValueError("target-KV snapshots require plain full or sliding attention")
+    _sliding_window(layer_config)
     if (
         spec.dtype != torch.bfloat16
         or spec.kv_quant_mode != KVQuantMode.NONE
@@ -245,17 +265,15 @@ def _validate_spec(spec: AttentionSpec) -> None:
         or spec.num_head_slots not in (None, spec.num_kv_heads)
         or spec.state_content_bytes is not None
         or spec.page_size_padded not in (None, spec.unpadded_page_size_bytes)
-        or (spec.sliding_window is not None and spec.sliding_window <= 0)
-        or (
-            isinstance(spec, FullAttentionSpec)
-            and (spec.non_causal or spec.attention_chunk_size is not None)
-        )
     ):
         raise ValueError("target-KV snapshots require dense causal BF16 K/V")
+    return spec
 
 
-def _range(spec: AttentionSpec, length: int) -> tuple[int, int, int]:
-    start = 0 if spec.sliding_window is None else max(0, length - spec.sliding_window)
+def _range(layer_config: KVCacheLayerConfig, length: int) -> tuple[int, int, int]:
+    spec = layer_config.spec
+    window = _sliding_window(layer_config)
+    start = 0 if window is None else max(0, length - window)
     return (
         start,
         start // spec.block_size,
@@ -263,15 +281,18 @@ def _range(spec: AttentionSpec, length: int) -> tuple[int, int, int]:
     )
 
 
-def _page_shape(spec: AttentionSpec) -> tuple[int, int, int]:
+def _page_shape(layer_config: KVCacheLayerConfig) -> tuple[int, int, int]:
+    spec = layer_config.spec
+    assert isinstance(spec, AttentionSpec)
     return spec.num_kv_heads, spec.block_size, 2 * spec.head_size
 
 
-def _table_width(spec: AttentionSpec, num_blocks: int) -> int:
+def _table_width(layer_config: KVCacheLayerConfig, num_blocks: int) -> int:
+    spec = layer_config.spec
     return get_block_table_width(
         num_blocks,
         spec.block_size,
-        token_alignment=spec.block_table_token_alignment,
+        token_alignment=layer_config.manager_cls.block_table_token_alignment,
     )
 
 
@@ -333,15 +354,15 @@ def snapshot_target_kv(
     total_pages = total_bytes = 0
     device = sources[0].cache.device
     for source in sources:
-        spec, cache = source.spec, source.cache
-        _validate_spec(spec)
+        layer_config, cache = source.layer_config, source.cache
+        spec = _validate_spec(layer_config)
         if (
             not source.layer_name
             or cache.device != device
             or device.type not in ("cpu", "cuda")
             or cache.dtype != spec.dtype
             or cache.ndim != 4
-            or tuple(cache.shape[1:]) != _page_shape(spec)
+            or tuple(cache.shape[1:]) != _page_shape(layer_config)
         ):
             raise ValueError(
                 "target-KV cache shape, dtype, or device differs from spec"
@@ -355,7 +376,7 @@ def snapshot_target_kv(
         )
         if physical is None or not physical.is_contiguous():
             raise ValueError("unsupported target-KV cache layout or strides")
-        start, first, end = _range(spec, materialized_length)
+        start, first, end = _range(layer_config, materialized_length)
         total_pages += end - first
         total_bytes += (end - first) * spec.unpadded_page_size_bytes
         budget.check(materialized_length, total_pages, total_bytes)
@@ -377,15 +398,16 @@ def snapshot_target_kv(
 
     layers = []
     for source, _start, first, blocks in plans:
+        spec = _validate_spec(source.layer_config)
         pages = torch.zeros(
-            (len(blocks), *_page_shape(source.spec)),
-            dtype=source.spec.dtype,
+            (len(blocks), *_page_shape(source.layer_config)),
+            dtype=spec.dtype,
             device=device,
         )
         layers.append(
             SnapshotLayer(
                 source.layer_name,
-                source.spec,
+                source.layer_config,
                 tuple(range(first, first + len(blocks))),
                 pages,
             )
@@ -402,7 +424,7 @@ def snapshot_target_kv(
                     logical_page=first + i,
                     start=start,
                     length=materialized_length,
-                    block_size=source.spec.block_size,
+                    block_size=source.layer_config.spec.block_size,
                 )
     return TargetKVSnapshot(identity, materialized_length, tuple(layers))
 
@@ -413,7 +435,7 @@ def import_target_kv(
     *,
     expected_identity: SnapshotIdentity,
     expected_materialized_length: int,
-    expected_specs: Mapping[str, AttentionSpec],
+    expected_specs: Mapping[str, KVCacheLayerConfig],
     budget: SnapshotBudget,
     device: torch.device,
 ) -> ImportedTargetKV:
@@ -439,7 +461,7 @@ def import_target_kv(
         tuple(
             ImportedLayer(
                 source.layer_name,
-                source.spec,
+                source.layer_config,
                 by_name[source.layer_name].cache,
                 by_name[source.layer_name].block_table[0],
             )
@@ -454,7 +476,7 @@ def import_target_kv_batch(
     *,
     expected_identities: Sequence[SnapshotIdentity],
     expected_materialized_lengths: Sequence[int],
-    expected_specs: Mapping[str, AttentionSpec],
+    expected_specs: Mapping[str, KVCacheLayerConfig],
     budget: SnapshotBudget,
     device: torch.device,
 ) -> ImportedTargetKVBatch:
@@ -498,17 +520,17 @@ def import_target_kv_batch(
             )
         row = {layer.layer_name: layer for layer in snapshot.layers}
         for name, layer in row.items():
-            spec = layer.spec
-            _validate_spec(spec)
-            _, first, end = _range(spec, length)
-            if spec != expected_specs[name]:
+            layer_config = layer.layer_config
+            spec = _validate_spec(layer_config)
+            _, first, end = _range(layer_config, length)
+            if layer_config != expected_specs[name]:
                 raise ValueError(
                     "target-KV snapshot attention spec differs from contract"
                 )
             if (
                 layer.logical_pages != tuple(range(first, end))
                 or layer.pages.dtype != spec.dtype
-                or tuple(layer.pages.shape) != (end - first, *_page_shape(spec))
+                or tuple(layer.pages.shape) != (end - first, *_page_shape(layer_config))
                 or not layer.pages.is_contiguous()
                 or layer.pages.device.type not in ("cpu", "cuda")
             ):
@@ -519,24 +541,30 @@ def import_target_kv_batch(
 
     plans = []
     total_pages = total_bytes = 0
-    for name, spec in expected_specs.items():
-        ranges = tuple(_range(spec, length) for length in expected_materialized_lengths)
+    for name, layer_config in expected_specs.items():
+        spec = _validate_spec(layer_config)
+        ranges = tuple(
+            _range(layer_config, length) for length in expected_materialized_lengths
+        )
         pages = 1 + sum(end - first for _, first, end in ranges)
-        width = max(_table_width(spec, end) for _, _, end in ranges)
+        width = max(_table_width(layer_config, end) for _, _, end in ranges)
         total_pages += pages
         total_bytes += pages * spec.unpadded_page_size_bytes + count * width * 4
         budget.check(max(expected_materialized_lengths), total_pages, total_bytes)
-        plans.append((name, spec, ranges, pages, width))
+        plans.append((name, layer_config, ranges, pages, width))
 
     layers = []
-    for name, spec, _, pages, width in plans:
+    for name, layer_config, _, pages, width in plans:
+        spec = _validate_spec(layer_config)
         cache = torch.zeros(
-            (pages, *_page_shape(spec)), dtype=spec.dtype, device=device
+            (pages, *_page_shape(layer_config)),
+            dtype=spec.dtype,
+            device=device,
         )
         block_table = torch.zeros((count, width), dtype=torch.int32, device=device)
-        layers.append(ImportedLayer(name, spec, cache, block_table))
+        layers.append(ImportedLayer(name, layer_config, cache, block_table))
     with _completed_copy_phase(device):
-        for receiver, (_, spec, ranges, _, _) in zip(layers, plans):
+        for receiver, (_, layer_config, ranges, _, _) in zip(layers, plans):
             physical = 1
             for row_index, (source_by_name, (start, _, _), length) in enumerate(
                 zip(source_rows, ranges, expected_materialized_lengths)
@@ -552,7 +580,7 @@ def import_target_kv_batch(
                         logical_page=logical,
                         start=start,
                         length=length,
-                        block_size=spec.block_size,
+                        block_size=layer_config.spec.block_size,
                     )
                     physical += 1
     return ImportedTargetKVBatch(
