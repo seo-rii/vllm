@@ -12,7 +12,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.spec_decode.remote.protocol import (
     Ping,
     ProtocolVersionError,
@@ -128,15 +132,19 @@ class SnapshotOracle:
 def wire_runtime(tmp_path, request):
     max_num_seqs = getattr(request, "param", 1)
     specs = {
-        "target.layers.1": SlidingWindowSpec(
-            block_size=4,
-            num_kv_heads=1,
-            head_size=4,
-            dtype=torch.bfloat16,
+        "target.layers.1": SlidingWindowManager.layer_config(
+            AttentionSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=4,
+                dtype=torch.bfloat16,
+            ),
             sliding_window=5,
         ),
-        "target.layers.3": FullAttentionSpec(
-            block_size=4, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        "target.layers.3": FullAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+            )
         ),
     }
     budget = SnapshotBudget(128, 1 << 20, 64)
@@ -223,7 +231,7 @@ def snapshot(client, key, round_id=0, length=9):
         tuple(
             SnapshotLayer(
                 p.name,
-                p.spec,
+                p.layer_config,
                 p.logical_pages,
                 torch.ones(p.shape, dtype=torch.bfloat16),
             )

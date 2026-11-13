@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.errors import (
     host_allocation_failure,
@@ -28,7 +29,6 @@ from vllm.v1.spec_decode.remote.protocol import (
 from vllm.v1.spec_decode.remote.reconnect import ReconnectBackoff
 from vllm.v1.spec_decode.remote.session import RemoteDraftError, tensor_to_frame
 from vllm.v1.spec_decode.remote.target_kv import (
-    AttentionSpec,
     SnapshotBudget,
     SnapshotIdentity,
     TargetKVSnapshot,
@@ -84,7 +84,7 @@ class TargetKVRemoteSession:
         endpoint: str,
         hello: TargetKVHello,
         *,
-        expected_specs: Mapping[str, AttentionSpec],
+        expected_specs: Mapping[str, KVCacheLayerConfig],
         failure_policy="error",
         request_timeout_ms=100,
         startup_timeout_ms=30000,
@@ -369,7 +369,7 @@ class TargetKVRemoteSession:
                 for plan in row_plans:
                     layer = layers[plan.name]
                     if (
-                        layer.spec != plan.spec
+                        layer.layer_config != plan.layer_config
                         or layer.logical_pages != plan.logical_pages
                         or tuple(layer.pages.shape) != plan.shape
                         or layer.pages.dtype != torch.bfloat16
