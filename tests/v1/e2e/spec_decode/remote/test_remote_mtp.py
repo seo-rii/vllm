@@ -1716,7 +1716,9 @@ def test_remote_native_mtp_matches_native_and_target(
         for layer in runner.get_model().modules():
             if not isinstance(layer, MambaBase):
                 continue
-            spec = layer.get_kv_cache_spec(worker.vllm_config)
+            layer_config = layer.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
+            spec = layer_config.spec
             assert isinstance(spec, MambaSpec)
             shapes = tuple(layer.get_state_shape())
             assert spec.shapes == shapes
@@ -1809,12 +1811,14 @@ def test_remote_native_mtp_matches_native_and_target(
         for attention in draft.modules():
             if not isinstance(attention, (Attention, MLAAttention)):
                 continue
-            spec = attention.get_kv_cache_spec(worker.vllm_config)
+            layer_config = attention.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
             policies.append(
                 (
                     attention.sliding_window,
-                    type(spec).__name__,
-                    getattr(spec, "sliding_window", None),
+                    type(layer_config.spec).__name__,
+                    layer_config.manager_cls.__name__,
+                    getattr(layer_config.manager_config.params, "sliding_window", None),
                 )
             )
         return policies
@@ -1848,11 +1852,10 @@ def test_remote_native_mtp_matches_native_and_target(
             [
                 (
                     window,
-                    "MLAAttentionSpec"
-                    if dense_mla
-                    else "FullAttentionSpec"
+                    "MLAAttentionSpec" if dense_mla else "AttentionSpec",
+                    "FullAttentionManager"
                     if window is None
-                    else "SlidingWindowSpec",
+                    else "SlidingWindowManager",
                     window,
                 )
                 for window in mtp_windows
@@ -2124,7 +2127,11 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
 
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.layers.attention import Attention
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.gpu import (
         GPUDraftStepExecutor,
@@ -2182,7 +2189,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
     assert len(layers) == depth
     assert [layer.sliding_window for layer in layers] == expected_windows
     assert all(layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers)
-    # Both dense spec types use this backend's token-major page representation.
+    # Both allocation policies use this backend's token-major page representation.
     assert all(layer.kv_cache.shape[1:] == (2, 16, 64) for layer in layers)
     assert all(layer.kv_cache.dtype == torch.bfloat16 for layer in layers)
     modules = executor.speculator.model.model.layers
@@ -2205,12 +2212,15 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
         ]
         assert len(matches) == 1
         group_id, group = matches[0]
-        spec = group.kv_cache_spec
-        assert isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
-        assert type(spec).__name__ == (
-            "FullAttentionSpec" if window is None else "SlidingWindowSpec"
+        spec = group.kv_cache_specs[layer.layer_name]
+        assert type(spec) is AttentionSpec
+        assert group.manager_cls is (
+            FullAttentionManager if window is None else SlidingWindowManager
         )
-        assert getattr(spec, "sliding_window", None) == window
+        assert getattr(group.manager_config.params, "sliding_window", None) == window
+        native_config = layer.get_kv_cache_config(config)
+        assert native_config is not None
+        assert group.manager_config == native_config.manager_config
         assert spec.block_size == 16 and spec.dtype == torch.bfloat16
         cache = layer.kv_cache
         size = (
@@ -2223,6 +2233,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
                 "window": window,
                 "group": group_id,
                 "spec": type(spec).__name__,
+                "manager": group.manager_cls.__name__,
                 "cache_shape": list(cache.shape),
                 "cache_strides": list(cache.stride()),
             }
