@@ -24,6 +24,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-feature-tokens", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-connections", type=int, default=1)
+    parser.add_argument("--max-sequences", type=int)
+    parser.add_argument("--max-sequences-per-verifier", type=int)
+    parser.add_argument("--max-pending-jobs", type=int, default=64)
+    parser.add_argument("--max-queued-snapshot-bytes", type=int, default=128 << 20)
+    parser.add_argument("--max-jobs-per-verifier", type=int, default=8)
+    parser.add_argument(
+        "--max-snapshot-bytes-per-verifier", type=int, default=128 << 20
+    )
+    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
     parser.add_argument("--language-model-only", action="store_true", required=True)
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args(argv)
@@ -63,6 +73,14 @@ def main(argv: list[str] | None = None) -> None:
         snapshot_budget=contract.snapshot_budget,
         receiver_budget=contract.receiver_budget,
         max_num_seqs=contract.max_num_seqs,
+        max_connections=args.max_connections,
+        max_sequences=args.max_sequences,
+        max_sequences_per_verifier=args.max_sequences_per_verifier,
+        max_pending_jobs=args.max_pending_jobs,
+        max_queued_snapshot_bytes=args.max_queued_snapshot_bytes,
+        max_jobs_per_verifier=args.max_jobs_per_verifier,
+        max_snapshot_bytes_per_verifier=args.max_snapshot_bytes_per_verifier,
+        batch_wait_ms=args.batch_wait_ms,
     )
     try:
         endpoint = server.start(args.endpoint)

@@ -18,6 +18,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-model-len", type=int, default=256)
     result.add_argument("--max-batch-size", type=int, default=4)
     result.add_argument("--max-feature-tokens", type=int, default=256)
+    result.add_argument("--max-pending-jobs", type=int, default=64)
+    result.add_argument("--max-queued-token-bytes", type=int, default=64 << 20)
+    result.add_argument("--max-jobs-per-verifier", type=int, default=8)
+    result.add_argument("--max-token-bytes-per-verifier", type=int, default=16 << 20)
+    result.add_argument("--max-sequences-per-verifier", type=int)
+    result.add_argument("--batch-wait-ms", type=float, default=1.0)
     result.add_argument("--dtype", default="bfloat16")
     result.add_argument("--block-size", type=int, default=16)
     result.add_argument("--attention-backend")
@@ -74,6 +80,12 @@ def main() -> None:
     adapter = create_adapter(args)
     server = TokenDraftServer(
         adapter,
+        max_pending_jobs=args.max_pending_jobs,
+        max_queued_token_bytes=args.max_queued_token_bytes,
+        max_jobs_per_verifier=args.max_jobs_per_verifier,
+        max_token_bytes_per_verifier=args.max_token_bytes_per_verifier,
+        max_sequences_per_verifier=args.max_sequences_per_verifier,
+        batch_wait_ms=args.batch_wait_ms,
         limits=RemoteServerLimits(
             args.max_batch_size,
             args.max_feature_tokens,
