@@ -435,18 +435,21 @@ def make_token_gpu_adapter(
         cache = None
         if outcome_cache is not None:
             assert isinstance(executor, TokenGPUStepExecutor)
+            from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
             from vllm.v1.kv_cache_interface import AttentionSpec
             from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
 
             if any(
-                not isinstance(group.kv_cache_spec, AttentionSpec)
-                or group.kv_cache_spec.dtype != torch.bfloat16
+                group.manager_cls is not FullAttentionManager
+                or any(
+                    type(spec) is not AttentionSpec or spec.dtype != torch.bfloat16
+                    for spec in group.kv_cache_specs.values()
+                )
                 for group in executor.kv_config.kv_cache_groups
             ):
                 raise ValueError("loaded outcome cache requires bfloat16 KV")
             page_bytes = sum(
-                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-                for group in executor.kv_config.kv_cache_groups
+                group.page_size_bytes for group in executor.kv_config.kv_cache_groups
             )
             blocks = outcome_cache.kv_budget_bytes // page_bytes
             if not 1 <= blocks <= executor.num_blocks - 1:

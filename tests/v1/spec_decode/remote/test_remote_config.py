@@ -384,12 +384,13 @@ def test_token_compatibility_contract_matches_public_schema_cli_and_native_load(
 
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.model_loader import get_model
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.runtime.token_gpu import (
         create_token_executor_config,
         validate_token_model_inputs,
     )
-    from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+    from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
     request.getfixturevalue("cpu_parallel_state")
     resource = create_token_executor_config(config)
@@ -397,13 +398,14 @@ def test_token_compatibility_contract_matches_public_schema_cli_and_native_load(
         hardware.setattr(torch.accelerator, "empty_cache", lambda: None)
         model = get_model(vllm_config=resource)
         validate_token_model_inputs(resource, model)
-        specs = get_kv_cache_spec(resource)
+        layer_configs = get_kv_cache_layer_configs(resource)
     assert type(model).__name__ == "Qwen3ForCausalLM"
-    assert len(specs) == resource.model_config.get_total_num_hidden_layers()
-    assert all(type(spec) is FullAttentionSpec for spec in specs.values())
+    assert len(layer_configs) == resource.model_config.get_total_num_hidden_layers()
     assert all(
-        isinstance(spec, FullAttentionSpec) and spec.dtype == getattr(torch, dtype)
-        for spec in specs.values()
+        type(layer.spec) is AttentionSpec
+        and layer.manager_cls is FullAttentionManager
+        and layer.spec.dtype == getattr(torch, dtype)
+        for layer in layer_configs.values()
     )
 
 
