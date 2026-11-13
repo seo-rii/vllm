@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU KV oracle and actual framed socket checks; no CUDA/model assertions."""
 
+import logging
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any
@@ -95,6 +96,7 @@ def test_token_server_cleanup_fence_retains_owners_without_thread_errors(
 ):
     import threading
 
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     state, _, server, session = socket_runtime
     owner_thread = server._workers[0]
     key = session.open_sequence(0, deadline=session.deadline())
@@ -457,6 +459,7 @@ def test_token_server_socket_close_error_retains_owner_and_requires_restart(
     import socket
     import threading
 
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     state, _, server, session = socket_runtime
     key = session.open_sequence(0, deadline=session.deadline())
     session.prefill(key, (1,), is_final=True, deadline=session.deadline())
