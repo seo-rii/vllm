@@ -19,6 +19,7 @@ configuration described below. All supported paths use scalar token positions.
 | `MiMoV2MTPModel` | `MiMoV2FlashForCausalLM` | Sliding-window DiffKV, QK192/V128 | First native head, sequential rollout |
 | `ErnieMTPModel` | `Ernie4_5_MoeForCausalLM` | Full attention | 1 |
 | `Qwen3NextMTP` | `Qwen3NextForCausalLM` | Full attention | Native sequential rollout |
+| `Qwen3_5MTP` / `Qwen3_5MoeMTP` | Flat-text `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` | Full attention | One checkpoint head, native sequential rollout |
 | `Glm4MoeMTPModel` | `Glm4MoeForCausalLM` | Full attention | Native sequential rollout |
 | `Glm4MoeLiteMTPModel` | `Glm4MoeLiteForCausalLM` | Dense MLA | Native sequential rollout |
 | `DeepSeekMTPModel` | `DeepseekV3ForCausalLM` | Dense MLA | One checkpoint head, native sequential rollout |
@@ -63,7 +64,7 @@ recycle evicted window pages. Budget the draft KV accordingly.
 
 Sparse/indexer MLA (including any `index_topk` configuration), compressed or
 packed KV, mixed MLA/dense groups, other multi-module model families, multimodal
-features, mRoPE and mHC are rejected. Nemotron MTP must contain only attention
+features, arbitrary mRoPE coordinates and mHC are rejected. Nemotron MTP must contain only attention
 and MoE layers.
 Gemma4's Q-only assistant reads target-owned KV and is not supported by this
 own-KV adapter. Its native local path is unaffected.
@@ -87,6 +88,35 @@ FP8 checkpoints require a separately validated loading and execution contract;
 passing a synthetic BF16 configuration does not establish their support.
 Select an MLA attention backend supported by the device for both native and
 remote comparison, and keep the MLA prefill backend consistent.
+
+### Qwen3.5 text
+
+Dense and MoE Qwen3.5 use their native flat-text target architectures and one
+full-attention MTP head (`mtp_num_hidden_layers=1`). The target retains its native
+Gated DeltaNet state and speculative rollback; the standalone head owns only
+attention KV and shares the target checkpoint's embedding and LM head.
+
+Use native unquantized BF16 target/draft weights and KV, target TP1, draft TP1,
+sequential greedy drafting and one inline endpoint. K controls sequential
+rollout of the single head. `transport="auto"` continues to select inline.
+Native weight-completeness checks include every split Q/K/V projection in
+dense and MoE BF16 MTP checkpoints, plus gate/up projections in dense checkpoints.
+Complete fused projections also load.
+Leaving `enable_weights_track` unset or setting it to `null` keeps these native
+BF16 checks enabled; an explicit `false` disables them.
+
+Saved text configurations may inherit three-axis `mrope_section` and
+`mrope_interleaved` metadata. The existing native flat-text configuration path
+removes those fields from the target's runtime RoPE configuration, and both the
+native and standalone MTP proposers use scalar logical positions. The checkpoint
+files are unchanged. The draft class advertises multimodal capabilities, but
+this contract accepts only the matching flat-text target; it does not transport
+image/video embeddings or arbitrary position axes.
+
+Conditional-generation wrappers, multimodal inputs, additional MTP heads,
+quantized checkpoints, CUDA IPC and pooled placement remain outside this
+contract. Small seeded model tests establish loading, state and placement
+correctness rather than trained quality or performance.
 
 ### MiMo-V2 Flash
 

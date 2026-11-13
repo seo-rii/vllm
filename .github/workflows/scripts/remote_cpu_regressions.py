@@ -17,6 +17,9 @@ NATIVE_SUITES = {
     "test_token_gpu.py",
 }
 EXTERNAL_REGRESSIONS = {
+    "tests/model_executor/model_loader/test_mtp_validation.py": (
+        "test_qwen35_moe_mtp_requires_every_attention_projection",
+    ),
     "tests/test_sampling_params.py": (
         "test_remote_draft_rejects_nonzero_temperature_at_admission",
         "test_remote_draft_accepts_greedy_sampling_at_admission",
