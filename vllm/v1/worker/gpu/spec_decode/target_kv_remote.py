@@ -25,6 +25,8 @@ from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
 from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotIdentity,
     TargetKVSource,
+    _sliding_window,
+    _validate_spec,
     select_draft_position,
     snapshot_target_kv,
 )
@@ -132,13 +134,14 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
         length = self.contract.snapshot_budget.max_model_len
         pages = nbytes = 0
         for _ in range(self.contract.max_num_seqs):
-            for spec in self.contract.expected_specs.values():
+            for layer_config in self.contract.expected_specs.values():
+                spec = _validate_spec(layer_config)
                 count = (length + spec.block_size - 1) // spec.block_size
-                if spec.sliding_window is not None:
+                window = _sliding_window(layer_config)
+                if window is not None:
                     count = min(
                         count,
-                        (spec.sliding_window + 2 * spec.block_size - 2)
-                        // spec.block_size,
+                        (window + 2 * spec.block_size - 2) // spec.block_size,
                     )
                 pages += count
                 nbytes += count * spec.unpadded_page_size_bytes
@@ -300,8 +303,11 @@ class TargetKVRemoteSpeculator(BaseSpeculator):
             ):
                 raise ValueError("target-KV requires causal text Triton metadata")
             cache = owner.kv_cache
+            actual = owner.get_kv_cache_config(self.config)
+            if actual is None:
+                raise ValueError("target-KV owner has no autoregressive cache")
             actual = replace(
-                owner.get_kv_cache_spec(self.config), block_size=cache.shape[2]
+                actual, spec=replace(actual.spec, block_size=cache.shape[2])
             )
             if actual != self.contract.expected_specs[canonical]:
                 raise ValueError("live target-KV geometry differs from the contract")

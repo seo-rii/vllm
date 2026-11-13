@@ -2336,7 +2336,11 @@ def test_loaded_token_kv_matches_attention_by_layer_not_group_counts(
 ):
     import torch
 
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.runtime.token_gpu import (
         create_token_executor_config,
         validate_token_model_kv_specs,
@@ -2357,9 +2361,11 @@ def test_loaded_token_kv_matches_attention_by_layer_not_group_counts(
         name += f".{'self_attn' if n == 0 else 'other_attn'}.attn"
         geometry = dict(block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float32)
         specs[name] = (
-            FullAttentionSpec(**geometry)
+            FullAttentionManager.layer_config(AttentionSpec(**geometry))
             if window is None
-            else SlidingWindowSpec(**geometry, sliding_window=window)
+            else SlidingWindowManager.layer_config(
+                AttentionSpec(**geometry), sliding_window=window
+            )
         )
     if error is None:
         validate_token_model_kv_specs(config, specs)

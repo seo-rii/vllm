@@ -1607,7 +1607,9 @@ def test_remote_native_mtp_matches_native_and_target(
         for layer in runner.get_model().modules():
             if not isinstance(layer, MambaBase):
                 continue
-            spec = layer.get_kv_cache_spec(worker.vllm_config)
+            layer_config = layer.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
+            spec = layer_config.spec
             assert isinstance(spec, MambaSpec)
             shapes = tuple(layer.get_state_shape())
             assert spec.shapes == shapes
@@ -1671,12 +1673,14 @@ def test_remote_native_mtp_matches_native_and_target(
         for attention in draft.modules():
             if not isinstance(attention, (Attention, MLAAttention)):
                 continue
-            spec = attention.get_kv_cache_spec(worker.vllm_config)
+            layer_config = attention.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
             policies.append(
                 (
                     attention.sliding_window,
-                    type(spec).__name__,
-                    getattr(spec, "sliding_window", None),
+                    type(layer_config.spec).__name__,
+                    layer_config.manager_cls.__name__,
+                    getattr(layer_config.manager_config.params, "sliding_window", None),
                 )
             )
         return policies
@@ -1706,10 +1710,13 @@ def test_remote_native_mtp_matches_native_and_target(
     assert all(len(output[0]) == 8 for batch in expected for output in batch)
     with vllm_runner(model, speculative_config=config, **kwargs) as native:
         policy = native.llm.collective_rpc(draft_kv_policy)
-        spec_type = "FullAttentionSpec" if mtp_window is None else "SlidingWindowSpec"
+        spec_type = "AttentionSpec"
+        manager_type = (
+            "FullAttentionManager" if mtp_window is None else "SlidingWindowManager"
+        )
         if dense_mla:
             spec_type = "MLAAttentionSpec"
-        assert policy == [[(mtp_window, spec_type, mtp_window)]]
+        assert policy == [[(mtp_window, spec_type, manager_type, mtp_window)]]
         record_property("native.kv_policy", policy)
         if dense_mla:
             layout = native.llm.collective_rpc(draft_mla_layout)
