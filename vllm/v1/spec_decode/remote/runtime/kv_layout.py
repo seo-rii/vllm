@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-group own-KV layouts for the standalone draft planner.
+"""Dense own-KV layouts for the standalone draft planner.
 
 Sliding-window attention keeps a full-context block table here. The attention
 backend applies its window; the planner does not evict or recycle old positions.
@@ -81,6 +81,33 @@ def select_standalone_kv_layer_config(
     return first_layer
 
 
+def group_standalone_kv_specs(
+    layer_configs: Mapping[str, KVCacheLayerConfig],
+) -> list[KVCacheGroup]:
+    """Group dense layers while sharing one logical block ID namespace."""
+    if not layer_configs:
+        raise ValueError("standalone drafter has no attention KV layers")
+    grouped: dict[KVCacheLayerConfig, dict[str, KVCacheLayerConfig]] = {}
+    first: AttentionSpec | None = None
+    for name, layer in layer_configs.items():
+        select_standalone_kv_layer_config({name: layer})
+        spec = layer.spec
+        assert isinstance(spec, AttentionSpec)
+        if first is None:
+            first = spec
+        elif spec.block_size != first.block_size or spec.dtype != first.dtype:
+            raise ValueError(
+                "standalone KV groups require a common block size and dtype"
+            )
+        elif isinstance(spec, MLAAttentionSpec) != isinstance(first, MLAAttentionSpec):
+            raise ValueError("standalone runtime cannot mix MLA and dense attention")
+        grouped.setdefault(layer, {})[name] = layer
+    return [
+        KVCacheGroup.from_layers(layers, is_eagle_group=True)
+        for layers in grouped.values()
+    ]
+
+
 def make_standalone_kv_config(
     layer_config: KVCacheLayerConfig,
     layer_names: list[str],
@@ -90,31 +117,47 @@ def make_standalone_kv_config(
     """Describe disjoint layer ranges for the shared KV allocator."""
     if not layer_names or len(set(layer_names)) != len(layer_names):
         raise ValueError("standalone KV layer names must be nonempty and unique")
-    layers = dict.fromkeys(layer_names, layer_config)
-    select_standalone_kv_layer_config(layers)
-    spec = layer_config.spec
+    return make_grouped_standalone_kv_config(
+        dict.fromkeys(layer_names, layer_config), kv_cache_bytes, layout
+    )
+
+
+def make_grouped_standalone_kv_config(
+    layer_configs: Mapping[str, KVCacheLayerConfig],
+    kv_cache_bytes: int,
+    layout: KVCacheLayout,
+) -> KVCacheConfig:
+    """Reserve every logical block in every layer, without cross-group aliasing."""
+    groups = group_standalone_kv_specs(layer_configs)
     if not layout.is_layer_compact:
         raise ValueError("standalone runtime requires layer-compact KV layout")
-    page_bytes = spec.page_size_bytes
-    num_blocks = kv_cache_bytes // (len(layer_names) * page_bytes)
+    page_bytes = sum(layer.spec.page_size_bytes for layer in layer_configs.values())
+    num_blocks = kv_cache_bytes // page_bytes
     if num_blocks < 2:
         raise ValueError("draft KV budget cannot hold null block plus one block")
-    layer_stride, block_stride, *_ = compute_layout_strides(
-        spec, num_blocks, len(layer_names), layout
-    )
-    if block_stride % spec.get_block_stride_alignment():
-        raise ValueError("standalone KV layout does not satisfy block alignment")
-    # All layers share one allocation, but must own distinct byte ranges.
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
+    tensors = []
+    offset = 0
+    for group in groups:
+        (spec,) = group.distinct_specs
+        layer_stride, block_stride, *_ = compute_layout_strides(
+            spec, num_blocks, len(group.layer_names), layout
+        )
+        if block_stride % spec.get_block_stride_alignment():
+            raise ValueError("standalone KV layout does not satisfy block alignment")
+        # Every descriptor refers to the same backing buffer, with disjoint ranges.
+        tensors.append(
             KVCacheTensor(
-                size=page_bytes * num_blocks * len(layer_names),
-                layers=list(layer_names),
+                size=page_bytes * num_blocks,
+                layers=group.layer_names,
                 layer_stride=layer_stride,
                 block_stride=block_stride,
+                offset=offset,
             )
-        ],
-        kv_cache_groups=[KVCacheGroup.from_layers(layers, is_eagle_group=True)],
+        )
+        offset += group.page_size_bytes * num_blocks
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=groups,
         kv_cache_layout=layout.name,
     )

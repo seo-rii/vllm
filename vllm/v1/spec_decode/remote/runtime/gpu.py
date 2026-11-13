@@ -23,9 +23,7 @@ from vllm.v1.spec_decode.remote.runtime.adapter import (
 )
 from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
 from vllm.v1.spec_decode.remote.runtime.kv_layout import (
-    make_standalone_kv_config as _make_standalone_kv_config,
-)
-from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+    make_grouped_standalone_kv_config,
     select_standalone_kv_layer_config,
 )
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
@@ -59,7 +57,6 @@ def initialize_standalone_kv_cache_config(
     from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
     layer_configs = get_kv_cache_layer_configs(vllm_config)
-    first = select_standalone_kv_layer_config(layer_configs)
     layers = get_layers_from_vllm_config(
         vllm_config,
         AttentionLayerBase,  # type: ignore[type-abstract]
@@ -75,9 +72,7 @@ def initialize_standalone_kv_cache_config(
     layout = resolve_kv_cache_layout(
         vllm_config, [[layout.name for layout in layouts]], layer_configs.values()
     )
-    kv_config = _make_standalone_kv_config(
-        first, list(layer_configs), kv_cache_bytes, layout
-    )
+    kv_config = make_grouped_standalone_kv_config(layer_configs, kv_cache_bytes, layout)
     vllm_config.cache_config.num_gpu_blocks = kv_config.num_blocks
     return kv_config
 
@@ -188,17 +183,20 @@ def make_standalone_block_tables(
     from vllm.v1.kv_cache_interface import get_block_table_width
     from vllm.v1.worker.gpu.block_table import BlockTables
 
-    group = kv_config.kv_cache_groups[0]
-    width = get_block_table_width(
-        math.ceil(max_model_len / group.block_size),
-        group.block_size,
-        token_alignment=group.manager_cls.block_table_token_alignment,
-    )
+    groups = kv_config.kv_cache_groups
+    widths = [
+        get_block_table_width(
+            math.ceil(max_model_len / group.block_size),
+            group.block_size,
+            token_alignment=group.manager_cls.block_table_token_alignment,
+        )
+        for group in groups
+    ]
     return BlockTables(
-        block_sizes=[group.block_size],
+        block_sizes=[group.block_size for group in groups],
         max_num_reqs=max_num_reqs,
         max_num_batched_tokens=max_num_tokens,
-        max_num_blocks_per_group=[width],
+        max_num_blocks_per_group=widths,
         device=device,
     )
 
@@ -330,7 +328,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
             draft_bytes,
             embedding_bytes,
             head_bytes,
-            sum(t.size for t in self.kv_config.kv_cache_tensors),
+            self.kv_config.kv_cache_tensors[0].size,
             torch.accelerator.memory_allocated(device),
             vllm_config.model_config.dtype,
             spec.draft_model_config.quantization,
@@ -343,6 +341,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         return create_runtime_contract(config)
 
     def _load_speculator(self, config, device, shared_weights_source):
+        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
@@ -354,6 +353,7 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         speculator_cls = MTPSpeculator if spec.method == "mtp" else EagleSpeculator
         speculator = speculator_cls(config, device)
         speculator.load_model(target_shell)
+        select_standalone_kv_layer_config(get_kv_cache_layer_configs(config))
         return speculator
 
     def _init_sampling_buffers(self, max_num_reqs: int) -> None:
@@ -454,7 +454,9 @@ class GPUDraftStepExecutor(DraftStepExecutor):
         try:
             for req_index, update in plan.block_table_updates.items():
                 self.block_tables.append_block_ids(
-                    req_index, (update.block_ids,), overwrite=update.start == 0
+                    req_index,
+                    (update.block_ids,) * self.block_tables.num_kv_cache_groups,
+                    overwrite=update.start == 0,
                 )
             self.block_tables.apply_staged_writes()
         except BaseException as error:

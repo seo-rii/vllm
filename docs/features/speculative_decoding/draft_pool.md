@@ -8,7 +8,8 @@ with one execution thread owning their mutable model and KV state.
 
 Token-only workers use `method="draft_model"`, inline transport, target TP1 and
 draft TP1. Each token-only model may use homogeneous full or sliding-window
-attention, with independently configured target and draft windows. Draft workers
+attention; Llama and Mistral also support mixed full/sliding layers. Target and
+draft use their own per-layer windows and ordering. Draft workers
 retain full-context KV rather than evicting old window positions; size their KV
 budget for the context limit. See the
 [token-only contract](../../design/unified_speculation_runtime.md#token-only-state-contract)

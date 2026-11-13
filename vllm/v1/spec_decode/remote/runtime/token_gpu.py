@@ -3,6 +3,8 @@
 """Token-only native model/attention execution, without a target shell or engine."""
 
 import inspect
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -33,6 +35,9 @@ from vllm.v1.spec_decode.remote.runtime.token_state import (
     TokenStepExecutor,
 )
 
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig
+
 
 def validate_token_model_inputs(config: VllmConfig, model: torch.nn.Module) -> None:
     """Fail closed when a native model needs inputs or state we do not supply."""
@@ -53,6 +58,7 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
     """Give the standalone model its own dimensions, topology and attention window."""
     spec = config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
+    windows = _validate_token_model(spec.draft_model_config, "draft")
     return replace(
         config,
         model_config=spec.draft_model_config,
@@ -61,9 +67,54 @@ def create_token_executor_config(config: VllmConfig) -> VllmConfig:
         cache_config=replace(
             config.cache_config,
             cache_dtype=spec.kv_cache_dtype or config.cache_config.cache_dtype,
-            sliding_window=_validate_token_model(spec.draft_model_config, "draft"),
+            # A global window also affects full-attention layers. Mixed models
+            # must obtain their windows from the native per-layer definitions.
+            sliding_window=windows[0] if len(set(windows)) == 1 else None,
         ),
     )
+
+
+def validate_token_model_kv_specs(
+    config: VllmConfig, specs: Mapping[str, "KVCacheLayerConfig"]
+) -> None:
+    """Verify loaded attention semantics by layer index, not group counts."""
+    from vllm.model_executor.models.utils import extract_layer_index
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+        group_standalone_kv_specs,
+    )
+
+    expected = _validate_token_model(config.model_config, "draft")
+    groups = group_standalone_kv_specs(specs)
+    if any(
+        any(type(spec) is not AttentionSpec for spec in group.distinct_specs)
+        for group in groups
+    ):
+        raise ValueError("token-only loaded draft requires dense attention KV")
+    if len(specs) != len(expected):
+        raise ValueError("token-only draft requires one attention KV per model layer")
+    seen: set[int] = set()
+    for name, layer_config in specs.items():
+        try:
+            index = extract_layer_index(name)
+        except (AssertionError, ValueError) as error:
+            raise ValueError("loaded draft KV must identify its model layer") from error
+        if index < 0 or index >= len(expected) or index in seen:
+            raise ValueError(
+                "loaded draft KV layer indices must be unique and complete"
+            )
+        seen.add(index)
+        actual = None
+        if layer_config.manager_cls is SlidingWindowManager:
+            params = layer_config.manager_config.params
+            assert isinstance(params, SlidingWindowManager.Params)
+            actual = params.sliding_window
+        if actual != expected[index]:
+            raise ValueError(
+                f"loaded draft attention window for layer {index} "
+                f"differs from its contract: {actual} != {expected[index]}"
+            )
 
 
 class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
@@ -98,32 +149,9 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
         validate_token_model_inputs(config, speculator.model)
-        from vllm.v1.core.single_type_kv_cache_manager import (
-            FullAttentionManager,
-            SlidingWindowManager,
-        )
-        from vllm.v1.kv_cache_interface import AttentionSpec
-        from vllm.v1.spec_decode.remote.runtime.kv_layout import (
-            select_standalone_kv_layer_config,
-        )
         from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
-        actual = select_standalone_kv_layer_config(get_kv_cache_layer_configs(config))
-        if type(actual.spec) is not AttentionSpec or actual.manager_cls not in (
-            FullAttentionManager,
-            SlidingWindowManager,
-        ):
-            raise ValueError(
-                "token-only loaded draft requires homogeneous full or "
-                "sliding-window attention KV"
-            )
-        window = None
-        if actual.manager_cls is SlidingWindowManager:
-            params = actual.manager_config.params
-            assert isinstance(params, SlidingWindowManager.Params)
-            window = params.sliding_window
-        if window != config.cache_config.sliding_window:
-            raise ValueError("loaded draft attention window differs from its contract")
+        validate_token_model_kv_specs(config, get_kv_cache_layer_configs(config))
         return speculator
 
     @property

@@ -478,6 +478,52 @@ def test_standalone_capacity_reaches_flex_attention_metadata_builder(num_blocks)
     )
 
 
+def test_standalone_mixed_attention_keeps_per_layer_metadata_and_capacity():
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.flex_attention import (
+        FlexAttentionBackend,
+        FlexAttentionMetadataBuilder,
+    )
+    from vllm.v1.worker.gpu.attn_utils import init_attn_backend
+
+    config = make_config()
+    with set_current_vllm_config(config):
+        layers = [
+            Attention(
+                num_heads=2,
+                head_size=head_size,
+                num_kv_heads=kv_heads,
+                scale=head_size**-0.5,
+                per_layer_sliding_window=window,
+                cache_config=config.cache_config,
+                prefix=f"draft.layers.{i}.self_attn",
+                attn_backend=FlexAttentionBackend,
+            )
+            for i, (window, head_size, kv_heads) in enumerate(
+                [(16, 8, 1), (None, 16, 2), (32, 8, 1)]
+            )
+        ]
+        layer_configs = [layer.get_kv_cache_config(config) for layer in layers]
+        specs = [layer.spec for layer in layer_configs if layer is not None]
+        assert all(spec is not None for spec in specs)
+        page_bytes = sum(spec.page_size_bytes for spec in specs if spec is not None)
+        kv_config = initialize_standalone_kv_cache_config(config, 7 * page_bytes)
+        groups, _, _ = init_attn_backend(kv_config, config, torch.device("cpu"))
+
+    assert kv_config.num_blocks == 7
+    assert len(groups) == 3
+    for i, (group, expected) in enumerate(zip(groups, specs)):
+        assert len(group) == 1
+        assert group[0].layer_names == [f"draft.layers.{i}.self_attn"]
+        assert group[0].kv_cache_spec == expected
+        builder = group[0].metadata_builders[0]
+        assert isinstance(builder, FlexAttentionMetadataBuilder)
+        assert builder.cache_config.num_gpu_blocks == 7
+        assert builder.kv_cache_spec == expected
+    assert {tensor.size for tensor in kv_config.kv_cache_tensors} == {7 * page_bytes}
+
+
 @pytest.mark.parametrize("non_causal", [False, True])
 def test_standalone_mla_checks_live_causality_before_assigning_capacity(non_causal):
     from vllm.config import set_current_vllm_config
@@ -522,21 +568,34 @@ def test_standalone_mla_checks_live_causality_before_assigning_capacity(non_caus
             }
 
 
-def test_standalone_sliding_window_tables_retain_full_context_capacity(monkeypatch):
-    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+@pytest.mark.parametrize("windows", [(5,), (None, 5, 9)])
+def test_standalone_sliding_window_tables_retain_full_context_capacity(
+    monkeypatch, windows
+):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.kv_cache_layout import KVCacheLayout
     from vllm.v1.spec_decode.remote.runtime.gpu import make_standalone_block_tables
-    from vllm.v1.spec_decode.remote.runtime.kv_layout import make_standalone_kv_config
+    from vllm.v1.spec_decode.remote.runtime.kv_layout import (
+        make_grouped_standalone_kv_config,
+    )
     from vllm.v1.worker.gpu import buffer_utils
 
     monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: False)
     spec = AttentionSpec(
         block_size=4, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
     )
-    layer = SlidingWindowManager.layer_config(spec, sliding_window=5)
-    kv_config = make_standalone_kv_config(
-        layer, ["draft"], 129 * spec.page_size_bytes, KVCacheLayout.LBNHC
+    layers = {
+        f"draft.{i}": FullAttentionManager.layer_config(spec)
+        if window is None
+        else SlidingWindowManager.layer_config(spec, sliding_window=window)
+        for i, window in enumerate(windows)
+    }
+    kv_config = make_grouped_standalone_kv_config(
+        layers, len(layers) * 129 * spec.page_size_bytes, KVCacheLayout.LBNHC
     )
     tables = make_standalone_block_tables(
         kv_config,
@@ -555,9 +614,13 @@ def test_standalone_sliding_window_tables_retain_full_context_capacity(monkeypat
     assert not failures
     req_index = planner.req_index(key)
     update = plan.block_table_updates[req_index]
-    tables.append_block_ids(req_index, (update.block_ids,), overwrite=True)
-    assert tables.block_tables[0].gpu.shape[1] >= 128
-    assert tables.num_blocks.np[0, req_index] == len(pool.blocks(req_index)) == 34
+    assert len(tables.block_tables) == len(windows)
+    tables.append_block_ids(
+        req_index, (update.block_ids,) * len(windows), overwrite=True
+    )
+    assert all(table.gpu.shape[1] >= 128 for table in tables.block_tables)
+    assert len(pool.blocks(req_index)) == 34
+    assert all(count == 34 for count in tables.num_blocks.np[:, req_index])
     planner.commit(plan)
     planner.close(key)
     assert pool.num_free_blocks == kv_config.num_blocks - 1
