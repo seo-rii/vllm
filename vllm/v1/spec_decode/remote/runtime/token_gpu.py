@@ -148,10 +148,6 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
             or spec.draft_parallel_config.tensor_parallel_size != 1
         ):
             raise ValueError("token-only runtime requires target TP1 and draft TP1")
-        if spec.draft_model_config.quantization is not None:
-            raise ValueError(
-                "token-only first runtime requires unquantized draft weights"
-            )
         # Allocate attention/KV from the independent draft's dimensions. No
         # target modules, embeddings or output head are constructed here.
         resource = create_token_executor_config(config)
