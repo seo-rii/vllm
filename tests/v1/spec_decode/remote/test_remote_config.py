@@ -396,6 +396,8 @@ def test_token_compatibility_contract_matches_public_schema_cli_and_native_load(
     resource = create_token_executor_config(config)
     with monkeypatch.context() as hardware, set_current_vllm_config(resource):
         hardware.setattr(torch.accelerator, "empty_cache", lambda: None)
+        if not hasattr(torch.ops._C, "convert_weight_packed"):
+            hardware.setattr(torch.cpu, "_is_amx_tile_supported", lambda: False)
         model = get_model(vllm_config=resource)
         validate_token_model_inputs(resource, model)
         layer_configs = get_kv_cache_layer_configs(resource)
