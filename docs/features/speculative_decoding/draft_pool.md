@@ -7,10 +7,13 @@ Workers combine proposals from different verifiers into a ragged GPU batch,
 with one execution thread owning their mutable model and KV state.
 
 Token-only workers use `method="draft_model"`, inline transport, target TP1 and
-draft TP1. Each token-only model may use homogeneous full or sliding-window
-attention; Llama and Mistral also support mixed full/sliding layers. Target and
-draft use their own per-layer windows and ordering. Draft workers
-retain full-context KV rather than evicting old window positions; size their KV
+draft TP1. Pooled token-only targets and drafts may use homogeneous full or
+sliding-window attention; Llama and Mistral also support mixed full/sliding
+layers. Qwen3Next, NemotronH and dense GLM4MoELite token-only targets currently
+require a single endpoint; their target-state recovery is outside this pool
+support matrix. Target and draft use their own per-layer windows and ordering.
+Draft workers retain full-context KV rather than evicting old window positions;
+size their KV
 budget for the context limit. See the
 [token-only contract](../../design/unified_speculation_runtime.md#token-only-state-contract)
 for model and tokenizer requirements.
