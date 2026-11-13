@@ -3,9 +3,10 @@
 The native local speculator remains the default. An opt-in backend boundary
 adds local wrappers, same-step dispatch/collect and a token-only standalone
 draft. Full-attention token-only execution additionally supports bounded
-target-prefix replay and eager MRV2 async scheduling. Predictive caching, N:M
-pooling, stochastic remote sampling, general prefix reuse, cross-node transport
-and draft TP expansion remain outside this implementation.
+target-prefix replay and eager MRV2 async scheduling. A separate opt-in
+all-accepted outcome cache supports ordinary BF16 Qwen3 drafts. N:M pooling,
+stochastic remote sampling, general prefix reuse, cross-node transport and
+draft TP expansion remain outside this implementation.
 
 ## Native local execution
 
@@ -66,8 +67,9 @@ a remote reader finished.
 
 ## Configuration and protocol boundaries
 
-Execution separates placement from the speculative method. Only `on_demand`
-policy and one endpoint are accepted. Local execution rejects remote endpoint,
+Execution separates placement from the speculative method. `on_demand` remains
+the default; `outcome_cache` is limited to the dense token-only contract below.
+Only one endpoint is accepted. Local execution rejects remote endpoint,
 transport, failure-policy, and timeout options. Supplying both legacy
 `remote_draft` and `execution` is an error. Legacy remote configuration keeps its
 existing defaults and v2 semantics; `transport="auto"` still means inline.
@@ -105,6 +107,64 @@ but ignores or omits it, retaining the previous queue-execution behavior.
 
 Capabilities belong to the concrete v2 and v3 runtime contracts. Owning KV
 does not imply independence from target features or support for future prediction.
+
+v3.2 adds explicit proposal-policy negotiation. A cache client requires the
+server to echo `outcome_cache` before sending request data. Older peers retain
+on-demand compatibility but cannot silently accept a cache request. Cache
+responses report each row's `cache` or `on_demand` origin without changing the
+authoritative prefix/proposal acknowledgment or adding tensor frames.
+
+## All-accepted outcome cache
+
+The first predictive policy supports unquantized BF16 full-attention Qwen3
+target/draft models, greedy generation, eager synchronous MRV2, target TP1,
+draft TP1, one verifier connection and same-host inline transport. Tokenizer
+artifacts must meet the existing exact identity contract. It does not enable
+MTP/EAGLE prediction, draft pooling, recurrent/MLA/windowed branches, stochastic
+sampling or local caching.
+
+After a proposal response is sent successfully, the existing draft owner may
+build one candidate for the outcome where every offered draft is accepted and
+the draft's next greedy token matches the target's bonus token. A branch shares
+whole pages of the immutable committed prefix. It allocates private pages for
+the partial committed page and the speculative/write tail, copying only written
+tail pages before starting a forward. Shared pages are reference counted and
+remain reserved until both leases close. Neither live nor predicted execution
+writes the shared prefix.
+
+Reserved internal request slots, branch count, additional physical branch KV
+pages and copy chunk size are bounded at startup. Shared prefix references do
+not consume the branch's additional-page budget; they remain charged once in
+the existing physical draft arena. Copy scratch is warmed before the listener
+becomes ready. Ready logs include shared/copied page counts, extra forwards and
+elapsed build-readiness time; the latter includes queue gaps between phases.
+
+Background work runs only when foreground/cleanup queues are empty and yields
+after one copy chunk or forward. The cache key includes sequence generation,
+session/cache epoch, source proposal, committed prefix revision, exact next K
+and checkpoint/tokenizer/sampling identity. A ready hit atomically transfers
+the branch's page lease to the live request and uses the incoming batch ID for
+the new proposal. Future speculative KV does not become committed context.
+
+A missing, unfinished, mismatched-K or rejected candidate uses ordinary
+on-demand drafting and keeps the session healthy. Explicit K0 still updates
+the authoritative context. Foreground allocation can retire unused branches;
+prediction must not cause an otherwise feasible live request to fail. Fatal or
+completion-unknown errors retain uncertain resources and require process
+replacement under the existing failure policy.
+
+Private tail copying and extra forwards consume memory and compute. Same-GPU
+correctness does not establish overlap or throughput gains; the policy is
+experimental and disabled by default. See the
+[configuration example](../features/speculative_decoding/remote_draft.md#all-accepted-outcome-cache).
+
+The token backend distinguishes receipt of a cache-origin response, installation
+as a target proposal, and later verification/acceptance. Its host-only progress
+snapshot is available through the existing worker RPC without changing wire
+semantics or introducing a GPU synchronization. Correctness uses an in-process
+engine to pace public steps using real server-ready events; the default
+multiprocessing core advances independently of frontend output consumption.
+Unpaced cache off/on measurements remain a separate experiment.
 
 ## Token-only state contract
 
@@ -273,3 +333,5 @@ ranks uses three GPUs; a single-GPU correctness run does not validate TP2 or its
 collectives.
 
 Draft TP2 requires dense full attention, unquantized BF16 weights/KV, eager synchronous execution and no prefix caching. The CPU owner sends identical commands to two native ranks, uses their common KV capacity and retires the whole group after uncertain completion.
+It supports the `on_demand` policy. The `outcome_cache` policy keeps its draft
+TP1 requirement and cannot be combined with two draft ranks.

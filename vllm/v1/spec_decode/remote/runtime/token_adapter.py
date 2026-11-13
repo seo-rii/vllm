@@ -4,15 +4,27 @@
 
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.schema import RuntimeContract
+from vllm.v1.spec_decode.remote.runtime.token_cache import TokenOutcomeCache
 from vllm.v1.spec_decode.remote.runtime.token_state import TokenStateMachine
 from vllm.v1.spec_decode.remote.server import PrefillInputs, StandaloneDraftAdapter
 from vllm.v1.spec_decode.remote.transport import DataFrame, frame_to_ints
 
 
 class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
-    def __init__(self, state: TokenStateMachine, contract: RuntimeContract) -> None:
+    def __init__(
+        self,
+        state: TokenStateMachine,
+        contract: RuntimeContract,
+        cache: TokenOutcomeCache | None = None,
+    ) -> None:
         self.state = state
         self.contract = contract
+        self.cache = cache
+
+    def advance_many(self, updates, *, deadlines=None):
+        if self.cache is not None:
+            return self.cache.advance_many(updates, deadlines=deadlines)
+        return self.state.advance_many(updates, deadlines=deadlines)
 
     def capabilities(self):
         return self.contract.capabilities
@@ -28,6 +40,8 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
 
     def warmup(self) -> None:
         self.state.executor.warmup()
+        if self.cache is not None:
+            self.cache.warmup()
 
     def close(self) -> None:
         self.state.executor.close()
@@ -39,7 +53,8 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
         frame = inputs.features[0]
         if not isinstance(frame, DataFrame):
             raise ValueError("missing prompt tokens")
-        self.state.prefill(
+        consumer = self.state if self.cache is None else self.cache
+        consumer.prefill(
             key, inputs.offset, tuple(frame_to_ints(frame)), is_final=inputs.is_final
         )
 
@@ -49,4 +64,6 @@ class TokenOnlyDraftAdapter(StandaloneDraftAdapter):
         )
 
     def close_sequences(self, keys: tuple[SequenceKey, ...]) -> None:
+        if self.cache is not None:
+            self.cache.close(keys)
         self.state.close(keys)
