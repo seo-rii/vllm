@@ -196,7 +196,11 @@ def test_recurrent_startup_reads_each_checkpoint_once_and_rechecks_changes(
 def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
     from tests.v1.spec_decode.remote.test_token_runtime import token_config
     from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
     from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
         create_recurrent_executor_config,
     )
@@ -213,16 +217,22 @@ def recurrent_cache_inputs(tmp_path, *, max_num_reqs):
         )
     )
     return config, {
-        "model.layers.0.mixer": MambaSpec(
-            block_size=config.cache_config.mamba_block_size,
-            shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(config),
-            dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(config),
+        "model.layers.0.mixer": MambaManager.layer_config(
+            MambaSpec(
+                block_size=config.cache_config.mamba_block_size,
+                shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(config),
+                dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(config),
+            )
         ),
-        "model.layers.1.mixer.attn": FullAttentionSpec(
-            block_size=config.cache_config.block_size,
-            num_kv_heads=config.model_config.get_num_kv_heads(config.parallel_config),
-            head_size=config.model_config.get_head_size(),
-            dtype=config.model_config.dtype,
+        "model.layers.1.mixer.attn": FullAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=config.cache_config.block_size,
+                num_kv_heads=config.model_config.get_num_kv_heads(
+                    config.parallel_config
+                ),
+                head_size=config.model_config.get_head_size(),
+                dtype=config.model_config.dtype,
+            )
         ),
     }
 
@@ -244,7 +254,16 @@ def _run_recurrent_native_cache_allocation(tmp_path):
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
     from vllm.model_executor.model_loader import get_model_loader
     from vllm.utils.torch_utils import set_default_torch_dtype
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MambaSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheGroup,
+        KVCacheLayerConfig,
+        MambaSpec,
+    )
     from vllm.v1.kv_cache_layout import KVCacheLayout
     from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
         create_recurrent_executor_config,
@@ -305,31 +324,39 @@ def _run_recurrent_native_cache_allocation(tmp_path):
                         config.model_config.dtype
                     ),
                 )
-            specs: dict[str, KVCacheSpec] = {}
+            specs: dict[str, KVCacheLayerConfig] = {}
             for name, layer in model.named_modules():
                 if isinstance(layer, (Attention, MambaMixer2)):
-                    spec = layer.get_kv_cache_spec(config)
-                    assert spec is not None
-                    specs[name] = spec
+                    layer_config = layer.get_kv_cache_config(config)
+                    assert layer_config is not None
+                    specs[name] = layer_config
             assert len(specs) == 2
-            state_name, state_spec = next(
-                (name, spec)
-                for name, spec in specs.items()
-                if isinstance(spec, MambaSpec)
+            state_name, state_layer = next(
+                (name, layer)
+                for name, layer in specs.items()
+                if isinstance(layer.spec, MambaSpec)
             )
-            attention_name, attention_spec = next(
-                (name, spec)
-                for name, spec in specs.items()
-                if isinstance(spec, FullAttentionSpec)
+            attention_name, attention_layer = next(
+                (name, layer)
+                for name, layer in specs.items()
+                if type(layer.spec) is AttentionSpec
             )
-            assert state_spec.num_prefill_checkpoint_blocks == 1
-            assert state_spec.prefill_checkpoint_alignment == 1
-            assert state_spec.mamba_cache_mode == "none"
-            assert state_spec.num_speculative_blocks == 0
+            state_spec, attention_spec = state_layer.spec, attention_layer.spec
+            assert isinstance(state_spec, MambaSpec)
+            assert type(attention_spec) is AttentionSpec
+            assert state_layer.manager_cls is MambaManager
+            assert attention_layer.manager_cls is FullAttentionManager
+            params = state_layer.manager_config.params
+            assert isinstance(params, MambaManager.Params)
+            assert params.num_prefill_checkpoint_blocks == 1
+            assert params.prefill_checkpoint_alignment == 1
+            assert params.mamba_cache_mode == "none"
+            assert params.num_speculative_blocks == 0
+            state_group = KVCacheGroup.from_layers({state_name: state_layer})
             assert (
-                state_spec.max_memory_usage_bytes(config) == state_spec.page_size_bytes
+                state_group.max_memory_usage_bytes(config) == state_spec.page_size_bytes
             )
-            assert state_spec.max_num_blocks_per_req(config, 64) == 1
+            assert state_group.max_num_blocks_per_req(config, 64) == 1
             budget = 3 * state_spec.page_size_bytes + 9 * attention_spec.page_size_bytes
             cache = make_recurrent_kv_config(
                 config, specs, budget, 2, KVCacheLayout.LBNHC
@@ -345,11 +372,12 @@ def _run_recurrent_native_cache_allocation(tmp_path):
                 for tensor in allocated.values()
             )
             preserved = next(
-                group.kv_cache_spec
+                group
                 for group in cache.kv_cache_groups
-                if isinstance(group.kv_cache_spec, MambaSpec)
+                if isinstance(group.distinct_specs[0], MambaSpec)
             )
-            assert preserved == state_spec
+            assert preserved.kv_cache_specs[state_name] == state_spec
+            assert preserved.manager_config == state_layer.manager_config
     finally:
         if initialized:
             try:
@@ -407,7 +435,7 @@ def test_recurrent_native_allocation_separates_token_pages_and_live_state_slots(
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=recurrent_blocks - 1)
     state_name, attention_name = specs
-    state_spec, attention_spec = specs.values()
+    state_spec, attention_spec = (layer.spec for layer in specs.values())
     budget = (
         recurrent_blocks * state_spec.page_size_bytes
         + attention_blocks * attention_spec.page_size_bytes
@@ -470,7 +498,7 @@ def test_recurrent_cache_rejects_descriptor_without_one_device_capacity(
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=2)
-    state, attention = specs.values()
+    state, attention = (layer.spec for layer in specs.values())
     budget = 3 * state.page_size_bytes + 9 * attention.page_size_bytes
     cache = make_recurrent_kv_config(config, specs, budget, 2, KVCacheLayout.LBNHC)
     descriptor = cache.kv_cache_tensors[0]
@@ -494,10 +522,44 @@ def test_recurrent_cache_budget_keeps_live_states_before_admitting_token_pages(
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config, specs = recurrent_cache_inputs(tmp_path, max_num_reqs=2)
-    state, attention = specs.values()
+    state, attention = (layer.spec for layer in specs.values())
     budget = 3 * state.page_size_bytes + attention.page_size_bytes
     with pytest.raises(ValueError, match="recurrent slots and two token pages"):
         make_recurrent_kv_config(config, specs, budget, 2, KVCacheLayout.LBNHC)
+
+
+@pytest.mark.parametrize("policy", ["window", "full", "align", "speculative"])
+def test_recurrent_cache_requires_ordinary_native_manager_policies(
+    tmp_path, monkeypatch, policy
+):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.spec_decode.remote.runtime.recurrent_kv import make_recurrent_kv_config
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config, layers = recurrent_cache_inputs(tmp_path, max_num_reqs=2)
+    state_name, attention_name = layers
+    state, attention = (layer.spec for layer in layers.values())
+    budget = 3 * state.page_size_bytes + 9 * attention.page_size_bytes
+    if policy == "window":
+        name = attention_name
+        manager = SlidingWindowManager.config(sliding_window=8)
+    else:
+        name = state_name
+        manager = {
+            "full": FullAttentionManager.config(),
+            "align": MambaManager.config(mamba_cache_mode="align"),
+            "speculative": MambaManager.config(num_speculative_blocks=1),
+        }[policy]
+    layers[name] = replace(layers[name], manager_config=manager)
+    with pytest.raises(
+        ValueError, match="unsupported cache layer|ordinary Mamba2 state"
+    ):
+        make_recurrent_kv_config(config, layers, budget, 2, KVCacheLayout.LBNHC)
 
 
 @pytest.mark.parametrize("kind", ["features", "custom_state"])
