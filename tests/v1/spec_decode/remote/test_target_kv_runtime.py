@@ -13,7 +13,11 @@ from vllm.v1.spec_decode.remote.runtime.target_kv_gpu import Gemma4SnapshotExecu
 from vllm.v1.spec_decode.remote.runtime.target_kv_schema import (
     create_target_kv_contract,
 )
-from vllm.v1.spec_decode.remote.target_kv import import_target_kv
+from vllm.v1.spec_decode.remote.target_kv import (
+    _sliding_window,
+    _validate_spec,
+    import_target_kv,
+)
 
 
 def _native_config(
@@ -151,12 +155,22 @@ def test_native_configs_derive_gemma_geometry_and_snapshot_import(
         "target.layers.17",
     )
     specs = contract.expected_specs
-    assert specs["target.layers.19"].head_size == head_dim
-    assert specs["target.layers.19"].sliding_window == window
-    assert specs["target.layers.17"].head_size == full_head_dim
-    assert specs["target.layers.19"].num_kv_heads == kv_heads
-    assert specs["target.layers.17"].num_kv_heads == (full_kv_heads or kv_heads)
-    assert len({s.page_size_bytes for s in specs.values()}) == 1
+    sliding_spec = _validate_spec(specs["target.layers.19"])
+    full_spec = _validate_spec(specs["target.layers.17"])
+    assert sliding_spec.head_size == head_dim
+    assert _sliding_window(specs["target.layers.19"]) == window
+    assert full_spec.head_size == full_head_dim
+    assert sliding_spec.num_kv_heads == kv_heads
+    assert full_spec.num_kv_heads == (full_kv_heads or kv_heads)
+    assert len({s.spec.page_size_bytes for s in specs.values()}) == 1
+    config.model_config.hf_config.get_text_config().sliding_window += 1
+    assistant = config.speculative_config.draft_model_config.hf_config.get_text_config()
+    assistant.sliding_window += 1
+    changed_policy = create_target_kv_contract(config)
+    assert {
+        name: value.spec for name, value in changed_policy.expected_specs.items()
+    } == {name: value.spec for name, value in specs.items()}
+    assert changed_policy.fingerprint != contract.fingerprint
     identity = SnapshotIdentity(SequenceKey("geometry", 0, 0), 1, 0)
     for length in (1, 31, 32, 33, 640):
         plans = snapshot_wire_plan(
@@ -165,7 +179,7 @@ def test_native_configs_derive_gemma_geometry_and_snapshot_import(
         layers = tuple(
             SnapshotLayer(
                 p.name,
-                p.spec,
+                p.layer_config,
                 p.logical_pages,
                 torch.ones(p.shape, dtype=torch.bfloat16),
             )
@@ -344,9 +358,25 @@ def test_native_hf_override_and_page_unification_match_gemma_e2b():
         "target.layers.14",
     )
     swa, full = contract.expected_specs.values()
-    assert (swa.block_size, swa.head_size, swa.sliding_window) == (32, 256, 512)
-    assert (full.block_size, full.head_size, full.sliding_window) == (16, 512, None)
-    assert swa.page_size_bytes == full.page_size_bytes
+    assert (
+        swa.spec.block_size,
+        _validate_spec(swa).head_size,
+        _sliding_window(swa),
+    ) == (
+        32,
+        256,
+        512,
+    )
+    assert (
+        full.spec.block_size,
+        _validate_spec(full).head_size,
+        _sliding_window(full),
+    ) == (
+        16,
+        512,
+        None,
+    )
+    assert swa.spec.page_size_bytes == full.spec.page_size_bytes
     assert create_target_kv_contract(_config()).fingerprint == contract.fingerprint
     changed = _config()
     changed.speculative_config.draft_model_config.revision = "b" * 40
@@ -590,7 +620,8 @@ def test_executor_fences_consumers_before_unbinding_or_quarantines(
                 spec,
                 (0,),
                 torch.zeros(
-                    (1, 1, spec.block_size, 2 * spec.head_size), dtype=torch.bfloat16
+                    (1, 1, spec.spec.block_size, 2 * _validate_spec(spec).head_size),
+                    dtype=torch.bfloat16,
                 ),
             )
             for name, spec in executor.contract.expected_specs.items()

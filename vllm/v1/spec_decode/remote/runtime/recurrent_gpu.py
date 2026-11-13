@@ -3,7 +3,6 @@
 """Ordinary native recurrent execution for an independent token-only draft."""
 
 import json
-import math
 import tempfile
 from pathlib import Path
 
@@ -120,10 +119,10 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
             get_supported_kv_cache_layouts,
             resolve_kv_cache_layout,
         )
+        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
         from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
+            AttentionSpec,
             MambaSpec,
-            get_block_table_width,
         )
         from vllm.v1.spec_decode.remote.runtime.recurrent_kv import (
             make_recurrent_kv_config,
@@ -133,7 +132,7 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
         )
         from vllm.v1.spec_decode.remote.runtime.weights import model_weight_bytes
         from vllm.v1.worker.gpu.attn_utils import (
-            get_kv_cache_spec,
+            get_kv_cache_layer_configs,
             init_attn_backend,
             init_kv_cache,
         )
@@ -194,7 +193,7 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
                     "recurrent draft requires the native full NemotronH model"
                 )
             self.model = model.eval()
-            specs = get_kv_cache_spec(resource)
+            layer_configs = get_kv_cache_layer_configs(resource)
             layers = get_layers_from_vllm_config(
                 resource,
                 AttentionLayerBase,  # type: ignore[type-abstract]
@@ -203,36 +202,30 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
                 layer.get_attn_backend() for layer in layers.values()
             )
             layout = resolve_kv_cache_layout(
-                resource, [[layout.name for layout in layouts]], specs.values()
+                resource, [[layout.name for layout in layouts]], layer_configs.values()
             )
             scheduler = resource.scheduler_config
             self.kv_config = make_recurrent_kv_config(
-                resource, specs, kv_cache_bytes, scheduler.max_num_seqs, layout
+                resource, layer_configs, kv_cache_bytes, scheduler.max_num_seqs, layout
             )
             self.num_blocks = self.kv_config.num_blocks
             resource.cache_config.num_gpu_blocks = self.num_blocks
             self.block_size = next(
-                value.block_size
-                for value in specs.values()
-                if type(value) is FullAttentionSpec
+                value.spec.block_size
+                for value in layer_configs.values()
+                if type(value.spec) is AttentionSpec
             )
             self.input_buffers = InputBuffers(
                 scheduler.max_num_seqs, scheduler.max_num_batched_tokens, device
             )
-            groups = [group.kv_cache_spec for group in self.kv_config.kv_cache_groups]
+            groups = self.kv_config.kv_cache_groups
             self.block_tables = BlockTables(
                 block_sizes=[group.block_size for group in groups],
                 max_num_reqs=scheduler.max_num_seqs,
                 max_num_batched_tokens=scheduler.max_num_batched_tokens,
                 max_num_blocks_per_group=[
-                    1
-                    if isinstance(group, MambaSpec)
-                    else get_block_table_width(
-                        math.ceil(
-                            resource.model_config.max_model_len / group.block_size
-                        ),
-                        group.block_size,
-                        token_alignment=group.block_table_token_alignment,
+                    group.block_table_width(
+                        resource, resource.model_config.max_model_len
                     )
                     for group in groups
                 ],
@@ -271,18 +264,21 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
                     for tensor in self.kv_config.kv_cache_tensors
                     if group.layer_names[0] in tensor.layers
                 )
-                value = group.kv_cache_spec
+                (value,) = group.distinct_specs
                 entry = dict(
                     kind=type(value).__name__,
+                    manager=group.manager_cls.__name__,
                     layers=list(group.layer_names),
                     blocks=self.kv_config.num_blocks_of(tensor),
                 )
                 if isinstance(value, MambaSpec):
+                    params = group.manager_config.params
+                    assert isinstance(params, MambaManager.Params)
                     entry.update(
                         shapes=value.shapes,
                         dtypes=[str(dtype) for dtype in value.dtypes],
-                        num_speculative_blocks=value.num_speculative_blocks,
-                        cache_mode=value.mamba_cache_mode,
+                        num_speculative_blocks=params.num_speculative_blocks,
+                        cache_mode=params.mamba_cache_mode,
                     )
                 cache_layouts.append(entry)
             self.loaded_identity = dict(
@@ -345,7 +341,7 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
                 req_index,
                 tuple(
                     [req_index + 1]
-                    if isinstance(group.kv_cache_spec, MambaSpec)
+                    if isinstance(group.distinct_specs[0], MambaSpec)
                     else list(blocks)
                     for group in self.kv_config.kv_cache_groups
                 ),
@@ -421,7 +417,7 @@ class RecurrentGPUStepExecutor(TokenStepExecutor):
                             pooling_params=None,
                             block_ids=tuple(
                                 [req_index + 1]
-                                if isinstance(group.kv_cache_spec, MambaSpec)
+                                if isinstance(group.distinct_specs[0], MambaSpec)
                                 else list(blocks)
                                 for group in self.kv_config.kv_cache_groups
                             ),
