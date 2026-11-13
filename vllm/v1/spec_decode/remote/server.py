@@ -837,14 +837,14 @@ class RemoteDraftServer:
         except Exception as error:
             self._adapter_failed(error)
             raise
-        self._start_listener(endpoint, name="remote-draft-acceptor")
+        resolved_endpoint = self._start_listener(endpoint, name="remote-draft-acceptor")
         try:
-            if not is_local_endpoint(self._listener.endpoint):
+            if not is_local_endpoint(resolved_endpoint):
                 logger.warning(
                     "Remote draft server listens on %s, which is reachable from "
                     "other hosts; the protocol has no authentication, so bind to "
                     "a loopback address or a UNIX socket.",
-                    self._listener.endpoint,
+                    resolved_endpoint,
                 )
             capabilities = self.adapter.capabilities()
             logger.info(
@@ -852,7 +852,7 @@ class RemoteDraftServer:
                 "draft fingerprint %r, required features %s, transports %s, "
                 "max_batch_size %d, max_model_len %d",
                 self.server_id,
-                self._listener.endpoint,
+                resolved_endpoint,
                 PROTOCOL_MAJOR,
                 PROTOCOL_MINOR,
                 sorted(self.adapter.supported_methods()),
@@ -862,7 +862,7 @@ class RemoteDraftServer:
                 self.limits.max_batch_size,
                 self.limits.max_model_len,
             )
-            return self._listener.endpoint
+            return resolved_endpoint
         except BaseException as error:
             self._rollback_start(error)
             raise

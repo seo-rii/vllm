@@ -26,6 +26,7 @@ from tests.v1.spec_decode.remote.test_session import (
 )
 from tests.v1.spec_decode.remote.test_session import cuda_runtime as cuda_runtime
 from vllm.config.speculative import RemoteDraftConfig
+from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.remote.cuda_ipc import CudaIpcError
 from vllm.v1.spec_decode.remote.runtime.adapter import TargetConditionedDraftAdapter
 from vllm.v1.spec_decode.remote.runtime.schema import create_runtime_contract
@@ -61,12 +62,15 @@ class ControlledAdapter(TargetConditionedDraftAdapter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.closed = threading.Event()
+        self.retired = threading.Event()
         self.close_error = None
 
     def close_sequences(self, keys):
         if self.close_error is not None:
             raise self.close_error
         super().close_sequences(keys)
+        if keys:
+            self.retired.set()
         self.closed.set()
 
 
@@ -235,6 +239,414 @@ def test_empty_proposal_preserves_batch_shape_without_rpc(verifier, effective_k)
     assert result.shape == (0, instance.num_speculative_steps)
     assert result.dtype == torch.int64
     assert not instance._requests and not executor.plans
+
+
+def split_step(batch, recovery, k=K):
+    last_sampled = torch.zeros(4, 1, dtype=torch.int64)
+    last_sampled[batch.idx_mapping, 0] = torch.tensor(recovery, dtype=torch.int64)
+    context = LocalExecutionContext(
+        batch,
+        {},
+        {},
+        torch.zeros(batch.num_tokens, 16),
+        None,
+        torch.ones(batch.num_reqs, dtype=torch.int32),
+        torch.zeros(batch.num_reqs, dtype=torch.int32),
+        last_sampled,
+        torch.zeros(1, 4, dtype=torch.int32),
+        torch.zeros(4),
+        torch.zeros(4, dtype=torch.int64),
+    )
+    return DraftStep.from_batch(batch, k), context
+
+
+@pytest.mark.parametrize("effective_k", [0, 1, K])
+def test_split_empty_batch_preserves_typed_shape_and_collects_once(
+    verifier, effective_k
+):
+    instance, executor, _, server = verifier
+    step, context = split_step(inputs([], [], [], []), [], effective_k)
+    handle = instance.dispatch(step, context)
+    output = instance.collect(handle)
+    assert output.token_ids.shape == (0, K)
+    assert output.valid_lengths.shape == (0,)
+    assert output.to_legacy_tokens().shape == (0, K)
+    assert executor.plans == [] and len(server.registry) == 0
+    assert instance._requests == {} and instance._pending is None
+    assert handle.context is None and not handle.retained
+    with pytest.raises(RuntimeError, match="stale|collected"):
+        instance.collect(handle)
+
+
+def test_split_dispatch_returns_before_execution_and_collects_once(verifier):
+    instance, executor, _, _ = verifier
+    executor.gate = threading.Event()
+    step, context = split_step(inputs(["a"], [[1, 2]], [[0, 1]], [2]), [3])
+    handle = instance.dispatch(step, context)
+    try:
+        assert executor.entered.wait(5)
+        assert handle.context is context and handle.retained
+        with pytest.raises(RuntimeError, match="in flight"):
+            instance.dispatch(step, context)
+    finally:
+        executor.gate.set()
+    output = instance.collect(handle)
+    assert output.token_ids.tolist() == [digest_row([1, 2], 3)]
+    assert output.valid_lengths.tolist() == [K]
+    assert handle.context is None and not handle.retained
+    with pytest.raises(RuntimeError, match="stale|collected"):
+        instance.collect(handle)
+
+
+@pytest.mark.parametrize("verifier", ["target_only", "error"], indirect=True)
+def test_split_deferred_close_releases_sibling_after_collection(verifier):
+    instance, executor, _, server = verifier
+    step, context = split_step(inputs(["b"], [[7]], [[0]], [1]), [8])
+    instance.collect(instance.dispatch(step, context))
+    key = instance._requests["b"].key
+    req_index = int(executor.plans[-1].req_indices[0])
+    executor.gate = threading.Event()
+    step, context = split_step(inputs(["a"], [[1, 2]], [[0, 1]], [2]), [3])
+    handle = instance.dispatch(step, context)
+    try:
+        assert executor.entered.wait(5)
+        for requests in (set(), {"unknown"}, {"b", "unknown"}):
+            instance.close_requests(requests)
+        assert instance._requests["b"].key == key
+        assert instance._session.sequence_state(key) is remote.SequenceState.READY
+        assert executor.pool.blocks(req_index)
+        assert instance._pending is handle
+    finally:
+        executor.gate.set()
+    output = instance.collect(handle)
+    assert output.token_ids.tolist() == [digest_row([1, 2], 3)]
+    assert output.valid_lengths.tolist() == [K]
+    assert instance._session.sequence_state(key) is None
+    assert "b" not in instance._requests and executor.pool.blocks(req_index) == ()
+    instance.close_requests({"b", "a"})
+    assert executor.pool.num_free_blocks == executor.pool.num_blocks - 1
+    assert len(server.registry) == 0
+
+
+@pytest.mark.parametrize("verifier", [("target_only", K, 1000)], indirect=True)
+def test_split_deferred_close_cannot_refresh_expired_round_budget(verifier):
+    instance, executor, _, server = verifier
+    step, context = split_step(inputs(["b"], [[7]], [[0]], [1]), [8])
+    instance.collect(instance.dispatch(step, context))
+    key = instance._requests["b"].key
+    executor.gate = threading.Event()
+    step, context = split_step(inputs(["a"], [[1, 2]], [[0, 1]], [2]), [3])
+    handle = instance.dispatch(step, context)
+    instance.close_requests({"b"})
+    try:
+        assert executor.entered.wait(5)
+        assert instance.collect(handle).valid_lengths.tolist() == [0]
+        assert not instance._session.connected
+        assert instance._session.sequence_state(key) is None
+        assert "b" not in instance._requests and not instance._closing_requests
+    finally:
+        executor.gate.set()
+    assert server.adapter.closed.wait(5)
+
+
+@pytest.mark.parametrize("finish", ["cancel", "close_request", "shutdown"])
+def test_split_pending_close_is_retired_on_cancellation(verifier, finish):
+    instance, _, _, _ = verifier
+    session = instance._session
+    step, context = split_step(inputs(["b"], [[7]], [[0]], [1]), [8])
+    instance.collect(instance.dispatch(step, context))
+    key = instance._requests["b"].key
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    handle = instance.dispatch(step, context)
+    instance.close_requests({"b"})
+    if finish == "cancel":
+        instance.cancel(handle, "test cancellation")
+    elif finish == "close_request":
+        instance.close_requests({"a"})
+    else:
+        instance.close()
+    assert "b" not in instance._requests and not instance._closing_requests
+    if finish != "shutdown":
+        assert session.sequence_state(key) is None
+    with pytest.raises(RuntimeError, match="stale|cancelled"):
+        instance.collect(handle)
+
+
+def test_split_cancel_and_request_id_reuse_fence_old_handle(verifier):
+    instance, _, _, _ = verifier
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    old = instance.dispatch(step, context)
+    instance.close_requests({"a"})
+    step, context = split_step(inputs(["a"], [[11]], [[0]], [1]), [12])
+    current = instance.dispatch(step, context)
+    with pytest.raises(RuntimeError, match="stale|cancelled"):
+        instance.collect(old)
+    assert instance.collect(current).token_ids.tolist() == [digest_row([11], 12)]
+
+
+def test_split_shutdown_releases_context_and_rejects_dispatch(verifier):
+    instance, _, _, _ = verifier
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    handle = instance.dispatch(step, context)
+    instance.close()
+    assert handle.context is None and not handle.retained
+    with pytest.raises(RuntimeError, match="stale|cancelled"):
+        instance.collect(handle)
+    with pytest.raises(RuntimeError, match="closed"):
+        instance.dispatch(step, context)
+
+
+def test_split_cancel_is_terminal_but_new_requests_can_reconnect(verifier):
+    instance, _, _, _ = verifier
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    old = instance.dispatch(step, context)
+    instance.cancel(old, "verification step cancelled")
+    for operation in (
+        lambda: instance.collect(old),
+        lambda: instance.cancel(old, "again"),
+    ):
+        with pytest.raises(RuntimeError, match="stale|cancelled"):
+            operation()
+    step, context = split_step(inputs(["a"], [[2]], [[1]], [0]), [3])
+    assert instance.collect(
+        instance.dispatch(step, context)
+    ).valid_lengths.tolist() == [0]
+    step, context = split_step(inputs(["fresh"], [[11]], [[0]], [1]), [12])
+    assert instance.collect(instance.dispatch(step, context)).token_ids.tolist() == [
+        digest_row([11], 12)
+    ]
+
+
+def test_split_collect_preserves_effective_budget_in_typed_output(verifier):
+    instance, _, _, _ = verifier
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2], k=1)
+    output = instance.collect(instance.dispatch(step, context))
+    assert output.valid_lengths.tolist() == [1]
+    assert output.token_ids.shape == (1, K)
+    assert output.token_ids[0, 0].item() == digest_row([1], 2)[0]
+
+
+def collect_with_staging_fault(instance, handle, patch, stage, kind, persistent=False):
+    output = handle.output
+    target = (
+        None
+        if output is None
+        else (output.token_ids if stage.startswith("tokens") else output.valid_lengths)
+    )
+    setitem, tolist = torch.Tensor.__setitem__, torch.Tensor.tolist
+    failures = 0
+    received = False
+
+    def fail(tensor):
+        nonlocal failures
+        if tensor is target and (persistent or failures == 0):
+            assert received, "staging failure must follow the real remote reply"
+            failures += 1
+            if kind == "memory":
+                raise MemoryError("remote result staging allocation failed")
+            raise RuntimeError(
+                "[enforce fail at alloc_cpu.cpp:127] err == 0. "
+                "DefaultCPUAllocator: can't allocate memory: you tried to allocate "
+                "67108864 bytes. Error code 12 (Cannot allocate memory)"
+            )
+
+    def copy(tensor, index, value):
+        nonlocal received
+        if output is not None and tensor is output.token_ids:
+            assert tolist(value) == [digest_row([1], 2)]
+            received = True
+        if stage.endswith("copy"):
+            fail(tensor)
+        return setitem(tensor, index, value)
+
+    def serialize(tensor):
+        fail(tensor)
+        return tolist(tensor)
+
+    zeros = torch.zeros
+
+    def reject_replacement(*args, **kwargs):
+        if received:
+            pytest.fail("completed result must reuse its allocated output")
+        return zeros(*args, **kwargs)
+
+    patch.setattr(torch.Tensor, "__setitem__", copy)
+    if stage.endswith("tolist"):
+        patch.setattr(torch.Tensor, "tolist", serialize)
+    if output is not None:
+        patch.setattr(torch, "zeros", reject_replacement)
+    result, error = None, None
+    try:
+        result = instance.collect(handle)
+    except RuntimeError as caught:
+        error = str(caught)
+    return result, error, failures
+
+
+@pytest.mark.parametrize("verifier", ["target_only", "error"], indirect=True)
+@pytest.mark.parametrize(
+    "stage", ["tokens_copy", "lengths_copy", "tokens_tolist", "lengths_tolist"]
+)
+@pytest.mark.parametrize("kind", ["memory", "cpu_allocator"])
+def test_split_collect_host_allocation_failure_fences_completed_result(
+    verifier, monkeypatch, stage, kind
+):
+    instance, executor, settings, _ = verifier
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    handle = instance.dispatch(step, context)
+    with monkeypatch.context() as patch:
+        result, error, failures = collect_with_staging_fault(
+            instance, handle, patch, stage, kind
+        )
+    assert failures == 1
+    if settings.speculative_config.remote_draft.failure_policy == "error":
+        assert error is not None and (
+            "staging allocation" in error or "allocate memory" in error
+        )
+    else:
+        assert error is None and result.valid_lengths.tolist() == [0]
+    assert instance._pending is None and handle.context is None and not handle.retained
+    plans = len(executor.plans)
+    assert propose(
+        instance, inputs(["a"], [[2]], [[1]], [0]), [1], [0], [3]
+    ).tolist() == [[-1] * K]
+    assert len(executor.plans) == plans
+
+
+def run_split_tp_fault(instance, failure, patch):
+    import socket
+
+    from vllm.v1.spec_decode.remote import protocol
+    from vllm.v1.spec_decode.remote.protocol import CloseSequence
+
+    rank = remote.get_tp_group().rank_in_group
+    mode = failure.removeprefix("split_")
+    if mode == "deferred_close":
+        step, context = split_step(inputs(["b"], [[7]], [[0]], [1]), [8])
+        instance.collect(instance.dispatch(step, context))
+        sibling = instance._requests["b"].key if rank == 0 else None
+    step, context = split_step(inputs(["a"], [[1]], [[0]], [1]), [2])
+    if mode == "preparation":
+        original_to = torch.Tensor.to
+        hidden = context.last_hidden_states
+
+        def fail_hidden(tensor, *args, **kwargs):
+            if tensor.data_ptr() == hidden.data_ptr():
+                raise torch.OutOfMemoryError("dispatch allocation failed")
+            return original_to(tensor, *args, **kwargs)
+
+        patch.setattr(torch.Tensor, "to", fail_hidden)
+    handle = instance.dispatch(step, context)
+    if mode == "deferred_close":
+        instance.close_requests({"b"})
+        encoder = protocol._encoder
+
+        class Encoder:
+            def encode(self, value):
+                if isinstance(value, CloseSequence):
+                    raise RuntimeError("close failed")
+                return encoder.encode(value)
+
+        patch.setattr(protocol, "_encoder", Encoder())
+    if mode == "cleanup":
+        target = None if handle.output is None else handle.output.token_ids
+        original_setitem, original_close = torch.Tensor.__setitem__, socket.socket.close
+        connection = instance._session._conn._sock if rank == 0 else None
+        cleanup_attempts = []
+
+        def fail_copy(tensor, index, value):
+            if tensor is target:
+                raise RuntimeError("injected collection failure")
+            return original_setitem(tensor, index, value)
+
+        def fail_close(sock):
+            original_close(sock)
+            if sock is connection:
+                cleanup_attempts.append(True)
+                raise RuntimeError("injected cleanup failure")
+
+        patch.setattr(torch.Tensor, "__setitem__", fail_copy)
+        patch.setattr(socket.socket, "close", fail_close)
+    result, error, failures = None, None, 0
+    if mode in ("allocation", "serialization"):
+        result, error, failures = collect_with_staging_fault(
+            instance, handle, patch, "tokens_tolist", "memory", mode == "serialization"
+        )
+        if rank == 0:
+            assert failures == (2 if mode == "serialization" else 1)
+    else:
+        try:
+            result = instance.collect(handle)
+        except RuntimeError as caught:
+            error = str(caught)
+    if mode == "deferred_close" and rank == 0:
+        assert instance._requests["b"].key == sibling
+        assert instance._session.sequence_state(sibling) is remote.SequenceState.CLOSING
+        assert "b" in instance._closing_requests
+    if mode == "cleanup" and rank == 0:
+        assert cleanup_attempts == [True]
+    assert instance._pending is None and handle.context is None and not handle.retained
+    return {
+        "error": error,
+        "lengths": None if result is None else result.valid_lengths.tolist(),
+    }
+
+
+@pytest.mark.parametrize(
+    "mode,policy",
+    [
+        ("deferred_close", "error"),
+        ("preparation", "target_only"),
+        ("preparation", "error"),
+        ("cleanup", "error"),
+        ("allocation", "target_only"),
+        ("allocation", "error"),
+        ("serialization", "target_only"),
+    ],
+)
+def test_split_tp_ranks_share_deferred_and_staging_failures(
+    verifier, tmp_path, mode, policy
+):
+    import json
+
+    instance, executor, settings, server = verifier
+    instance.close()
+    settings.parallel_config.tensor_parallel_size = 2
+    settings.speculative_config.remote_draft.failure_policy = policy
+    torch.multiprocessing.spawn(
+        _tp_proposal_worker,
+        args=(
+            settings,
+            f"file://{tmp_path / 'split-store'}",
+            str(tmp_path),
+            f"split_{mode}",
+        ),
+        nprocs=2,
+        join=True,
+    )
+    results = [
+        json.loads((tmp_path / f"rank-{rank}.json").read_text()) for rank in range(2)
+    ]
+    assert results[0] == results[1]
+    if mode in ("preparation", "allocation") and policy == "target_only":
+        assert results[0] == {"error": None, "lengths": [0]}
+    else:
+        match = {
+            "deferred_close": "close failed",
+            "preparation": "dispatch allocation failed",
+            "cleanup": "injected collection failure",
+            "allocation": "staging allocation",
+            "serialization": "staging allocation",
+        }[mode]
+        assert match in results[0]["error"]
+    if mode == "preparation":
+        assert executor.plans == []
+
+    if mode == "deferred_close":
+        assert server.adapter.retired.wait(5), "shutdown retained the owned draft KV"
+        server.stop()
+        assert executor.pool.num_free_blocks == executor.pool.num_blocks - 1
+        assert len(server.registry) == 0
 
 
 def test_chunks_rejections_and_request_reordering_preserve_verified_context(verifier):
@@ -526,6 +938,10 @@ def _tp_proposal_worker(rank, settings, rendezvous, output_dir, failure):
         device = torch.device("cuda:0" if ipc else "cpu")
         instance = remote.RemoteSpeculator(settings, device)
         try:
+            if failure.startswith("split_"):
+                result = run_split_tp_fault(instance, failure, patch)
+                Path(output_dir, f"rank-{rank}.json").write_text(json.dumps(result))
+                return
             batch = inputs(["tp"], [[1]], [[0]], [1])
             hidden = (
                 {"hidden_states": _CudaFeature((batch.num_tokens, 16))} if ipc else {}

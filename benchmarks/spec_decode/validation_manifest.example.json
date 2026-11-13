@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "source": {
+    "parent_sha": null,
+    "head_sha": null,
+    "runtime_source_verified": false,
+    "tracked_source_manifest_sha256": null
+  },
+  "models": {
+    "target": null,
+    "target_revision": null,
+    "draft": null,
+    "draft_revision": null,
+    "tokenizer_identity": null
+  },
+  "environment": {
+    "gpu_topology": null,
+    "driver": null,
+    "cuda": null,
+    "torch": null,
+    "resolved_config_artifact": null
+  },
+  "validation": {
+    "cpu_contract": {"status": "not_run", "log": null},
+    "socket_codec": {"status": "not_run", "log": null},
+    "cuda_primitive": {"status": "not_run", "log": null},
+    "model_differential": {"status": "not_run", "log": null},
+    "http_serving": {"status": "not_run", "log": null},
+    "fault_recovery": {"status": "not_run", "log": null}
+  },
+  "baselines": {
+    "target_only": {"status": "not_run", "raw_results": []},
+    "native_local": {"status": "not_run", "raw_results": []},
+    "local_wrapper": {"status": "not_run", "raw_results": []},
+    "remote_inline": {"status": "not_run", "raw_results": []},
+    "remote_cuda_ipc": {"status": "not_run", "raw_results": []}
+  },
+  "limitations": []
+}

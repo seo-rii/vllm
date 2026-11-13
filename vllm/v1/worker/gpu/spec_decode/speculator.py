@@ -76,6 +76,7 @@ class BaseSpeculator(ABC):
     allocates draft KV cache for.
     """
 
+    num_speculative_steps: int
     num_query_per_req: int = 1
     supports_mm_inputs: bool = False
     # Draft logits for probabilistic rejection sampling, or None for
@@ -300,9 +301,12 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
-        self._validate_local_argmax_reduction()
+        self._finalize_model_load(target_attn_layer_names)
         if self.use_draft_logits:
             self._init_draft_logits(target_model)
+
+    def _finalize_model_load(self, target_attn_layer_names: set[str]) -> None:
+        self._validate_local_argmax_reduction()
 
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
