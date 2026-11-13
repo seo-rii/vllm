@@ -6,6 +6,11 @@ import time
 import uuid
 
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.remote.observability import (
+    current_server_observation,
+    init_remote_tracing,
+    server_observation,
+)
 from vllm.v1.spec_decode.remote.protocol import (
     CloseSequence,
     ErrorReply,
@@ -13,6 +18,7 @@ from vllm.v1.spec_decode.remote.protocol import (
     Ping,
     Pong,
     ProtocolError,
+    RemoteObservation,
     SpeculatorStatusCode,
     limit_shortfalls,
 )
@@ -59,6 +65,7 @@ class TokenDraftServer(RemoteDraftServer):
     adapter: TokenOnlyDraftAdapter
 
     def start(self, endpoint: str) -> str:
+        init_remote_tracing()
         if self._listener is not None or not self.healthy:
             raise RuntimeError("token runtime is already started or unhealthy")
         if not is_local_endpoint(endpoint):
@@ -119,9 +126,23 @@ class _TokenServerSession(_ServerSession):
             deadline = time.monotonic() + self.server.send_timeout_s
         for frame in frames or ():
             self.conn.send_data(frame, deadline=deadline)
+        observation = current_server_observation()
+        snapshot = None
+        if self.observability:
+            blocks = self.server.adapter.kv_statistics()
+            snapshot = RemoteObservation(
+                0.0 if observation is None else observation.queue_seconds,
+                0.0 if observation is None else observation.execute_seconds,
+                self.server.registry.count(self.verifier_instance_id),
+                None if blocks is None else blocks[0],
+                None if blocks is None else blocks[1],
+            )
         self.conn.send_control(
             encode_token_message(
-                message, session_id=self.session_id, request_id=request_id
+                message,
+                session_id=self.session_id,
+                request_id=request_id,
+                observation=snapshot,
             ),
             deadline=deadline,
         )
@@ -170,6 +191,7 @@ class _TokenServerSession(_ServerSession):
         self.session_epoch = self.server.next_epoch()
         self.verifier_instance_id = hello.verifier_instance_id
         self.num_speculative_tokens = hello.num_speculative_tokens
+        self.observability = hello.observability and envelope.protocol_minor >= 2
         self.selected_transport = "inline"
         self.max_pending_frames = 8
         slot = (1 << 64) - 1
@@ -188,6 +210,7 @@ class _TokenServerSession(_ServerSession):
                 self.session_epoch,
                 contract.tokenizer_fingerprint,
                 self.server.limits,
+                self.observability,
             ),
             envelope.request_id,
             deadline=deadline,
@@ -204,9 +227,21 @@ class _TokenServerSession(_ServerSession):
         elif isinstance(message, CloseSequence):
             self._close(message, request_id)
         elif isinstance(message, TokenPrefill):
-            self._prefill_tokens(message, request_id)
+            with server_observation(
+                "token",
+                "prefill",
+                envelope.trace_context if self.observability else None,
+                enabled=self.observability,
+            ):
+                self._prefill_tokens(message, request_id)
         elif isinstance(message, TokenAdvance):
-            self._advance_tokens(message, request_id)
+            with server_observation(
+                "token",
+                "proposal",
+                envelope.trace_context if self.observability else None,
+                enabled=self.observability,
+            ):
+                self._advance_tokens(message, request_id)
         elif isinstance(message, Ping):
             self._send(
                 Pong(

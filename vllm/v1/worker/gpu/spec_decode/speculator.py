@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.remote.metrics import RemoteDraftStats
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -82,6 +83,13 @@ class BaseSpeculator(ABC):
     # Draft logits for probabilistic rejection sampling, or None for
     # greedy-draft verification and for speculators without a draft model.
     draft_logits: DraftLogitsCache | None = None
+
+    def take_remote_draft_stats(self) -> RemoteDraftStats | None:
+        return None
+
+    def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
+        """Retain optional request context for a distributed draft backend."""
+        return None
 
     def close_requests(self, req_ids: Collection[str]) -> None:
         """Release per-request draft state on finish, cancellation or preemption."""

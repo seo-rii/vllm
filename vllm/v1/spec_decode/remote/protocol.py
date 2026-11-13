@@ -28,7 +28,7 @@ from vllm.v1.spec_decode.remote.transport import TransportError, check_data_fram
 # v2 requires peers to honor the per-round draft budget, including zero.
 # A v1 server would silently ignore it and still generate the maximum K.
 PROTOCOL_MAJOR = 2
-PROTOCOL_MINOR = 2
+PROTOCOL_MINOR = 3
 
 # Field-level range constraints are enforced by msgspec on decode, so a
 # peer cannot deliver negative identifiers or degenerate shapes. Checks
@@ -120,7 +120,7 @@ class RemoteServerLimits(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     ring_slots: NonNegativeInt = 0
 
 
-class Hello(msgspec.Struct):
+class Hello(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     """Verifier -> server handshake request."""
 
     verifier_instance_id: str
@@ -137,9 +137,10 @@ class Hello(msgspec.Struct):
     """Largest feature token count per message; 0 means undeclared."""
     max_model_len: NonNegativeInt = 0
     """Longest sequence the verifier may grow; 0 means undeclared."""
+    observability: bool = False
 
 
-class HelloAck(msgspec.Struct):
+class HelloAck(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     """Server -> verifier handshake response."""
 
     server_id: str
@@ -150,6 +151,7 @@ class HelloAck(msgspec.Struct):
     feature_schema: TargetFeatureSchema
     limits: RemoteServerLimits
     server_vllm_version: str = ""
+    observability: bool = False
 
 
 class OpenSequence(msgspec.Struct):
@@ -263,7 +265,20 @@ class ErrorReply(msgspec.Struct):
     detail: str = ""
 
 
-class MessageEnvelope(msgspec.Struct):
+class TraceContext(msgspec.Struct, frozen=True, omit_defaults=True):  # type: ignore[call-arg]
+    traceparent: Annotated[str, msgspec.Meta(max_length=55)]
+    tracestate: Annotated[str, msgspec.Meta(max_length=512)] | None = None
+
+
+class RemoteObservation(msgspec.Struct, frozen=True, omit_defaults=True):  # type: ignore[call-arg]
+    queue_seconds: Annotated[float, msgspec.Meta(ge=0)]
+    execute_seconds: Annotated[float, msgspec.Meta(ge=0)]
+    active_sequences: NonNegativeInt | None = None
+    kv_used_blocks: NonNegativeInt | None = None
+    kv_capacity_blocks: NonNegativeInt | None = None
+
+
+class MessageEnvelope(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     """Outer frame of every control-plane message.
 
     ``request_id`` correlates an RPC with its reply; model state identity is
@@ -276,6 +291,8 @@ class MessageEnvelope(msgspec.Struct):
     session_id: str
     request_id: NonNegativeInt
     payload: bytes
+    trace_context: TraceContext | None = None
+    observation: RemoteObservation | None = None
 
 
 _MESSAGE_TYPES: dict[str, type[msgspec.Struct]] = {
@@ -308,6 +325,8 @@ def encode_message(
     *,
     session_id: str = "",
     request_id: int = 0,
+    trace_context: TraceContext | None = None,
+    observation: RemoteObservation | None = None,
 ) -> bytes:
     """Wrap a payload struct in a MessageEnvelope and encode it."""
     type_name = _TYPE_NAMES.get(type(message))
@@ -320,6 +339,8 @@ def encode_message(
         session_id=session_id,
         request_id=request_id,
         payload=_encoder.encode(message),
+        trace_context=trace_context,
+        observation=observation,
     )
     return _encoder.encode(envelope)
 

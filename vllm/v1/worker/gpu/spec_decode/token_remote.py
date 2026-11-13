@@ -4,7 +4,7 @@
 
 import itertools
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +17,7 @@ from vllm.v1.spec_decode.remote.errors import (
     cuda_context_fatal,
     host_allocation_failure,
 )
+from vllm.v1.spec_decode.remote.metrics import RemoteDraftStats
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.token_schema import (
     create_token_runtime_contract,
@@ -110,6 +111,15 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def capture(self) -> None:
         pass
 
+    def register_trace_context(self, req_id: str, headers: Mapping[str, str]) -> None:
+        if self._session is not None:
+            self._session.observation.register(req_id, headers)
+
+    def take_remote_draft_stats(self) -> RemoteDraftStats | None:
+        if self._session is not None:
+            return self._session.observation.take_stats()
+        return None
+
     def _empty(self, n, *, device="cpu") -> SpeculatorOutput:
         return SpeculatorOutput(
             torch.zeros(
@@ -145,6 +155,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             return handle
         if self._tp.rank_in_group == 0:
             try:
+                assert self._session is not None
                 handle.output = self._empty(len(step.request_ids))
                 if not 0 <= step.num_speculative_tokens <= self.num_speculative_steps:
                     raise ValueError(
@@ -239,6 +250,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     or sampled[i] != int(final)
                 ):
                     raise ValueError("unexpected sampling counts in token prefill")
+                session.observation.select((req_id,))
                 session.prefill(
                     request.key,
                     tuple(tokens[start : start + prompt_tokens]),
@@ -283,6 +295,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             indices.append(i)
         handle.rows = tuple(indices)
         if rows:
+            session.observation.select(
+                tuple(handle.step.request_ids[i] for i in indices)
+            )
             handle.rpc = session.dispatch(
                 handle.round_id,
                 tuple(rows),
@@ -384,6 +399,8 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:
             return
+        if self._session is not None:
+            self._session.observation.forget(tuple(req_ids))
         self._terminal_requests.difference_update(req_ids)
         if self._pending is not None and set(req_ids).intersection(
             self._pending.step.request_ids
