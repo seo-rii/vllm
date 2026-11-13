@@ -2,21 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Checkpoint-derived Gemma4 contract for the bounded Q-only remote runtime."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 from vllm.v1.spec_decode.remote.runtime.schema import (
     _fingerprint,
     _model_identity,
     _tokenizer_identity,
 )
 from vllm.v1.spec_decode.remote.target_kv import (
-    AttentionSpec,
     SnapshotBudget,
+    _sliding_window,
     _table_width,
+    _validate_spec,
     gemma4_source_layers,
 )
 from vllm.v1.spec_decode.remote.target_kv_protocol import (
@@ -31,7 +36,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class TargetKVRuntimeContract:
     fingerprint: str
-    expected_specs: dict[str, AttentionSpec]
+    expected_specs: dict[str, KVCacheLayerConfig]
     source_indices: dict[str, int]
     draft_source_names: tuple[str, ...]
     hidden_size: int
@@ -95,6 +100,7 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         or cache.cache_dtype not in ("auto", "bfloat16")
         or cache.enable_prefix_caching
         or getattr(cache, "calculate_kv_scales", False)
+        or getattr(cache, "skip_page_size_padded", None) is not None
     ):
         errors.append(
             "block_size=16 and unscaled BF16 KV without prefix reuse required"
@@ -161,8 +167,7 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
     )
     from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
-    specs: dict[str, KVCacheSpec] = {}
-    layer_spec: AttentionSpec
+    specs: dict[str, KVCacheLayerConfig] = {}
     for i, kind in enumerate(
         text.layer_types[: text.num_hidden_layers - text.num_kv_shared_layers]
     ):
@@ -180,31 +185,32 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
             head_size=layer.head_dim,
             dtype=torch.bfloat16,
         )
+        layer_spec = AttentionSpec(**kwargs)
         if kind == "sliding_attention":
             if text.sliding_window < 1:
                 raise ValueError("Gemma4 sliding window must be positive")
-            layer_spec = SlidingWindowSpec(**kwargs, sliding_window=text.sliding_window)
+            layer_config = SlidingWindowManager.layer_config(
+                layer_spec, sliding_window=text.sliding_window
+            )
         else:
-            layer_spec = FullAttentionSpec(**kwargs)
-        specs[f"target.layers.{i}"] = layer_spec
+            layer_config = FullAttentionManager.layer_config(layer_spec)
+        specs[f"target.layers.{i}"] = layer_config
     unified = unify_kv_cache_spec_page_size(specs)
     source_names = tuple(f"target.layers.{i}" for i in owners)
-    expected: dict[str, AttentionSpec] = {}
+    expected: dict[str, KVCacheLayerConfig] = {}
     for name in dict.fromkeys(source_names):
-        unified_spec = unified[name]
-        assert isinstance(unified_spec, (FullAttentionSpec, SlidingWindowSpec))
-        expected[name] = unified_spec
+        expected[name] = unified[name]
     for i, name in enumerate(source_names):
         layer = assistant.per_layer_config[i]
-        owner = expected[name]
+        owner_config = expected[name]
+        owner = owner_config.spec
+        assert isinstance(owner, AttentionSpec)
+        window = _sliding_window(owner_config)
         if (
             layer.head_dim != owner.head_size
             or layer.num_key_value_heads != owner.num_kv_heads
             or assistant.num_attention_heads % owner.num_kv_heads
-            or (
-                isinstance(owner, SlidingWindowSpec)
-                and assistant.sliding_window != owner.sliding_window
-            )
+            or (window is not None and assistant.sliding_window != window)
         ):
             raise ValueError("assistant attention must match its target KV owner")
     budget = SnapshotBudget(1024, 128 * 1024**2, target.max_model_len)
@@ -218,13 +224,15 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         budget,
     )
     pages = nbytes = table_bytes = 0
-    for layer in expected.values():
+    for layer_config in expected.values():
+        layer = _validate_spec(layer_config)
         count = (target.max_model_len + layer.block_size - 1) // layer.block_size
-        table_bytes += _table_width(layer, count) * 4
-        if layer.sliding_window is not None:
+        table_bytes += _table_width(layer_config, count) * 4
+        window = _sliding_window(layer_config)
+        if window is not None:
             count = min(
                 count,
-                (layer.sliding_window + 2 * layer.block_size - 2) // layer.block_size,
+                (window + 2 * layer.block_size - 2) // layer.block_size,
             )
         pages += count
         nbytes += count * layer.unpadded_page_size_bytes
@@ -234,7 +242,10 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         target.max_model_len,
         size * pages + len(expected),
         size * (nbytes + table_bytes)
-        + sum(layer.unpadded_page_size_bytes for layer in expected.values()),
+        + sum(
+            _validate_spec(layer).unpadded_page_size_bytes
+            for layer in expected.values()
+        ),
     )
     identity = {
         "target": _model_identity(target),
@@ -245,7 +256,14 @@ def create_target_kv_contract(config: "VllmConfig") -> TargetKVRuntimeContract:
         "tokenizer": _tokenizer_identity(target),
         "tokenizer_mode": target.tokenizer_mode,
         "sources": source_names,
-        "specs": {name: vars(value) for name, value in expected.items()},
+        "specs": {
+            name: {
+                "storage": vars(value.spec),
+                "manager": value.manager_cls.__qualname__,
+                "policy": asdict(value.manager_config.params),
+            }
+            for name, value in expected.items()
+        },
         "max_model_len": target.max_model_len,
         "contract": "gemma4-q-only-bf16-k1-v2",
     }

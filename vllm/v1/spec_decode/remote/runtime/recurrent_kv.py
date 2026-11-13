@@ -10,11 +10,12 @@ import torch
 
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheSpec,
+    KVCacheGroup,
+    KVCacheLayerConfig,
     KVCacheTensor,
     MambaSpec,
     compute_layout_strides,
@@ -53,7 +54,7 @@ class RecurrentKVCacheConfig(KVCacheConfig):
 
 def make_recurrent_kv_config(
     config: "VllmConfig",
-    specs: Mapping[str, KVCacheSpec],
+    layer_configs: Mapping[str, KVCacheLayerConfig],
     kv_cache_bytes: int,
     max_num_reqs: int,
     layout: KVCacheLayout,
@@ -81,15 +82,20 @@ def make_recurrent_kv_config(
         or not layout.is_layer_compact
     ):
         raise ValueError("recurrent KV requires an ordinary native NemotronH config")
-    attention: dict[str, KVCacheSpec] = {}
-    recurrent: dict[str, MambaSpec] = {}
+    attention: dict[str, KVCacheLayerConfig] = {}
+    recurrent: dict[str, KVCacheLayerConfig] = {}
     indices: set[int] = set()
-    for name, spec in specs.items():
+    for name, layer_config in layer_configs.items():
+        spec = layer_config.spec
         index = extract_layer_index(name)
         if index in indices or not 0 <= index < len(pattern):
             raise ValueError("recurrent KV layer indices do not match the model")
         indices.add(index)
-        if type(spec) is FullAttentionSpec and pattern[index] == "*":
+        if (
+            type(spec) is AttentionSpec
+            and layer_config.manager_cls is FullAttentionManager
+            and pattern[index] == "*"
+        ):
             if (
                 spec.dtype != torch.bfloat16
                 or spec.block_size != config.cache_config.block_size
@@ -97,12 +103,18 @@ def make_recurrent_kv_config(
                 or spec.head_size != model.get_head_size()
             ):
                 raise ValueError("loaded recurrent draft attention geometry differs")
-            attention[name] = spec
-        elif type(spec) is MambaSpec and pattern[index] == "M":
+            attention[name] = layer_config
+        elif (
+            type(spec) is MambaSpec
+            and layer_config.manager_cls is MambaManager
+            and pattern[index] == "M"
+        ):
+            params = layer_config.manager_config.params
+            assert isinstance(params, MambaManager.Params)
             if (
                 spec.mamba_type != MambaAttentionBackendEnum.MAMBA2
-                or spec.mamba_cache_mode != "none"
-                or spec.num_speculative_blocks != 0
+                or params.mamba_cache_mode != "none"
+                or params.num_speculative_blocks != 0
                 or spec.tp_replicated
                 or spec.block_size != config.cache_config.mamba_block_size
                 or spec.num_heads != 1
@@ -117,25 +129,30 @@ def make_recurrent_kv_config(
                 raise ValueError(
                     "loaded recurrent draft requires ordinary Mamba2 state"
                 )
-            recurrent[name] = spec
+            recurrent[name] = layer_config
         else:
             raise ValueError("loaded recurrent draft has an unsupported cache layer")
     expected = {i for i, kind in enumerate(pattern) if kind in "M*"}
     if not attention or not recurrent or indices != expected:
         raise ValueError("loaded recurrent draft is missing attention or Mamba layers")
     groups = group_standalone_kv_specs(attention)
-    for name, spec in recurrent.items():
+    for name, layer_config in recurrent.items():
         for group in groups:
-            if group.kv_cache_spec == spec:
-                group.layer_names.append(name)
+            if (
+                group.manager_config == layer_config.manager_config
+                and group.distinct_specs == (layer_config.spec,)
+            ):
+                group.kv_cache_specs[name] = layer_config.spec
                 break
         else:
-            groups.append(KVCacheGroupSpec([name], spec))
+            groups.append(KVCacheGroup.from_layers({name: layer_config}))
     recurrent_blocks = max_num_reqs + 1
     recurrent_bytes = recurrent_blocks * sum(
-        s.page_size_bytes for s in recurrent.values()
+        layer.spec.page_size_bytes for layer in recurrent.values()
     )
-    attention_page_bytes = sum(s.page_size_bytes for s in attention.values())
+    attention_page_bytes = sum(
+        layer.spec.page_size_bytes for layer in attention.values()
+    )
     blocks = (kv_cache_bytes - recurrent_bytes) // attention_page_bytes
     if blocks < 2:
         raise ValueError(
@@ -145,7 +162,7 @@ def make_recurrent_kv_config(
     tensors = []
     offset = 0
     for group in groups:
-        spec = group.kv_cache_spec
+        (spec,) = group.distinct_specs
         capacity = recurrent_blocks if isinstance(spec, MambaSpec) else blocks
         layer_stride, block_stride, *_ = compute_layout_strides(
             spec, capacity, len(group.layer_names), layout

@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from vllm.config.speculative import RemoteDraftConfig, SpeculativeConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
@@ -23,6 +24,8 @@ from vllm.v1.spec_decode.remote.target_kv import (
     SnapshotBudget,
     SnapshotCompletionError,
     TargetKVSnapshot,
+    _sliding_window,
+    _validate_spec,
 )
 from vllm.v1.spec_decode.remote.target_kv_session import (
     TargetKVProposalHandle,
@@ -122,8 +125,8 @@ class Session:
 
 @pytest.fixture
 def verifier(monkeypatch):
-    spec = FullAttentionSpec(
-        block_size=4, num_kv_heads=1, head_size=2, dtype=torch.bfloat16
+    spec = FullAttentionManager.layer_config(
+        AttentionSpec(block_size=4, num_kv_heads=1, head_size=2, dtype=torch.bfloat16)
     )
     budget = SnapshotBudget(32, 4096, 32)
     contract = NS(
@@ -137,7 +140,7 @@ def verifier(monkeypatch):
     )
     owner = NS(
         kv_cache=torch.arange(9 * 1 * 4 * 4).reshape(9, 1, 4, 4).to(torch.bfloat16),
-        get_kv_cache_spec=lambda config: spec,
+        get_kv_cache_config=lambda config: spec,
     )
     cfg = NS(
         speculative_config=NS(
@@ -501,7 +504,6 @@ def test_gemma_config_permits_only_the_dedicated_snapshot_contract(override):
     spec.draft_tensor_parallel_size = 1
     spec.draft_sample_method = "greedy"
     spec.parallel_drafting = False
-    spec.use_heterogeneous_vocab = False
     for key, value in override.items():
         setattr(spec, key, value)
     if override:
@@ -680,7 +682,8 @@ def test_collect_allocation_failure_cancels_owned_rpc(tmp_path, cleanup_failure)
     )
     metadata = {}
     with set_current_vllm_config(config), set_default_torch_dtype(torch.bfloat16):
-        for canonical, spec in contract.expected_specs.items():
+        for canonical, layer_config in contract.expected_specs.items():
+            spec = _validate_spec(layer_config)
             index = contract.source_indices[canonical]
             name = f"model.layers.{index}.self_attn.attn"
             owner = Attention(
@@ -689,7 +692,7 @@ def test_collect_allocation_failure_cancels_owned_rpc(tmp_path, cleanup_failure)
                 spec.head_size**-0.5,
                 num_kv_heads=spec.num_kv_heads,
                 cache_config=config.cache_config,
-                per_layer_sliding_window=spec.sliding_window,
+                per_layer_sliding_window=_sliding_window(layer_config),
                 prefix=name,
                 attn_backend=TritonAttentionBackend,
             )

@@ -13,7 +13,11 @@ import torch
 from msgspec.structs import replace as replace_message
 
 from tests.v1.spec_decode.remote.test_target_kv_wire import SnapshotOracle
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.session import RemoteDraftError
 from vllm.v1.spec_decode.remote.target_kv import (
@@ -38,14 +42,15 @@ from vllm.v1.spec_decode.remote.transport import FramedConnection
 def pool_runtime(request):
     quotas = getattr(request, "param", {})
     specs = {
-        "full": FullAttentionSpec(
-            block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
+        "full": FullAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
+            )
         ),
-        "window": SlidingWindowSpec(
-            block_size=4,
-            num_kv_heads=1,
-            head_size=4,
-            dtype=torch.bfloat16,
+        "window": SlidingWindowManager.layer_config(
+            AttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
+            ),
             sliding_window=5,
         ),
     }
@@ -107,7 +112,7 @@ def snapshots(pool, keys, *, round_id=0):
             tuple(
                 SnapshotLayer(
                     plan.name,
-                    plan.spec,
+                    plan.layer_config,
                     plan.logical_pages,
                     torch.full(plan.shape, i + 1, dtype=torch.bfloat16),
                 )
@@ -273,8 +278,8 @@ def test_many_open_requests_share_one_deadline_even_when_peers_never_ack():
     errors = []
     threads = []
     endpoints = []
-    spec = FullAttentionSpec(
-        block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16
+    spec = FullAttentionManager.layer_config(
+        AttentionSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
     )
     with ExitStack() as cleanup:
         for index in range(2):
