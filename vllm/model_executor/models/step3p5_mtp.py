@@ -226,7 +226,7 @@ class Step3p5MTP(nn.Module):
             name = self._rewrite_spec_layer_name(spec_layer, name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if name in params_dict or weight_name not in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
