@@ -147,14 +147,18 @@ class TokenGPUStepExecutor(GPUDraftStepExecutor, TokenStepExecutor):
         speculator = StandaloneARSpeculator(config, device)
         speculator.load_standalone_model()
         validate_token_model_inputs(config, speculator.model)
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import AttentionSpec
         from vllm.v1.spec_decode.remote.runtime.kv_layout import (
-            select_standalone_kv_spec,
+            select_standalone_kv_layer_config,
         )
-        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+        from vllm.v1.worker.gpu.attn_utils import get_kv_cache_layer_configs
 
-        actual = select_standalone_kv_spec(get_kv_cache_spec(config))
-        if type(actual) is not FullAttentionSpec:
+        actual = select_standalone_kv_layer_config(get_kv_cache_layer_configs(config))
+        if (
+            type(actual.spec) is not AttentionSpec
+            or actual.manager_cls is not FullAttentionManager
+        ):
             raise ValueError(
                 "token-only loaded draft requires homogeneous full attention KV"
             )
