@@ -4,8 +4,11 @@
 
 import itertools
 import math
+import sys
 import time
 from dataclasses import dataclass
+
+import msgspec
 
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
@@ -86,10 +89,19 @@ class TokenOnlyRemoteSession:
         failure_policy="error",
         request_timeout_ms=100,
         startup_timeout_ms=30000,
+        allow_cross_node: bool = False,
         clock=time.monotonic,
     ):
-        if not is_local_endpoint(endpoint) or hello.transport != "inline":
+        if hello.transport != "inline" or (
+            not is_local_endpoint(endpoint) and not allow_cross_node
+        ):
             raise ValueError("token-only v3 requires same-host inline transport")
+        if allow_cross_node:
+            if not endpoint.startswith("tcp://"):
+                raise ValueError("cross-node token-only drafting requires inline TCP")
+            hello = msgspec.structs.replace(
+                hello, cross_node=True, byte_order=sys.byteorder
+            )
         if failure_policy not in ("error", "target_only"):
             raise ValueError("invalid token-only failure policy")
         for name, value in (
@@ -99,6 +111,7 @@ class TokenOnlyRemoteSession:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         self.endpoint, self.hello = endpoint, hello
+        self.allow_cross_node = allow_cross_node
         self.failure_policy = failure_policy
         self.request_timeout_s = request_timeout_ms / 1000
         self.startup_timeout_s = startup_timeout_ms / 1000
@@ -221,6 +234,10 @@ class TokenOnlyRemoteSession:
                 or ack.tokenizer_fingerprint != self.hello.tokenizer_fingerprint
             ):
                 raise ProtocolError("invalid token hello acknowledgment")
+            if self.allow_cross_node and (
+                not ack.cross_node or ack.byte_order != sys.byteorder
+            ):
+                raise ProtocolError("server did not confirm the cross-node byte order")
             if (
                 ack.limits.max_batch_size < self.hello.max_num_seqs
                 or ack.limits.max_feature_tokens < self.hello.max_num_batched_tokens

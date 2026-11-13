@@ -22,7 +22,7 @@ from vllm.v1.spec_decode.remote.protocol import (
 )
 
 TOKEN_PROTOCOL_MAJOR = 3
-TOKEN_PROTOCOL_MINOR = 1
+TOKEN_PROTOCOL_MINOR = 2
 
 
 class TokenHello(msgspec.Struct):
@@ -37,6 +37,8 @@ class TokenHello(msgspec.Struct):
     max_model_len: PositiveInt
     method: str = "draft_model"
     transport: str = "inline"
+    cross_node: bool = False
+    byte_order: str = ""
 
 
 class TokenHelloAck(msgspec.Struct):
@@ -44,6 +46,8 @@ class TokenHelloAck(msgspec.Struct):
     session_epoch: PositiveInt
     tokenizer_fingerprint: str
     limits: RemoteServerLimits
+    cross_node: bool = False
+    byte_order: str = ""
 
 
 class TokenPrefill(msgspec.Struct):
@@ -99,6 +103,12 @@ def encode_token_message(
     name = _NAMES.get(type(message))
     if name is None:
         raise ProtocolError(f"unregistered token message: {type(message).__name__}")
+    payload = msgspec.msgpack.encode(message)
+    if isinstance(message, (TokenHello, TokenHelloAck)) and not message.cross_node:
+        fields = msgspec.to_builtins(message)
+        fields.pop("cross_node", None)
+        fields.pop("byte_order", None)
+        payload = msgspec.msgpack.encode(fields)
     return msgspec.msgpack.encode(
         MessageEnvelope(
             TOKEN_PROTOCOL_MAJOR,
@@ -106,7 +116,7 @@ def encode_token_message(
             name,
             session_id,
             request_id,
-            msgspec.msgpack.encode(message),
+            payload,
         )
     )
 

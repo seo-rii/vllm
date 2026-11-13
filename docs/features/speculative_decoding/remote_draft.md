@@ -18,6 +18,8 @@ remote sequences; `error` propagates the allocation failure.
 The same single-endpoint TP1 combination has an experimental eager MRV2
 [async verifier scheduling mode](../../design/unified_speculation_runtime.md#async-verifier-scheduling).
 Other remote backends retain their synchronous scheduling requirement.
+Ordinary token-only placement also has an explicit
+[cross-node TCP experiment](../../design/unified_speculation_runtime.md#cross-node-token-only-experiment).
 
 ## Configuration and lifecycle
 
@@ -57,7 +59,7 @@ Connections, partial frames, pending bytes and adapter waiters have server-side
 bounds. A shutdown grace timeout does not authorize freeing GPU storage whose
 completion is unknown; the process must be restarted in that state.
 
-This placement does not provide predictive caching, cross-node execution or
+This target-conditioned placement does not provide predictive caching, cross-node execution or
 N:M routing. Moving a speculator to another GPU does not by itself overlap its
 computation with target verification or guarantee higher throughput.
 
