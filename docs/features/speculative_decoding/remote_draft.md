@@ -12,7 +12,7 @@ and draft TP1. The protocol test adapter is for development only.
 ## Configuration and lifecycle
 
 `speculative_config.remote_draft` takes a single `endpoint`, a `transport`
-(`auto` or `inline`) and a `failure_policy` (`target_only` or `error`). `auto`
+(`auto`, `inline` or `cuda_ipc`) and a `failure_policy` (`target_only` or `error`). `auto`
 selects inline. Use a Unix socket or loopback TCP endpoint on the same host.
 The protocol does not authenticate peers; non-loopback server binding requires
 explicit `--allow-remote-connections`.
@@ -32,6 +32,8 @@ With older peers, the client waits for each prefill ACK before sending the next
 chunk, using the same round deadline. Already executing GPU work is not cancelled.
 When buffered final prompt chunks require multiple draft forwards, they also
 share the proposal deadline; expired rows do not start another forward.
+The server also checks the remaining budget after importing CUDA IPC features,
+before starting prefill or proposal computation.
 
 Socket cleanup errors encountered while handling a transport failure do not
 replace that failure or interrupt the configured fallback.
@@ -99,3 +101,20 @@ suitable for long prefills. EAGLE3 currently accepts GPT-OSS and Qwen3 targets;
 see [own-KV MTP contracts](remote_mtp.md) for the experimental MTP families.
 Prefix caching, input streaming, async scheduling, multimodal input, LoRA and
 `draft_lm_head_quantization` are rejected for this backend. Native local speculation retains its own support.
+
+## CUDA IPC feature transport
+
+On a single NVIDIA host, `transport="cuda_ipc"` explicitly selects bounded
+CUDA IPC arenas for target features. `auto` continues to select inline.
+The receiver copies features into independently owned GPU storage before
+acknowledging a lease; this is not zero-copy. Both processes must see the
+source GPU, and the actual device UUIDs and peer-copy support are validated.
+
+Producer arenas are reserved before target KV profiling. A timeout, disconnect
+or cancel does not prove a device copy has finished: uncertain storage is
+quarantined, further admission is fenced, and the process requires restart.
+Ordinary request failures preserve the selected target-only or error policy.
+
+For a historical two-GPU correctness, throughput and memory comparison, see
+[validation snapshot](remote_placement_validation.md). Its measurements belong
+to the recorded source revision and do not validate subsequent commits.
