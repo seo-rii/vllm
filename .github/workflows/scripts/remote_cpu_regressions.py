@@ -17,6 +17,15 @@ NATIVE_SUITES = {
     "test_token_gpu.py",
 }
 EXTERNAL_REGRESSIONS = {
+    "tests/test_sampling_params.py": (
+        "test_remote_draft_rejects_nonzero_temperature_at_admission",
+        "test_remote_draft_accepts_greedy_sampling_at_admission",
+        "test_spec_decode_accepts_min_p_and_logit_bias",
+    ),
+    "tests/v1/worker/test_gpu_model_runner_v2.py": (
+        "test_sample_tokens_preserves_native_hooks_and_workspace_order",
+        "test_non_last_pp_rank_uses_global_batch_for_sample_feedback",
+    ),
     "tests/v1/worker/test_draft_tokens_handler.py": (
         "test_variable_length_drafts_wait_for_copy_before_trimming",
         "test_retained_drafts_wait_only_for_their_own_copy",
