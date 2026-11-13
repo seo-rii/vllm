@@ -2196,7 +2196,11 @@ def _check_independent_recurrent_state(model, model_state, config):
     from vllm.model_executor.layers.attention import Attention
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
     from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
     assert type(model) is NemotronHForCausalLM
@@ -2212,16 +2216,24 @@ def _check_independent_recurrent_state(model, model_state, config):
     attention = [layer for layer in model.modules() if isinstance(layer, Attention)]
     assert len(recurrent) == len(attention) == 1
     states = recurrent[0].kv_cache
-    state_spec = recurrent[0].get_kv_cache_spec(config)
+    state_layer = recurrent[0].get_kv_cache_config(config)
+    assert state_layer is not None
+    assert state_layer.manager_cls is MambaManager
+    state_spec = state_layer.spec
+    params = state_layer.manager_config.params
+    assert isinstance(params, MambaManager.Params)
     assert isinstance(state_spec, MambaSpec)
-    assert state_spec.num_speculative_blocks == 0
+    assert params.num_speculative_blocks == 0
     assert state_spec.dtypes == (torch.bfloat16, torch.float32)
     assert tuple(tuple(state.shape[1:]) for state in states) == state_spec.shapes
     assert tuple(state.dtype for state in states) == state_spec.dtypes
     assert sorted(state_spec.shapes[0]) == [3, 384]
     assert state_spec.shapes[1] == (4, 64, 64)
-    attn_spec = attention[0].get_kv_cache_spec(config)
-    assert type(attn_spec) is FullAttentionSpec
+    attention_layer = attention[0].get_kv_cache_config(config)
+    assert attention_layer is not None
+    assert attention_layer.manager_cls is FullAttentionManager
+    attn_spec = attention_layer.spec
+    assert type(attn_spec) is AttentionSpec
     assert (attn_spec.num_kv_heads, attn_spec.head_size, attn_spec.block_size) == (
         2,
         32,
@@ -2235,7 +2247,7 @@ def _check_independent_recurrent_state(model, model_state, config):
         speculative_config=None,
         num_speculative_tokens=0,
         hybrid_pattern="M*",
-        mamba_cache_mode=state_spec.mamba_cache_mode,
+        mamba_cache_mode=params.mamba_cache_mode,
         mamba_backend="triton",
         state_shapes=state_spec.shapes,
         state_dtypes=[str(dtype) for dtype in state_spec.dtypes],
@@ -2834,7 +2846,9 @@ def _compare_native_and_remote_draft(
         for layer in runner.get_model().modules():
             if not isinstance(layer, MambaBase):
                 continue
-            spec = layer.get_kv_cache_spec(worker.vllm_config)
+            layer_config = layer.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
+            spec = layer_config.spec
             assert isinstance(spec, MambaSpec)
             shapes = tuple(layer.get_state_shape())
             assert spec.shapes == shapes
@@ -2957,12 +2971,14 @@ def _compare_native_and_remote_draft(
         for attention in draft.modules():
             if not isinstance(attention, (Attention, MLAAttention)):
                 continue
-            spec = attention.get_kv_cache_spec(worker.vllm_config)
+            layer_config = attention.get_kv_cache_config(worker.vllm_config)
+            assert layer_config is not None
             policies.append(
                 (
                     attention.sliding_window,
-                    type(spec).__name__,
-                    getattr(spec, "sliding_window", None),
+                    type(layer_config.spec).__name__,
+                    layer_config.manager_cls.__name__,
+                    getattr(layer_config.manager_config.params, "sliding_window", None),
                 )
             )
         return policies
@@ -3186,9 +3202,10 @@ def _compare_native_and_remote_draft(
                         window,
                         "MLAAttentionSpec"
                         if mla_draft or (dense_mla and not independent)
-                        else "FullAttentionSpec"
+                        else "AttentionSpec",
+                        "FullAttentionManager"
                         if window is None
-                        else "SlidingWindowSpec",
+                        else "SlidingWindowManager",
                         window,
                     )
                     for window in ((None, None) if independent else mtp_windows)
@@ -3362,7 +3379,8 @@ def _compare_native_and_remote_draft(
         layouts = ast.literal_eval(layout_text)
         assert layouts and sum(layout["layers"] for layout in layouts) == 2
         assert all(
-            layout["kind"] == ("MLAAttentionSpec" if mla_draft else "FullAttentionSpec")
+            layout["kind"] == ("MLAAttentionSpec" if mla_draft else "AttentionSpec")
+            and layout["manager"] == "FullAttentionManager"
             and layout["kv_heads"] == 1
             and layout["head_size"] == (576 if mla_draft else 32)
             and layout["window"] is None
@@ -3394,9 +3412,18 @@ def _compare_native_and_remote_draft(
         assert identity["max_model_len"] == identity["max_num_tokens"] == 128
         layouts = identity["kv_layouts"]
         assert {layout["kind"] for layout in layouts} == {
-            "FullAttentionSpec",
+            "AttentionSpec",
             "MambaSpec",
         }
+        assert all(
+            layout["manager"]
+            == (
+                "MambaManager"
+                if layout["kind"] == "MambaSpec"
+                else "FullAttentionManager"
+            )
+            for layout in layouts
+        )
         recurrent = next(layout for layout in layouts if layout["kind"] == "MambaSpec")
         assert recurrent["blocks"] == 5
         assert recurrent["num_speculative_blocks"] == 0
@@ -3432,7 +3459,11 @@ def _run_independent_recurrent_oracle(
     from vllm.model_executor.layers.attention import Attention
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
     from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
     from vllm.v1.spec_decode.remote.runtime.recurrent_gpu import (
@@ -3478,10 +3509,11 @@ def _run_independent_recurrent_oracle(
         shapes=NemotronHForCausalLM.get_mamba_state_shape_from_config(ordinary),
         dtypes=NemotronHForCausalLM.get_mamba_state_dtype_from_config(ordinary),
         page_size_padded=ordinary.cache_config.mamba_page_size_padded,
-        num_prefill_checkpoint_blocks=1,
-        prefill_checkpoint_alignment=1,
     )
-    attention_spec = FullAttentionSpec(
+    state_layer = MambaManager.layer_config(
+        state_spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=1
+    )
+    attention_spec = AttentionSpec(
         block_size=16, num_kv_heads=2, head_size=32, dtype=torch.bfloat16
     )
     budget = (live_slots + 1) * state_spec.page_size_bytes + (
@@ -3501,17 +3533,21 @@ def _run_independent_recurrent_oracle(
     assert executor.max_num_reqs == 1
     assert identity["attention_block_size"] == 16
     assert [
-        group.kv_cache_spec
+        group.distinct_specs[0]
         for group in executor.kv_config.kv_cache_groups
-        if type(group.kv_cache_spec) is FullAttentionSpec
+        if group.manager_cls is FullAttentionManager
     ] == [attention_spec]
-    assert [
-        group.kv_cache_spec
+    state_groups = [
+        group
         for group in executor.kv_config.kv_cache_groups
-        if isinstance(group.kv_cache_spec, MambaSpec)
-    ] == [state_spec]
-    assert state_spec.max_memory_usage_bytes(ordinary) == state_spec.page_size_bytes
-    assert state_spec.max_num_blocks_per_req(ordinary, 128) == 1
+        if group.manager_cls is MambaManager
+    ]
+    assert len(state_groups) == 1
+    state_group = state_groups[0]
+    assert state_group.distinct_specs == (state_spec,)
+    assert state_group.manager_config == state_layer.manager_config
+    assert state_group.max_memory_usage_bytes(ordinary) == state_spec.page_size_bytes
+    assert state_group.max_num_blocks_per_req(ordinary, 128) == 1
     mamba = next(
         layer for layer in executor.model.modules() if isinstance(layer, MambaMixer2)
     )
@@ -3923,10 +3959,13 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
 
     def identity(worker):
         from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            MambaManager,
+        )
         from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
+            AttentionSpec,
             MambaSpec,
-            iter_layer_specs,
         )
 
         runner = worker.model_runner
@@ -3943,16 +3982,22 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
             for layer in runner.get_model().modules()
             if isinstance(layer, Attention)
         )
-        public_attention_spec = attention.get_kv_cache_spec(config)
-        assert type(public_attention_spec) is FullAttentionSpec
+        public_attention_layer = attention.get_kv_cache_config(config)
+        assert public_attention_layer is not None
+        assert public_attention_layer.manager_cls is FullAttentionManager
+        public_attention_spec = public_attention_layer.spec
+        assert type(public_attention_spec) is AttentionSpec
         full_specs = []
         native_groups = []
         for index, group in enumerate(groups):
-            specs = list(iter_layer_specs(group.kv_cache_spec))
+            specs = list(group.distinct_specs)
             assert len(specs) == 1
             spec = specs[0]
-            assert isinstance(spec, (FullAttentionSpec, MambaSpec))
-            if type(spec) is FullAttentionSpec:
+            assert isinstance(spec, (AttentionSpec, MambaSpec))
+            assert group.manager_cls is (
+                FullAttentionManager if type(spec) is AttentionSpec else MambaManager
+            )
+            if type(spec) is AttentionSpec:
                 assert group.layer_names == [attention.layer_name]
                 assert (
                     spec.num_kv_heads,
@@ -3967,6 +4012,7 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
             native_groups.append(
                 dict(
                     kind=type(spec).__name__,
+                    manager=group.manager_cls.__name__,
                     layers=list(group.layer_names),
                     block_size=spec.block_size,
                     page_size_bytes=spec.page_size_bytes,
@@ -3976,7 +4022,7 @@ def test_remote_independent_recurrent_state_matches_native_full_prefix(
             )
         assert len(full_specs) == 1
         assert {group["kind"] for group in native_groups} == {
-            "FullAttentionSpec",
+            "AttentionSpec",
             "MambaSpec",
         }
         result["kv_groups"] = native_groups
@@ -4076,6 +4122,7 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
         MLACommonMetadata,
     )
     from vllm.v1.attention.backends.mla.triton_mla import TritonMLAMetadataBuilder
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.kv import DraftBlockPool
@@ -4145,7 +4192,9 @@ def _run_independent_mla_oracle(target_path, draft_path, result_path):
     assert len(layers) == 2
     layout, ranges = [], []
     for layer in layers:
-        spec = layer.get_kv_cache_spec(executor.vllm_config)
+        layer_config = layer.get_kv_cache_config(executor.vllm_config)
+        assert layer_config.manager_cls is FullAttentionManager
+        spec = layer_config.spec
         assert type(spec) is MLAAttentionSpec
         assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
         assert spec.block_size == 16 and spec.dtype == torch.bfloat16
@@ -4542,6 +4591,7 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
         from vllm.v1.attention.backends.mla.triton_mla import (
             TritonMLAMetadataBuilder,
         )
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         config, runner = worker.vllm_config, worker.model_runner
@@ -4557,7 +4607,9 @@ def test_remote_independent_mla_state_matches_authoritative_replay(
         layers = [m for m in model.modules() if isinstance(m, MLAAttention)]
         assert len(layers) == 2
         for layer in layers:
-            spec = layer.get_kv_cache_spec(config)
+            layer_config = layer.get_kv_cache_config(config)
+            assert layer_config.manager_cls is FullAttentionManager
+            spec = layer_config.spec
             assert isinstance(spec, MLAAttentionSpec)
             assert (spec.num_kv_heads, spec.head_size, spec.head_size_v) == (1, 576, 0)
             assert spec.dtype == torch.bfloat16 and spec.block_size == 16
@@ -4837,7 +4889,11 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
 
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.layers.attention import Attention
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.spec_decode.remote.protocol import SequenceKey, SpeculatorStatusCode
     from vllm.v1.spec_decode.remote.runtime.gpu import (
         GPUDraftStepExecutor,
@@ -4895,7 +4951,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
     assert len(layers) == depth
     assert [layer.sliding_window for layer in layers] == expected_windows
     assert all(layer.get_attn_backend().get_name() == "TRITON_ATTN" for layer in layers)
-    # Both dense spec types use this backend's token-major page representation.
+    # Both allocation policies use this backend's token-major page representation.
     assert all(layer.kv_cache.shape[1:] == (2, 16, 64) for layer in layers)
     assert all(layer.kv_cache.dtype == torch.bfloat16 for layer in layers)
     modules = executor.speculator.model.model.layers
@@ -4918,12 +4974,15 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
         ]
         assert len(matches) == 1
         group_id, group = matches[0]
-        spec = group.kv_cache_spec
-        assert isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
-        assert type(spec).__name__ == (
-            "FullAttentionSpec" if window is None else "SlidingWindowSpec"
+        spec = group.kv_cache_specs[layer.layer_name]
+        assert type(spec) is AttentionSpec
+        assert group.manager_cls is (
+            FullAttentionManager if window is None else SlidingWindowManager
         )
-        assert getattr(spec, "sliding_window", None) == window
+        assert getattr(group.manager_config.params, "sliding_window", None) == window
+        native_config = layer.get_kv_cache_config(config)
+        assert native_config is not None
+        assert group.manager_config == native_config.manager_config
         assert spec.block_size == 16 and spec.dtype == torch.bfloat16
         cache = layer.kv_cache
         size = (
@@ -4936,6 +4995,7 @@ def _multi_module_oracle(model_path, result_path, transport, resources) -> None:
                 "window": window,
                 "group": group_id,
                 "spec": type(spec).__name__,
+                "manager": group.manager_cls.__name__,
                 "cache_shape": list(cache.shape),
                 "cache_strides": list(cache.stride()),
             }
