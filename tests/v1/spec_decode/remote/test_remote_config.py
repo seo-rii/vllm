@@ -100,6 +100,41 @@ def test_new_remote_configuration_preserves_legacy_defaults():
     assert config == RemoteDraftConfig(endpoint="unix:///draft.sock")
 
 
+def test_remote_cost_options_preserve_typed_configuration_and_reject_local():
+    from vllm.config.speculative import RemoteDraftCostConfig
+
+    execution = SpeculativeExecutionConfig(
+        placement="remote",
+        endpoints=("unix:///draft.sock",),
+        cost_aware={"min_samples": 3, "min_speedup": 1.2},
+    )
+    assert execution.remote_config().cost_aware == RemoteDraftCostConfig(
+        min_samples=3,
+        min_speedup=1.2,
+    )
+    with pytest.raises(ValidationError, match="local execution"):
+        SpeculativeExecutionConfig(cost_aware={})
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"min_samples": 0},
+        {"min_samples": 65},
+        {"ema_alpha": 0},
+        {"ema_alpha": float("nan")},
+        {"min_speedup": 0.9},
+        {"switch_margin": -1},
+        {"probe_interval": 0},
+    ],
+)
+def test_invalid_remote_cost_options_are_rejected(options):
+    from vllm.config.speculative import RemoteDraftCostConfig
+
+    with pytest.raises(ValidationError):
+        RemoteDraftCostConfig(**options)
+
+
 def test_remote_configuration_validates_transport_and_preserves_overrides():
     execution = SpeculativeExecutionConfig(
         placement="remote",
