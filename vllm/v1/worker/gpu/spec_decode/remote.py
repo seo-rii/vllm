@@ -155,9 +155,25 @@ class RemoteSpeculator(BaseSpeculator):
         ):
             unsupported.append("PP, DP and context parallelism must be disabled")
         if config.cache_config.enable_prefix_caching:
-            unsupported.append("enable_prefix_caching must be False")
+            from vllm.v1.spec_decode.remote.runtime.token_schema import (
+                supports_token_prefix_replay,
+            )
+
+            if not supports_token_prefix_replay(config):
+                unsupported.append(
+                    "prefix caching requires full-attention token-only models, "
+                    "TP1 and one inline endpoint"
+                )
         if config.scheduler_config.async_scheduling:
-            unsupported.append("async_scheduling must be False")
+            from vllm.v1.spec_decode.remote.runtime.token_schema import (
+                supports_token_async_scheduling,
+            )
+
+            if not supports_token_async_scheduling(config):
+                unsupported.append(
+                    "async scheduling requires eager MRV2, full-attention token-only "
+                    "models, TP1 and one inline endpoint"
+                )
         if config.lora_config is not None:
             unsupported.append("LoRA is unsupported")
         if config.model_config.is_multimodal_model:

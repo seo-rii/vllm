@@ -4,13 +4,14 @@
 
 import itertools
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.contracts import DraftStep, LocalExecutionContext
 from vllm.v1.spec_decode.proposal import ProposalHandle, SpeculatorOutput
 from vllm.v1.spec_decode.remote.errors import (
@@ -20,8 +21,10 @@ from vllm.v1.spec_decode.remote.errors import (
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.runtime.token_schema import (
     create_token_runtime_contract,
+    supports_token_prefix_replay,
 )
 from vllm.v1.spec_decode.remote.runtime.token_state import TokenAdvanceRow
+from vllm.v1.spec_decode.remote.session import RemoteDraftError
 from vllm.v1.spec_decode.remote.token_protocol import TokenHello
 from vllm.v1.spec_decode.remote.token_session import (
     TokenOnlyRemoteSession,
@@ -29,6 +32,8 @@ from vllm.v1.spec_decode.remote.token_session import (
 )
 from vllm.v1.worker.gpu.spec_decode.remote import RemoteSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -70,6 +75,14 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
         self._rounds = itertools.count()
         self._sequences = itertools.count()
         self._requests: dict[str, _Request] = {}
+        self._prefix_replay = (
+            vllm_config.cache_config.enable_prefix_caching
+            and supports_token_prefix_replay(vllm_config)
+        )
+        self._cached_prefixes: dict[str, tuple[int, ...]] = {}
+        self._max_model_len = vllm_config.model_config.max_model_len
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._vocab_size = vllm_config.model_config.get_vocab_size()
         self._terminal_requests: set[str] = set()
         self._pending: _TokenHandle | None = None
         self._closed = False
@@ -110,6 +123,61 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
     def capture(self) -> None:
         pass
 
+    def register_cached_prefix(
+        self,
+        req_id: str,
+        token_ids: Sequence[int],
+        *,
+        num_computed_tokens: int | None = None,
+    ) -> None:
+        """Retain authoritative CPU tokens omitted by the target prefix hit."""
+        if self._closed or self._pending is not None:
+            raise RuntimeError(
+                "cannot register a cached prefix on a closed or busy backend"
+            )
+        if not self._prefix_replay:
+            raise ValueError("token cached-prefix replay is not enabled")
+        if (
+            req_id in self._requests
+            or req_id in self._terminal_requests
+            or req_id in self._cached_prefixes
+        ):
+            raise ValueError("cached prefix already belongs to a request identity")
+        if len(self._requests) + len(self._cached_prefixes) >= self._max_num_seqs:
+            raise ValueError("cached prefix exceeds the request capacity")
+        count = len(token_ids) if num_computed_tokens is None else num_computed_tokens
+        if (
+            type(count) is not int
+            or not 0 < count < self._max_model_len
+            or count > len(token_ids)
+        ):
+            raise ValueError(
+                "cached prefix requires in-vocabulary tokens within context"
+            )
+        try:
+            prefix = tuple(
+                token_ids if num_computed_tokens is None else token_ids[:count]
+            )
+            if any(
+                type(token) is not int or not 0 <= token < self._vocab_size
+                for token in prefix
+            ):
+                raise ValueError(
+                    "cached prefix requires in-vocabulary tokens within context"
+                )
+            self._cached_prefixes[req_id] = prefix
+        except Exception as error:
+            if cuda_context_fatal(error) or not host_allocation_failure(error):
+                raise
+            self._cached_prefixes.pop(req_id, None)
+            self._terminal_requests.add(req_id)
+            assert self._session is not None
+            detail = f"cached prefix allocation failed for request {req_id}: {error}"
+            if self._session.failure_policy == "error":
+                raise RemoteDraftError(detail) from error
+            # No remote key exists yet; keep healthy sibling sequences connected.
+            logger.warning("%s; continuing target-only", detail)
+
     def _empty(self, n, *, device="cpu") -> SpeculatorOutput:
         return SpeculatorOutput(
             torch.zeros(
@@ -125,6 +193,8 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             raise error
         assert self._session is not None
         self._terminal_requests.update(handle.step.request_ids)
+        for req_id in handle.step.request_ids:
+            self._cached_prefixes.pop(req_id, None)
         self._session.fail(f"token metadata allocation failed: {error}")
         if handle.output is None:
             handle.output = self._empty(len(handle.step.request_ids))
@@ -203,9 +273,15 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 raise ValueError("target query cannot be empty")
             request = self._requests.get(req_id)
             if request is None:
-                if not handle.step.is_prefilling[i] or positions[start] != 0:
+                prefix = self._cached_prefixes.pop(req_id, ())
+                if (
+                    not handle.step.is_prefilling[i]
+                    or positions[start] != len(prefix)
+                    or len(prefix) >= int(batch.prefill_len_np[i])
+                ):
                     raise ValueError(
-                        "new token requests must prefill from position zero"
+                        "new token requests require position zero "
+                        "or their registered prefix"
                     )
                 key = session.open_sequence(next(self._sequences), deadline=deadline)
                 try:
@@ -217,6 +293,11 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                     session._invalidate()
                     session.close_sequences((key,))
                     raise
+                if prefix and session.active(key):
+                    assert isinstance(session, TokenOnlyRemoteSession)
+                    session.prefill(key, prefix, is_final=False, deadline=deadline)
+                    if session.active(key):
+                        request.target_computed = len(prefix)
             if not session.active(request.key):
                 continue
             if positions[start:end] != list(
@@ -361,6 +442,9 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
                 torch.tensor(lengths, dtype=torch.int32, device=self.device),
             )
         finally:
+            if not context.dummy_run and not context.is_profile:
+                for req_id in handle.step.request_ids:
+                    self._cached_prefixes.pop(req_id, None)
             self._discard(handle)
 
     def cancel(self, handle: ProposalHandle, reason: str) -> None:
@@ -379,12 +463,16 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             if error is not None:
                 raise RuntimeError(f"token cancellation failed: {error}")
         finally:
+            for req_id in handle.step.request_ids:
+                self._cached_prefixes.pop(req_id, None)
             self._discard(handle)
 
     def close_requests(self, req_ids: Collection[str]) -> None:
         if not req_ids:
             return
         self._terminal_requests.difference_update(req_ids)
+        for req_id in req_ids:
+            self._cached_prefixes.pop(req_id, None)
         if self._pending is not None and set(req_ids).intersection(
             self._pending.step.request_ids
         ):
@@ -410,6 +498,7 @@ class TokenOnlyRemoteSpeculator(BaseSpeculator):
             self._session.close()
             self._session = None
         self._requests.clear()
+        self._cached_prefixes.clear()
         self._terminal_requests.clear()
         if self._pending is not None:
             self._discard(self._pending)
