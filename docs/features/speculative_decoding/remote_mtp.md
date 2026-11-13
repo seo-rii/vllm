@@ -89,6 +89,27 @@ passing a synthetic BF16 configuration does not establish their support.
 Select an MLA attention backend supported by the device for both native and
 remote comparison, and keep the MLA prefill backend consistent.
 
+### DeepSeek-V3.2 sparse MLA (validation pending)
+
+The experimental V3.2 contract is separate from dense DeepSeek-V3. It pairs one
+native BF16 MLA cache (576 elements per token) with its own indexer cache
+(132 bytes per token: FP8 values plus FP32 scale). Both use 64-token logical
+blocks, with distinct physical storage and separate native metadata builders.
+This does not enable arbitrary byte caches, compressed MLA, or FP8 main KV.
+
+The candidate accepts a flat-text `DeepseekV32ForCausalLM` target and one native
+`DeepseekV32MTPModel` head, BF16 weights/features/main KV, target/draft TP1 and
+one inline endpoint. Top-k is 512, 1024 or 2048; indexer heads are 64 by 128.
+The draft retains its constructor-owned top-k buffers, native streams and
+completion events. Iteration index sharing, target index reuse, HiSparse,
+quantized model weights, multiple heads, GLM DSA, IPC and pooling are excluded.
+
+Actual NVIDIA model loading, sparse/indexer kernels, proposal correctness and
+acceptance still require validation on Hopper with the native sparse backend
+and DeepGEMM build. A100 cannot run this native path. CPU allocation/binding
+checks and checkpoint serialization do not establish model-serving support.
+Do not treat this candidate as a validated replacement for native V3.2 serving.
+
 ### Qwen3.5 text
 
 Dense and MoE Qwen3.5 use their native flat-text target architectures and one

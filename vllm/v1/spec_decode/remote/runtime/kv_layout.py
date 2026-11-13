@@ -7,6 +7,7 @@ backend applies its window; the planner does not evict or recycle old positions.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 
@@ -26,6 +27,71 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+
+@dataclass(frozen=True)
+class SparseMLAKVContract:
+    """A single native DeepSeek V3.2 MTP cache and its FP8 indexer record."""
+
+    topk_tokens: int
+    block_size: int = 64
+
+    def __post_init__(self) -> None:
+        if type(self.topk_tokens) is not int or self.topk_tokens not in (
+            512,
+            1024,
+            2048,
+        ):
+            raise ValueError("standalone sparse MLA requires top-k 512, 1024 or 2048")
+        if type(self.block_size) is not int or self.block_size != 64:
+            raise ValueError("standalone sparse MLA requires 64-token blocks")
+
+    def validate_specs(self, specs: Mapping[str, KVCacheLayerConfig]) -> None:
+        if len(specs) != 2 or any(
+            type(layer.spec) is not MLAAttentionSpec for layer in specs.values()
+        ):
+            raise ValueError("standalone sparse MLA requires one MLA/indexer pair")
+        attention = [
+            name
+            for name, layer in specs.items()
+            if isinstance(layer.spec, MLAAttentionSpec)
+            and layer.spec.cache_role == SparseCacheRole.SPARSE
+        ]
+        if len(attention) != 1 or not attention[0].endswith(".self_attn.attn"):
+            raise ValueError("standalone sparse MLA requires a native attention name")
+        attention_name = attention[0]
+        indexer_name = attention_name.removesuffix(".attn") + ".indexer.k_cache"
+        if indexer_name not in specs:
+            raise ValueError("standalone sparse MLA requires its own layer indexer")
+        for name, layer in specs.items():
+            spec = layer.spec
+            assert isinstance(spec, MLAAttentionSpec)
+            is_indexer = name == indexer_name
+            if (
+                spec.block_size != self.block_size
+                or spec.num_kv_heads != 1
+                or spec.max_tp_shards != 1
+                or spec.head_size != (132 if is_indexer else 576)
+                or spec.dtype != (torch.uint8 if is_indexer else torch.bfloat16)
+                or spec.cache_role
+                != (SparseCacheRole.INDEXER if is_indexer else SparseCacheRole.SPARSE)
+                or spec.is_index_group_leader != (not is_indexer)
+                or spec.topk_buffer_width != (None if is_indexer else self.topk_tokens)
+                or spec.head_size_v != 0
+                or spec.tokens_per_state != 1
+                or spec.num_head_slots is not None
+                or spec.state_content_bytes is not None
+                or spec.kv_quant_mode != KVQuantMode.NONE
+                or spec.page_size_padded is not None
+                or spec.alignment is not None
+                or spec.model_version is not None
+                or layer.manager_cls is not FullAttentionManager
+                or spec.cache_dtype_str
+                not in ((None,) if is_indexer else (None, "auto", "bfloat16"))
+            ):
+                raise ValueError(
+                    "standalone sparse MLA requires native BF16/byte pages"
+                )
 
 
 def select_standalone_kv_layer_config(
@@ -83,19 +149,26 @@ def select_standalone_kv_layer_config(
 
 def group_standalone_kv_specs(
     layer_configs: Mapping[str, KVCacheLayerConfig],
+    *,
+    sparse_mla: SparseMLAKVContract | None = None,
 ) -> list[KVCacheGroup]:
     """Group dense layers while sharing one logical block ID namespace."""
     if not layer_configs:
         raise ValueError("standalone drafter has no attention KV layers")
+    if sparse_mla is not None:
+        sparse_mla.validate_specs(layer_configs)
     grouped: dict[KVCacheLayerConfig, dict[str, KVCacheLayerConfig]] = {}
     first: AttentionSpec | None = None
     for name, layer in layer_configs.items():
-        select_standalone_kv_layer_config({name: layer})
+        if sparse_mla is None:
+            select_standalone_kv_layer_config({name: layer})
         spec = layer.spec
         assert isinstance(spec, AttentionSpec)
         if first is None:
             first = spec
-        elif spec.block_size != first.block_size or spec.dtype != first.dtype:
+        elif sparse_mla is None and (
+            spec.block_size != first.block_size or spec.dtype != first.dtype
+        ):
             raise ValueError(
                 "standalone KV groups require a common block size and dtype"
             )
@@ -126,9 +199,11 @@ def make_grouped_standalone_kv_config(
     layer_configs: Mapping[str, KVCacheLayerConfig],
     kv_cache_bytes: int,
     layout: KVCacheLayout,
+    *,
+    sparse_mla: SparseMLAKVContract | None = None,
 ) -> KVCacheConfig:
     """Reserve every logical block in every layer, without cross-group aliasing."""
-    groups = group_standalone_kv_specs(layer_configs)
+    groups = group_standalone_kv_specs(layer_configs, sparse_mla=sparse_mla)
     if not layout.is_layer_compact:
         raise ValueError("standalone runtime requires layer-compact KV layout")
     page_bytes = sum(layer.spec.page_size_bytes for layer in layer_configs.values())
