@@ -7,6 +7,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
+from msgspec.structs import replace
+
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
@@ -56,11 +58,19 @@ class TokenDraftPool:
         failure_policy="error",
         request_timeout_ms=100,
         startup_timeout_ms=30000,
+        routing_policy="least_sequences",
         clock=time.monotonic,
     ):
         if not 1 <= len(endpoints) <= 16 or len(set(endpoints)) != len(endpoints):
             raise ValueError("token pool requires 1..16 distinct endpoints")
+        if routing_policy not in ("least_sequences", "load_aware"):
+            raise ValueError("unknown token pool routing policy")
+        if routing_policy == "load_aware" and len(endpoints) < 2:
+            raise ValueError("load-aware routing requires multiple token workers")
+        if routing_policy == "load_aware":
+            hello = replace(hello, report_load=True)
         self.hello = hello
+        self.routing_policy = routing_policy
         self.clock = clock
         self.failure_policy = failure_policy
         self.request_timeout_s = request_timeout_ms / 1000
@@ -91,6 +101,9 @@ class TokenDraftPool:
         self._owner = object()
         self._pending: TokenPoolHandle | None = None
         self._probes: dict[int, Future] = {}
+        self._load_probes: dict[int, Future] = {}
+        self._load_attempts = [float("-inf")] * len(endpoints)
+        self._load_selections = self._load_fallbacks = 0
         self._deferred_closes: set[SequenceKey] = set()
         self._closed = False
         self._last_batch = -1
@@ -154,7 +167,75 @@ class TokenDraftPool:
             and self._sessions[index].active(key)
         )
 
+    def _reap_load_probes(self):
+        for worker, future in tuple(self._load_probes.items()):
+            if future.done():
+                try:
+                    future.result()
+                except Exception as error:
+                    logger.warning(
+                        "Remote draft worker %d load probe failed: %s", worker, error
+                    )
+                del self._load_probes[worker]
+
+    def _load_score(self, index, snapshot):
+        assert snapshot is not None
+        load = snapshot.load
+        growth = max(0, self._counts[index] - snapshot.local_sequences)
+        available = max(0, load.available_sequences - growth)
+        unavailable = (
+            not load.healthy
+            or not available
+            or not load.available_kv_blocks
+            or load.queue_jobs >= load.queue_capacity
+            or load.queued_bytes >= load.byte_capacity
+        )
+        pressure = max(
+            1 - available / load.sequence_capacity,
+            1 - load.available_kv_blocks / load.kv_capacity_blocks,
+        ) + max(
+            load.queue_jobs / load.queue_capacity,
+            load.queued_bytes / load.byte_capacity,
+        )
+        work_ms = int(snapshot.round_trip_s * 1000) * (load.queue_jobs + 1)
+        return (
+            unavailable,
+            pressure,
+            work_ms,
+            self._counts[index],
+            (index - self._next) % len(self._sessions),
+        )
+
+    def _select_by_load(self, candidates, fallback, deadline):
+        now = self.clock()
+        reports = {i: self._sessions[i].load_snapshot for i in candidates}
+        if all(
+            report is not None and 0 <= now - report.received_at <= 1.0
+            for report in reports.values()
+        ):
+            index = min(candidates, key=lambda i: self._load_score(i, reports[i]))
+            self._load_selections += 1
+        else:
+            index = fallback
+            self._load_fallbacks += 1
+        for worker in candidates:
+            session = self._sessions[worker]
+            snapshot = session.load_snapshot
+            if (
+                session.load_reports_enabled
+                and session._conn is not None
+                and worker not in self._load_probes
+                and now - self._load_attempts[worker] >= 0.1
+                and (snapshot is None or now - snapshot.received_at >= 0.1)
+            ):
+                self._load_attempts[worker] = now
+                self._load_probes[worker] = self._call(
+                    worker, "refresh_load", deadline=min(deadline, now + 0.02)
+                )
+        return index
+
     def _select_worker(self, deadline):
+        self._reap_load_probes()
         self._reap_probes()
         candidates = [
             i
@@ -192,8 +273,18 @@ class TokenDraftPool:
             candidates,
             key=lambda i: (self._counts[i], (i - self._next) % len(self._sessions)),
         )
+        if self.routing_policy == "load_aware":
+            index = self._select_by_load(candidates, index, deadline)
         self._next = (index + 1) % len(self._sessions)
         return index
+
+    def get_routing_stats(self):
+        return dict(
+            assigned_sequences=tuple(self._counts),
+            load_aware_selections=self._load_selections,
+            fallback_selections=self._load_fallbacks,
+            load_refreshes=tuple(session.load_refreshes for session in self._sessions),
+        )
 
     def reserve_sequence(self, sequence_id, *, deadline):
         if self._closed or self._pending is not None:
@@ -434,6 +525,7 @@ class TokenDraftPool:
             self._closed = True
             for driver in self._drivers:
                 driver.shutdown(wait=True)
+            self._reap_load_probes()
             self.records.clear()
             self._routes.clear()
             self._deferred_closes.clear()

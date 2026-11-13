@@ -82,12 +82,21 @@ def pool_runtime():
             assert server.endpoint is not None
             endpoints.append(server.endpoint)
 
-        def client(identity="v-a", policy="error"):
+        def client(
+            identity="v-a",
+            policy="error",
+            *,
+            routing_policy="least_sequences",
+            selected_endpoints=None,
+            clock=time.monotonic,
+        ):
             pool = TokenDraftPool(
-                tuple(endpoints),
+                tuple(endpoints) if selected_endpoints is None else selected_endpoints,
                 replace(hello, verifier_instance_id=identity),
                 failure_policy=policy,
                 request_timeout_ms=5000,
+                routing_policy=routing_policy,
+                clock=clock,
             )
             cleanup.callback(pool.close)
             pool.connect()
@@ -105,6 +114,130 @@ def open_prompt(pool, sequence_id, prompt=(1, 2)):
     key = pool.open_sequence(sequence_id, deadline=pool.deadline())
     pool.prefill(key, prompt, is_final=True, deadline=pool.deadline())
     return key
+
+
+def test_load_aware_open_uses_global_credits_and_keeps_affinity(pool_runtime):
+    client, servers, states, _ = pool_runtime
+    blocker = client("external", selected_endpoints=(servers[0].endpoint,))
+    busy = tuple(open_prompt(blocker, i) for i in range(4))
+    control = client("control", policy="target_only")
+    rejected = control.open_sequence(0, deadline=control.deadline())
+    assert not control.active(rejected)
+    control.close_sequences((rejected,))
+
+    pool = client("aware", routing_policy="load_aware")
+    key = open_prompt(pool, 0)
+    assert key in states[1].sequences
+    assert key not in states[0].sequences
+    assert pool.get_routing_stats()["assigned_sequences"] == (0, 1)
+    assert pool.get_routing_stats()["load_aware_selections"] == 1
+    blocker.close_sequences(busy)
+    output = pool.collect(
+        pool.dispatch(
+            0,
+            (TokenAdvanceRow(key, 2, None, 0, 0, (3,)),),
+            3,
+            deadline=pool.deadline(),
+        )
+    )
+    assert output.valid_lengths == (3,)
+    assert output.token_ids[0][0] == KVOracle.predict([1, 2, 3])
+    assert key in states[1].sequences
+    pool.close_sequences((key,))
+    assert not pool.records
+    assert all(not state.sequences for state in states)
+    assert all(state.block_pool.num_free_blocks == 32 for state in states)
+
+
+def test_load_aware_open_uses_actual_kv_pressure_across_verifiers(pool_runtime):
+    client, servers, states, _ = pool_runtime
+    blocker = client("external", selected_endpoints=(servers[0].endpoint,))
+    resident = open_prompt(blocker, 0, tuple(range(32)))
+    pool = client("aware", routing_policy="load_aware")
+    key = open_prompt(pool, 0)
+    assert key in states[1].sequences
+    assert states[0].block_pool.num_free_blocks == 24
+    assert pool.get_routing_stats()["load_aware_selections"] == 1
+    blocker.close_sequences((resident,))
+    pool.close_sequences((key,))
+    assert all(state.block_pool.num_free_blocks == 32 for state in states)
+
+
+def test_stale_load_reports_use_local_counts_until_bounded_refresh(pool_runtime):
+    from tests.v1.spec_decode.remote.test_token_pool_server import until
+
+    class Clock:
+        offset = 0.0
+
+        def __call__(self):
+            return time.monotonic() + self.offset
+
+    clock = Clock()
+    client, servers, states, _ = pool_runtime
+    pool = client("aware", routing_policy="load_aware", clock=clock)
+    blocker = client("external", selected_endpoints=(servers[0].endpoint,))
+    resident = open_prompt(blocker, 0, tuple(range(32)))
+    clock.offset = 2.0
+    key = open_prompt(pool, 0)
+    assert key in states[0].sequences
+    assert pool.get_routing_stats()["fallback_selections"] == 1
+    until(lambda: all(pool.get_routing_stats()["load_refreshes"]))
+    second = open_prompt(pool, 1)
+    assert second in states[1].sequences
+    assert pool.get_routing_stats()["load_aware_selections"] == 1
+    assert pool.get_routing_stats()["load_refreshes"] == (1, 1)
+    pool.close_sequences((key, second))
+    blocker.close_sequences((resident,))
+    assert all(state.block_pool.num_free_blocks == 32 for state in states)
+
+
+def test_load_routing_sees_other_verifiers_executing_queue_credit(pool_runtime):
+    client, _, states, oracles = pool_runtime
+    blocker = client("external")
+    keys = tuple(open_prompt(blocker, i) for i in range(2))
+    oracles[0].release = threading.Event()
+    handle = blocker.dispatch(
+        0,
+        (TokenAdvanceRow(keys[0], 2, None, 0, 0, (3,)),),
+        1,
+        deadline=blocker.deadline(),
+    )
+    try:
+        assert oracles[0].entered.wait(3)
+        pool = client("aware", routing_policy="load_aware")
+        key = open_prompt(pool, 0)
+        assert key in states[1].sequences
+        assert pool.get_routing_stats()["load_aware_selections"] == 1
+        pool.close_sequences((key,))
+    finally:
+        oracles[0].release.set()
+    assert blocker.collect(handle).valid_lengths == (1,)
+    blocker.close_sequences(keys)
+    assert all(state.block_pool.num_free_blocks == 32 for state in states)
+
+
+@pytest.mark.parametrize("routing_policy", ["least_sequences", "load_aware"])
+def test_load_routing_admission_under_a_shared_worker_hotspot(
+    pool_runtime,
+    routing_policy,
+    record_property,
+):
+    client, servers, _, _ = pool_runtime
+    blocker = client("external", selected_endpoints=(servers[0].endpoint,))
+    busy = tuple(open_prompt(blocker, i) for i in range(4))
+    admitted = 0
+    for i in range(8):
+        pool = client(
+            f"arrival-{i}", policy="target_only", routing_policy=routing_policy
+        )
+        key = pool.open_sequence(0, deadline=pool.deadline())
+        admitted += int(pool.active(key))
+        pool.close_sequences((key,))
+        pool.close()
+    record_property("remote_admissions", admitted)
+    record_property("new_verifiers", 8)
+    assert admitted == (8 if routing_policy == "load_aware" else 0)
+    blocker.close_sequences(busy)
 
 
 def test_two_verifiers_share_two_workers_without_namespace_or_row_mixups(pool_runtime):
@@ -245,10 +378,15 @@ def test_native_speculative_config_preserves_all_pool_endpoints(tmp_path):
     assert spec.get_remote_draft_endpoints() == endpoints
 
 
-def test_recovered_worker_rejoins_without_reviving_its_old_sequences(pool_runtime):
+@pytest.mark.parametrize("routing_policy", ["least_sequences", "load_aware"])
+def test_recovered_worker_rejoins_without_reviving_its_old_sequences(
+    pool_runtime,
+    routing_policy,
+):
     client, servers, states, _ = pool_runtime
-    pool = client(policy="target_only")
+    pool = client(policy="target_only", routing_policy=routing_policy)
     keys = [open_prompt(pool, i) for i in range(2)]
+    keys.sort(key=lambda key: key not in states[0].sequences)
     endpoint = servers[0].endpoint
     assert endpoint is not None
     servers[0].stop()
