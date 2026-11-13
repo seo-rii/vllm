@@ -11,10 +11,11 @@ from dataclasses import dataclass
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.spec_decode.proposal import ProposalHandle
 from vllm.v1.spec_decode.remote.protocol import SequenceKey
 from vllm.v1.spec_decode.remote.session import RemoteDraftError
-from vllm.v1.spec_decode.remote.target_kv import AttentionSpec, TargetKVSnapshot
+from vllm.v1.spec_decode.remote.target_kv import TargetKVSnapshot
 from vllm.v1.spec_decode.remote.target_kv_protocol import (
     TargetKVHello,
     snapshot_batch_wire_plan,
@@ -51,7 +52,7 @@ class TargetKVDraftPool:
         endpoints: tuple[str, ...],
         hello: TargetKVHello,
         *,
-        expected_specs: Mapping[str, AttentionSpec],
+        expected_specs: Mapping[str, KVCacheLayerConfig],
         failure_policy="error",
         request_timeout_ms=100,
         startup_timeout_ms=30000,

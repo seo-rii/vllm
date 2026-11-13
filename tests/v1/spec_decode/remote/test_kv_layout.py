@@ -10,12 +10,18 @@ import torch
 from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
+from vllm.v1.core.single_type_kv_cache_manager import (
+    ChunkedLocalAttentionManager,
+    CrossAttentionManager,
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     HiddenStateCacheSpec,
+    HiSparseHotPageSpec,
+    KVQuantMode,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
-    SlidingWindowSpec,
     SparseCacheRole,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -26,7 +32,7 @@ from vllm.v1.spec_decode.remote.runtime.kv_layout import (
     group_standalone_kv_specs,
     make_grouped_standalone_kv_config,
     make_standalone_kv_config,
-    select_standalone_kv_spec,
+    select_standalone_kv_layer_config,
 )
 from vllm.v1.spec_decode.remote.runtime.step import DraftStepPlanner, DraftStepRow
 from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache_to_layers
@@ -42,23 +48,37 @@ def _spec(kind):
     if kind == "mla":
         return MLAAttentionSpec(**(kwargs | {"num_kv_heads": 1, "head_size": 5}))
     if kind == "swa":
-        return SlidingWindowSpec(**kwargs, head_size_v=4, sliding_window=5)
-    return FullAttentionSpec(**kwargs)
+        return AttentionSpec(**kwargs, head_size_v=4)
+    return AttentionSpec(**kwargs)
+
+
+def _layer_config(kind):
+    spec = _spec(kind)
+    if kind == "swa":
+        return SlidingWindowManager.layer_config(spec, sliding_window=5)
+    return FullAttentionManager.layer_config(spec)
 
 
 @pytest.mark.parametrize("kind", ["full", "mla", "swa"])
 @pytest.mark.parametrize("layout_name", ["LBHNC", "LBNHC", "LHBNC"])
 def test_dense_own_kv_layers_and_blocks_never_alias(kind, layout_name):
-    spec = _spec(kind)
+    layer_config = _layer_config(kind)
+    spec = layer_config.spec
     names = ["draft.0", "draft.1", "draft.2"]
-    assert select_standalone_kv_spec(dict.fromkeys(names, spec)) is spec
+    assert (
+        select_standalone_kv_layer_config(dict.fromkeys(names, layer_config))
+        is layer_config
+    )
     page_group_bytes = len(names) * spec.page_size_bytes
     budget = page_group_bytes * 6 - 1
     layout = KVCacheLayout[layout_name]
-    config = make_standalone_kv_config(spec, names, budget, layout)
+    config = make_standalone_kv_config(layer_config, names, budget, layout)
     caches = allocate_kv_cache(config, torch.device("cpu"), layout)
     assert config.num_blocks == 5
-    assert config.kv_cache_groups[0].kv_cache_spec is spec
+    group = config.kv_cache_groups[0]
+    assert all(value is spec for value in group.kv_cache_specs.values())
+    assert group.manager_config == layer_config.manager_config
+    assert group.is_eagle_group
     for layer, cache in enumerate(caches.values()):
         assert cache.shape == (
             5,
@@ -82,11 +102,15 @@ def test_dense_own_kv_layers_and_blocks_never_alias(kind, layout_name):
 def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
     layout_name, split_kernel_blocks
 ):
-    full = replace(_spec("full"), dtype=torch.bfloat16)
-    sliding = _spec("swa")
-    wider = replace(sliding, sliding_window=9, num_kv_heads=1, head_size=7)
+    full = FullAttentionManager.layer_config(
+        replace(_spec("full"), dtype=torch.bfloat16)
+    )
+    sliding = _layer_config("swa")
+    wider = SlidingWindowManager.layer_config(
+        replace(sliding.spec, num_kv_heads=1, head_size=7), sliding_window=9
+    )
     specs = {"a": full, "b": sliding, "c": full, "d": wider, "e": sliding}
-    page_bytes = sum(spec.page_size_bytes for spec in specs.values())
+    page_bytes = sum(layer.spec.page_size_bytes for layer in specs.values())
     budget = page_bytes * 6 - 1
     layout = KVCacheLayout[layout_name]
     config = make_grouped_standalone_kv_config(specs, budget, layout)
@@ -95,10 +119,13 @@ def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
         ["b", "e"],
         ["d"],
     ]
-    assert [group.kv_cache_spec for group in config.kv_cache_groups] == [
-        full,
-        sliding,
-        wider,
+    assert [group.kv_cache_specs for group in config.kv_cache_groups] == [
+        dict.fromkeys(("a", "c"), full.spec),
+        dict.fromkeys(("b", "e"), sliding.spec),
+        {"d": wider.spec},
+    ]
+    assert [group.manager_config for group in config.kv_cache_groups] == [
+        layer.manager_config for layer in (full, sliding, wider)
     ]
     assert config.num_blocks == 5
     kernel_sizes = [4, 2, 1] if split_kernel_blocks else [4, 4, 4]
@@ -109,10 +136,10 @@ def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
         kernel_sizes[1] = 4
     caches = allocate_kv_cache(config, torch.device("cpu"), layout, kernel_sizes)
     for group, kernel_size in zip(config.kv_cache_groups, kernel_sizes):
-        ratio = full.block_size // kernel_size
+        ratio = full.spec.block_size // kernel_size
         for name in group.layer_names:
             cache = caches[name]
-            spec = specs[name]
+            spec = specs[name].spec
             assert cache.shape == (
                 5 * ratio,
                 spec.num_kv_heads,
@@ -124,7 +151,7 @@ def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
                     10 * list(specs).index(name) + block
                 )
     for group, kernel_size in zip(config.kv_cache_groups, kernel_sizes):
-        ratio = full.block_size // kernel_size
+        ratio = full.spec.block_size // kernel_size
         for name in group.layer_names:
             cache = caches[name]
             assert not cache[:ratio].count_nonzero().item()
@@ -146,13 +173,28 @@ def test_mixed_attention_groups_keep_every_layer_and_logical_block_independent(
 @pytest.mark.parametrize(
     "other, message",
     [
-        (replace(_spec("swa"), block_size=8), "common block size and dtype"),
-        (_spec("full"), "common block size and dtype"),
-        (_spec("mla"), "cannot mix MLA and dense"),
-        (replace(_spec("swa"), tokens_per_state=2), "dense unquantized"),
-        (replace(_spec("swa"), page_size_padded=256), "dense unquantized"),
         (
-            replace(_spec("full"), dtype=torch.bfloat16, non_causal=True),
+            replace(_layer_config("swa"), spec=replace(_spec("swa"), block_size=8)),
+            "common block size and dtype",
+        ),
+        (_layer_config("full"), "common block size and dtype"),
+        (_layer_config("mla"), "cannot mix MLA and dense"),
+        (
+            replace(
+                _layer_config("swa"), spec=replace(_spec("swa"), tokens_per_state=2)
+            ),
+            "dense unquantized",
+        ),
+        (
+            replace(
+                _layer_config("swa"), spec=replace(_spec("swa"), page_size_padded=256)
+            ),
+            "dense unquantized",
+        ),
+        (
+            ChunkedLocalAttentionManager.layer_config(
+                replace(_spec("full"), dtype=torch.bfloat16), attention_chunk_size=4
+            ),
             "causal token-addressed",
         ),
     ],
@@ -161,7 +203,31 @@ def test_mixed_groups_do_not_bypass_per_layer_or_shared_planner_contract(
     other, message
 ):
     with pytest.raises(ValueError, match=message):
-        group_standalone_kv_specs({"a": _spec("swa"), "b": other})
+        group_standalone_kv_specs({"a": _layer_config("swa"), "b": other})
+
+
+def test_identical_storage_keeps_full_and_distinct_window_policies_separate():
+    spec = _spec("full")
+    layers = {
+        "full": FullAttentionManager.layer_config(spec),
+        "short": SlidingWindowManager.layer_config(spec, sliding_window=5),
+        "long": SlidingWindowManager.layer_config(spec, sliding_window=9),
+    }
+    config = make_grouped_standalone_kv_config(
+        layers, 9 * spec.page_size_bytes, KVCacheLayout.LBNHC
+    )
+    assert [group.layer_names for group in config.kv_cache_groups] == [
+        [name] for name in layers
+    ]
+    assert [group.manager_config for group in config.kv_cache_groups] == [
+        layer.manager_config for layer in layers.values()
+    ]
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBNHC)
+    for i, cache in enumerate(caches.values(), 1):
+        cache[1].fill_(i)
+    for i, cache in enumerate(caches.values(), 1):
+        assert torch.all(cache[1] == i)
+        assert not cache[0].count_nonzero()
 
 
 def test_grouped_cache_requires_at_least_one_attention_layer():
@@ -171,15 +237,16 @@ def test_grouped_cache_requires_at_least_one_attention_layer():
 
 @pytest.mark.parametrize("kind", ["full", "mla", "swa"])
 def test_each_layer_budget_reserves_a_null_block(kind):
-    spec = _spec(kind)
+    layer_config = _layer_config(kind)
+    spec = layer_config.spec
     names = ["a"] if kind == "full" else ["a", "b"]
     page_group_bytes = len(names) * spec.page_size_bytes
     with pytest.raises(ValueError, match="null block plus one block"):
         make_standalone_kv_config(
-            spec, names, 2 * page_group_bytes - 1, KVCacheLayout.LBNHC
+            layer_config, names, 2 * page_group_bytes - 1, KVCacheLayout.LBNHC
         )
     config = make_standalone_kv_config(
-        spec, names, 2 * page_group_bytes, KVCacheLayout.LBNHC
+        layer_config, names, 2 * page_group_bytes, KVCacheLayout.LBNHC
     )
     pool = DraftBlockPool(config.num_blocks, spec.block_size)
     assert pool.ensure(0, spec.block_size) == [1]
@@ -188,10 +255,11 @@ def test_each_layer_budget_reserves_a_null_block(kind):
 
 @pytest.mark.parametrize("layout_name", ["LBHNC", "LBNHC", "LHBNC"])
 def test_mla_kernel_block_splitting_preserves_latent_vectors(layout_name):
-    spec = _spec("mla")
+    layer_config = _layer_config("mla")
+    spec = layer_config.spec
     layout = KVCacheLayout[layout_name]
     config = make_standalone_kv_config(
-        spec, ["a", "b"], 6 * spec.page_size_bytes, layout
+        layer_config, ["a", "b"], 6 * spec.page_size_bytes, layout
     )
     caches = allocate_kv_cache(config, torch.device("cpu"), layout, [2])
     for layer, cache in enumerate(caches.values()):
@@ -205,9 +273,10 @@ def test_mla_kernel_block_splitting_preserves_latent_vectors(layout_name):
 
 
 def test_sliding_window_planner_keeps_full_context_for_rejection():
-    spec = _spec("swa")
+    layer_config = _layer_config("swa")
+    spec = layer_config.spec
     config = make_standalone_kv_config(
-        spec, ["draft"], 8 * spec.page_size_bytes, KVCacheLayout.LBNHC
+        layer_config, ["draft"], 8 * spec.page_size_bytes, KVCacheLayout.LBNHC
     )
     pool = DraftBlockPool(config.num_blocks, spec.block_size)
     planner = DraftStepPlanner(
@@ -231,12 +300,29 @@ def test_sliding_window_planner_keeps_full_context_for_rejection():
 
 @pytest.mark.parametrize("kind", ["full", "mla", "swa"])
 def test_mixed_or_differently_sized_layers_are_rejected(kind):
-    spec = _spec(kind)
+    layer_config = _layer_config(kind)
     with pytest.raises(ValueError, match="one uniform KV group"):
-        select_standalone_kv_spec({"a": spec, "b": replace(spec, head_size=7)})
+        select_standalone_kv_layer_config(
+            {
+                "a": layer_config,
+                "b": replace(
+                    layer_config, spec=replace(layer_config.spec, head_size=7)
+                ),
+            }
+        )
     with pytest.raises(ValueError, match="one uniform KV group"):
-        select_standalone_kv_spec(
-            {"a": spec, "b": _spec("swa" if kind != "swa" else "mla")}
+        select_standalone_kv_layer_config(
+            {"a": layer_config, "b": _layer_config("swa" if kind != "swa" else "mla")}
+        )
+    with pytest.raises(ValueError, match="one uniform KV group"):
+        select_standalone_kv_layer_config(
+            {
+                "a": layer_config,
+                "b": replace(
+                    layer_config,
+                    manager_config=SlidingWindowManager.config(sliding_window=8),
+                ),
+            }
         )
 
 
@@ -248,54 +334,88 @@ def test_mixed_or_differently_sized_layers_are_rejected(kind):
         replace(_spec("swa"), page_size_padded=256),
         replace(_spec("full"), num_head_slots=3),
         replace(_spec("full"), dtype=torch.uint8),
+        replace(_spec("full"), kv_quant_mode=KVQuantMode.FP8_PER_TENSOR),
     ],
 )
 def test_compressed_packed_padded_and_quantized_pages_are_rejected(spec):
     with pytest.raises(ValueError, match="dense unquantized KV pages"):
-        select_standalone_kv_spec({"draft": spec})
+        select_standalone_kv_layer_config(
+            {"draft": FullAttentionManager.layer_config(spec)}
+        )
 
 
 @pytest.mark.parametrize(
-    "changes",
+    "changes,manager_config",
     [
-        {"model_version": "deepseek_v4"},
-        {"is_index_group_leader": True},
-        {"topk_buffer_width": 512},
-        {"cache_role": SparseCacheRole.INDEXER},
-        {"non_causal_multi_token_decode": True},
-        {"sliding_window": 8},
-        {"head_size_v": 3},
-        {"num_kv_heads": 2},
+        ({"model_version": "deepseek_v4"}, None),
+        ({"is_index_group_leader": True}, None),
+        ({"cache_role": SparseCacheRole.INDEXER}, None),
+        ({}, CrossAttentionManager.config()),
+        ({}, SlidingWindowManager.config(sliding_window=8)),
+        ({"head_size_v": 3}, None),
+        ({"num_kv_heads": 2}, None),
+        ({"topk_buffer_width": 8}, None),
+        ({"alignment": 1}, None),
     ],
 )
-def test_sparse_and_nonstandard_mla_require_a_separate_contract(changes):
+def test_sparse_and_nonstandard_mla_require_a_separate_contract(
+    changes, manager_config
+):
+    layer_config = _layer_config("mla")
+    layer_config = replace(
+        layer_config,
+        spec=replace(layer_config.spec, **changes),
+        manager_config=manager_config or layer_config.manager_config,
+    )
     with pytest.raises(ValueError, match="dense MLA without an indexer"):
-        select_standalone_kv_spec({"draft": replace(_spec("mla"), **changes)})
+        select_standalone_kv_layer_config({"draft": layer_config})
 
 
-@pytest.mark.parametrize("spec_type", [SlidingWindowMLASpec, HiddenStateCacheSpec])
-def test_other_cache_spec_subclasses_are_not_implicitly_admitted(spec_type):
-    kwargs = dict(block_size=4, num_kv_heads=1, head_size=5, dtype=torch.bfloat16)
-    if spec_type is SlidingWindowMLASpec:
-        kwargs["sliding_window"] = 8
+@pytest.mark.parametrize(
+    "spec",
+    [
+        HiddenStateCacheSpec(
+            block_size=4, num_kv_heads=1, head_size=5, dtype=torch.bfloat16
+        ),
+        HiSparseHotPageSpec(block_size=4, page_size=64),
+    ],
+)
+def test_other_cache_spec_subclasses_are_not_implicitly_admitted(spec):
     with pytest.raises(ValueError, match="unsupported"):
-        select_standalone_kv_spec({"draft": spec_type(**kwargs)})
+        select_standalone_kv_layer_config(
+            {"draft": FullAttentionManager.layer_config(spec)}
+        )
 
 
-@pytest.mark.parametrize("changes", [{"non_causal": True}, {"attention_chunk_size": 8}])
-def test_noncausal_and_chunked_attention_are_rejected(changes):
+@pytest.mark.parametrize(
+    "manager_config",
+    [
+        CrossAttentionManager.config(),
+        ChunkedLocalAttentionManager.config(attention_chunk_size=8),
+        SlidingWindowManager.config(sliding_window=8, bounded_replay=True),
+    ],
+)
+def test_noncausal_and_chunked_attention_are_rejected(manager_config):
     with pytest.raises(ValueError, match="causal token-addressed KV"):
-        select_standalone_kv_spec({"draft": replace(_spec("full"), **changes)})
+        select_standalone_kv_layer_config(
+            {"draft": replace(_layer_config("full"), manager_config=manager_config)}
+        )
 
 
 def test_nonempty_unique_layer_names_and_hardware_alignment_are_required():
-    spec = _spec("full")
+    layer_config = _layer_config("full")
     for names in ([], ["a", "a"]):
         with pytest.raises(ValueError, match="nonempty and unique"):
-            make_standalone_kv_config(spec, names, 4096, KVCacheLayout.LBNHC)
+            make_standalone_kv_config(layer_config, names, 4096, KVCacheLayout.LBNHC)
     with pytest.raises(ValueError, match="block alignment"):
         make_standalone_kv_config(
-            replace(spec, block_stride_alignment=1024), ["a"], 4096, KVCacheLayout.LBNHC
+            replace(
+                layer_config,
+                spec=replace(layer_config.spec, block_stride_alignment=1024),
+            ),
+            ["a"],
+            4096,
+            KVCacheLayout.LBNHC,
         )
 
 
@@ -304,7 +424,7 @@ def test_nonempty_unique_layer_names_and_hardware_alignment_are_required():
 def test_all_cache_types_require_layer_compact_layout(kind, layout_name):
     with pytest.raises(ValueError, match="layer-compact"):
         make_standalone_kv_config(
-            _spec(kind), ["draft"], 4096, KVCacheLayout[layout_name]
+            _layer_config(kind), ["draft"], 4096, KVCacheLayout[layout_name]
         )
 
 
@@ -331,9 +451,11 @@ def sparse_mla_pair():
             is_index_group_leader=True,
         )
     )
+    indexer_config = indexer.get_kv_cache_config(config)
+    assert indexer_config is not None
     specs = {
-        f"{stem}.attn": mla,
-        indexer.prefix: indexer.get_kv_cache_spec(config),
+        f"{stem}.attn": FullAttentionManager.layer_config(mla),
+        indexer.prefix: indexer_config,
     }
     return config, indexer, specs
 
@@ -348,7 +470,7 @@ def test_sparse_pair_keeps_logical_blocks_and_native_byte_records_independent(
     if indexer_first:
         specs = dict(reversed(specs.items()))
     layout = KVCacheLayout[layout_name]
-    page_bytes = sum(spec.page_size_bytes for spec in specs.values())
+    page_bytes = sum(layer.spec.page_size_bytes for layer in specs.values())
     assert page_bytes == 64 * (576 * 2 + 132)
     budget = 5 * page_bytes - 1
     config = make_grouped_standalone_kv_config(
@@ -374,7 +496,7 @@ def test_sparse_pair_keeps_logical_blocks_and_native_byte_records_independent(
         assert (
             cache.stride(0)
             * cache.element_size()
-            % specs[name].get_block_stride_alignment()
+            % specs[name].spec.get_block_stride_alignment()
             == 0
         )
 
@@ -448,6 +570,8 @@ def test_sparse_pair_requires_explicit_contract(sparse_mla_pair):
         "compressed",
         "padded",
         "noncausal",
+        "window",
+        "chunked",
     ],
 )
 def test_sparse_pair_does_not_admit_unrelated_or_changed_cache_semantics(
@@ -464,6 +588,13 @@ def test_sparse_pair_does_not_admit_unrelated_or_changed_cache_semantics(
         )
     elif mutation == "extra_layer":
         specs[mla_name.replace("layers.1", "layers.2")] = specs[mla_name]
+    elif mutation in ("noncausal", "window", "chunked"):
+        policy = {
+            "noncausal": CrossAttentionManager.config(),
+            "window": SlidingWindowManager.config(sliding_window=64),
+            "chunked": ChunkedLocalAttentionManager.config(attention_chunk_size=64),
+        }[mutation]
+        specs[mla_name] = replace(specs[mla_name], manager_config=policy)
     else:
         name, changes = {
             "wrong_role": (indexer.prefix, {"cache_role": SparseCacheRole.SPARSE}),
@@ -472,9 +603,8 @@ def test_sparse_pair_does_not_admit_unrelated_or_changed_cache_semantics(
             "wrong_topk": (mla_name, {"topk_buffer_width": 1024}),
             "compressed": (mla_name, {"tokens_per_state": 2}),
             "padded": (mla_name, {"page_size_padded": 131072}),
-            "noncausal": (mla_name, {"non_causal": True}),
         }[mutation]
-        specs[name] = replace(specs[name], **changes)
+        specs[name] = replace(specs[name], spec=replace(specs[name].spec, **changes))
     with pytest.raises(ValueError, match="standalone sparse MLA"):
         make_grouped_standalone_kv_config(
             specs, 1 << 20, KVCacheLayout.LBNHC, sparse_mla=SparseMLAKVContract(512)
